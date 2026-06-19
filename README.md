@@ -56,8 +56,8 @@ Once published to [database.dev](https://database.dev), install as a Trusted Lan
 Extension:
 
 ```sql
-select dbdev.install('<your-handle>@pg_partition_magician');
-create extension "<your-handle>@pg_partition_magician" version '0.1.0' cascade;
+select dbdev.install('dventimisupabase@pg_partition_magician');
+create extension "dventimisupabase@pg_partition_magician" version '0.1.0' cascade;
 ```
 
 The Supabase demo applies the module as a migration; that migration is **generated**
@@ -326,7 +326,7 @@ to [database.dev](https://database.dev). You can also run either workflow manual
 1. Create a [database.dev](https://database.dev) account and an API token.
 2. Add it as a repo secret named **`DBDEV_TOKEN`** (Settings → Secrets and variables →
    Actions). The package publishes under your account handle as
-   `@<your-handle>/pg_partition_magician`.
+   `@dventimisupabase/pg_partition_magician`.
 
 > The dbdev channel is build- and psql-install-tested in CI, but the TLE
 > `CREATE EXTENSION` path itself is exercised at publish/install time (no dbdev
