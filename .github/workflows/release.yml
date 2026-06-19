@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  validate:
+    name: Validate + full test matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version tag
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid tag '$VERSION' (expected v#.# or v#.#.#)"; exit 1
+          fi
+          echo "Releasing $VERSION"
+      - uses: docker/setup-buildx-action@v3
+      - name: Channel test matrix (PG 15-18)
+        run: ./test.sh
+
+  release:
+    name: Create GitHub Release
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: echo "version=${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes
+        run: |
+          VER="${{ steps.v.outputs.version }}"; NUM="${VER#v}"
+          if [ -f CHANGELOG.md ] && grep -q "## \[$NUM\]" CHANGELOG.md; then
+            awk -v ver="$NUM" '
+              /^## \[/ { if (found) exit; if (index($0, "[" ver "]")) { found=1; next } }
+              found { print }
+            ' CHANGELOG.md > NOTES.md
+          else
+            PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              git log "$PREV"..HEAD --no-merges --pretty='- %s (%h)' > NOTES.md
+            else
+              git log --no-merges --pretty='- %s (%h)' > NOTES.md
+            fi
+          fi
+          cat NOTES.md
+
+      - name: Build release assets
+        run: |
+          VER="${{ steps.v.outputs.version }}"; NUM="${VER#v}"
+          mkdir -p release-assets
+          # Self-contained bundle (Supabase SQL editor) and minified dbdev/TLE package.
+          scripts/build_install_bundle.sh sql/pg_partition_magician.sql "release-assets/pg_partition_magician-${VER}-bundle.sql"
+          scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql "release-assets/pg_partition_magician--${NUM}.sql"
+          # Source tarball.
+          tar -czf "release-assets/pg_partition_magician-${VER}.tar.gz" \
+            sql/pg_partition_magician.sql sql/uninstall.sql extension.control README.md ONBOARDING.md \
+            $([ -f CHANGELOG.md ] && echo CHANGELOG.md)
+          ls -la release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.version }}
+          name: pg_partition_magician ${{ steps.v.outputs.version }}
+          body_path: NOTES.md
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-dbdev:
+    name: Publish to database.dev
+    needs: release
+    uses: ./.github/workflows/publish-dbdev.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+    secrets:
+      DBDEV_TOKEN: ${{ secrets.DBDEV_TOKEN }}

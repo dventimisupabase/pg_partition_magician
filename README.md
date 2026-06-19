@@ -52,9 +52,17 @@ scripts/build_dbdev_package.sh sql/pg_partition_magician.sql dist/pg_partition_m
 `psql -f sql/uninstall.sql` (removes the `pgpm` schema + its cron jobs; your partitioned
 tables and data are left intact).
 
+Once published to [database.dev](https://database.dev), install as a Trusted Language
+Extension:
+
+```sql
+select dbdev.install('<your-handle>@pg_partition_magician');
+create extension "<your-handle>@pg_partition_magician" version '0.1.0' cascade;
+```
+
 The Supabase demo applies the module as a migration; that migration is **generated**
 from the source by `scripts/sync_supabase_migration.sh` (CI fails on drift), so there's
-no hand-maintained copy. Release automation and database.dev publishing are deferred.
+no hand-maintained copy.
 
 ## Use it
 
@@ -298,6 +306,31 @@ tables) and update the app to populate the new column going forward.
 
 (`pg_partman` reaches the same conclusion — its howto says incoming FKs require an
 outage to drop and recreate against the new partitioned table.)
+
+## Releasing & publishing
+
+Tag a version and CI does the rest (`.github/workflows/release.yml`):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+On a `v*` tag the Release workflow runs the full PG 15–18 channel matrix, creates a
+GitHub Release with the bundle + minified dbdev package + a source tarball (release
+notes pulled from `CHANGELOG.md`), then calls `publish-dbdev.yml` to push the package
+to [database.dev](https://database.dev). You can also run either workflow manually via
+*workflow_dispatch* with an explicit version.
+
+**One-time setup for publishing** (the publish job is inert until both exist):
+
+1. Create a [database.dev](https://database.dev) account and an API token.
+2. Add it as a repo secret named **`DBDEV_TOKEN`** (Settings → Secrets and variables →
+   Actions). The package publishes under your account handle as
+   `@<your-handle>/pg_partition_magician`.
+
+> The dbdev channel is build- and psql-install-tested in CI, but the TLE
+> `CREATE EXTENSION` path itself is exercised at publish/install time (no dbdev
+> account in CI).
 
 ## Teardown
 

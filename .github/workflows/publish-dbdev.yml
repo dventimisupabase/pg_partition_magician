@@ -1,0 +1,65 @@
+name: Publish to database.dev
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+        type: string
+    secrets:
+      DBDEV_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+# Requires a database.dev account and a DBDEV_TOKEN repo secret (see README).
+# Inert until those exist; no-ops can't run without a tag/dispatch.
+jobs:
+  publish:
+    name: dbdev publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: Normalize version (dbdev requires x.y.z)
+        run: |
+          RAW="${{ inputs.version }}"; VER="${RAW#v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+$ ]]; then VER="${VER}.0"; fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Build the dbdev package
+        run: |
+          VER="${{ steps.v.outputs.version }}"
+          mkdir -p dbdev-pkg
+          # Minified single-file extension SQL (CREATE EXTENSION runs server-side,
+          # so no psql metacommands; under dbdev's 250k-char cap).
+          scripts/build_dbdev_package.sh sql/pg_partition_magician.sql "dbdev-pkg/pg_partition_magician--${VER}.sql"
+          # dbdev expects <name>.control alongside <name>--<ver>.sql.
+          cp extension.control dbdev-pkg/pg_partition_magician.control
+          sed -i "s/^default_version = .*/default_version = '${VER}'/" dbdev-pkg/pg_partition_magician.control
+          SIZE=$(wc -c < "dbdev-pkg/pg_partition_magician--${VER}.sql")
+          echo "package size: ${SIZE} chars"
+          [ "$SIZE" -le 250000 ] || { echo "exceeds dbdev 250,000-char cap"; exit 1; }
+
+      - name: Install the dbdev CLI
+        run: |
+          DEB_URL=$(curl -fsSL https://api.github.com/repos/supabase/dbdev/releases/latest \
+            | jq -r '.assets[] | select(.name | endswith("linux-amd64.deb")) | .browser_download_url')
+          curl -fsSL -o dbdev.deb "$DEB_URL"
+          sudo dpkg -i dbdev.deb
+
+      - name: Authenticate to dbdev
+        env:
+          DBDEV_TOKEN: ${{ secrets.DBDEV_TOKEN }}
+        run: |
+          mkdir -p ~/.dbdev
+          printf '[registries.dbdev]\ntoken = "%s"\n' "$DBDEV_TOKEN" > ~/.dbdev/credentials.toml
+
+      - name: Publish
+        run: cd dbdev-pkg && dbdev publish
