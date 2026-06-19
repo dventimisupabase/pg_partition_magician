@@ -84,7 +84,11 @@ partition key *is* the column other tables reference (typical for `id`), the PK
 stays single-column and **incoming FKs need no denormalization** — just a re-point.
 
 UUIDv7/ULID generation is the app's job (PG 15 has no `uuidv7()`); the tool only
-stores, compares, and encodes boundary uuids — a pure-SQL `uuid↔ms` codec.
+stores, compares, and encodes boundary uuids — a pure-SQL `uuid↔ms` codec. Since
+the column type is just `uuid`, `adopt_by_uuidv7()` can't *know* the values are
+time-ordered, so it samples them and **warns** if they don't decode to plausible
+recent timestamps (i.e. likely random/UUIDv4); `pgpm.check_uuidv7(table, col)` runs
+the same check on demand. It's a heuristic, not a proof.
 
 ### API
 
@@ -100,6 +104,7 @@ stores, compares, and encodes boundary uuids — a pure-SQL `uuid↔ms` codec.
 | `pgpm.drain_all(parent, batch, include_open)` | Drive the drain to completion (ignores pause) |
 | `pgpm.retention(parent)` | Drop partitions older than the policy |
 | `pgpm.check_default(parent)` | Rows still in the DEFAULT, and how many are in already-closed intervals (the alert) |
+| `pgpm.check_uuidv7(table, col)` | Sanity-sample a uuid column: fraction whose embedded prefix decodes to a plausible recent timestamp (catches random/v4) |
 | `pgpm.generate_fk_recovery(parent)` | Emit a path-A recovery script per dropped incoming FK (denormalize + composite FK) |
 | `pgpm.status()` / `pgpm.partitions` | Monitoring |
 

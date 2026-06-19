@@ -415,6 +415,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
+  v_uchk_n bigint; v_uchk_frac numeric;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -444,6 +445,16 @@ begin
     end if;
   elsif p_control_kind = 'uuidv7' and v_typname <> 'uuid' then
     raise exception 'pg_partition_magician: control_kind uuidv7 needs a uuid column (got %)', v_typname;
+  end if;
+
+  -- uuidv7 sanity check: the type can't tell us the values are time-ordered, so
+  -- sample them -- random (UUIDv4) columns decode to implausible timestamps.
+  if p_control_kind = 'uuidv7' then
+    select sampled, fraction into v_uchk_n, v_uchk_frac from pgpm.check_uuidv7(p_parent, p_control, 1000);
+    if coalesce(v_uchk_n, 0) > 0 and v_uchk_frac < 0.95 then
+      raise notice 'pg_partition_magician: only % of % sampled % values decode to plausible recent timestamps; the column may be random (UUIDv4) rather than time-ordered (UUIDv7/ULID) -- partitioning will misbehave. Proceeding; verify with pgpm.check_uuidv7().',
+        (round(v_uchk_frac * 100, 1) || '%'), v_uchk_n, quote_ident(p_control);
+    end if;
   end if;
 
   -- existing PK columns and identity columns
@@ -672,6 +683,25 @@ begin
   return query execute format(
     'select count(*)::bigint, count(*) filter (where %I < %L)::bigint, (select t.%I::text from %s t order by t.%I limit 1) from %s',
     cfg.control_column, v_cur_lit, cfg.control_column, v_def, cfg.control_column, v_def);
+end;
+$$;
+
+-- check_uuidv7(): sanity-sample a uuid column. Genuine UUIDv7/ULID values decode
+-- (via their leading 48-bit ms prefix) to plausible recent timestamps and score
+-- ~1.0; random UUIDv4 columns score near 0. A heuristic, not a proof.
+create or replace function pgpm.check_uuidv7(p_table regclass, p_control name, p_sample int default 1000)
+returns table (sampled bigint, plausible bigint, fraction numeric, oldest timestamptz, newest timestamptz)
+language plpgsql as $$
+begin
+  return query execute format($q$
+    with s as (select pgpm._uuid_to_ts(%I) as ts from %s limit %s)
+    select count(*)::bigint,
+           count(*) filter (where ts between timestamptz '2015-01-01' and now() + interval '1 day')::bigint,
+           round(coalesce(count(*) filter (where ts between timestamptz '2015-01-01' and now() + interval '1 day')::numeric
+                          / nullif(count(*), 0), 0), 4),
+           min(ts), max(ts)
+    from s
+  $q$, p_control, p_table::text, p_sample);
 end;
 $$;
 
