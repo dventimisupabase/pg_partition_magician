@@ -34,13 +34,27 @@ and PL/pgSQL — you can install it anywhere you can run SQL and schedule a job.
 
 ## Install
 
+`sql/pg_partition_magician.sql` is the single source of truth — pure SQL, idempotent,
+no psql metacommands. It ships through three channels (all built from that one file):
+
 ```bash
+# 1. psql -- run the source directly
 psql "$DATABASE_URL" -f sql/pg_partition_magician.sql
+
+# 2. bundle -- self-contained, BEGIN/COMMIT-wrapped; paste into the Supabase SQL editor
+scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
+
+# 3. dbdev / TLE -- minified single file for CREATE EXTENSION / database.dev (<250k cap)
+scripts/build_dbdev_package.sh sql/pg_partition_magician.sql dist/pg_partition_magician--0.1.0.sql
 ```
 
-Pure SQL, idempotent. (In this repo the same file is also applied as a Supabase
-migration — `supabase/migrations/*_install_pg_partition_magician.sql` is a copy of
-`sql/pg_partition_magician.sql`, the single source of truth.)
+`extension.control` carries the TLE metadata (`requires = 'pg_cron'`). Uninstall with
+`psql -f sql/uninstall.sql` (removes the `pgpm` schema + its cron jobs; your partitioned
+tables and data are left intact).
+
+The Supabase demo applies the module as a migration; that migration is **generated**
+from the source by `scripts/sync_supabase_migration.sh` (CI fails on drift), so there's
+no hand-maintained copy. Release automation and database.dev publishing are deferred.
 
 ## Use it
 
@@ -187,15 +201,23 @@ Scale the seed: `alter database postgres set poc.seed_count = 1000000;` then
 
 ## Tests
 
-pgTAP, run against a freshly reset DB:
+53 pgTAP tests across structure, write-routing, drain, row conservation, the
+scan-skip attach method, premake, retention, secondary-index propagation,
+incoming-FK handling + recovery, and the `id` and `uuidv7` dimensions (incl. the
+uuid↔ts codec). Two ways to run them:
 
 ```bash
+# local dev — via Supabase against a freshly reset DB
 supabase db reset && supabase test db
+
+# the CI matrix — install each channel on PostgreSQL 15/16/17/18 (Docker),
+# load the demo migrations as fixtures, run pg_prove, verify a clean uninstall
+./test.sh                       # all versions x all channels
+./test.sh 15 --channel=bundle   # one version / channel
 ```
 
-50 tests across structure, write-routing, drain, row conservation, the scan-skip
-attach method, premake, retention, secondary-index propagation, incoming-FK
-handling + recovery, and the `id` and `uuidv7` dimensions (incl. the uuid↔ts codec).
+`test.sh` builds a pg_cron+pgtap image per version (`Dockerfile`/`docker-compose.yml`)
+and is what `.github/workflows/test.yml` runs.
 
 > Reset before testing: tests assume the pristine post-reset state (data in the
 > DEFAULT, maintenance paused). A live drain mutates committed state.

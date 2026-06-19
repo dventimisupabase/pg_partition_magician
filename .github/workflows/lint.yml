@@ -1,0 +1,44 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  markdown-lint:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: |
+            **/*.md
+
+  shellcheck:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+
+  sql-syntax:
+    name: SQL unterminated-block check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check dollar-quote / comment balance in the module
+        run: |
+          awk '
+            /\$\$/ { n=gsub(/\$\$/,"&"); dq += n }
+            END {
+              if (dq % 2 != 0) { print "Unbalanced $$ dollar quotes"; exit 1 }
+              print "dollar-quote check passed"
+            }
+          ' sql/pg_partition_magician.sql

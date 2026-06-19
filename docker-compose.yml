@@ -1,0 +1,47 @@
+x-pg-base: &pg-base
+  environment:
+    POSTGRES_DB: postgres
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+  # mount the repo read-only so the harness can psql -f the source, the
+  # migrations (fixtures), built bundles, and pg_prove the tests.
+  volumes:
+    - .:/repo:ro
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 5s
+    timeout: 5s
+    retries: 10
+
+services:
+  postgres15:
+    <<: *pg-base
+    profiles: ["pg15", "all"]
+    build: { context: ., args: { PG_VERSION: 15 } }
+    image: pgpm_test:15
+    container_name: pgpm_test-15
+    ports: ["5515:5432"]
+
+  postgres16:
+    <<: *pg-base
+    profiles: ["pg16", "all"]
+    build: { context: ., args: { PG_VERSION: 16 } }
+    image: pgpm_test:16
+    container_name: pgpm_test-16
+    ports: ["5516:5432"]
+
+  postgres17:
+    <<: *pg-base
+    profiles: ["pg17", "all"]
+    build: { context: ., args: { PG_VERSION: 17 } }
+    image: pgpm_test:17
+    container_name: pgpm_test-17
+    ports: ["5517:5432"]
+
+  postgres18:
+    <<: *pg-base
+    profiles: ["pg18", "all"]
+    build: { context: ., args: { PG_VERSION: 18 } }
+    image: pgpm_test:18
+    container_name: pgpm_test-18
+    ports: ["5518:5432"]

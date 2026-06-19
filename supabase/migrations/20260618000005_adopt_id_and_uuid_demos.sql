@@ -16,7 +16,7 @@ create table public.events_id (
   payload text not null
 );
 insert into public.events_id (payload)
-  select 'evt ' || g from generate_series(1, 45000) g;
+  select 'evt ' || g from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g;
 analyze public.events_id;
 
 -- step = 10,000 ids per partition; keep 2 ahead
@@ -41,7 +41,7 @@ from (
           * (((g::bigint * 2654435761) % 1000000)::double precision / 1000000.0)
     )) * 1000)::bigint), 12, '0')
     || substr(replace(gen_random_uuid()::text, '-', ''), 13) as h
-  from generate_series(1, 45000) g
+  from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g
 ) s;
 analyze public.events_uuid;
 

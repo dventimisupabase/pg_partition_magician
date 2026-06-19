@@ -1,5 +1,5 @@
 -- Verifies integer/id-range partitioning (events_id): structure, premake ahead
--- of the id frontier, full drain, and row conservation.
+-- of the id frontier, full drain, and row conservation. Robust to seed size.
 create extension if not exists pgtap;
 
 begin;
@@ -20,14 +20,15 @@ select is(
   'RANGE (id)', 'events_id is RANGE-partitioned on id'
 );
 
--- premade partitions ahead of the current max id (~45000)
+-- premade partitions sit ahead of the current id frontier
 select cmp_ok(
   (select count(*) from pgpm.part
-    where parent_table = 'public.events_id'::regclass and lo::numeric > 45000)::int,
+    where parent_table = 'public.events_id'::regclass
+      and lo::numeric > (select max(id) from public.events_id))::int,
   '>=', 2, 'at least 2 id partitions premade ahead of the frontier'
 );
 
--- drive the full drain (closed id-ranges + the active one)
+create temporary table _before_id on commit drop as select count(*) as n from public.events_id;
 select pgpm.drain_all('public.events_id', p_include_open => true);
 
 select is(
@@ -37,7 +38,7 @@ select is(
 
 select is(
   (select count(*) from public.events_id)::bigint,
-  45000::bigint, 'row count conserved across the id migration'
+  (select n from _before_id)::bigint, 'row count conserved across the id migration'
 );
 
 select * from finish();

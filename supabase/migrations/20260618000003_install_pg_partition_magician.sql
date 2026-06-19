@@ -1,3 +1,7 @@
+-- GENERATED FILE -- do not edit.
+-- Source of truth: sql/pg_partition_magician.sql
+-- Regenerate with: scripts/sync_supabase_migration.sh
+
 -- =============================================================================
 -- pg_partition_magician  --  a lightweight, pure-SQL range-partition manager
 --

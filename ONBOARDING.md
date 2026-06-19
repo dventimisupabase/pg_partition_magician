@@ -34,11 +34,16 @@ psql postgresql://postgres:postgres@127.0.0.1:54322/postgres   -- local DB URL
 | Path | What it is |
 |---|---|
 | `sql/pg_partition_magician.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
+| `sql/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
+| `extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
+| `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
+| `scripts/sync_supabase_migration.sh` | **Regenerate** the install migration from the source (run after editing the module) |
+| `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap) |
 | `supabase/migrations/0001..0002` | Demo: create + seed the unpartitioned `messages` table |
-| `supabase/migrations/0003_install_pg_partition_magician.sql` | **A copy of `sql/pg_partition_magician.sql`** (see gotcha below) |
+| `supabase/migrations/0003_install_pg_partition_magician.sql` | **Generated** from the source by `sync_supabase_migration.sh` — do not edit |
 | `supabase/migrations/0004..0005` | Demo: `adopt` the time / id / uuidv7 tables + schedule paused pg_cron maintenance |
-| `supabase/tests/*.sql` | pgTAP tests (one concern per file) |
-| `README.md` | Product docs: dimensions, the design, the control-type contract |
+| `supabase/tests/*.sql` | pgTAP tests (one concern per file) — also run by the Docker matrix |
+| `README.md` | Product docs: dimensions, install channels, the design, the control-type contract |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
 
 ## The mental model (in one breath)
@@ -58,25 +63,29 @@ attach. See README for the full story.
 **TDD is the norm** (see `~/.claude` global guidance and the existing suite). Add a
 failing pgTAP test, then make it pass.
 
-### ⚠️ The one gotcha that will bite you
+### After editing the module, re-sync the migration
 
-`sql/pg_partition_magician.sql` is the source of truth, but Supabase migrations
-can't `\i` an external file, so `supabase/migrations/0003_install_pg_partition_magician.sql`
-is a **hand-kept copy**. After editing the module you **must** re-sync:
+`sql/pg_partition_magician.sql` is the source of truth, but Supabase migrations can't
+`\i` an external file, so `supabase/migrations/0003_install_*.sql` is **generated**
+from it. After editing the module, regenerate it:
 
 ```bash
-cp sql/pg_partition_magician.sql supabase/migrations/20260618000003_install_pg_partition_magician.sql
+scripts/sync_supabase_migration.sh
 ```
 
-Forgetting this means your changes don't take effect on `db reset`. (Automating /
-de-duplicating this is a known deferred TODO.)
+(CI fails on drift, so a stale copy can't slip through — but regenerate before you
+`db reset` or your change won't take effect locally.)
 
 ### The inner loop
 
 ```bash
 # edit sql/pg_partition_magician.sql
-cp sql/pg_partition_magician.sql supabase/migrations/20260618000003_install_pg_partition_magician.sql
-supabase db reset && supabase test db
+scripts/sync_supabase_migration.sh
+supabase db reset && supabase test db        # fast local loop
+
+# before pushing, exercise the distribution channels on real PG versions:
+./test.sh 15                                 # one version, all channels (~3-5 min: image build)
+./test.sh                                    # full matrix PG 15-18 (what CI runs)
 ```
 
 `supabase test db` assumes a **freshly reset** DB (data in the `DEFAULT`, maintenance

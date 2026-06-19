@@ -1,11 +1,11 @@
 -- Verifies uuidv7 (time-grid, uuid-encoded boundaries) partitioning on
 -- events_uuid: codec roundtrip, structure, premake, full drain, conservation.
+-- Robust to seed size.
 create extension if not exists pgtap;
 
 begin;
 select plan(7);
 
--- the uuid<->ts codec roundtrips at ms resolution
 select is(
   pgpm._uuid_to_ts(pgpm._ts_to_uuid('2026-07-15 12:00:00+00'::timestamptz)),
   '2026-07-15 12:00:00+00'::timestamptz,
@@ -27,7 +27,6 @@ select is(
   'RANGE (id)', 'events_uuid is RANGE-partitioned on the uuid id'
 );
 
--- premade future partitions (time grid: native bounds are timestamps)
 select cmp_ok(
   (select count(*) from pgpm.part
     where parent_table = 'public.events_uuid'::regclass
@@ -35,7 +34,7 @@ select cmp_ok(
   '>=', 2, 'at least 2 uuid partitions premade ahead of the frontier'
 );
 
--- full drain
+create temporary table _before_uuid on commit drop as select count(*) as n from public.events_uuid;
 select pgpm.drain_all('public.events_uuid', p_include_open => true);
 
 select is(
@@ -45,7 +44,7 @@ select is(
 
 select is(
   (select count(*) from public.events_uuid)::bigint,
-  45000::bigint, 'row count conserved across the uuid migration'
+  (select n from _before_uuid)::bigint, 'row count conserved across the uuid migration'
 );
 
 select * from finish();
