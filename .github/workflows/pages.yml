@@ -1,0 +1,67 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - index.html
+      - install.html
+      - sql/uninstall.sql
+      - .github/workflows/pages.yml
+  # Re-deploy after a Release so the install page picks up the new bundle.
+  # workflow_run (not `release: published`) because GitHub doesn't cascade
+  # release events created by another workflow's GITHUB_TOKEN.
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Skip cascade deploys when the upstream Release failed.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site
+          cp index.html install.html _site/
+          cp sql/uninstall.sql _site/pg_partition_magician-uninstall.sql
+
+          TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$TAG" ]; then
+            echo "Latest release: $TAG"
+            gh release download "$TAG" -p '*-bundle.sql' --dir _site --clobber || true
+            # Stable filename so install.html can fetch it regardless of version.
+            for f in _site/pg_partition_magician-*-bundle.sql; do
+              [ -e "$f" ] && mv "$f" _site/pg_partition_magician-bundle.sql
+            done
+            sed -i "s/RELEASE_VERSION/${TAG}/g" _site/install.html
+          else
+            echo "No release yet — bundle fetch will degrade gracefully."
+            sed -i "s/RELEASE_VERSION/(unreleased)/g" _site/install.html
+          fi
+          ls -la _site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

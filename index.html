@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pg_partition_magician — partition a live Postgres table without moving a row</title>
+  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing table into a native RANGE-partitioned table online — time, bigint id, or UUIDv7 — driven by pg_cron." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      /* Supabase dark family + official green; brass is this project's own accent. */
+      --bg: #121212;
+      --bg-surface: #181818;
+      --bg-raised: #1E1E1E;
+      --bg-control: #232323;
+      --green: #3ECF8E;          /* official Supabase green */
+      --green-dark: #24B47E;
+      --green-glow: rgba(62, 207, 142, 0.13);
+      --brass: #E8B96B;          /* pg_partition_magician's secondary accent */
+      --brass-dim: #C99A4E;
+      --fg: #FAFAFA;
+      --fg-dim: #B4B4B4;
+      --fg-muted: #8A8A8A;
+      --fg-faint: #565656;
+      --border: #262626;
+      --border-strong: #383838;
+      --destructive: #E5675D;
+      --font-display: 'Fraunces', Georgia, 'Times New Roman', serif;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Source Code Pro', Menlo, monospace;
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+      --maxw: 1120px;
+    }
+
+    html { color-scheme: dark; scroll-behavior: smooth; }
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--green); text-decoration: none; }
+    a:hover { color: var(--green-dark); }
+    ::selection { background: rgba(232, 185, 107, 0.25); }
+
+    .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 28px; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--brass);
+    }
+    .display { font-family: var(--font-display); font-weight: 500; letter-spacing: -0.015em; line-height: 1.05; }
+
+    /* ---------- nav ---------- */
+    nav {
+      position: sticky; top: 0; z-index: 50;
+      background: rgba(18, 18, 18, 0.72);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-family: var(--font-mono); font-weight: 500; font-size: 15px; color: var(--fg); }
+    .brand:hover { color: var(--fg); }
+    .nav-links { display: flex; align-items: center; gap: 28px; }
+    .nav-links a { color: var(--fg-dim); font-size: 14px; }
+    .nav-links a:hover { color: var(--fg); }
+    .nav-gh { display: inline-flex; align-items: center; gap: 7px; color: var(--fg) !important; padding: 7px 14px; border: 1px solid var(--border-strong); border-radius: 7px; }
+    .nav-gh:hover { border-color: var(--green); }
+    .nav-gh svg { width: 15px; height: 15px; }
+    @media (max-width: 760px) { .nav-links a:not(.nav-gh) { display: none; } }
+
+    /* ---------- hero ---------- */
+    .hero { position: relative; padding: 96px 0 72px; overflow: hidden; }
+    .hero-spot {
+      position: absolute; top: -180px; left: 50%; transform: translateX(-50%);
+      width: 1100px; height: 620px;
+      background: radial-gradient(ellipse at center, var(--green-glow) 0%, transparent 65%);
+      pointer-events: none; z-index: 0;
+    }
+    .hero-inner { position: relative; z-index: 1; display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 56px; align-items: center; }
+    .hero h1 { font-size: clamp(2.4rem, 5.2vw, 3.9rem); margin: 18px 0 22px; }
+    .hero h1 em { font-style: italic; color: var(--brass); }
+    .hero p.lede { color: var(--fg-dim); font-size: 1.12rem; max-width: 52ch; }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 32px; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 13px; border: 1px solid var(--border-strong); border-radius: 100px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); }
+    .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+    .btn { display: inline-flex; align-items: center; gap: 9px; padding: 12px 22px; border-radius: 8px; font-family: var(--font-sans); font-size: 15px; font-weight: 500; cursor: pointer; border: 1px solid transparent; transition: background 140ms var(--ease), border-color 140ms var(--ease), color 140ms var(--ease), transform 140ms var(--ease); }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background: var(--green); color: #06140D; }
+    .btn-primary:hover { background: var(--green-dark); color: #06140D; }
+    .btn-ghost { background: var(--bg-control); color: var(--fg); border-color: var(--border-strong); }
+    .btn-ghost:hover { border-color: var(--green); color: var(--fg); }
+    .btn svg { width: 16px; height: 16px; }
+
+    /* ---------- signature: the sleight-of-hand fan ---------- */
+    .stage { position: relative; height: 380px; display: flex; align-items: center; justify-content: center; }
+    .stage-caption { position: absolute; bottom: -6px; left: 0; right: 0; text-align: center; font-family: var(--font-mono); font-size: 12px; color: var(--fg-muted); }
+    .stage-caption b { color: var(--brass); font-weight: 500; }
+    .fan { position: relative; width: 320px; height: 300px; }
+    .card {
+      position: absolute; left: 50%; bottom: 28px;
+      width: 132px; height: 188px; margin-left: -66px;
+      border-radius: 12px;
+      background: linear-gradient(160deg, var(--bg-raised), var(--bg-surface));
+      border: 1px solid var(--border-strong);
+      transform-origin: 50% 130%;
+      transform: rotate(0deg);
+      transition: transform 900ms var(--ease), opacity 700ms var(--ease);
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: 14px; box-shadow: 0 18px 40px rgba(0,0,0,0.45);
+    }
+    .card .suit { font-family: var(--font-display); font-size: 19px; }
+    .card .lbl { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); letter-spacing: 0.04em; }
+    .card .rows { height: 4px; border-radius: 2px; background: var(--border-strong); }
+    .card .rows + .rows { margin-top: 5px; width: 70%; }
+    .card.is-default { border-color: var(--brass-dim); background: linear-gradient(160deg, rgba(232,185,107,0.10), var(--bg-surface)); }
+    .card.is-default .suit, .card.is-default .lbl { color: var(--brass); }
+    .card.is-part .suit { color: var(--green); }
+    .card.is-part .rows { background: rgba(62,207,142,0.35); }
+    /* fanned-out angles (post-reveal) */
+    .fan.revealed .card:nth-child(1) { transform: rotate(-30deg) translateY(-6px); }
+    .fan.revealed .card:nth-child(2) { transform: rotate(-15deg); }
+    .fan.revealed .card:nth-child(3) { transform: rotate(0deg) translateY(-8px); z-index: 3; }
+    .fan.revealed .card:nth-child(4) { transform: rotate(15deg); }
+    .fan.revealed .card:nth-child(5) { transform: rotate(30deg) translateY(-6px); }
+    /* pre-reveal: stacked monolith */
+    .card { opacity: 0; }
+    .fan.revealed .card { opacity: 1; }
+
+    /* ---------- sections ---------- */
+    .section { padding: 96px 0; border-top: 1px solid var(--border); }
+    .section-head { max-width: 640px; margin-bottom: 56px; }
+    .section-head h2 { font-size: clamp(1.9rem, 3.6vw, 2.7rem); margin: 14px 0 16px; }
+    .section-head p { color: var(--fg-dim); font-size: 1.06rem; }
+
+    /* acts (the mechanism — a real sequence) */
+    .acts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+    .act { background: var(--bg-surface); padding: 34px 32px; }
+    .act:hover { background: var(--bg-raised); }
+    .act-no { font-family: var(--font-display); font-style: italic; font-size: 1.5rem; color: var(--brass); }
+    .act h3 { font-size: 1.18rem; margin: 10px 0 9px; letter-spacing: -0.01em; }
+    .act p { color: var(--fg-dim); font-size: 0.97rem; }
+    .act code { font-family: var(--font-mono); font-size: 0.86em; color: var(--green); }
+    @media (max-width: 720px) { .acts { grid-template-columns: 1fr; } }
+
+    /* dimensions (three suits — not a sequence) */
+    .suits { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .suit-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: border-color 160ms var(--ease), transform 160ms var(--ease); }
+    .suit-card:hover { border-color: var(--border-strong); transform: translateY(-3px); }
+    .suit-card .glyph { font-family: var(--font-display); font-size: 1.8rem; color: var(--brass); }
+    .suit-card h3 { font-family: var(--font-mono); font-size: 0.95rem; color: var(--fg); margin: 14px 0 8px; }
+    .suit-card p { color: var(--fg-dim); font-size: 0.95rem; min-height: 66px; }
+    .suit-card pre { margin-top: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 13px; overflow-x: auto; }
+    .suit-card code { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--fg-dim); white-space: pre; }
+    .suit-card code .k { color: var(--green); }
+    @media (max-width: 880px) { .suits { grid-template-columns: 1fr; } }
+
+    /* honesty grid */
+    .truths { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+    .truth { display: flex; gap: 16px; padding: 24px; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 12px; }
+    .truth .mk { flex: none; width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--green-glow); }
+    .truth .mk svg { width: 17px; height: 17px; stroke: var(--green); fill: none; stroke-width: 1.6; }
+    .truth h3 { font-size: 1rem; margin-bottom: 5px; }
+    .truth p { color: var(--fg-dim); font-size: 0.93rem; }
+    @media (max-width: 720px) { .truths { grid-template-columns: 1fr; } }
+
+    /* install cta */
+    .cta { text-align: center; }
+    .cta h2 { font-size: clamp(1.9rem, 3.6vw, 2.6rem); margin-bottom: 14px; }
+    .cta p { color: var(--fg-dim); margin-bottom: 28px; }
+    .codecopy { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 10px; background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 6px 6px 6px 18px; text-align: left; }
+    .codecopy code { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg-dim); overflow-x: auto; white-space: nowrap; }
+    .codecopy button { flex: none; }
+    .cta-actions { margin-top: 26px; display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; }
+
+    /* ---------- footer ---------- */
+    footer { border-top: 1px solid var(--border); padding: 48px 0 64px; }
+    .foot-inner { display: flex; justify-content: space-between; gap: 32px; flex-wrap: wrap; }
+    .foot-inner p { color: var(--fg-muted); font-size: 14px; }
+    .foot-brand { font-family: var(--font-mono); color: var(--fg); margin-bottom: 8px; }
+    .attribution { text-align: right; }
+    .attribution .sb { display: inline-flex; align-items: center; gap: 8px; color: var(--fg-dim); font-size: 14px; }
+    .attribution .sb svg { width: 18px; height: 19px; }
+    .attribution small { display: block; color: var(--fg-faint); font-size: 12px; margin-top: 8px; max-width: 34ch; margin-left: auto; }
+    @media (max-width: 680px) { .attribution, .attribution small { text-align: left; margin-left: 0; } }
+
+    /* reveal */
+    .reveal { opacity: 0; transform: translateY(16px); transition: opacity 620ms var(--ease), transform 620ms var(--ease); }
+    .reveal.in { opacity: 1; transform: none; }
+
+    @media (max-width: 920px) {
+      .hero-inner { grid-template-columns: 1fr; gap: 24px; }
+      .stage { height: 320px; order: -1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { scroll-behavior: auto !important; }
+      .reveal { opacity: 1; transform: none; transition: none; }
+      .card { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="3" y="6" width="5" height="14" rx="1.5" transform="rotate(-12 5.5 13)" fill="var(--brass)"/>
+          <rect x="9.5" y="4" width="5" height="16" rx="1.5" fill="var(--green)"/>
+          <rect x="16" y="6" width="5" height="14" rx="1.5" transform="rotate(12 18.5 13)" fill="var(--green-dark)"/>
+        </svg>
+        pg_partition_magician
+      </a>
+      <div class="nav-links">
+        <a href="#how">How it works</a>
+        <a href="#dimensions">Dimensions</a>
+        <a href="#truth">Honesty</a>
+        <a href="install.html">Install</a>
+        <a class="nav-gh" href="https://github.com/dventimisupabase/improved-octo-happiness" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero" id="top">
+    <div class="hero-spot"></div>
+    <div class="wrap hero-inner">
+      <div>
+        <span class="eyebrow">Pure SQL · pg_cron only</span>
+        <h1 class="display">Partition a live table<br>without moving <em>a row</em>.</h1>
+        <p class="lede">pg_partition_magician adopts an existing Postgres table into a native RANGE-partitioned table — online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="install.html">Install</a>
+          <a class="btn btn-ghost" href="https://github.com/dventimisupabase/improved-octo-happiness" target="_blank" rel="noopener">
+            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            View on GitHub
+          </a>
+        </div>
+        <div style="margin-top:26px"><span class="pill"><span class="dot"></span>time · bigint · uuidv7 — schema <code style="font-family:var(--font-mono)">pgpm</code></span></div>
+      </div>
+
+      <div class="stage">
+        <div class="fan" id="fan" aria-hidden="true">
+          <div class="card is-default"><div><div class="suit">♠</div><div class="lbl">DEFAULT</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit">♦</div><div class="lbl">2026_03</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit">♣</div><div class="lbl">2026_04</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit">♥</div><div class="lbl">2026_05</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-part"><div><div class="suit">♠</div><div class="lbl">2026_06</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+        </div>
+        <div class="stage-caption">one table, fanned into partitions — <b>no rows moved</b></div>
+      </div>
+    </div>
+  </header>
+
+  <section class="section" id="how">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">The trick</span>
+        <h2 class="display">No data moves. At first.</h2>
+        <p>The whole conversion is one well-behaved background job — not a maintenance window. Four moves:</p>
+      </div>
+      <div class="acts">
+        <div class="act reveal">
+          <div class="act-no">I</div>
+          <h3>Adopt</h3>
+          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the app sees no change.</p>
+        </div>
+        <div class="act reveal">
+          <div class="act-no">II</div>
+          <h3>Premake</h3>
+          <p>Keep partitions ready <em>ahead</em> of the write frontier, so every new row always has a real partition to land in.</p>
+        </div>
+        <div class="act reveal">
+          <div class="act-no">III</div>
+          <h3>Drain</h3>
+          <p>Move the <code>DEFAULT</code>'s closed tail into partitions in small batches. A <code>CHECK</code>-constraint trick keeps the work off the blocking lock — a 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>.</p>
+        </div>
+        <div class="act reveal">
+          <div class="act-no">IV</div>
+          <h3>Maintain</h3>
+          <p>Premake, drain, and retention run on a <code>pg_cron</code> schedule. Pause whenever you want — the <code>DEFAULT</code> partition keeps everything safe meanwhile.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="dimensions">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Any monotonic key</span>
+        <h2 class="display">Any key that grows with time.</h2>
+        <p>If the partition key only moves forward — a clock, a sequence, a time-ordered id — pg_partition_magician can manage it.</p>
+      </div>
+      <div class="suits">
+        <div class="suit-card reveal">
+          <div class="glyph">♦</div>
+          <h3>time</h3>
+          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly — any interval.</p>
+          <pre><code><span class="k">select</span> pgpm.adopt(
+  'public.events',
+  'created_at', '1 month');</code></pre>
+        </div>
+        <div class="suit-card reveal">
+          <div class="glyph">♣</div>
+          <h3>id</h3>
+          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence — including Snowflake-style ids, where time lives in the high bits.</p>
+          <pre><code><span class="k">select</span> pgpm.adopt_by_id(
+  'public.events',
+  'id', 10000000);</code></pre>
+        </div>
+        <div class="suit-card reveal">
+          <div class="glyph">♠</div>
+          <h3>uuidv7</h3>
+          <p>Time-ordered uuids — and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
+          <pre><code><span class="k">select</span> pgpm.adopt_by_uuidv7(
+  'public.events',
+  'id', '1 day');</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="truth">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">No smoke, no mirrors</span>
+        <h2 class="display">It tells you the truth.</h2>
+        <p>The hard parts are documented, not hidden. The illusion is discipline, not deception.</p>
+      </div>
+      <div class="truths">
+        <div class="truth reveal">
+          <div class="mk"><svg viewBox="0 0 20 20"><path d="M3 14l4-5 3 3 4-6 3 4"/><path d="M3 17h14"/></svg></div>
+          <div><h3>One rule: monotonicity</h3><p>The key must only move forward. Float keys are rejected outright — <code style="font-family:var(--font-mono);color:var(--fg-dim)">NaN</code> and infinity would poison the frontier math.</p></div>
+        </div>
+        <div class="truth reveal">
+          <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
+          <div><h3>Foreign keys, handled</h3><p>An incoming FK can't survive a repartition silently, so <code>adopt</code> refuses by default — or drops and records them, and hands you a composite-FK recovery script.</p></div>
+        </div>
+        <div class="truth reveal">
+          <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
+          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row that arrives without a home is caught there, never lost — and surfaced by a check function.</p></div>
+        </div>
+        <div class="truth reveal">
+          <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
+          <div><h3>Proven across versions</h3><p>53 tests on PostgreSQL 15, 16, 17, and 18 — each installed three different ways, every partition kind exercised.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta">
+    <div class="wrap">
+      <div class="reveal">
+        <span class="eyebrow">Install</span>
+        <h2 class="display">One paste, and it's yours.</h2>
+        <p>On a managed Postgres with Trusted Language Extensions (like Supabase):</p>
+        <div class="codecopy">
+          <code id="dbdev-cmd">select dbdev.install('dventimisupabase@pg_partition_magician');</code>
+          <button class="btn btn-ghost" id="copy-dbdev" type="button">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
+            <span class="lbl">Copy</span>
+          </button>
+        </div>
+        <div class="cta-actions">
+          <a class="btn btn-primary" href="install.html">All install options</a>
+          <a class="btn btn-ghost" href="https://github.com/dventimisupabase/improved-octo-happiness" target="_blank" rel="noopener">Read the docs</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap foot-inner">
+      <div>
+        <p class="foot-brand">pg_partition_magician</p>
+        <p>A pure-SQL RANGE-partition manager for PostgreSQL.<br><a href="https://github.com/dventimisupabase/improved-octo-happiness">GitHub</a> · <a href="install.html">Install</a> · Apache-2.0</p>
+      </div>
+      <div class="attribution">
+        <span class="sb">Published on
+          <!-- Supabase official mark, unmodified -->
+          <svg viewBox="0 0 109 113" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Supabase">
+            <path d="M63.708 108.14c-2.632 3.29-7.852 1.46-7.922-2.78l-1.08-61.66h42.408c7.674 0 11.874 8.88 6.934 14.66L63.708 108.14z" fill="url(#sb-a)"/>
+            <path d="M63.708 108.14c-2.632 3.29-7.852 1.46-7.922-2.78l-1.08-61.66h42.408c7.674 0 11.874 8.88 6.934 14.66L63.708 108.14z" fill="url(#sb-b)" fill-opacity=".2"/>
+            <path d="M43.953 4.574c2.632-3.293 7.852-1.464 7.922 2.777l.534 61.659H11.408c-7.673 0-11.873-8.876-6.934-14.654L43.953 4.574z" fill="#3ECF8E"/>
+            <defs>
+              <linearGradient id="sb-a" x1="55.484" y1="55.94" x2="90.268" y2="78.96" gradientUnits="userSpaceOnUse"><stop stop-color="#249361"/><stop offset="1" stop-color="#3ECF8E"/></linearGradient>
+              <linearGradient id="sb-b" x1="35.255" y1="35.03" x2="56.131" y2="79.79" gradientUnits="userSpaceOnUse"><stop/><stop offset="1" stop-opacity="0"/></linearGradient>
+            </defs>
+          </svg>
+          database.dev
+        </span>
+        <small>A community project. Not an official Supabase product; the Supabase mark denotes the registry it's published on.</small>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Scroll-reveal (respects reduced-motion via the CSS fallback).
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    }, { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+
+    // Fan the cards on load — the table "becomes" partitions.
+    const fan = document.getElementById('fan');
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      fan.classList.add('revealed');
+    } else {
+      requestAnimationFrame(() => setTimeout(() => fan.classList.add('revealed'), 220));
+    }
+
+    // Copy the dbdev one-liner.
+    const btn = document.getElementById('copy-dbdev');
+    btn.addEventListener('click', async () => {
+      const lbl = btn.querySelector('.lbl');
+      try {
+        await navigator.clipboard.writeText(document.getElementById('dbdev-cmd').textContent);
+        lbl.textContent = 'Copied';
+        setTimeout(() => { lbl.textContent = 'Copy'; }, 1800);
+      } catch { lbl.textContent = 'Copy failed'; }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Install pg_partition_magician</title>
+  <meta name="description" content="Install pg_partition_magician: a Trusted Language Extension on database.dev, a paste-and-run SQL bundle, or psql." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #121212; --bg-surface: #181818; --bg-control: #232323;
+      --green: #3ECF8E; --green-dark: #24B47E; --green-glow: rgba(62,207,142,0.13);
+      --brass: #E8B96B; --brass-dim: #C99A4E;
+      --fg: #FAFAFA; --fg-dim: #B4B4B4; --fg-muted: #8A8A8A; --fg-faint: #565656;
+      --border: #262626; --border-strong: #383838; --destructive: #E5675D;
+      --font-display: 'Fraunces', Georgia, serif;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Source Code Pro', Menlo, monospace;
+    }
+    html { color-scheme: dark; scroll-behavior: smooth; }
+    body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); line-height: 1.6; font-size: 15px; -webkit-font-smoothing: antialiased; min-height: 100vh; }
+    a { color: var(--green); text-decoration: none; }
+    a:hover { color: var(--green-dark); }
+    code { font-family: var(--font-mono); }
+    .container { max-width: 880px; margin: 0 auto; padding: 40px 24px 96px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; padding-bottom: 22px; border-bottom: 1px solid var(--border); margin-bottom: 44px; }
+    .topbar .brand { display: flex; align-items: center; gap: 9px; font-family: var(--font-mono); font-weight: 500; font-size: 14px; color: var(--fg); }
+    .topbar a { font-size: 13px; color: var(--fg-dim); }
+    .topbar a:hover { color: var(--green); }
+    h1 { font-family: var(--font-display); font-weight: 500; font-size: 2.4rem; letter-spacing: -0.015em; line-height: 1.05; margin-bottom: 14px; }
+    h1 em { font-style: italic; color: var(--brass); }
+    .lede { color: var(--fg-dim); font-size: 1.05rem; max-width: 62ch; }
+    .version-pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 13px; background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 100px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); margin-top: 14px; }
+    .version-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+    .step { margin-top: 32px; padding: 28px; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 12px; }
+    .step-eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--brass); }
+    .step-title { font-size: 1.3rem; letter-spacing: -0.01em; margin: 8px 0 4px; }
+    .step-desc { color: var(--fg-dim); margin-bottom: 18px; font-size: 14px; }
+    .step-desc code, .footer code, .lede code { background: var(--bg-control); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--brass); }
+
+    .sqlbox { background: var(--bg); border: 1px solid var(--border-strong); border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+    .sqlbox code { display: block; white-space: pre; font-size: 12.5px; line-height: 1.65; color: var(--fg-dim); }
+    .sqlbox .k { color: var(--green); }
+    .sqlbox .c { color: var(--fg-faint); }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 14px; }
+    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 7px; font-family: var(--font-sans); font-size: 14px; font-weight: 500; cursor: pointer; border: 1px solid transparent; transition: background 120ms ease, border-color 120ms ease, color 120ms ease; text-decoration: none; }
+    .btn svg { width: 16px; height: 16px; }
+    .btn-primary { background: var(--green); color: #06140D; }
+    .btn-primary:hover { background: var(--green-dark); color: #06140D; }
+    .btn-primary[disabled] { background: var(--bg-control); color: var(--fg-faint); cursor: not-allowed; }
+    .btn-secondary { background: var(--bg-control); color: var(--fg); border-color: var(--border-strong); }
+    .btn-secondary:hover { border-color: var(--green); color: var(--green); }
+    .btn-destructive { background: var(--destructive); color: #1A0907; }
+    .btn-destructive:hover { background: #C9554C; color: #1A0907; }
+    .btn-destructive[disabled] { background: var(--bg-control); color: var(--fg-faint); cursor: not-allowed; }
+    .btn.copied { background: var(--bg-surface); color: var(--green); border-color: var(--green); }
+    .btn.error { background: var(--bg-surface); color: var(--destructive); border-color: var(--destructive); }
+    .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--font-mono); }
+    .meta.error { color: var(--destructive); }
+
+    details { margin-top: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); }
+    details summary { padding: 10px 16px; cursor: pointer; font-size: 13px; color: var(--fg-dim); user-select: none; }
+    details summary:hover { color: var(--green); }
+    details[open] summary { border-bottom: 1px solid var(--border); }
+    details pre { max-height: 460px; overflow: auto; padding: 16px; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--fg-dim); white-space: pre; }
+
+    .step.uninstall { border-left: 3px solid var(--destructive); }
+    .step.uninstall .step-eyebrow { color: var(--destructive); }
+    .section-rule { margin-top: 64px; margin-bottom: 4px; font-family: var(--font-display); font-weight: 500; font-size: 1.7rem; letter-spacing: -0.015em; }
+
+    .footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); font-size: 13px; color: var(--fg-muted); }
+    .footer p { margin-bottom: 8px; }
+    .prereq { list-style: none; margin: 10px 0 0; padding: 0; }
+    .prereq li { padding: 3px 0; }
+    .prereq li::before { content: "›"; color: var(--brass); margin-right: 10px; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <span class="brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="3" y="6" width="5" height="14" rx="1.5" transform="rotate(-12 5.5 13)" fill="var(--brass)"/>
+          <rect x="9.5" y="4" width="5" height="16" rx="1.5" fill="var(--green)"/>
+          <rect x="16" y="6" width="5" height="14" rx="1.5" transform="rotate(12 18.5 13)" fill="var(--green-dark)"/>
+        </svg>
+        pg_partition_magician
+      </span>
+      <span><a href="./">← Project page</a></span>
+    </div>
+
+    <h1>Install in <em>one paste</em>.</h1>
+    <p class="lede">Three ways in, all from one source of truth. Every one needs <code>pg_cron</code>; the registry path also needs <code>pg_tle</code>.</p>
+    <p class="version-pill"><span class="dot"></span>Latest release: <span id="version">RELEASE_VERSION</span></p>
+
+    <section class="step">
+      <span class="step-eyebrow">Recommended · managed Postgres</span>
+      <h2 class="step-title">database.dev (Trusted Language Extension)</h2>
+      <p class="step-desc">On Supabase or any Postgres with <code>pg_tle</code>, install straight from the registry. Run it in the SQL editor.</p>
+      <div class="actions">
+        <button class="btn btn-primary" id="copy-dbdev" type="button">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
+          <span class="label">Copy</span>
+        </button>
+      </div>
+      <div class="sqlbox"><code id="dbdev-sql"><span class="k">select</span> dbdev.install('dventimisupabase@pg_partition_magician');
+<span class="k">create extension</span> "dventimisupabase@pg_partition_magician"
+  <span class="k">version</span> '0.1.0' <span class="k">cascade</span>;</code></div>
+    </section>
+
+    <section class="step">
+      <span class="step-eyebrow">Any Postgres · SQL editor or psql</span>
+      <h2 class="step-title">Self-contained SQL bundle</h2>
+      <p class="step-desc">One file, wrapped in <code>BEGIN; … COMMIT;</code> — no metacommands. Paste it into the Supabase SQL editor, or <code>psql -f</code> the download.</p>
+      <div class="actions">
+        <button class="btn btn-primary" id="copy-bundle" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
+          <span class="label">Loading…</span>
+        </button>
+        <a class="btn btn-secondary" href="pg_partition_magician-bundle.sql" download>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2v9M4 7l4 4 4-4M3 14h10"/></svg>
+          Download
+        </a>
+        <span class="meta" id="bundle-meta"></span>
+      </div>
+      <details><summary>Preview SQL</summary><pre id="bundle-preview">Loading…</pre></details>
+    </section>
+
+    <h2 class="section-rule">Uninstall</h2>
+    <p class="lede" style="margin-top:6px"><strong style="color:var(--destructive)">Removes the tool, not your data.</strong> Drops the <code>pgpm</code> schema and unschedules its <code>pgpm_*</code> cron jobs. Tables you adopted stay partitioned; their rows are untouched.</p>
+
+    <section class="step uninstall">
+      <span class="step-eyebrow">Uninstall</span>
+      <h2 class="step-title">Remove pg_partition_magician</h2>
+      <p class="step-desc">Run in the SQL editor or via <code>psql -f</code>. If you installed it as a TLE, <code>drop extension "dventimisupabase@pg_partition_magician"</code> does the same.</p>
+      <div class="actions">
+        <button class="btn btn-destructive" id="copy-uninstall" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
+          <span class="label">Loading…</span>
+        </button>
+        <a class="btn btn-secondary" href="pg_partition_magician-uninstall.sql" download>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2v9M4 7l4 4 4-4M3 14h10"/></svg>
+          Download
+        </a>
+        <span class="meta" id="uninstall-meta"></span>
+      </div>
+      <details><summary>Preview SQL</summary><pre id="uninstall-preview">Loading…</pre></details>
+    </section>
+
+    <div class="footer">
+      <p><strong>Before you install:</strong></p>
+      <ul class="prereq">
+        <li>Enable <code>pg_cron</code> — it drives scheduled maintenance (premake, drain, retention).</li>
+        <li>For the registry path, enable <code>pg_tle</code> too (preinstalled on Supabase).</li>
+        <li>After installing, adopt a table: <code>select pgpm.adopt('public.your_table', 'created_at', '1 month');</code> then watch <code>select * from pgpm.status();</code></li>
+      </ul>
+      <p style="margin-top:16px">See the <a href="./">project page</a> for how the online migration works, or the <a href="https://github.com/dventimisupabase/improved-octo-happiness">repository</a> for the full docs.</p>
+    </div>
+  </div>
+
+  <script>
+    function humanSize(b) { return b >= 1048576 ? (b/1048576).toFixed(1)+' MB' : b >= 1024 ? (b/1024).toFixed(0)+' KB' : b+' B'; }
+    function clip(t, n = 220) { const l = t.split('\n'); return l.length <= n ? t : l.slice(0, n).join('\n') + '\n\n-- … ' + (l.length - n) + ' more lines …'; }
+
+    function copyText(btn, getText, ok) {
+      btn.addEventListener('click', async () => {
+        const text = getText();
+        if (text == null) return;
+        const label = btn.querySelector('.label');
+        try { await navigator.clipboard.writeText(text); btn.classList.add('copied'); label.textContent = ok;
+          setTimeout(() => { btn.classList.remove('copied'); label.textContent = btn.dataset.idle || 'Copy'; }, 2200); }
+        catch { btn.classList.add('error'); label.textContent = 'Copy failed'; }
+      });
+    }
+
+    // Static dbdev snippet.
+    const dbdevBtn = document.getElementById('copy-dbdev');
+    dbdevBtn.dataset.idle = 'Copy';
+    copyText(dbdevBtn, () => document.getElementById('dbdev-sql').textContent, 'Copied');
+
+    // Fetched files (deployed alongside this page by the Pages workflow).
+    function wireFile(url, copyId, previewId, metaId, okMsg) {
+      const btn = document.getElementById(copyId), pre = document.getElementById(previewId), meta = document.getElementById(metaId);
+      const label = btn.querySelector('.label'); btn.dataset.idle = 'Copy'; let text = null;
+      fetch(url, { cache: 'no-store' })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+        .then(body => { text = body; pre.textContent = clip(body); meta.textContent = humanSize(body.length) + ' · ' + body.split('\n').length.toLocaleString() + ' lines'; label.textContent = 'Copy'; btn.disabled = false; })
+        .catch(err => { label.textContent = 'Unavailable'; meta.textContent = err.message; meta.classList.add('error'); pre.textContent = '-- Failed to load: ' + err.message + '\n-- (available once a release has been published)'; btn.classList.add('error'); });
+      copyText(btn, () => text, okMsg);
+    }
+    wireFile('pg_partition_magician-bundle.sql', 'copy-bundle', 'bundle-preview', 'bundle-meta', 'Copied — paste & run');
+    wireFile('pg_partition_magician-uninstall.sql', 'copy-uninstall', 'uninstall-preview', 'uninstall-meta', 'Copied');
+  </script>
+</body>
+</html>
