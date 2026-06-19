@@ -25,10 +25,6 @@ full lifecycle of native `RANGE`-partitioned tables:
 
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
-> Born from the design doc in
-> [`postgresql_online_partition_migration_summary.md`](./postgresql_online_partition_migration_summary.md)
-> and the locking analysis that followed.
-
 ## Why it exists
 
 `pg_partman` is excellent, but it's a compiled C extension: it needs `CREATE
