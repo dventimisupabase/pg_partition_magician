@@ -177,9 +177,41 @@ attach method, premake, and retention.
   index, no rebuild), so they propagate to every partition. Unique secondary indexes
   are skipped (a partitioned unique index must include the partition key) — recreate
   those on the parent by hand.
-- **Incoming foreign keys** to the adopted table still require an outage to re-point
-  (true of any such migration).
+- **Incoming foreign keys** — see the dedicated section below; `adopt()` refuses by
+  default and offers an opt-in drop.
 - Boundaries align to the database timezone (UTC on Supabase).
+
+## Incoming foreign keys
+
+If other tables reference the table you're adopting (e.g. `reactions(message_id) →
+messages(id)`), partitioning forces a hard reckoning, because a partitioned table's
+**only** unique key is one that includes the partition key:
+
+- A single-column FK like `→ messages(id)` becomes **impossible** — *"there is no
+  unique constraint matching given keys"* — and the old PK can't even be dropped
+  while a dependent FK exists.
+- The only way to keep DB-enforced RI is a **composite FK**: the referencing table
+  must also carry `created_at` and reference `messages(created_at, id)`. (A composite
+  FK to the *parent* survives the drain — a row keeps its `(created_at, id)` as it
+  moves between partitions.)
+
+So there's no "move the FK" trick; FKs can only be dropped and recreated, and
+recreating requires denormalizing the partition key into the referencing side. This
+is the operator's data-model decision, so `adopt()` doesn't do it silently:
+
+- **Default (`p_incoming_fks => 'error'`)**: detects incoming FKs and **refuses**
+  with a report, mutating nothing.
+- **`p_incoming_fks => 'drop'`**: drops each incoming FK and records its original
+  definition in `pgpm.dropped_fk`, then proceeds. You then either re-enforce RI in
+  the app, or rebuild composite FKs after denormalizing the referencing tables.
+
+```sql
+select pgpm.adopt('public.messages', 'created_at', '1 month', p_incoming_fks => 'drop');
+select * from pgpm.dropped_fk;   -- what was dropped, for reconstruction
+```
+
+(`pg_partman` reaches the same conclusion — its howto says incoming FKs require an
+outage to drop and recreate against the new partitioned table.)
 
 ## Teardown
 

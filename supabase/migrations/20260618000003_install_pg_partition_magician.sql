@@ -64,6 +64,19 @@ create table if not exists pgpm.log (
   at           timestamptz not null default now()
 );
 
+-- Incoming foreign keys dropped by adopt(p_incoming_fks => 'drop'), recorded so
+-- they can be reviewed/reconstructed. NOTE: `definition` is the ORIGINAL FK
+-- (e.g. single-column); it will NOT recreate as-is against the now-partitioned
+-- table -- rebuild it as a composite FK on the partition key (see README).
+create table if not exists pgpm.dropped_fk (
+  id                bigint generated always as identity primary key,
+  parent_table      regclass    not null,
+  referencing_table regclass    not null,
+  constraint_name   name        not null,
+  definition        text        not null,
+  dropped_at        timestamptz not null default now()
+);
+
 -- ---------------------------------------------------------------------------
 -- _lo(): floor a timestamp to the partition-grid lower bound for an interval.
 -- Supports whole-month intervals (1/3/12 months, ...) and fixed-duration
@@ -374,7 +387,8 @@ create or replace function pgpm.adopt(
   p_keep_default boolean     default true,
   p_drain_batch  int         default 5000,
   p_anchor       timestamptz default '2000-01-01 00:00:00+00',
-  p_paused       boolean     default true
+  p_paused       boolean     default true,
+  p_incoming_fks text        default 'error'   -- 'error' | 'drop'
 )
 returns regclass
 language plpgsql
@@ -397,6 +411,7 @@ declare
   v_new     name;
   v_pdef    text;
   j         int;
+  v_fk      record;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
@@ -431,6 +446,33 @@ begin
 
   if v_oldpk is not null then
     v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+  end if;
+
+  -- 0. Incoming foreign keys. A partitioned table's only unique key includes the
+  --    partition key, so a single-column FK to this table cannot survive -- and
+  --    the old PK can't even be dropped while a dependent FK exists. Handle this
+  --    before any mutation so a refusal leaves the table untouched.
+  if p_incoming_fks not in ('error', 'drop') then
+    raise exception 'pg_partition_magician: p_incoming_fks must be ''error'' or ''drop'' (got %)', p_incoming_fks;
+  end if;
+  if exists (select 1 from pg_constraint where confrelid = p_parent and contype = 'f') then
+    if p_incoming_fks = 'error' then
+      raise exception
+        'pg_partition_magician: % has incoming foreign key(s) (%); a single-column FK cannot reference a partitioned table. Re-point them as composite FKs on the partition key, or call adopt(..., p_incoming_fks => ''drop'') to drop and record them in pgpm.dropped_fk.',
+        p_parent,
+        (select string_agg(conname || ' on ' || conrelid::regclass::text, ', ')
+           from pg_constraint where confrelid = p_parent and contype = 'f');
+    else
+      for v_fk in
+        select conrelid::regclass as reltbl, conname, pg_get_constraintdef(oid) as def
+          from pg_constraint where confrelid = p_parent and contype = 'f'
+      loop
+        insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
+          values (p_parent, v_fk.reltbl, v_fk.conname, v_fk.def);
+        execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
+        insert into pgpm.log (parent_table, action, method) values (p_parent, 'drop_incoming_fk', v_fk.conname::text);
+      end loop;
+    end if;
   end if;
 
   -- 1. rename the live table to the DEFAULT partition name (keeps all its data)
