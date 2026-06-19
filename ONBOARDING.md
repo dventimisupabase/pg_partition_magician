@@ -11,22 +11,26 @@ For *what it does and why*, read [`README.md`](./README.md). This file is about
 
 ## Get it running (5 minutes)
 
-Prereqs: **Docker** (running) and the **Supabase CLI** (`supabase --version`, tested
-on 2.105). The local stack is pinned to **PostgreSQL 15** (`supabase/config.toml`).
+The only prerequisite is **Docker**. Everything runs in containers — no Postgres,
+psql, or other tooling needed on the host.
 
 ```bash
-supabase start          # first run pulls images
-supabase db reset       # apply migrations: install pgpm + adopt the 3 demo tables
-supabase test db        # run the pgTAP suite (53 tests, 13 files)
+./test.sh 15        # PG 15: build a pg_cron+pgtap image, install each channel,
+                    # load fixtures, run the 53-test pgTAP suite, verify uninstall
+./test.sh           # the full matrix: PG 15, 16, 17, 18
 ```
 
-After `db reset` you have three adopted demo tables — `public.messages` (time),
-`public.events_id` (id), `public.events_uuid` (uuidv7) — each RANGE-partitioned with
-maintenance **paused**. Inspect with:
+`test.sh` exercises all three install channels (`psql`, bundle, dbdev) against a
+throwaway container and tears it down after. To poke at it interactively, bring a
+container up yourself:
 
-```sql
-select * from pgpm.status();
-psql postgresql://postgres:postgres@127.0.0.1:54322/postgres   -- local DB URL
+```bash
+docker compose --profile pg15 up -d
+psql 'postgresql://postgres:postgres@127.0.0.1:5515/postgres' \
+  -c 'create extension pg_cron; create extension pgtap;' \
+  -f sql/pg_partition_magician.sql -f fixtures/demo.sql
+psql 'postgresql://postgres:postgres@127.0.0.1:5515/postgres' -c 'select * from pgpm.status();'
+docker compose --profile pg15 down -v
 ```
 
 ## Repo layout
@@ -37,12 +41,9 @@ psql postgresql://postgres:postgres@127.0.0.1:54322/postgres   -- local DB URL
 | `sql/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
 | `extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
-| `scripts/sync_supabase_migration.sh` | **Regenerate** the install migration from the source (run after editing the module) |
-| `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap) |
-| `supabase/migrations/0001..0002` | Demo: create + seed the unpartitioned `messages` table |
-| `supabase/migrations/0003_install_pg_partition_magician.sql` | **Generated** from the source by `sync_supabase_migration.sh` — do not edit |
-| `supabase/migrations/0004..0005` | Demo: `adopt` the time / id / uuidv7 tables + schedule paused pg_cron maintenance |
-| `supabase/tests/*.sql` | pgTAP tests (one concern per file) — also run by the Docker matrix |
+| `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
+| `fixtures/demo.sql` | Builds + adopts the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
+| `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `README.md` | Product docs: dimensions, install channels, the design, the control-type contract |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
 
@@ -63,38 +64,26 @@ attach. See README for the full story.
 **TDD is the norm** (see `~/.claude` global guidance and the existing suite). Add a
 failing pgTAP test, then make it pass.
 
-### After editing the module, re-sync the migration
-
-`sql/pg_partition_magician.sql` is the source of truth, but Supabase migrations can't
-`\i` an external file, so `supabase/migrations/0003_install_*.sql` is **generated**
-from it. After editing the module, regenerate it:
-
-```bash
-scripts/sync_supabase_migration.sh
-```
-
-(CI fails on drift, so a stale copy can't slip through — but regenerate before you
-`db reset` or your change won't take effect locally.)
+`sql/pg_partition_magician.sql` is the single source of truth — edit it directly.
+The bundle and dbdev packages are built from it (`scripts/build_*.sh`); nothing else
+needs to be kept in sync.
 
 ### The inner loop
 
 ```bash
-# edit sql/pg_partition_magician.sql
-scripts/sync_supabase_migration.sh
-supabase db reset && supabase test db        # fast local loop
-
-# before pushing, exercise the distribution channels on real PG versions:
-./test.sh 15                                 # one version, all channels (~3-5 min: image build)
-./test.sh                                    # full matrix PG 15-18 (what CI runs)
+# edit sql/pg_partition_magician.sql, then:
+./test.sh 15                  # one version, all channels (~3-5 min on a cold image)
+./test.sh 15 --channel=psql   # fastest: just the psql channel
+./test.sh                     # full matrix PG 15-18 (what CI runs) before pushing
 ```
 
-`supabase test db` assumes a **freshly reset** DB (data in the `DEFAULT`, maintenance
-paused) — always `db reset` first; a live drain mutates committed state. Tests run in
-`begin/rollback`, so they don't persist.
+Each run starts from a fresh container and tears it down, so tests never depend on
+leftover state. Within a run the pgTAP files use `begin/rollback`, so they don't
+persist either.
 
 ### Adding a test
 
-Drop `supabase/tests/NN_my_thing_test.sql` following the existing pattern:
+Drop `tests/NN_my_thing_test.sql` following the existing pattern:
 
 ```sql
 create extension if not exists pgtap;

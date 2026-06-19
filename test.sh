@@ -9,7 +9,7 @@
 #
 # Channels:
 #   psql    sql/pg_partition_magician.sql via psql -f         (the source)
-#   bundle  scripts/build_install_bundle.sh output            (Supabase SQL editor)
+#   bundle  scripts/build_install_bundle.sh output            (dashboard SQL editor)
 #   dbdev   scripts/build_dbdev_package.sh output (minified)  (dbdev / TLE / CREATE EXTENSION)
 set -euo pipefail
 
@@ -52,13 +52,10 @@ install_channel() {  # <channel> <profile> <service>
   esac
 }
 
-load_fixtures() {  # <profile> <service> -- the demo migrations double as fixtures
+load_fixtures() {  # <profile> <service> -- build the demo tables for the pgTAP suite
   local p="$1" s="$2"
   psql_run "$p" "$s" -c "ALTER DATABASE postgres SET poc.seed_count = 8000; ALTER DATABASE postgres SET poc.events_count = 4000;" >/dev/null
-  psql_run "$p" "$s" -f /repo/supabase/migrations/20260618000001_create_messages_unpartitioned.sql >/dev/null
-  psql_run "$p" "$s" -f /repo/supabase/migrations/20260618000002_seed_legacy_data.sql >/dev/null
-  psql_run "$p" "$s" -f /repo/supabase/migrations/20260618000004_adopt_messages_demo.sql >/dev/null
-  psql_run "$p" "$s" -f /repo/supabase/migrations/20260618000005_adopt_id_and_uuid_demos.sql >/dev/null
+  psql_run "$p" "$s" -f /repo/fixtures/demo.sql >/dev/null
 }
 
 uninstall_and_verify() {  # <profile> <service>
@@ -96,7 +93,7 @@ run_version() {  # <pg_version>
     echo "--- channel: $ch ---"
     install_channel "$ch" "$p" "$s"
     load_fixtures "$p" "$s"
-    $DC --profile "$p" exec -T "$s" sh -c 'pg_prove --timer -U postgres -d postgres /repo/supabase/tests/*.sql'
+    $DC --profile "$p" exec -T "$s" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/*.sql'
     uninstall_and_verify "$p" "$s"
     reset_demo "$p" "$s"
     echo "PG $v / $ch: PASS"

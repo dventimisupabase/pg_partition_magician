@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a self-contained single-file install bundle for clients that do not
-# process psql metacommands -- e.g. the Supabase dashboard SQL editor. Paste the
-# result in and run. Wrapped in BEGIN/COMMIT so a partial failure rolls back.
+# process psql metacommands -- e.g. a dashboard SQL editor. Paste the result in
+# and run. Wrapped in BEGIN/COMMIT so a partial failure rolls back.
 #
 # pg_partition_magician's source (sql/pg_partition_magician.sql) is already a flat
 # single file with no metacommands, so this is mostly a wrap. The `\ir`/`\i`
@@ -20,7 +20,7 @@ SRC_DIR="$(cd "$(dirname "$SRC")" && pwd)"
 cat > "$OUT" <<EOF
 -- pg_partition_magician install bundle (generated from $(basename "$SRC")).
 -- Self-contained single-file install for clients that don't process psql
--- metacommands (e.g. the Supabase SQL editor). Wrapped in BEGIN/COMMIT.
+-- metacommands (e.g. a dashboard SQL editor). Wrapped in BEGIN/COMMIT.
 
 BEGIN;
 

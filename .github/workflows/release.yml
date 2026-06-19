@@ -64,7 +64,7 @@ jobs:
         run: |
           VER="${{ steps.v.outputs.version }}"; NUM="${VER#v}"
           mkdir -p release-assets
-          # Self-contained bundle (Supabase SQL editor) and minified dbdev/TLE package.
+          # Self-contained bundle (dashboard SQL editor) and minified dbdev/TLE package.
           scripts/build_install_bundle.sh sql/pg_partition_magician.sql "release-assets/pg_partition_magician-${VER}-bundle.sql"
           scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql "release-assets/pg_partition_magician--${NUM}.sql"
           # Source tarball.

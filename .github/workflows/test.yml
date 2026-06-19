@@ -21,20 +21,6 @@ jobs:
       - name: Test channels on PostgreSQL ${{ matrix.pg_version }}
         run: ./test.sh ${{ matrix.pg_version }}
 
-  sync-check:
-    name: Install migration in sync with source
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Regenerate the Supabase install migration and check for drift
-        run: |
-          scripts/sync_supabase_migration.sh
-          if ! git diff --exit-code -- supabase/migrations/20260618000003_install_pg_partition_magician.sql; then
-            echo "ERROR: the install migration is out of sync with sql/pg_partition_magician.sql."
-            echo "Run scripts/sync_supabase_migration.sh and commit the result."
-            exit 1
-          fi
-
   packages:
     name: Build channel packages
     runs-on: ubuntu-latest
@@ -44,7 +30,7 @@ jobs:
         run: |
           scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
           scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql dist/pg_partition_magician--0.1.0.sql
-          # bundle must be free of psql metacommands (Supabase SQL editor target)
+          # bundle must be free of psql metacommands (dashboard SQL editor target)
           if grep -nE '^\\' dist/pg_partition_magician-bundle.sql dist/pg_partition_magician--0.1.0.sql; then
             echo "ERROR: a package still contains psql metacommands"; exit 1
           fi
@@ -52,11 +38,10 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [test, sync-check, packages]
+    needs: [test, packages]
     if: always()
     steps:
       - run: |
           [ "${{ needs.test.result }}" = "success" ] || { echo "matrix tests failed"; exit 1; }
-          [ "${{ needs.sync-check.result }}" = "success" ] || { echo "sync check failed"; exit 1; }
           [ "${{ needs.packages.result }}" = "success" ] || { echo "package build failed"; exit 1; }
-          echo "All tests, sync check, and package builds passed."
+          echo "All tests and package builds passed."

@@ -1,7 +1,0 @@
--- Intentionally empty.
---
--- Seeding happens in migration 02 (20260618000002_seed_legacy_data.sql), BEFORE
--- the table is converted to partitioned. Supabase runs seed.sql AFTER all
--- migrations, which would be too late for the "seed an existing large table,
--- then convert it" narrative -- and adding rows here would skew the row-count
--- conservation checks. Leave this file empty on purpose.

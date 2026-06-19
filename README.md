@@ -38,31 +38,28 @@ and PL/pgSQL — you can install it anywhere you can run SQL and schedule a job.
 no psql metacommands. It ships through three channels (all built from that one file):
 
 ```bash
-# 1. psql -- run the source directly
+# psql -- run the source directly (the simplest path on any Postgres)
 psql "$DATABASE_URL" -f sql/pg_partition_magician.sql
+```
 
-# 2. bundle -- self-contained, BEGIN/COMMIT-wrapped; paste into the Supabase SQL editor
+For a SQL client that doesn't process psql metacommands (a dashboard editor, say),
+build a self-contained `BEGIN/COMMIT`-wrapped bundle and paste it in:
+
+```bash
 scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
-
-# 3. dbdev / TLE -- minified single file for CREATE EXTENSION / database.dev (<250k cap)
-scripts/build_dbdev_package.sh sql/pg_partition_magician.sql dist/pg_partition_magician--0.1.0.sql
 ```
 
 `extension.control` carries the TLE metadata (`requires = 'pg_cron'`). Uninstall with
 `psql -f sql/uninstall.sql` (removes the `pgpm` schema + its cron jobs; your partitioned
 tables and data are left intact).
 
-Once published to [database.dev](https://database.dev), install as a Trusted Language
-Extension:
+On a managed Postgres that has `pg_tle`, you can instead install it as a Trusted
+Language Extension from [database.dev](https://database.dev):
 
 ```sql
 select dbdev.install('dventimisupabase@pg_partition_magician');
 create extension "dventimisupabase@pg_partition_magician" version '0.1.0' cascade;
 ```
-
-The Supabase demo applies the module as a migration; that migration is **generated**
-from the source by `scripts/sync_supabase_migration.sh` (CI fails on drift), so there's
-no hand-maintained copy.
 
 ## Use it
 
@@ -175,60 +172,40 @@ would reject live writes), so it attaches via a **plain** `ATTACH` — which *bl
 briefly rather than *rejecting*. Cheapest when it's drained last, against a small
 default. Force it with `drain_all(parent, include_open => true)`.
 
-## Demo (this repo)
+## Try it
 
-The Supabase stack seeds three unpartitioned tables and adopts one of each kind:
-`public.messages` (`time`, ~50k rows over 6 months), `public.events_id` (`id`, 45k
-bigint rows), and `public.events_uuid` (`uuidv7`, 45k time-ordered uuids).
-
-```bash
-supabase start
-supabase db reset     # seed -> install pgpm -> adopt all three (maintenance PAUSED)
-```
-
-After reset each table is `RANGE`-partitioned, its `*_default` holds all rows, future
-partitions are premade, and a paused `pgpm-maintenance` cron job exists.
-`select * from pgpm.status();` shows all three. Drive one:
+Install the module, then adopt a table and watch it work:
 
 ```sql
--- live (pg_cron, every 30s):
-update pgpm.config set paused = false;
-select * from pgpm.status();
-select * from pgpm.check_default('public.messages');
-
--- or synchronous, finishing the current month too:
-select pgpm.drain_all('public.messages', p_include_open => true);
+-- after psql -f sql/pg_partition_magician.sql (and pg_cron enabled)
+select pgpm.adopt('public.your_events', 'created_at', '1 month');
+select * from pgpm.status();                          -- partitions, rows still in DEFAULT
+update pgpm.config set paused = false;                -- let scheduled maintenance run
+-- or drive it synchronously, finishing the current period too:
+select pgpm.drain_all('public.your_events', p_include_open => true);
 ```
 
-Pinned to **PostgreSQL 15** (`supabase/config.toml`) — the realistic older-but-still-
-supported workhorse (PG 14 leaves long-term support in late 2025); behavior is
-identical on 15–17.
-
-Scale the seed: `alter database postgres set poc.seed_count = 1000000;` then
-`supabase db reset`.
+`fixtures/demo.sql` builds three throwaway tables and adopts one of each kind
+(`messages` by time, `events_id` by bigint, `events_uuid` by uuidv7) — the test
+harness loads it, and you can `psql -f` it yourself against a scratch database.
 
 ## Tests
 
 53 pgTAP tests across structure, write-routing, drain, row conservation, the
 scan-skip attach method, premake, retention, secondary-index propagation,
 incoming-FK handling + recovery, and the `id` and `uuidv7` dimensions (incl. the
-uuid↔ts codec). Two ways to run them:
+uuid↔ts codec). Testing needs only **Docker** — no other tooling.
 
 ```bash
-# local dev — via Supabase against a freshly reset DB
-supabase db reset && supabase test db
-
-# the CI matrix — install each channel on PostgreSQL 15/16/17/18 (Docker),
-# load the demo migrations as fixtures, run pg_prove, verify a clean uninstall
 ./test.sh                       # all versions x all channels
+./test.sh 15                    # one PostgreSQL version, all channels
 ./test.sh 15 --channel=bundle   # one version / channel
 ```
 
-`test.sh` builds a pg_cron+pgtap image per version (`Dockerfile`/`docker-compose.yml`)
-and is what `.github/workflows/test.yml` runs.
-
-> Reset before testing: tests assume the pristine post-reset state (data in the
-> DEFAULT, maintenance paused). A live drain mutates committed state.
+For each PostgreSQL version (15, 16, 17, 18) `test.sh` builds a `pg_cron`+`pgtap`
+image (`Dockerfile`/`docker-compose.yml`), installs the module through each channel,
+loads `fixtures/demo.sql`, runs `pg_prove tests/*.sql`, and verifies a clean
+uninstall. It's exactly what `.github/workflows/test.yml` runs on every push.
 
 ## v1 scope & caveats
 
@@ -250,7 +227,8 @@ and is what `.github/workflows/test.yml` runs.
   those on the parent by hand.
 - **Incoming foreign keys** — see the dedicated section below; `adopt()` refuses by
   default and offers an opt-in drop.
-- Boundaries align to the database timezone (UTC on Supabase).
+- Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database
+  timezone (UTC by default).
 
 ## Incoming foreign keys
 
@@ -331,9 +309,3 @@ to [database.dev](https://database.dev). You can also run either workflow manual
 > The dbdev channel is build- and psql-install-tested in CI, but the TLE
 > `CREATE EXTENSION` path itself is exercised at publish/install time (no dbdev
 > account in CI).
-
-## Teardown
-
-```bash
-supabase stop
-```
