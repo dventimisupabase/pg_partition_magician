@@ -83,8 +83,12 @@ Two hard facts drive the design:
 1. **You can't convert a table to partitioned in place.** So `adopt()` renames the
    live table out of the way, creates a partitioned parent under the original name,
    and **attaches the old table as the `DEFAULT` partition** — no rows move, the app
-   sees no change. (PK is rebuilt to include the partition key; identity is moved to
-   the parent and its sequence advanced.)
+   sees no change. The PK is rebuilt to include the partition key *without rebuilding
+   the index on the default*: the existing index is promoted to the default's PK and
+   the parent's PK reuses it (metadata only — creating the parent *with* a PK and
+   then attaching would instead rebuild that index on the whole default under
+   `ACCESS EXCLUSIVE`). Identity moves to the parent; non-unique secondary indexes
+   are carried over by attaching the default's existing index.
 2. **Adding a partition while the `DEFAULT` holds data forces a full scan of the
    `DEFAULT` under `ACCESS EXCLUSIVE`** (PG 15 docs) — the biggest scaling risk.
 
@@ -168,8 +172,11 @@ attach method, premake, and retention.
   stays ahead so the default stays empty; `check_default()` flags any stray row.
 - **Retention uses plain `DROP`** (brief lock). `DETACH … CONCURRENTLY` can't run
   inside a function; for huge cold partitions, detach concurrently by hand.
-- **Secondary indexes**: add them to the *parent* (they propagate to new partitions);
-  `adopt()` does not auto-copy non-PK indexes off the old table in v1.
+- **Secondary indexes**: `adopt()` copies the old table's non-unique secondary
+  indexes onto the parent as partitioned indexes (attaching the default's existing
+  index, no rebuild), so they propagate to every partition. Unique secondary indexes
+  are skipped (a partitioned unique index must include the partition key) — recreate
+  those on the parent by hand.
 - **Incoming foreign keys** to the adopted table still require an outage to re-point
   (true of any such migration).
 - Boundaries align to the database timezone (UTC on Supabase).

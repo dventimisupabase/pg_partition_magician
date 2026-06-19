@@ -389,8 +389,14 @@ declare
   v_pkcols  text[];
   v_idcols  name[];
   v_pkname  name;
-  v_pk_clause text := '';
   v_col     name;
+  v_idx_names text[];
+  v_idx_defs  text[];
+  v_skipped   int;
+  v_old     name;
+  v_new     name;
+  v_pdef    text;
+  j         int;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
@@ -406,10 +412,25 @@ begin
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a','d') and not a.attisdropped;
 
+  -- Capture secondary (non-PK, non-unique) indexes BEFORE the rename, so their
+  -- definitions reference the original name (which becomes the parent). They are
+  -- recreated as partitioned indexes on the parent below. Unique secondary
+  -- indexes are skipped (a partitioned unique index must include the partition
+  -- key) -- recreate those by hand if needed.
+  select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid))
+    into v_idx_names, v_idx_defs
+    from pg_index i join pg_class c on c.oid = i.indexrelid
+   where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
+  select count(*) into v_skipped
+    from pg_index i
+   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary;
+  if v_skipped > 0 then
+    raise notice 'pg_partition_magician: skipped % unique secondary index(es) on %; recreate on the parent manually (must include the partition key)',
+                 v_skipped, p_parent;
+  end if;
+
   if v_oldpk is not null then
     v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
-    v_pk_clause := ', primary key (' ||
-                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x) || ')';
   end if;
 
   -- 1. rename the live table to the DEFAULT partition name (keeps all its data)
@@ -421,23 +442,36 @@ begin
     execute format('alter table %s drop constraint %I', v_defreg::text, v_pkname);
   end if;
 
-  -- 3. identity belongs on the parent; drop on the default, keep control NOT NULL
+  -- 3. identity belongs on the parent; drop it on the default. Ensure the key
+  --    columns are NOT NULL.
   if v_idcols is not null then
     foreach v_col in array v_idcols loop
       execute format('alter table %s alter column %I drop identity if exists', v_defreg::text, v_col);
     end loop;
   end if;
   execute format('alter table %s alter column %I set not null', v_defreg::text, p_control);
-
-  -- 4. composite unique index the parent PK will adopt for this partition
   if v_pkcols is not null then
-    execute format('create unique index on %s (%s)', v_defreg::text,
-                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    foreach v_col in array v_pkcols loop
+      execute format('alter table %s alter column %I set not null', v_defreg::text, v_col);
+    end loop;
   end if;
 
-  -- 5. create the partitioned parent under the original name
-  execute format('create table %I.%I (like %s including defaults including generated%s) partition by range (%I)',
-                 v_nsp, v_rel, v_defreg::text, v_pk_clause, p_control);
+  -- 4. Build the composite unique index on the default and PROMOTE it to the
+  --    default's PRIMARY KEY. This index is reused (never rebuilt) when the
+  --    parent PK is established below -- the key to an online swap on a huge
+  --    table. (Creating the parent WITH a PK and then attaching would instead
+  --    rebuild this index on the whole default under ACCESS EXCLUSIVE.)
+  if v_pkcols is not null then
+    execute format('create unique index %I on %s (%s)',
+                   (v_default || '_pk_tmp'), v_defreg::text,
+                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+    execute format('alter table %s add constraint %I primary key using index %I',
+                   v_defreg::text, (v_default || '_pkey'), (v_default || '_pk_tmp'));
+  end if;
+
+  -- 5. create the partitioned parent under the original name (no PK yet)
+  execute format('create table %I.%I (like %s including defaults including generated) partition by range (%I)',
+                 v_nsp, v_rel, v_defreg::text, p_control);
   v_parent := format('%I.%I', v_nsp, v_rel)::regclass;
 
   -- 6. re-establish identity on the parent for former identity columns
@@ -447,10 +481,18 @@ begin
     end loop;
   end if;
 
-  -- 7. attach the existing table as the DEFAULT partition (no rows move)
+  -- 7. attach the existing table as the DEFAULT partition (no rows move; the
+  --    parent has no PK yet, so no index build is triggered)
   execute format('alter table %s attach partition %s default', v_parent::text, v_defreg::text);
 
-  -- 8. advance identity sequences past the largest existing value
+  -- 8. establish the parent PRIMARY KEY -- reuses the default's promoted PK index
+  --    (no rebuild). New/premade partitions build their own (empty) PK index.
+  if v_pkcols is not null then
+    execute format('alter table %s add primary key (%s)', v_parent::text,
+                   (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
+  end if;
+
+  -- 8b. advance identity sequences past the largest existing value
   if v_idcols is not null then
     foreach v_col in array v_idcols loop
       execute format('select setval(pg_get_serial_sequence(%L, %L), coalesce((select max(%I) from %s), 0) + 1, false)',
@@ -463,6 +505,20 @@ begin
               || 'autovacuum_vacuum_scale_factor = 0.0, autovacuum_vacuum_threshold = 1000, '
               || 'autovacuum_analyze_scale_factor = 0.0, autovacuum_analyze_threshold = 1000, '
               || 'autovacuum_vacuum_cost_limit = 2000, autovacuum_vacuum_cost_delay = 2)', v_defreg::text);
+
+  -- 9b. recreate secondary indexes as PARTITIONED indexes on the parent, then
+  --     ATTACH the default's existing index to each (no rebuild of the big
+  --     default). New/premade partitions inherit these automatically.
+  if v_idx_names is not null then
+    for j in 1 .. array_length(v_idx_names, 1) loop
+      v_old  := v_idx_names[j]::name;
+      v_new  := (v_old || '_pgpm')::name;
+      v_pdef := regexp_replace(v_idx_defs[j], '^CREATE INDEX \S+ ON ',
+                               'CREATE INDEX ' || quote_ident(v_new) || ' ON ONLY ');
+      execute v_pdef;
+      execute format('alter index %I.%I attach partition %I.%I', v_nsp, v_new, v_nsp, v_old);
+    end loop;
+  end if;
 
   -- 10. register and premake the initial future partitions
   insert into pgpm.config (parent_table, control_column, partition_interval, premake, retention,
