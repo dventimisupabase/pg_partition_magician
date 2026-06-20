@@ -287,7 +287,7 @@ if [ "$BENCH_PGFR" = "1" ]; then
       have_pgfr=1
       echo "  pg_flight_recorder: enabled ($(q "select count(*) from cron.job where jobname like 'pgfr%'" 2>/dev/null || echo '?') cron jobs)"
     else
-      echo "  pg_flight_recorder: install/enable failed (needs pg_stat_statements preloaded) — continuing without pgfr"
+      echo "  pg_flight_recorder: install/enable failed (needs pg_stat_statements preloaded), continuing without pgfr"
     fi
   else
     echo "  WARNING: BENCH_PGFR=1 but $BENCH_PGFR_DIR/pgfr_record/install.sql not found; skipping pgfr"
@@ -461,7 +461,7 @@ run_phase post "$BENCH_PHASE_SECS"
 # ---- 7. report -------------------------------------------------------------
 say "report"
 {
-  echo "# pg_partition_magician — at-scale load test"
+  echo "# pg_partition_magician: at-scale load test"
   echo
   echo "- rows: $(q "select count(*) from bench.events")"
   echo "- events size: $(q "select $EVENTS_SIZE_SUB")"

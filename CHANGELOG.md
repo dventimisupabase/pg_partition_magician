@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
-- `build_pk_concurrently(parent, control)` — a procedure that builds the default's
+- `build_pk_concurrently(parent, control)`: a procedure that builds the default's
   composite PK index ONLINE before `adopt`, so the cutover stays metadata-only even on
   very large tables (at ~300M rows the previous in-transaction build was a ~28-minute
   write-blocking window). `CREATE INDEX CONCURRENTLY` can't run inside a function, but it
-  can from a pg_cron worker — so this schedules the CIC as a cron job, polls until the
+  can from a pg_cron worker, so this schedules the CIC as a cron job, polls until the
   index is valid, then unschedules. Entirely inside pgpm (no DDL handed to the operator),
   using the existing pg_cron dependency. `adopt` then detects the pre-built index by its
   columns and promotes it; it falls back to the in-transaction build when none exists.
