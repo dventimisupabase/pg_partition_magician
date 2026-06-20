@@ -100,7 +100,7 @@
     <p class="version-pill"><span class="dot"></span>Latest release: <span id="version">RELEASE_VERSION</span></p>
 
     <section class="step">
-      <span class="step-eyebrow">Recommended · any Postgres</span>
+      <span class="step-eyebrow">Recommended · any Postgres 15–18</span>
       <h2 class="step-title">Run the SQL: psql or editor</h2>
       <p class="step-desc">One self-contained file, wrapped in <code>BEGIN; … COMMIT;</code>, no metacommands. <code>psql -f</code> the download, or paste it into the Supabase SQL editor.</p>
       <div class="actions">
@@ -129,7 +129,7 @@
       </div>
       <div class="sqlbox"><code id="dbdev-sql"><span class="k">select</span> dbdev.install('dventimisupabase@pg_partition_magician');
 <span class="k">create extension</span> "dventimisupabase@pg_partition_magician"
-  <span class="k">version</span> '0.1.0' <span class="k">cascade</span>;</code></div>
+  <span class="k">version</span> 'DBDEV_VERSION' <span class="k">cascade</span>;</code></div>
     </section>
 
     <h2 class="section-rule">Uninstall</h2>

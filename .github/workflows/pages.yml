@@ -52,10 +52,12 @@ jobs:
             for f in _site/pg_partition_magician-*-bundle.sql; do
               [ -e "$f" ] && mv "$f" _site/pg_partition_magician-bundle.sql
             done
-            sed -i "s/RELEASE_VERSION/${TAG}/g" _site/install.html
+            # Version pill shows the tag (v0.1.0); the dbdev create-extension needs the numeric form (0.1.0).
+            sed -i "s/RELEASE_VERSION/${TAG}/g; s/DBDEV_VERSION/${TAG#v}/g" _site/install.html
           else
             echo "No release yet, bundle fetch will degrade gracefully."
-            sed -i "s/RELEASE_VERSION/(unreleased)/g" _site/install.html
+            DEFV=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" extension.control | head -1)
+            sed -i "s/RELEASE_VERSION/(unreleased)/g; s/DBDEV_VERSION/${DEFV}/g" _site/install.html
           fi
           ls -la _site
 
