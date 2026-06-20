@@ -113,6 +113,22 @@ pgss_snapshot() {
      ) to stdout with (format csv, header true)" > "$RESULTS/$label.pgss.csv"
 }
 
+# top temp-file writers across ALL statements this phase -- attributes pgfr's TEMP_FILE_SPILLS
+# to a concrete query (workload? index build? pgfr's own collection?) instead of guessing.
+temp_snapshot() {
+  [ "$have_pgss" = "1" ] || return 0
+  local label="$1"
+  q "copy (
+       select '$label' as phase, calls,
+              round(temp_blks_written*8/1024.0,1) as temp_mb_written,
+              round(total_exec_time::numeric,1) as total_ms,
+              left(regexp_replace(query,'\s+',' ','g'),110) as query
+       from pg_stat_statements
+       where temp_blks_written > 0
+       order by temp_blks_written desc limit 15
+     ) to stdout with (format csv, header true)" > "$RESULTS/$label.temp.csv"
+}
+
 # total size of bench.events INCLUDING all partitions (a partitioned parent has no
 # heap of its own, so pg_total_relation_size(parent) alone reads 0 post-conversion)
 EVENTS_SIZE_SUB="(select pg_size_pretty(coalesce((select sum(pg_total_relation_size(c.oid)) from pg_class c
@@ -173,7 +189,7 @@ run_phase() {
   rm -f "$RESULTS/pgb_$label".*
   if [ -n "$BENCH_DSN" ]; then "$PGBENCH" "$BENCH_DSN" "${args[@]}"; else "$PGBENCH" "${args[@]}"; fi \
     | tee "$RESULTS/$label.pgbench.txt"
-  pgss_snapshot "$label"
+  pgss_snapshot "$label"; temp_snapshot "$label"
   printf '%s\n' "$(pctiles "$label")" > "$RESULTS/$label.pctiles.txt"
   echo "  latency: $(cat "$RESULTS/$label.pctiles.txt")"
 }
@@ -377,7 +393,7 @@ done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
-pgss_snapshot convert
+pgss_snapshot convert; temp_snapshot convert
 printf '%s\n' "$(pctiles convert)" > "$RESULTS/convert.pctiles.txt"
 echo "  ambient-workload latency through the conversion: $(cat "$RESULTS/convert.pctiles.txt")"
 
@@ -431,6 +447,7 @@ say "report"
   fi
   echo
   echo "Per-phase server-side workload statement latency: \`*.pgss.csv\`."
+  echo "Per-phase temp-file (work_mem-spill) attribution: \`*.temp.csv\`."
 } > "$RESULTS/report.md"
 
 # pg_flight_recorder narrative, focused on the conversion window (analyze) + stop collection
