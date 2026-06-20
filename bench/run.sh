@@ -142,6 +142,24 @@ pctiles() {
     }'
 }
 
+# tps + avg-latency for a label DERIVED from the pgbench --log. The convert-phase pgbench is
+# killed when the drain settles, so it never prints its own summary -- we recover throughput
+# from its per-transaction log instead. Emits "tps = ...|latency average = ... ms".
+pgbench_log_summary() {
+  local label="$1" files
+  files=$(ls "$RESULTS/pgb_$label".* 2>/dev/null || true)
+  [ -n "$files" ] || { echo "n/a|n/a"; return 0; }
+  # col3 = per-txn latency (us); cols 5,6 = epoch seconds + us-within-second. The convert
+  # pgbench is killed, so its final log line can be truncated (empty/garbage epoch) -- guard
+  # on a real epoch in $5 so a partial line can't poison the min timestamp (which would make
+  # the elapsed span ~1.7e9 and the tps read as ~0).
+  # shellcheck disable=SC2086
+  awk '$5+0 > 1000000000 { n++; lat+=$3; t=$5+$6/1e6; if(mn==0||t<mn)mn=t; if(t>mx)mx=t }
+       END{ if(n==0){print "n/a|n/a"; exit}
+            el=mx-mn; if(el<=0)el=1;
+            printf "tps = %.1f (from --log)|latency average = %.1f ms", n/el, (lat/n)/1000.0 }' $files
+}
+
 # run a fixed-duration load phase; capture pgbench summary + client percentiles + the
 # workload's per-phase server-side statement latency (pgss). System metrics are pgfr's job.
 run_phase() {
@@ -265,7 +283,6 @@ qf "$BENCH_DIR/sql/20_workload.sql" >/dev/null
 echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_size_pretty(pg_total_relation_size('bench.events'))")"
 
 # ---- 3. baseline (unpartitioned, under load) -------------------------------
-run_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # for slicing pgfr's time-series
 run_phase baseline "$BENCH_PHASE_SECS"
 assert_workload_healthy baseline   # bail now if the workload is timing out, before adopt/drain/post
 
@@ -327,19 +344,20 @@ obs_start=$(q "select extract(epoch from clock_timestamp())")
 drain_started=0; warned_stall=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
-  now_s=$(q "select extract(epoch from clock_timestamp())" 2>/dev/null) || { echo "  (observe poll failed -- retrying)"; continue; }
+  # ONE round-trip per poll (fewer fresh connections over the NAT'd path = less churn/risk):
+  #   epoch | default n_live_tup | partition count | drain ops | secs since last drain op (-1 if none)
+  poll=$(q "select extract(epoch from clock_timestamp())::bigint
+            ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
+            ||'|'|| (select count(*) from pg_inherits where inhparent='bench.events'::regclass)
+            ||'|'|| (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
+            ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
+                              from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)" 2>/dev/null) \
+    || { echo "  (observe poll failed -- retrying)"; continue; }
+  IFS='|' read -r now_s drows nparts moves age <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
-  drows=$(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass" 2>/dev/null) || drows='?'
-  nparts=$(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass" 2>/dev/null) || nparts='?'
-  # moves = # of drain ops so far; age = seconds since the last one ('-1' if the drain hasn't moved anything yet)
-  stat=$(q "select (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
-                   ||'|'||
-                   coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
-                             from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))::text,'-1')" 2>/dev/null) || stat='?|?'
-  moves=${stat%%|*}; age=${stat##*|}
   printf '%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" >> "$RESULTS/drain.progress.csv"
   printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
-  [ "$moves" != '?' ] && [ "$moves" -ge 1 ] && drain_started=1
+  if [ "$moves" -ge 1 ]; then drain_started=1; fi
   if [ "$drain_started" = 1 ] && [ "$age" != '?' ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
     echo; echo "  pgpm drain settled -- $moves drain ops, none for ${age}s (default drained to the open interval)"; break
   fi
@@ -382,8 +400,10 @@ say "report"
   echo "| phase | pgbench tps | pgbench avg latency | client p50 / p95 / p99 (pgbench --log) |"
   echo "|-------|-------------|---------------------|----------------------------------------|"
   for ph in baseline convert post; do
-    tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
-    lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || echo "n/a")
+    tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
+    lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
+    # convert's pgbench is killed at settle and prints no summary -> derive tps/avg from its log
+    if [ -z "$tps" ]; then s=$(pgbench_log_summary "$ph"); tps=${s%%|*}; lat=${s##*|}; fi
     pct=$(cat "$RESULTS/$ph.pctiles.txt" 2>/dev/null || echo "n/a")
     printf '| %s | %s | %s | %s |\n' "$ph" "${tps:-n/a}" "${lat:-n/a}" "$pct"
   done
@@ -414,10 +434,11 @@ say "report"
 
 # pg_flight_recorder narrative, focused on the conversion window (analyze) + stop collection
 if [ "$have_pgfr" = "1" ]; then
-  run_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
-  q "select pgfr_analyze.incident_timeline('$convert_start','$convert_end')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
+  # the narrative report() (anomalies / wait-event summary / snapshot deltas), scoped to the
+  # conversion window -- NOT incident_timeline(), which is a raw per-event firehose.
+  q "select pgfr_analyze.report('$convert_start'::timestamptz,'$convert_end'::timestamptz)" > "$RESULTS/pgfr_report.md" 2>/dev/null \
     || q "select pgfr_analyze.report('1 hour')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
-    || q "select pgfr_analyze.incident_timeline('$run_start','$run_end')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
+    || q "select pgfr_analyze.incident_timeline('$convert_start','$convert_end')" > "$RESULTS/pgfr_report.md" 2>/dev/null \
     || echo "(pgfr_analyze report unavailable)" > "$RESULTS/pgfr_report.md"
   q "select pgfr_record.disable()" >/dev/null 2>&1 || true
 fi
