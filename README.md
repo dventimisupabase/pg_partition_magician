@@ -1,8 +1,8 @@
 # pg_partition_magician
 
-**[→ Explainer &amp; install page](https://dventimisupabase.github.io/improved-octo-happiness/)**
+**[→ Explainer &amp; install page](https://dventimisupabase.github.io/pg_partition_magician/)**
 
-[![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
+[![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://dventimisupabase.github.io/pg_partition_magician/)
 
 A lightweight, **pure-SQL** RANGE-partition manager for PostgreSQL whose only
 runtime dependency is **pg_cron**, and even that only to run its background jobs. No compiled
@@ -34,7 +34,7 @@ and PL/pgSQL; you can install it anywhere you can run SQL and schedule a job.
 
 ## Install
 
-Prefer copy-paste? The [install page](https://dventimisupabase.github.io/improved-octo-happiness/install.html)
+Prefer copy-paste? The [install page](https://dventimisupabase.github.io/pg_partition_magician/install.html)
 has one-click bundles and the registry command.
 
 `sql/pg_partition_magician.sql` is the single source of truth: pure SQL, idempotent,
