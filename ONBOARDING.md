@@ -1,9 +1,9 @@
-# Onboarding — pg_partition_magician
+# Onboarding: pg_partition_magician
 
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
 It adopts an existing (possibly huge, live) table into a native partitioned table
-*online*, then manages the lifecycle (premake → drain → retention) — across three
+*online*, then manages the lifecycle (premake → drain → retention) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
 For *what it does and why*, read [`README.md`](./README.md). This file is about
@@ -11,7 +11,7 @@ For *what it does and why*, read [`README.md`](./README.md). This file is about
 
 ## Get it running (5 minutes)
 
-The only prerequisite is **Docker**. Everything runs in containers — no Postgres,
+The only prerequisite is **Docker**. Everything runs in containers: no Postgres,
 psql, or other tooling needed on the host.
 
 ```bash
@@ -64,7 +64,7 @@ attach. See README for the full story.
 **TDD is the norm** (see `~/.claude` global guidance and the existing suite). Add a
 failing pgTAP test, then make it pass.
 
-`sql/pg_partition_magician.sql` is the single source of truth — edit it directly.
+`sql/pg_partition_magician.sql` is the single source of truth; edit it directly.
 The bundle and dbdev packages are built from it (`scripts/build_*.sh`); nothing else
 needs to be kept in sync.
 
@@ -103,7 +103,7 @@ rollback;
   sync local `main`.
 - **PostgreSQL 15** is the target (realistic older-but-supported workhorse; behavior
   is identical 15–17). Keep SQL PG-15-compatible.
-- Pure SQL + pg_cron only — no new runtime dependencies, no compiled extensions.
+- Pure SQL + pg_cron only: no new runtime dependencies, no compiled extensions.
 
 ## Gotchas worth knowing (learned the hard way)
 
@@ -114,15 +114,15 @@ rollback;
   every kind; cast per kind (`::timestamptz` / `::numeric` / `::uuid`) when comparing.
 - **float/double are rejected** as control columns (imprecise boundaries; NaN/Inf
   poison the frontier).
-- **UUIDv7/ULID can't be verified by type** — `adopt_by_uuidv7` samples and *warns* if
+- **UUIDv7/ULID can't be verified by type**: `adopt_by_uuidv7` samples and *warns* if
   the values look random (v4); `pgpm.check_uuidv7(table, col)` runs the check on demand.
 - **Incoming FKs**: `adopt` refuses by default; `p_incoming_fks => 'drop'` records +
   drops them; `generate_fk_recovery()` emits the rebuild script.
 
 ## Where to go deeper
 
-- `README.md` — dimensions, API, the control-type contract, design facts + timings.
-- `sql/pg_partition_magician.sql` — heavily commented; the adapter layer
+- `README.md`: dimensions, API, the control-type contract, design facts + timings.
+- `sql/pg_partition_magician.sql`: heavily commented; the adapter layer
   (`_grid_floor`/`_grid_next`/`_encode`/`_decode`/`_frontier_native`/`_part_name`) is
   where new partition kinds plug in.
-- `postgresql_online_partition_migration_summary.md` — the origin design doc.
+- `postgresql_online_partition_migration_summary.md`: the origin design doc.

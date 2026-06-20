@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Install pg_partition_magician</title>
-  <meta name="description" content="Install pg_partition_magician: pure SQL — psql -f or a paste-and-run bundle for any SQL editor. A Trusted Language Extension package on database.dev is available too." />
+  <meta name="description" content="Install pg_partition_magician: pure SQL, via psql -f or a paste-and-run bundle for any SQL editor. A Trusted Language Extension package on database.dev is available too." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -96,13 +96,13 @@
     </div>
 
     <h1>Install in <em>one paste</em>.</h1>
-    <p class="lede">Pure SQL from one source of truth — <code>psql -f</code> the file, or paste it into any SQL editor. Everything needs only <code>pg_cron</code>. (A Trusted Language Extension package is available too, for completeness.)</p>
+    <p class="lede">Pure SQL from one source of truth: <code>psql -f</code> the file, or paste it into any SQL editor. Everything needs only <code>pg_cron</code>. (A Trusted Language Extension package is available too, for completeness.)</p>
     <p class="version-pill"><span class="dot"></span>Latest release: <span id="version">RELEASE_VERSION</span></p>
 
     <section class="step">
       <span class="step-eyebrow">Recommended · any Postgres</span>
-      <h2 class="step-title">Run the SQL — psql or editor</h2>
-      <p class="step-desc">One self-contained file, wrapped in <code>BEGIN; … COMMIT;</code> — no metacommands. <code>psql -f</code> the download, or paste it into the Supabase SQL editor.</p>
+      <h2 class="step-title">Run the SQL: psql or editor</h2>
+      <p class="step-desc">One self-contained file, wrapped in <code>BEGIN; … COMMIT;</code>, no metacommands. <code>psql -f</code> the download, or paste it into the Supabase SQL editor.</p>
       <div class="actions">
         <button class="btn btn-primary" id="copy-bundle" disabled>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
@@ -156,7 +156,7 @@
     <div class="footer">
       <p><strong>Before you install:</strong></p>
       <ul class="prereq">
-        <li>Enable <code>pg_cron</code> — it drives scheduled maintenance (premake, drain, retention).</li>
+        <li>Enable <code>pg_cron</code>, which drives scheduled maintenance (premake, drain, retention).</li>
         <li>Only for the optional TLE path, enable <code>pg_tle</code> too (preinstalled on Supabase).</li>
         <li>After installing, adopt a table: <code>select pgpm.adopt('public.your_table', 'created_at', '1 month');</code> then watch <code>select * from pgpm.status();</code></li>
       </ul>
@@ -194,7 +194,7 @@
         .catch(err => { label.textContent = 'Unavailable'; meta.textContent = err.message; meta.classList.add('error'); pre.textContent = '-- Failed to load: ' + err.message + '\n-- (available once a release has been published)'; btn.classList.add('error'); });
       copyText(btn, () => text, okMsg);
     }
-    wireFile('pg_partition_magician-bundle.sql', 'copy-bundle', 'bundle-preview', 'bundle-meta', 'Copied — paste & run');
+    wireFile('pg_partition_magician-bundle.sql', 'copy-bundle', 'bundle-preview', 'bundle-meta', 'Copied, paste & run');
     wireFile('pg_partition_magician-uninstall.sql', 'copy-uninstall', 'uninstall-preview', 'uninstall-meta', 'Copied');
   </script>
 </body>

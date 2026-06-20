@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pg_partition_magician — partition a live Postgres table without moving a row</title>
-  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing table into a native RANGE-partitioned table online — time, bigint id, or UUIDv7 — driven by pg_cron." />
+  <title>pg_partition_magician: partition a live Postgres table without moving a row</title>
+  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing table into a native RANGE-partitioned table online (time, bigint id, or UUIDv7), driven by pg_cron." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -144,7 +144,7 @@
     .section-head h2 { font-size: clamp(1.9rem, 3.6vw, 2.7rem); margin: 14px 0 16px; }
     .section-head p { color: var(--fg-dim); font-size: 1.06rem; }
 
-    /* acts (the mechanism — a real sequence) */
+    /* acts (the mechanism, a real sequence) */
     .acts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
     .act { background: var(--bg-surface); padding: 34px 32px; }
     .act:hover { background: var(--bg-raised); }
@@ -154,7 +154,7 @@
     .act code { font-family: var(--font-mono); font-size: 0.86em; color: var(--green); }
     @media (max-width: 720px) { .acts { grid-template-columns: 1fr; } }
 
-    /* dimensions (three suits — not a sequence) */
+    /* dimensions (three suits, not a sequence) */
     .suits { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
     .suit-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: border-color 160ms var(--ease), transform 160ms var(--ease); }
     .suit-card:hover { border-color: var(--border-strong); transform: translateY(-3px); }
@@ -242,7 +242,7 @@
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
         <h1 class="display">Partition a live table<br>without moving <em>a row</em>.</h1>
-        <p class="lede">pg_partition_magician adopts an existing Postgres table into a native RANGE-partitioned table — online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
+        <p class="lede">pg_partition_magician adopts an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>
           <a class="btn btn-ghost" href="https://github.com/dventimisupabase/improved-octo-happiness" target="_blank" rel="noopener">
@@ -250,7 +250,7 @@
             View on GitHub
           </a>
         </div>
-        <div style="margin-top:26px"><span class="pill"><span class="dot"></span>time · bigint · uuidv7 — schema <code style="font-family:var(--font-mono)">pgpm</code></span></div>
+        <div style="margin-top:26px"><span class="pill"><span class="dot"></span>time · bigint · uuidv7 · schema <code style="font-family:var(--font-mono)">pgpm</code></span></div>
       </div>
 
       <div class="stage">
@@ -261,7 +261,7 @@
           <div class="card is-part"><div><div class="suit">♥</div><div class="lbl">2026_05</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit">♠</div><div class="lbl">2026_06</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
         </div>
-        <div class="stage-caption">one table, fanned into partitions — <b>no rows moved</b></div>
+        <div class="stage-caption">one table, fanned into partitions: <b>no rows moved</b></div>
       </div>
     </div>
   </header>
@@ -271,7 +271,7 @@
       <div class="section-head reveal">
         <span class="eyebrow">The trick</span>
         <h2 class="display">No data moves. At first.</h2>
-        <p>The whole conversion is one well-behaved background job — not a maintenance window. Four moves:</p>
+        <p>The whole conversion is one well-behaved background job, not a maintenance window. Four moves:</p>
       </div>
       <div class="acts">
         <div class="act reveal">
@@ -287,12 +287,12 @@
         <div class="act reveal">
           <div class="act-no">III</div>
           <h3>Drain</h3>
-          <p>Move the <code>DEFAULT</code>'s closed tail into partitions in small batches. A <code>CHECK</code>-constraint trick keeps the work off the blocking lock — a 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>.</p>
+          <p>Move the <code>DEFAULT</code>'s closed tail into partitions in small batches. A <code>CHECK</code>-constraint trick keeps the work off the blocking lock: a 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>.</p>
         </div>
         <div class="act reveal">
           <div class="act-no">IV</div>
           <h3>Maintain</h3>
-          <p>Premake, drain, and retention run on a <code>pg_cron</code> schedule. Pause whenever you want — the <code>DEFAULT</code> partition keeps everything safe meanwhile.</p>
+          <p>Premake, drain, and retention run on a <code>pg_cron</code> schedule. Pause whenever you want; the <code>DEFAULT</code> partition keeps everything safe meanwhile.</p>
         </div>
       </div>
     </div>
@@ -303,13 +303,13 @@
       <div class="section-head reveal">
         <span class="eyebrow">Any monotonic key</span>
         <h2 class="display">Any key that grows with time.</h2>
-        <p>If the partition key only moves forward — a clock, a sequence, a time-ordered id — pg_partition_magician can manage it.</p>
+        <p>If the partition key only moves forward (a clock, a sequence, a time-ordered id), pg_partition_magician can manage it.</p>
       </div>
       <div class="suits">
         <div class="suit-card reveal">
           <div class="glyph">♦</div>
           <h3>time</h3>
-          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly — any interval.</p>
+          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly: any interval.</p>
           <pre><code><span class="k">select</span> pgpm.adopt(
   'public.events',
   'created_at', '1 month');</code></pre>
@@ -317,7 +317,7 @@
         <div class="suit-card reveal">
           <div class="glyph">♣</div>
           <h3>id</h3>
-          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence — including Snowflake-style ids, where time lives in the high bits.</p>
+          <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence, including Snowflake-style ids, where time lives in the high bits.</p>
           <pre><code><span class="k">select</span> pgpm.adopt_by_id(
   'public.events',
   'id', 10000000);</code></pre>
@@ -325,7 +325,7 @@
         <div class="suit-card reveal">
           <div class="glyph">♠</div>
           <h3>uuidv7</h3>
-          <p>Time-ordered uuids — and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
+          <p>Time-ordered uuids, and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
           <pre><code><span class="k">select</span> pgpm.adopt_by_uuidv7(
   'public.events',
   'id', '1 day');</code></pre>
@@ -344,19 +344,19 @@
       <div class="truths">
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M3 14l4-5 3 3 4-6 3 4"/><path d="M3 17h14"/></svg></div>
-          <div><h3>One rule: monotonicity</h3><p>The key must only move forward. Float keys are rejected outright — <code style="font-family:var(--font-mono);color:var(--fg-dim)">NaN</code> and infinity would poison the frontier math.</p></div>
+          <div><h3>One rule: monotonicity</h3><p>The key must only move forward. Float keys are rejected outright: <code style="font-family:var(--font-mono);color:var(--fg-dim)">NaN</code> and infinity would poison the frontier math.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, handled</h3><p>An incoming FK can't survive a repartition silently, so <code>adopt</code> refuses by default — or drops and records them, and hands you a composite-FK recovery script.</p></div>
+          <div><h3>Foreign keys, handled</h3><p>An incoming FK can't survive a repartition silently, so <code>adopt</code> refuses by default, or drops and records them, and hands you a composite-FK recovery script.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
-          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row that arrives without a home is caught there, never lost — and surfaced by a check function.</p></div>
+          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row that arrives without a home is caught there, never lost, and surfaced by a check function.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>53 tests on PostgreSQL 15, 16, 17, and 18 — each installed three different ways, every partition kind exercised.</p></div>
+          <div><h3>Proven across versions</h3><p>53 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
         </div>
       </div>
     </div>
@@ -367,7 +367,7 @@
       <div class="reveal">
         <span class="eyebrow">Install</span>
         <h2 class="display">One file. Run it with psql.</h2>
-        <p>Pure SQL — no compiled extension, no superuser. Point <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">psql</code> at the single source file and you're done:</p>
+        <p>Pure SQL, no compiled extension, no superuser. Point <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">psql</code> at the single source file and you're done:</p>
         <div class="codecopy">
           <code id="install-cmd">psql "$DATABASE_URL" -f sql/pg_partition_magician.sql</code>
           <button class="btn btn-ghost" id="copy-install" type="button">
@@ -416,7 +416,7 @@
     }, { threshold: 0.12 });
     document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
 
-    // Fan the cards on load — the table "becomes" partitions.
+    // Fan the cards on load, the table "becomes" partitions.
     const fan = document.getElementById('fan');
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       fan.classList.add('revealed');

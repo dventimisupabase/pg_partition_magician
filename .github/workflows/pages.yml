@@ -54,7 +54,7 @@ jobs:
             done
             sed -i "s/RELEASE_VERSION/${TAG}/g" _site/install.html
           else
-            echo "No release yet — bundle fetch will degrade gracefully."
+            echo "No release yet, bundle fetch will degrade gracefully."
             sed -i "s/RELEASE_VERSION/(unreleased)/g" _site/install.html
           fi
           ls -la _site

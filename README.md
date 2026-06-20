@@ -2,26 +2,26 @@
 
 **[→ Explainer &amp; install page](https://dventimisupabase.github.io/improved-octo-happiness/)**
 
-[![pg_partition_magician — partition a live Postgres table without moving a row](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
+[![pg_partition_magician: partition a live Postgres table without moving a row](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
 
 A lightweight, **pure-SQL** RANGE-partition manager for PostgreSQL whose only
-runtime dependency is **pg_cron** — and even that only for scheduling. No compiled
+runtime dependency is **pg_cron**, and even that only for scheduling. No compiled
 extension, no superuser beyond what running a SQL script needs. Install it by
 running one file.
 
-It partitions on any **monotonic** key — time, integer/bigint ids (including
-Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids) — and manages the
+It partitions on any **monotonic** key: time, integer/bigint ids (including
+Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids). It then manages the
 full lifecycle of native `RANGE`-partitioned tables:
 
-- **`adopt()` / `adopt_by_id()` / `adopt_by_uuidv7()`** — convert an existing
+- **`adopt()` / `adopt_by_id()` / `adopt_by_uuidv7()`**: convert an existing
   (possibly huge, *live*) unpartitioned table into a partitioned one **online**,
   with no up-front data movement.
-- **premake** — keep N partitions ahead of the write frontier so live writes
+- **premake**: keep N partitions ahead of the write frontier so live writes
   always have a real partition.
-- **drain** — move the `DEFAULT` partition's closed tail into proper partitions in
+- **drain**: move the `DEFAULT` partition's closed tail into proper partitions in
   paced microbatches.
-- **retention** — drop partitions older than a policy.
-- **maintenance** — the single procedure `pg_cron` calls (premake + retention + drain).
+- **retention**: drop partitions older than a policy.
+- **maintenance**: the single procedure `pg_cron` calls (premake + retention + drain).
 
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
@@ -30,14 +30,14 @@ Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 `pg_partman` is excellent, but it's a compiled C extension: it needs `CREATE
 EXTENSION`, the binary installed, and privileges that some managed/locked-down
 Postgres environments don't grant. `pg_partition_magician` is just tables, views,
-and PL/pgSQL — you can install it anywhere you can run SQL and schedule a job.
+and PL/pgSQL; you can install it anywhere you can run SQL and schedule a job.
 
 ## Install
 
 Prefer copy-paste? The [install page](https://dventimisupabase.github.io/improved-octo-happiness/install.html)
 has one-click bundles and the registry command.
 
-`sql/pg_partition_magician.sql` is the single source of truth — pure SQL, idempotent,
+`sql/pg_partition_magician.sql` is the single source of truth: pure SQL, idempotent,
 no psql metacommands. It ships through three channels (all built from that one file):
 
 ```bash
@@ -57,7 +57,7 @@ scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_
 tables and data are left intact).
 
 For completeness, on a managed Postgres that has `pg_tle` it can also be installed as a
-Trusted Language Extension from [database.dev](https://database.dev) — but the `psql -f`
+Trusted Language Extension from [database.dev](https://database.dev), but the `psql -f`
 path above is simpler and is the recommended way:
 
 ```sql
@@ -101,13 +101,13 @@ changes per kind is `_grid_floor` / `_grid_next` / `_encode` / `_decode` /
 | `uuidv7` | `adopt_by_uuidv7(…, p_interval)` | `uuid` | interval / interval | time grid, boundaries encoded as uuids; also **ULID-as-uuid** |
 
 The "frontier" generalizes `now()`: for `id`/`uuidv7` it's the current max of the
-control column. **float/double are explicitly rejected** — they can't guarantee
+control column. **float/double are explicitly rejected**: they can't guarantee
 gapless boundaries and `NaN`/`Inf` sort highest and poison the frontier. When the
 partition key *is* the column other tables reference (typical for `id`), the PK
-stays single-column and **incoming FKs need no denormalization** — just a re-point.
+stays single-column and **incoming FKs need no denormalization**: just a re-point.
 
 UUIDv7/ULID generation is the app's job (PG 15 has no `uuidv7()`); the tool only
-stores, compares, and encodes boundary uuids — a pure-SQL `uuid↔ms` codec. Since
+stores, compares, and encodes boundary uuids: a pure-SQL `uuid↔ms` codec. Since
 the column type is just `uuid`, `adopt_by_uuidv7()` can't *know* the values are
 time-ordered, so it samples them and **warns** if they don't decode to plausible
 recent timestamps (i.e. likely random/UUIDv4); `pgpm.check_uuidv7(table, col)` runs
@@ -117,9 +117,9 @@ the same check on demand. It's a heuristic, not a proof.
 
 | Function | Purpose |
 |---|---|
-| `pgpm.adopt(parent, control, interval, …)` | Online swap + register + premake — **time** kind |
-| `pgpm.adopt_by_id(parent, control, step, …)` | Online swap — **id** kind (bigint/numeric) |
-| `pgpm.adopt_by_uuidv7(parent, control, interval, …)` | Online swap — **uuidv7/ULID** kind |
+| `pgpm.adopt(parent, control, interval, …)` | Online swap + register + premake, **time** kind |
+| `pgpm.adopt_by_id(parent, control, step, …)` | Online swap, **id** kind (bigint/numeric) |
+| `pgpm.adopt_by_uuidv7(parent, control, interval, …)` | Online swap, **uuidv7/ULID** kind |
 | `pgpm.maintenance_all()` | Premake + retention + one drain batch for every managed table (the pg_cron entry) |
 | `pgpm.maintenance(parent)` | Same, for one table (respects the pause flag) |
 | `pgpm.premake(parent)` | Create partitions up to `premake` ahead of now |
@@ -140,18 +140,18 @@ Two hard facts drive the design:
 
 1. **You can't convert a table to partitioned in place.** So `adopt()` renames the
    live table out of the way, creates a partitioned parent under the original name,
-   and **attaches the old table as the `DEFAULT` partition** — no rows move, the app
+   and **attaches the old table as the `DEFAULT` partition**: no rows move, the app
    sees no change. The PK is rebuilt to include the partition key *without rebuilding
    the index on the default*: the existing index is promoted to the default's PK and
-   the parent's PK reuses it (metadata only — creating the parent *with* a PK and
+   the parent's PK reuses it (metadata only: creating the parent *with* a PK and
    then attaching would instead rebuild that index on the whole default under
    `ACCESS EXCLUSIVE`). Identity moves to the parent; non-unique secondary indexes
    are carried over by attaching the default's existing index.
 2. **Adding a partition while the `DEFAULT` holds data forces a full scan of the
-   `DEFAULT` under `ACCESS EXCLUSIVE`** (PG 15 docs) — the biggest scaling risk.
+   `DEFAULT` under `ACCESS EXCLUSIVE`** (PG 15 docs), the biggest scaling risk.
 
-The tool sidesteps #2 for every range that receives **no concurrent writes** —
-closed past intervals (drain) and future intervals (premake) — by:
+The tool sidesteps #2 for every range that receives **no concurrent writes**,
+closed past intervals (drain) and future intervals (premake), by:
 
 ```sql
 ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
@@ -163,7 +163,7 @@ DROP CONSTRAINT excl
 The one rule that keeps this safe: **never exclude the interval currently receiving
 writes.** A `NOT VALID` CHECK is enforced on new rows, so excluding the live range
 would *reject* writes routing to the default. So the active interval simply lives in
-the `DEFAULT` until it closes, then drains as a closed tail — and premake keeps
+the `DEFAULT` until it closes, then drains as a closed tail, and premake keeps
 future intervals ready so live writes always have a real partition. *The only window
 we ever drain is the now-closed tail.*
 
@@ -172,7 +172,7 @@ vs scan-skip attach **0.43 ms**; the ~97 ms scan moves to `VALIDATE` under the
 non-blocking lock. Same for `CREATE … PARTITION OF` premake (108 ms → 2 ms).
 
 For the open/current interval there's no non-blocking option (a `NOT VALID` CHECK
-would reject live writes), so it attaches via a **plain** `ATTACH` — which *blocks*
+would reject live writes), so it attaches via a **plain** `ATTACH`, which *blocks*
 briefly rather than *rejecting*. Cheapest when it's drained last, against a small
 default. Force it with `drain_all(parent, include_open => true)`.
 
@@ -190,7 +190,7 @@ select pgpm.drain_all('public.your_events', p_include_open => true);
 ```
 
 `fixtures/demo.sql` builds three throwaway tables and adopts one of each kind
-(`messages` by time, `events_id` by bigint, `events_uuid` by uuidv7) — the test
+(`messages` by time, `events_id` by bigint, `events_uuid` by uuidv7); the test
 harness loads it, and you can `psql -f` it yourself against a scratch database.
 
 ## Tests
@@ -198,7 +198,7 @@ harness loads it, and you can `psql -f` it yourself against a scratch database.
 53 pgTAP tests across structure, write-routing, drain, row conservation, the
 scan-skip attach method, premake, retention, secondary-index propagation,
 incoming-FK handling + recovery, and the `id` and `uuidv7` dimensions (incl. the
-uuid↔ts codec). Testing needs only **Docker** — no other tooling.
+uuid↔ts codec). Testing needs only **Docker**, no other tooling.
 
 ```bash
 ./test.sh                       # all versions x all channels
@@ -213,10 +213,10 @@ uninstall. It's exactly what `.github/workflows/test.yml` runs on every push.
 
 ## v1 scope & caveats
 
-- **Dimensions**: `time` (interval step; whole-month or fixed-duration — mixed
+- **Dimensions**: `time` (interval step; whole-month or fixed-duration; mixed
   month+duration is rejected), `id` (bigint/numeric step), `uuidv7`/ULID-as-uuid
   (time grid, uuid boundaries). **float/double rejected.** Other sortable encodings
-  (KSUID, base32 ULID, ObjectId) aren't built in — partition on a companion column.
+  (KSUID, base32 ULID, ObjectId) aren't built in: partition on a companion column.
 - **Monotonicity is the precondition.** uuidv7/ULID are ms-resolution monotonic with
   a small clock-skew/late-arrival window; the don't-close-until-frontier-past rule
   plus the `DEFAULT` safety net absorb stragglers. Arbitrary backdated keys break it.
@@ -227,9 +227,9 @@ uninstall. It's exactly what `.github/workflows/test.yml` runs on every push.
 - **Secondary indexes**: `adopt()` copies the old table's non-unique secondary
   indexes onto the parent as partitioned indexes (attaching the default's existing
   index, no rebuild), so they propagate to every partition. Unique secondary indexes
-  are skipped (a partitioned unique index must include the partition key) — recreate
+  are skipped (a partitioned unique index must include the partition key); recreate
   those on the parent by hand.
-- **Incoming foreign keys** — see the dedicated section below; `adopt()` refuses by
+- **Incoming foreign keys**: see the dedicated section below; `adopt()` refuses by
   default and offers an opt-in drop.
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database
   timezone (UTC by default).
@@ -240,12 +240,12 @@ If other tables reference the table you're adopting (e.g. `reactions(message_id)
 messages(id)`), partitioning forces a hard reckoning, because a partitioned table's
 **only** unique key is one that includes the partition key:
 
-- A single-column FK like `→ messages(id)` becomes **impossible** — *"there is no
-  unique constraint matching given keys"* — and the old PK can't even be dropped
+- A single-column FK like `→ messages(id)` becomes **impossible** (*"there is no
+  unique constraint matching given keys"*), and the old PK can't even be dropped
   while a dependent FK exists.
 - The only way to keep DB-enforced RI is a **composite FK**: the referencing table
   must also carry `created_at` and reference `messages(created_at, id)`. (A composite
-  FK to the *parent* survives the drain — a row keeps its `(created_at, id)` as it
+  FK to the *parent* survives the drain: a row keeps its `(created_at, id)` as it
   moves between partitions.)
 
 So there's no "move the FK" trick; FKs can only be dropped and recreated, and
@@ -264,7 +264,7 @@ select * from pgpm.dropped_fk;   -- what was dropped, for reconstruction
 ```
 
 To take path A, `generate_fk_recovery()` emits a ready-to-review script per dropped
-FK — add the partition-key companion column, backfill it, and rebuild the FK as a
+FK: add the partition-key companion column, backfill it, and rebuild the FK as a
 composite FK (with `NOT VALID` + `VALIDATE` to avoid a long lock). It's generated,
 not executed:
 
@@ -286,7 +286,7 @@ ALTER TABLE public.reactions VALIDATE CONSTRAINT reactions_message_id_fkey;
 Review it (the companion column name is a suggestion; batch the backfill for large
 tables) and update the app to populate the new column going forward.
 
-(`pg_partman` reaches the same conclusion — its howto says incoming FKs require an
+(`pg_partman` reaches the same conclusion: its howto says incoming FKs require an
 outage to drop and recreate against the new partitioned table.)
 
 ## Releasing & publishing
