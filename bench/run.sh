@@ -398,7 +398,7 @@ health_snapshot adopt
 wal_snapshot adopt
 pgfr_snapshot adopt
 printf '%s\n' "$(pctiles adopt)" > "$RESULTS/adopt.pctiles.txt"
-echo "  default holds: $(q "select default_rows from pgpm.check_default('bench.events')") rows to drain"
+echo "  default holds: $(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass") rows to drain"
 
 # ---- 5. drain under load ---------------------------------------------------
 say "drain under load"
@@ -416,7 +416,9 @@ rm -f "$RESULTS/pgb_drain".*   # drop any prior-run logs so pctiles is fresh
 load_pid=$!; BG_PIDS+=("$load_pid")
 drain_start=$(q "select extract(epoch from clock_timestamp())")
 : > "$RESULTS/drain.progress.csv"
-echo "elapsed_s,default_rows,partitions,status" >> "$RESULTS/drain.progress.csv"
+# default_rows_est is pg_stat_user_tables.n_live_tup (instant estimate) -- an exact
+# count(*) over the default is a full scan (100s+ at scale) and would dominate the loop.
+echo "elapsed_s,default_rows_est,partitions,status" >> "$RESULTS/drain.progress.csv"
 steps=0
 while :; do
   status=$(q "select pgpm.drain_step('bench.events', $BENCH_DRAIN_BATCH)")
@@ -424,7 +426,7 @@ while :; do
   if [ $((steps % 10)) -eq 0 ] || [ "${status%%:*}" = "attached" ]; then
     now_s=$(q "select extract(epoch from clock_timestamp())")
     elapsed=$(awk -v a="$drain_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
-    drows=$(q "select default_rows from pgpm.check_default('bench.events')")
+    drows=$(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass")
     nparts=$(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass")
     printf '%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$status" >> "$RESULTS/drain.progress.csv"
     printf '\r  drain: %ss elapsed, default=%s rows, %s partitions, last=%s   ' \
