@@ -774,17 +774,19 @@ begin
   if cfg.paused then return 'paused'; end if;
 
   -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
-  -- workload. Premaking a future partition takes ACCESS EXCLUSIVE on the parent and scans the
-  -- DEFAULT (to prove no rows fall in the new range); that fights concurrent inserts into the
-  -- default's open cell, and left unbounded the two sides deadlock. So we (1) cap how long any
-  -- lock wait blocks, turning a would-be deadlock into a fast, retryable miss, and (2) isolate
-  -- each step in its own subtransaction. A premake/retention that loses the lock race is then
-  -- DEFERRED (retried on the next tick, during a quieter moment) WITHOUT aborting the drain --
-  -- the drain is the actual online conversion and the priority. The closed-tail drain attaches
-  -- via the scan-skip path (NOT VALID check + VALIDATE under SHARE UPDATE EXCLUSIVE), so it does
-  -- not contend for the parent's ACCESS EXCLUSIVE lock the way premake does, and makes progress
-  -- even while premake keeps deferring.
-  perform set_config('lock_timeout', '3s', true);
+  -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
+  -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
+  --
+  -- premake/retention get a VERY SHORT lock_timeout. Premaking a future partition's first step
+  -- (ADD CONSTRAINT on the default, for the scan-skip path) takes ACCESS EXCLUSIVE on the default
+  -- -- which the live workload's inserts hold almost continuously. A long timeout there is doubly
+  -- bad: it blocks the workload for the whole wait (the pending ACCESS EXCLUSIVE queues every new
+  -- locker behind it), AND if it does win the lock it goes on to VALIDATE-scan the entire default
+  -- before the CREATE -- a scan that is wasted whenever the CREATE then can't get its lock. Failing
+  -- fast makes a deferral nearly free: no long block, and it bails before that scan. premake is
+  -- optional (the future cells aren't written yet; the DEFAULT catches anything), so it simply
+  -- retries when the workload next has a gap.
+  perform set_config('lock_timeout', '200ms', true);
 
   begin
     v_made := pgpm.premake(p_parent);
@@ -800,6 +802,10 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
   end;
 
+  -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
+  -- so progress isn't starved. Its scans run under SHARE UPDATE EXCLUSIVE (non-blocking to the
+  -- workload); only the brief final ATTACH needs a stronger lock.
+  perform set_config('lock_timeout', '3s', true);
   begin
     v_drain := pgpm.drain_step(p_parent);
   exception when others then
