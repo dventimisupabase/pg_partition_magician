@@ -303,6 +303,10 @@ notes pulled from `CHANGELOG.md`), then calls `publish-dbdev.yml` to push the pa
 to [database.dev](https://database.dev). You can also run either workflow manually via
 *workflow_dispatch* with an explicit version.
 
+> **One manual step CI can't do:** on a version bump, bump the pinned `version '…'`
+> in the [Install](#install) section's dbdev example. The install page fills it in from the
+> release tag automatically; this README copy is pinned by hand (dbdev recommends pinning).
+
 **One-time setup for publishing** (the publish job is inert until both exist):
 
 1. Create a [database.dev](https://database.dev) account and an API token.
