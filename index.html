@@ -154,6 +154,147 @@
     .act code { font-family: var(--font-mono); font-size: 0.86em; color: var(--green); }
     @media (max-width: 720px) { .acts { grid-template-columns: 1fr; } }
 
+    /* ---------- the reveal: scroll-driven "how the trick is done" ---------- */
+    .beats { display: flex; flex-direction: column; gap: 72px; }
+    .beat { display: grid; grid-template-columns: 1fr 1fr; gap: 52px; align-items: center; }
+    .beat:nth-child(even) .beat-copy { order: 2; }
+    .beat:nth-child(even) .fig { order: 1; }
+    .beat-wide { grid-template-columns: 1fr; gap: 30px; justify-items: center; }
+    .beat-wide .beat-copy { max-width: 760px; text-align: center; }
+    .beat-wide .fig { width: 100%; }
+
+    .beat-copy .move { font-family: var(--font-mono); font-size: 12.5px; letter-spacing: 0.03em; color: var(--brass); display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .beat-wide .beat-copy .move { justify-content: center; }
+    .beat-copy .move code { color: var(--brass-dim); font-size: 0.92em; }
+    .move-n { flex: none; width: 23px; height: 23px; border-radius: 50%; border: 1px solid var(--brass-dim); display: inline-grid; place-items: center; font-family: var(--font-display); font-style: normal; font-size: 13px; color: var(--brass); }
+    .beat-copy h3 { font-family: var(--font-display); font-weight: 500; font-size: clamp(1.3rem, 2.4vw, 1.72rem); line-height: 1.16; letter-spacing: -0.01em; margin: 15px 0 13px; }
+    .beat-copy h3 em { font-style: italic; color: var(--brass); }
+    .beat-copy p { color: var(--fg-dim); font-size: 1rem; }
+    .beat-copy code { font-family: var(--font-mono); font-size: 0.84em; color: var(--green); }
+
+    /* figure frame + the scroll-progress var (0 = before, 1 = resolved) */
+    .fig { margin: 0; }
+    .dg { --p: 0; position: relative; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 30px 28px; min-height: 260px; display: flex; flex-direction: column; justify-content: center; gap: 16px; overflow: hidden; }
+
+    /* shared primitives */
+    .box { position: relative; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--bg-raised); padding: 13px 14px; min-height: 56px; }
+    .box .tag { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); letter-spacing: 0.02em; }
+    .box .rows { display: block; height: 4px; border-radius: 2px; background: var(--border-strong); margin-top: 8px; }
+    .box .rows + .rows { width: 64%; }
+    .box.def { border-color: var(--brass-dim); background: linear-gradient(160deg, rgba(232,185,107,0.12), var(--bg-surface)); }
+    .box.def .tag { color: var(--brass); }
+    .box.def .rows { background: rgba(232,185,107,0.4); }
+    .box.part { border-color: var(--green-dark); background: linear-gradient(160deg, rgba(62,207,142,0.10), var(--bg-surface)); }
+    .box.part .tag { color: var(--green); }
+    .box.parent { border-style: dashed; border-color: var(--green-dark); background: transparent; }
+    .box.parent .tag { color: var(--green); }
+    .box .pin { position: absolute; top: 10px; right: 12px; font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.08em; color: var(--brass); border: 1px solid var(--brass-dim); border-radius: 5px; padding: 2px 6px; }
+
+    .lane { position: relative; display: flex; align-items: center; gap: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; min-height: 44px; }
+    .lane.ghost { opacity: 0.5; }
+    .lane-lbl { flex: none; width: 130px; font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-muted); line-height: 1.3; }
+    .bar { position: relative; flex: 1; height: 16px; border-radius: 5px; background: var(--bg-control); overflow: hidden; font-family: var(--font-mono); font-size: 10px; color: var(--fg); display: flex; align-items: center; padding-left: 8px; white-space: nowrap; }
+    .bar::after { content: ""; position: absolute; inset: 0; transform-origin: left; transform: scaleX(var(--p)); }
+    .bar.block::after { background: linear-gradient(90deg, rgba(229,103,93,0.5), rgba(229,103,93,0.85)); }
+    .bar.ok::after { background: linear-gradient(90deg, rgba(62,207,142,0.45), rgba(62,207,142,0.8)); }
+    .bar.fill2::after { transform: scaleX(var(--p)); }
+    .lockbadge { flex: none; font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.04em; padding: 3px 8px; border-radius: 5px; }
+    .lockbadge.x { color: var(--destructive); border: 1px solid rgba(229,103,93,0.5); background: rgba(229,103,93,0.08); }
+    .lockbadge.s { color: var(--green); border: 1px solid var(--green-dark); background: var(--green-glow); }
+
+    .op { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); display: flex; align-items: center; gap: 8px; }
+    .op code { color: var(--fg-dim); }
+    .op.tiny { font-size: 11px; opacity: calc(0.35 + var(--p) * 0.65); }
+    .xmark { color: var(--destructive); font-size: 1.2em; }
+    .tick { color: var(--green); }
+
+    /* 1 · setup */
+    .dg-setup .box.big { min-height: 78px; }
+    .dg-setup .copylane .lane-lbl { color: var(--destructive); }
+
+    /* 2 · switch */
+    .dg-switch .app { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); text-align: center; }
+    .dg-switch .app .arr { display: block; color: var(--brass); margin-top: 2px; }
+    .dg-switch .swapstage { position: relative; display: flex; flex-direction: column; gap: 12px; padding-top: 6px; }
+    .dg-switch .box.parent { opacity: var(--p); transform: translateY(calc((1 - var(--p)) * 10px)); transition: none; }
+    .dg-switch .tag-rename .becomes { color: var(--brass); opacity: var(--p); }
+    .dg-switch .box.def .pin { opacity: var(--p); }
+
+    /* 3 · prepare */
+    .dg-prepare .lane.ghost { margin-top: 2px; }
+
+    /* 4 · frontier */
+    .dg-frontier { gap: 12px; }
+    .dg-frontier .writes { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-muted); padding-left: calc(50% + 6px); }
+    .dg-frontier .writes .arr { color: var(--brass); }
+    .dg-frontier .timeline { position: relative; display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; }
+    .dg-frontier .ival { position: relative; border-radius: 8px; padding: 14px 6px 12px; text-align: center; font-family: var(--font-mono); font-size: 12px; border: 1px solid var(--border-strong); background: var(--bg-raised); color: var(--fg-dim); }
+    .dg-frontier .ival .mini { display: block; font-size: 8.5px; color: var(--fg-muted); margin-top: 4px; letter-spacing: 0.02em; }
+    .dg-frontier .ival.part { border-color: var(--green-dark); background: rgba(62,207,142,0.08); color: var(--green); }
+    .dg-frontier .ival.tail { border-color: var(--brass-dim); background: rgba(232,185,107,0.07); color: var(--brass); border-style: dashed; }
+    .dg-frontier .ival.open { border-color: var(--brass); background: rgba(232,185,107,0.16); color: var(--brass); }
+    .dg-frontier .ival.future { border-style: dashed; border-color: var(--green-dark); color: var(--green); opacity: 0.78; }
+    .dg-frontier .frontier { position: absolute; top: -10px; bottom: -10px; left: calc(50% + (var(--p) - 0.5) * 16.6%); width: 2px; background: var(--brass); box-shadow: 0 0 10px var(--brass); }
+    .dg-frontier .frontier span { position: absolute; top: -16px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-family: var(--font-mono); font-size: 9px; color: var(--brass); }
+    .dg-frontier .axis { height: 1px; background: var(--border-strong); margin-top: 2px; }
+    .dg-frontier .legend { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 4px; }
+    .dg-frontier .k { font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-muted); display: inline-flex; align-items: center; gap: 6px; }
+    .dg-frontier .k::before { content: ""; width: 9px; height: 9px; border-radius: 3px; border: 1px solid; }
+    .dg-frontier .k.part::before { border-color: var(--green-dark); background: rgba(62,207,142,0.4); }
+    .dg-frontier .k.tail::before { border-color: var(--brass-dim); background: rgba(232,185,107,0.3); border-style: dashed; }
+    .dg-frontier .k.open::before { border-color: var(--brass); background: var(--brass); }
+    .dg-frontier .k.future::before { border-color: var(--green-dark); border-style: dashed; }
+
+    /* 5 · lock / misdirection */
+    .dg-lock .seq { display: grid; grid-template-columns: 0.8fr 1.3fr 1fr; gap: 8px; }
+    .seg { position: relative; border-radius: 7px; padding: 11px 10px; font-family: var(--font-mono); font-size: 11px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg-dim); line-height: 1.3; }
+    .seg .us { display: block; font-size: 8.5px; color: var(--fg-muted); margin-top: 4px; }
+    .seg.ok { border-color: var(--green-dark); }
+    .seg.meta { border-color: var(--brass-dim); color: var(--brass); }
+    .seg.s1 { opacity: calc(0.25 + var(--p) * 3); }
+    .seg.s2 { opacity: calc(0.25 + (var(--p) - 0.33) * 3); }
+    .seg.s3 { opacity: calc(0.25 + (var(--p) - 0.66) * 3); }
+    .dg-lock .bar.block { color: var(--fg); }
+    .dg-lock .lockrow { display: flex; justify-content: flex-end; opacity: calc((var(--p) - 0.3) * 2); }
+
+    /* 6 · drain */
+    .dg-drain { flex-direction: row; align-items: stretch; gap: 22px; }
+    .dg-drain .drainbox { flex: none; width: 132px; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden; }
+    .dg-drain .drainbox .tag { position: absolute; top: 11px; left: 14px; }
+    .dg-drain .lvl { display: block; border-radius: 5px; background: rgba(232,185,107,0.4); height: calc(18px + (1 - var(--p)) * 96px); transition: none; }
+    .dg-drain .chunk { position: absolute; width: 26px; height: 9px; border-radius: 3px; background: var(--green); }
+    .dg-drain .chunk.c1 { left: 18px; bottom: 20px; transform: translate(calc(var(--p) * 150px), calc(var(--p) * -8px)); opacity: calc(1 - var(--p) * 1.2); }
+    .dg-drain .chunk.c2 { left: 18px; bottom: 44px; transform: translate(calc(var(--p) * 158px), calc(var(--p) * 22px)); opacity: calc(1 - var(--p) * 1.2); }
+    .dg-drain .chunk.c3 { left: 18px; bottom: 68px; transform: translate(calc(var(--p) * 150px), calc(var(--p) * 54px)); opacity: calc(1 - var(--p) * 1.2); }
+    .dg-drain .parts { flex: 1; display: flex; flex-direction: column; gap: 9px; justify-content: center; }
+    .dg-drain .parts .box { min-height: 0; padding: 9px 12px; }
+    .dg-drain .parts .p1 { box-shadow: inset 999px 0 0 -983px var(--green); }
+    .dg-drain .parts .p2 { box-shadow: inset 999px 0 0 -987px var(--green); opacity: calc(0.55 + var(--p) * 0.45); }
+    .dg-drain .parts .p3 { opacity: calc(0.45 + var(--p) * 0.55); }
+
+    /* 7 · loop */
+    .dg-loop { align-items: center; gap: 18px; }
+    .dg-loop .ring { position: relative; width: 132px; height: 132px; border-radius: 50%; border: 1px dashed var(--green-dark); display: grid; place-items: center; }
+    .dg-loop .ring-lbl { font-family: var(--font-mono); font-size: 10px; color: var(--green); text-align: center; max-width: 80px; line-height: 1.3; }
+    .dg-loop .tickdot { position: absolute; top: 50%; left: 50%; width: 11px; height: 11px; margin: -5.5px; border-radius: 50%; background: var(--brass); box-shadow: 0 0 10px var(--brass); transform: rotate(calc(var(--p) * 360deg)) translateY(-66px); }
+    .dg-loop .jobs { display: flex; flex-direction: column; gap: 9px; }
+    .dg-loop .job { font-family: var(--font-mono); font-size: 11.5px; color: var(--green); border: 1px solid var(--green-dark); border-radius: 7px; padding: 8px 14px; background: var(--green-glow); }
+    .dg-loop .ledger { margin-left: auto; align-self: stretch; min-width: 120px; background: var(--bg); border: 1px solid var(--border); border-radius: 9px; padding: 12px; }
+    .dg-loop .ledger-lbl { font-family: var(--font-mono); font-size: 10px; color: var(--fg-muted); }
+    .dg-loop .ledger i { display: block; height: 4px; border-radius: 2px; background: var(--border-strong); margin-top: 9px; transform-origin: left; }
+    .dg-loop .ledger i:nth-child(2) { transform: scaleX(calc(var(--p) * 3)); }
+    .dg-loop .ledger i:nth-child(3) { width: 80%; transform: scaleX(calc((var(--p) - 0.33) * 3)); }
+    .dg-loop .ledger i:nth-child(4) { width: 60%; transform: scaleX(calc((var(--p) - 0.66) * 3)); }
+
+    @media (max-width: 820px) {
+      .beat, .beat:nth-child(even) .beat-copy, .beat:nth-child(even) .fig { grid-template-columns: 1fr; order: 0; }
+      .beat { gap: 26px; }
+      .dg-drain { flex-direction: column; }
+      .dg-drain .drainbox { width: auto; }
+      .dg-loop { flex-direction: column; }
+      .dg-loop .ledger { margin-left: 0; width: 100%; }
+    }
+
     /* dimensions (three suits, not a sequence) */
     .suits { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
     .suit-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: border-color 160ms var(--ease), transform 160ms var(--ease); }
@@ -209,6 +350,7 @@
       * { scroll-behavior: auto !important; }
       .reveal { opacity: 1; transform: none; transition: none; }
       .card { transition: none; }
+      .dg { --p: 1; }   /* resolve every figure to its final, labeled state; no scrubbing */
     }
   </style>
 </head>
@@ -269,36 +411,143 @@
   <section class="section" id="how">
     <div class="wrap">
       <div class="section-head reveal">
-        <span class="eyebrow">The trick</span>
-        <h2 class="display">No data moves. At first.</h2>
-        <p>The heavy lifting runs later, as paced background work, not a big up-front migration. One prep step, then four moves:</p>
+        <span class="eyebrow">The reveal</span>
+        <h2 class="display">Here's how the trick is done.</h2>
+        <p>A good magician will, just once, turn the box around and show you the hinges. No data teleports; there's no secret copy. There are seven moves, and every one is plain Postgres &mdash; performed in the right order, on the right lock.</p>
       </div>
-      <div class="acts">
-        <div class="act reveal">
-          <div class="act-no">0</div>
-          <h3>Prepare</h3>
-          <p>On a large table, build the parent's composite primary-key index <em>online</em> first: <code>build_pk_concurrently</code> runs <code>CREATE&nbsp;INDEX&nbsp;CONCURRENTLY</code> through a <code>pg_cron</code> worker &mdash; no blocking. Adopt then promotes that ready index, so the cutover stays metadata-only instead of rebuilding the key under a lock.</p>
+
+      <div class="beats">
+
+        <!-- 1 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">1</span> The setup</span>
+            <h3>A live table can't <em>become</em> partitioned.</h3>
+            <p>Postgres has no <code>ALTER TABLE &hellip; PARTITION BY</code>. The only built-in route is to create a fresh partitioned table and copy every row into it &mdash; a long lock, or a long migration with a risky cutover at the end. On a 200-million-row table that's the part nobody wants. <strong style="color:var(--fg)">pg_partition_magician never copies the table.</strong> Watch the hands.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-setup">
+              <div class="box big"><span class="tag">events &middot; 200M rows</span><i class="rows"></i><i class="rows"></i><i class="rows"></i></div>
+              <div class="op"><span class="xmark">&times;</span> <code>ALTER TABLE &hellip; PARTITION BY</code></div>
+              <div class="lane copylane"><span class="lane-lbl">the honest way: <code>COPY</code> every row</span><b class="bar block fill"></b><span class="lockbadge x">downtime</span></div>
+            </div>
+          </figure>
         </div>
-        <div class="act reveal">
-          <div class="act-no">I</div>
-          <h3>Adopt</h3>
-          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the swap takes a brief lock &mdash; with the key built ahead in step&nbsp;0, no index rebuild happens inside it &mdash; then the app carries on against the same table.</p>
+
+        <!-- 2 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">2</span> The switch &middot; <code>adopt</code></span>
+            <h3>The table you query is swapped for an identical one &mdash; mid-show.</h3>
+            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows, same indexes. The app keeps querying <code>events</code> and never sees the hand move &mdash; the swap is catalog-only and holds the lock for a blink.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-switch">
+              <div class="app"><code>SELECT &hellip; FROM events</code><span class="arr">&darr;</span></div>
+              <div class="swapstage">
+                <div class="box parent stage-2"><span class="tag">events &middot; PARTITIONED</span></div>
+                <div class="box def stage-1"><span class="tag tag-rename">events <span class="becomes">&rarr; events_default</span></span><span class="pin">DEFAULT</span><i class="rows"></i><i class="rows"></i></div>
+              </div>
+            </div>
+          </figure>
         </div>
-        <div class="act reveal">
-          <div class="act-no">II</div>
-          <h3>Premake</h3>
-          <p>Keep partitions ready <em>ahead</em> of the write frontier, so every new row always has a real partition to land in.</p>
+
+        <!-- 3 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">3</span> Palming the index &middot; <code>build_pk_concurrently</code></span>
+            <h3>The hard part is built <em>before</em> the switch, in plain sight.</h3>
+            <p>A partitioned table's primary key must contain the partition key, so the key widens from <code>(id)</code> to <code>(created_at,&nbsp;id)</code> &mdash; and building that index is the expensive move. <code>build_pk_concurrently</code> does it ahead of time with <code>CREATE INDEX CONCURRENTLY</code> on the live table, driven by <code>pg_cron</code>: no lock, app still serving. When the switch comes, the index is already in hand and <code>adopt</code> just promotes it. Skip this and the index gets built <em>inside</em> the cutover, under <code>ACCESS EXCLUSIVE</code> &mdash; <code>O(rows)</code>, about 28&nbsp;minutes at 300M rows.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-prepare">
+              <div class="lane"><span class="lane-lbl">pgpm &middot; offstage</span><b class="bar ok fill"></b><span class="lockbadge s">no lock</span></div>
+              <div class="op tiny"><span class="tick">&check;</span> <code>adopt</code>: promote &middot; metadata</div>
+              <div class="lane ghost"><span class="lane-lbl">the clumsy way &middot; in cutover</span><b class="bar block fill2"></b><span class="lockbadge x">ACCESS EXCLUSIVE</span></div>
+            </div>
+          </figure>
         </div>
-        <div class="act reveal">
-          <div class="act-no">III</div>
-          <h3>Drain</h3>
-          <p>Move the <code>DEFAULT</code>'s closed tail into partitions in small batches. A <code>CHECK</code>-constraint trick keeps the work off the blocking lock: a 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>.</p>
+
+        <!-- 4 -->
+        <div class="beat reveal beat-wide">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">4</span> The one rule of the act</span>
+            <h3>Never touch the interval that's live.</h3>
+            <p>Everything keys off one moving point &mdash; the <b style="color:var(--brass)">frontier</b>, the line between the settled past and the active present. Intervals <em>behind</em> it are <b style="color:var(--green)">closed</b>: no new row will ever land there, so they're safe to rebuild into real partitions. The interval <em>straddling</em> it is <b style="color:var(--brass)">open</b> &mdash; writes are arriving now &mdash; and pgpm's single rule is to leave it alone. New rows fall into a <b style="color:var(--green)">premade</b> future partition, or, if none fits yet, safely into <code>DEFAULT</code>. The frontier advances; the open interval closes; only <em>then</em> does it get reorganized.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-frontier">
+              <div class="writes"><span class="arr">writes &darr;</span></div>
+              <div class="timeline">
+                <div class="ival part">Jan</div>
+                <div class="ival part">Feb</div>
+                <div class="ival tail">Mar<span class="mini">in DEFAULT</span></div>
+                <div class="ival open">Apr<span class="mini">open &middot; live</span></div>
+                <div class="ival future">May</div>
+                <div class="ival future">Jun</div>
+                <div class="frontier"><span>frontier &middot; now</span></div>
+              </div>
+              <div class="axis"></div>
+              <div class="legend"><span class="k part">real partition</span><span class="k tail">closed tail &middot; DEFAULT</span><span class="k open">open</span><span class="k future">premade</span></div>
+            </div>
+          </figure>
         </div>
-        <div class="act reveal">
-          <div class="act-no">IV</div>
-          <h3>Maintain</h3>
-          <p>Premake, drain, and retention run on a <code>pg_cron</code> schedule. Pause whenever you want; the <code>DEFAULT</code> partition keeps everything safe meanwhile.</p>
+
+        <!-- 5 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">5</span> The misdirection</span>
+            <h3>Attaching a partition looks like it needs a full scan. It doesn't.</h3>
+            <p>Attach a partition while <code>DEFAULT</code> holds data and Postgres scans the whole <code>DEFAULT</code> under <code>ACCESS EXCLUSIVE</code> &mdash; a hard lock &mdash; to prove no row belongs in the new partition. pgpm proves it the other way first: <code>ADD&nbsp;CHECK&nbsp;(&hellip;)&nbsp;NOT&nbsp;VALID</code> is catalog-only and instant, then <code>VALIDATE</code> runs the scan under <code>SHARE UPDATE EXCLUSIVE</code> &mdash; a gentle lock that lets reads <em>and</em> writes continue. With the proof in hand, the <code>ATTACH</code> skips its scan and is metadata-only. A 4-million-row attach drops from <strong style="color:var(--fg)">101&nbsp;ms to 0.4&nbsp;ms</strong>; the cost moves to the lock nobody waits on.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-lock">
+              <div class="lane"><span class="lane-lbl">naive <code>ATTACH</code></span><b class="bar block">scan 4M rows</b><span class="lockbadge x">ACCESS EXCLUSIVE &middot; blocks all</span></div>
+              <div class="seq">
+                <b class="seg ok s1">CHECK NOT&nbsp;VALID<span class="us">instant</span></b>
+                <b class="seg ok s2">VALIDATE<span class="us">the scan &middot; non-blocking</span></b>
+                <b class="seg meta s3">ATTACH<span class="us">scan skipped &middot; 0.4ms</span></b>
+              </div>
+              <div class="lockrow"><span class="lockbadge s">SHARE UPDATE EXCLUSIVE &middot; reads + writes continue</span></div>
+            </div>
+          </figure>
         </div>
+
+        <!-- 6 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">6</span> Vanishing the backlog &middot; <code>drain</code></span>
+            <h3>The old rows leave <code>DEFAULT</code> a chunk at a time.</h3>
+            <p>The closed tail still sitting in <code>DEFAULT</code> is moved into its real partitions in small microbatches &mdash; <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it where it belongs, commit, repeat. Background, paced, and pausable: <code>DEFAULT</code> shrinks toward empty while reads and writes never stop. Each newly-filled interval is attached by the misdirection above, so even that is a blink.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-drain">
+              <div class="box def drainbox"><span class="tag">DEFAULT</span><i class="lvl"></i><span class="chunk c1"></span><span class="chunk c2"></span><span class="chunk c3"></span></div>
+              <div class="parts">
+                <div class="box part p1"><span class="tag">2026_01</span></div>
+                <div class="box part p2"><span class="tag">2026_02</span></div>
+                <div class="box part p3"><span class="tag">2026_03</span></div>
+              </div>
+            </div>
+          </figure>
+        </div>
+
+        <!-- 7 -->
+        <div class="beat reveal">
+          <div class="beat-copy">
+            <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain</code></span>
+            <h3>One <code>pg_cron</code> tick repeats every move &mdash; and shows its hands.</h3>
+            <p>A single scheduled call ties it together: <b style="color:var(--green)">premake</b> keeps the future stocked, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retention</b> drops cold partitions. It loops on <code>pg_cron</code> forever &mdash; and every action is written to an audit log in <code>pgpm.log</code>, the magician keeping his hands open. Pause it whenever; the <code>DEFAULT</code> keeps everything safe in the meantime.</p>
+          </div>
+          <figure class="fig" aria-hidden="true">
+            <div class="dg dg-loop">
+              <div class="ring"><span class="tickdot"></span><span class="ring-lbl">pg_cron &middot; maintain()</span></div>
+              <div class="jobs"><b class="job">premake</b><b class="job">drain</b><b class="job">retention</b></div>
+              <div class="ledger"><span class="ledger-lbl">pgpm.log</span><i></i><i></i><i></i></div>
+            </div>
+          </figure>
+        </div>
+
       </div>
     </div>
   </section>
@@ -420,6 +669,28 @@
       for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
     }, { threshold: 0.12 });
     document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+
+    // Scroll-driven figures: set --p (0=before, 1=resolved) per figure from its viewport progress.
+    const figs = Array.from(document.querySelectorAll('.dg'));
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      figs.forEach((f) => f.style.setProperty('--p', '1'));   // honor reduced-motion: show the end state
+    } else if (figs.length) {
+      let ticking = false;
+      const update = () => {
+        ticking = false;
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        for (const f of figs) {
+          const r = f.getBoundingClientRect();
+          if (r.bottom < -40 || r.top > vh + 40) continue;                 // off-screen: leave as-is
+          const p = (vh * 0.88 - r.top) / ((r.height * 0.62) || 1);        // 0 as it enters, 1 once well in view
+          f.style.setProperty('--p', Math.max(0, Math.min(1, p)).toFixed(3));
+        }
+      };
+      const onScroll = () => { if (!ticking) { ticking = true; requestAnimationFrame(update); } };
+      window.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll, { passive: true });
+      update();
+    }
 
     // Fan the cards on load, the table "becomes" partitions.
     const fan = document.getElementById('fan');
