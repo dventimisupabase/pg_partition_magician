@@ -47,6 +47,18 @@ BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
 BENCH_PREPARE_ADOPT="${BENCH_PREPARE_ADOPT:-0}"  # 1 = build the PK index CONCURRENTLY (online, under load) before adopt, so adopt is metadata-only (essential at scale)
 
+# TCP keepalives on every connection (libpq defaults them OFF). The bulk generators and the
+# long convert-phase pgbench sit idle on the wire for tens of seconds at a stretch (the server
+# backend is busy inserting/draining, not talking to the client). Over a NAT'd path -- e.g.
+# Tailscale to a managed endpoint -- an idle flow gets reaped with no RST, leaving the client
+# half-open: psql/pgbench then block forever on a dead socket while the server-side work has
+# already finished, and the whole run hangs. Keepalives keep the mapping warm (probe after 30s
+# idle) and surface a genuinely dead peer in ~80s instead of ~2h. Append if the DSN lacks them.
+if [ -n "$BENCH_DSN" ] && [[ "$BENCH_DSN" != *keepalives=* ]]; then
+  if [[ "$BENCH_DSN" == *\?* ]]; then BENCH_DSN="$BENCH_DSN&"; else BENCH_DSN="$BENCH_DSN?"; fi
+  BENCH_DSN="${BENCH_DSN}keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+fi
+
 mkdir -p "$RESULTS"
 
 # Always reap background load drivers, even on error/interrupt -- an orphaned
@@ -358,15 +370,18 @@ assert_workload_healthy baseline   # bail now if the workload is timing out, bef
 say "conversion: trigger pgpm.adopt, then observe pgpm self-drive (pg_cron) under load"
 pgss_reset
 rm -f "$RESULTS/pgb_convert".*
-# one continuous ambient workload spanning the whole conversion (prep + adopt + drain)
+# one continuous ambient workload spanning the whole conversion (prep + adopt + drain).
+# Background pgbench DIRECTLY (not inside a `( ... ) &` subshell): $! must be the pgbench pid
+# itself, or cleanup() kills only the subshell wrapper and pgbench is reparented and orphaned --
+# left hammering the server (holding connections/locks) and corrupting the next run.
 conv_bg_secs=$(( BENCH_DRAIN_MAX_SECS + 1200 ))
-( if [ -n "$BENCH_DSN" ]; then \
-    "$PGBENCH" "$BENCH_DSN" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert"; \
-  else \
-    "$PGBENCH" -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5 \
-      -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert"; \
-  fi > "$RESULTS/convert.pgbench.txt" 2>&1 ) &
+conv_args=( -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5
+            -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert" )
+if [ -n "$BENCH_DSN" ]; then
+  "$PGBENCH" "$BENCH_DSN" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
+else
+  "$PGBENCH" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
+fi
 load_pid=$!; BG_PIDS+=("$load_pid")
 
 # 4a. operator prep (online): build the PK index concurrently so adopt stays metadata-only
@@ -392,23 +407,42 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 
 # 4d. OBSERVE (passive): sample + watch pgpm.log until pgpm's drain settles. A failed poll
 #     is non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless.
+#     "Settled" requires the drain to have actually STARTED (>=1 drain op) and THEN gone quiet:
+#     a bare "time since last drain op" can't tell "never started" from "finished long ago"
+#     (an empty pgpm.log reads as idle-forever), so we gate the idle test on real progress and
+#     surface a stall -- with the maintenance cron's own errors -- if the drain never starts.
 : > "$RESULTS/drain.progress.csv"
-echo "observed_s,default_rows_est,partitions,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
+echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
+drain_started=0; warned_stall=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
   now_s=$(q "select extract(epoch from clock_timestamp())" 2>/dev/null) || { echo "  (observe poll failed -- retrying)"; continue; }
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
   drows=$(q "select coalesce(n_live_tup,0)::bigint from pg_stat_user_tables where relid='bench.events_default'::regclass" 2>/dev/null) || drows='?'
   nparts=$(q "select count(*) from pg_inherits where inhparent='bench.events'::regclass" 2>/dev/null) || nparts='?'
-  age=$(q "select coalesce(round(extract(epoch from (clock_timestamp()-max(at))))::int, 999999) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')" 2>/dev/null) || age='?'
-  printf '%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$age" >> "$RESULTS/drain.progress.csv"
-  printf '\r  observing: %ss, default~%s rows, %s partitions, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$age"
-  if [ "$age" != '?' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
-    echo; echo "  pgpm drain settled -- no drain activity for ${age}s (default drained to the open interval)"; break
+  # moves = # of drain ops so far; age = seconds since the last one ('-1' if the drain hasn't moved anything yet)
+  stat=$(q "select (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
+                   ||'|'||
+                   coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
+                             from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))::text,'-1')" 2>/dev/null) || stat='?|?'
+  moves=${stat%%|*}; age=${stat##*|}
+  printf '%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" >> "$RESULTS/drain.progress.csv"
+  printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
+  [ "$moves" != '?' ] && [ "$moves" -ge 1 ] && drain_started=1
+  if [ "$drain_started" = 1 ] && [ "$age" != '?' ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
+    echo; echo "  pgpm drain settled -- $moves drain ops, none for ${age}s (default drained to the open interval)"; break
+  fi
+  # Stall detector: maintenance was scheduled but no drain op has landed -- maintenance is failing.
+  if [ "$drain_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" != '?' ] && [ "$elapsed" -ge 60 ]; then
+    warned_stall=1
+    echo; echo "  WARNING: no drain activity after ${elapsed}s -- pgpm.maintenance may be failing. Recent cron runs:"
+    q "select start_time::time(0)||' '||status||' '||left(coalesce(return_message,''),80)
+         from cron.job_run_details where jobid in (select jobid from cron.job where jobname='pgpm_maint_bench')
+         order by start_time desc limit 3" 2>/dev/null | sed 's/^/    /' || true
   fi
   if awk -v e="$elapsed" -v m="$BENCH_DRAIN_MAX_SECS" 'BEGIN{exit !(e+0 > m+0)}'; then
-    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping"; break
+    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping (drain_started=$drain_started, $moves ops)"; break
   fi
 done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
