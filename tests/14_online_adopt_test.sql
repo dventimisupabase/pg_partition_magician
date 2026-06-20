@@ -7,7 +7,7 @@
 create extension if not exists pgtap;
 
 begin;
-select plan(4);
+select plan(6);
 
 -- 1. the cron-driven online builder is installed as a procedure
 select ok(
@@ -55,6 +55,21 @@ select is(
   (select count(*) from public.pa)::int,
   5000,
   'all rows conserved through adopt'
+);
+
+-- 5. adopt() does the cutover ONLY -- it does not premake inside its ACCESS EXCLUSIVE
+-- transaction (that would scan the default and block). The DEFAULT is the only partition.
+select is(
+  (select count(*)::int from pg_inherits where inhparent = 'public.pa'::regclass),
+  1,
+  'adopt() leaves only the DEFAULT partition (no in-transaction premake)'
+);
+
+-- 6. premake(), run separately afterward, builds the future partitions
+select pgpm.premake('public.pa');
+select ok(
+  (select count(*) from pg_inherits where inhparent = 'public.pa'::regclass) > 1,
+  'premake() (run after adopt) adds the future partitions'
 );
 
 select * from finish();

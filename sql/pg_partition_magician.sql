@@ -630,7 +630,15 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  perform pgpm.premake(v_parent);
+  -- NOTE: premake is intentionally NOT run inside adopt. It attaches future partitions,
+  -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
+  -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
+  -- for the whole scan (O(default), minutes on a large table). adopt() therefore does the
+  -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
+  -- so it stays online even at scale. Run pgpm.premake(parent) (or pgpm.maintenance, or the
+  -- scheduled maintenance job) AFTER adopt to build the future partitions online -- its
+  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until premake
+  -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
   return v_parent;
 end;
 $$;
