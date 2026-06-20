@@ -27,6 +27,20 @@ source ~/.pgpm-bench.env            # BENCH_DSN (never echoed) + project metadat
 set +a
 : "${BENCH_DSN:?BENCH_DSN must come from ~/.pgpm-bench.env}"
 
+# Optional: route the client through the Supavisor SESSION-mode pooler (public IPv4/IPv6) instead
+# of the direct .red host (which rides the flaky Tailscale/NAT path and has dropped the workload
+# connection mid-window on every at-scale green run). SESSION mode (port 5432) keeps a stable server
+# backend per connection, so per-connection `set statement_timeout=0`, the COMMIT-ing generator
+# procedure, and pgpm's advisory locks all behave -- transaction mode (6543) would break them.
+# Built from the sourced parts at runtime; nothing new is persisted. Unset = direct .red (default).
+if [ "${BENCH_USE_POOLER:-0}" = "1" ]; then
+  : "${BENCH_PROJECT_REF:?}" "${BENCH_DB_PASSWORD:?}" "${BENCH_REGION:?}"
+  pooler_host="${BENCH_POOLER_HOST:-aws-0-${BENCH_REGION}.pooler.supabase.green}"
+  pw_enc="$(python3 -c 'import urllib.parse,os;print(urllib.parse.quote(os.environ["BENCH_DB_PASSWORD"],safe=""))')"
+  export BENCH_DSN="postgresql://postgres.${BENCH_PROJECT_REF}:${pw_enc}@${pooler_host}:5432/postgres?sslmode=require"
+  echo "  connection path: Supavisor session-mode pooler ($pooler_host:5432) -- off the Tailscale path"
+fi
+
 # ---- shared knobs (same workload + pgfr across rungs and profiles) ----
 export BENCH_MONTHS=2 BENCH_GEN_JOBS=8 BENCH_CHUNK=2000000
 export BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_OPS=10
