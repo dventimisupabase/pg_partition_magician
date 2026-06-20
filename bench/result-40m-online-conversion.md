@@ -1,4 +1,4 @@
-# Banked result — 40M-row online conversion under load (rung 3)
+# Banked result: 40M-row online conversion under load (rung 3)
 
 A run of the passive-observer harness (`bench/run.sh`) converting an unpartitioned
 `bench.events` to RANGE-partitioned **online**, while a 16-client OLTP workload runs
@@ -13,15 +13,15 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
   `pgpm.maintenance` scheduled on pg_cron every 2 s. pgpm self-drives premake + drain;
   the harness only observes. Drain batch 150 000.
 
-## Result — converted online, workload never stopped
+## Result: converted online, workload never stopped
 - **Online PK build: 51.8 s** (`CREATE INDEX CONCURRENTLY` via a pg_cron worker).
-- **`adopt()`: 8.3 s metadata cutover** — reused the pre-built index (no in-txn rebuild).
+- **`adopt()`: 8.3 s metadata cutover**, reused the pre-built index (no in-txn rebuild).
 - **Drain: 27.4 M closed-tail rows moved** in 184 microbatches, attaching 2 closed
   partitions; default drained to the open-month residue (`closed_rows = 0`). 6 partitions
   total (default + 3 premade-ahead + 2 drained). **40 M rows conserved.**
 - **`maintenance()` hardening validated under load:** premake **succeeded 3×** (during
   lulls) and **deferred 14×** (`premake_skip`, when it lost the lock race to the live
-  insert workload) — and the drain ran to completion regardless. Before the fix, the first
+  insert workload), and the drain ran to completion regardless. Before the fix, the first
   premake deadlock aborted the whole maintenance run and the drain never started.
 
 ## Throughput / latency by phase
@@ -32,7 +32,7 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
 | post (partitioned) | 165.8 | 96.4 ms | 95 / 105 / 162 / 318 ms |
 
 Throughput dropped sharply during the convert phase (the drain's delete+insert microbatches
-emit **123 GB of WAL** — see below — and contend for I/O), but the workload kept committing
+emit **123 GB of WAL**, see below, and contend for I/O), but the workload kept committing
 (0 failed) and p50 held ~104 ms; post-conversion latency is *better* than baseline (queries
 now hit the right partition). The 13.4 s max during convert is lock-contention tail from the
 partition attaches.
@@ -61,8 +61,8 @@ generation ~6 min; phases ~3 min. The remainder is a harness artifact: the obser
 progress sampling had a **single ~46-min-equivalent gap** (`drain.progress.csv` jumps from
 observed_s 90 → 2851) where one poll iteration blocked, so the observer did not register
 "drain settled" until ~17 min after the drain had actually finished. The **server-side
-drain was unaffected** (it runs on pg_cron, not on the observer's connection) — this is the
-passive-observer design working — but the observer's *visibility* stalled. Root cause of the
+drain was unaffected** (it runs on pg_cron, not on the observer's connection); this is the
+passive-observer design working, but the observer's *visibility* stalled. Root cause of the
 poll stall is not yet established from the evidence; candidate fix: give each observer poll a
 bounded `statement_timeout` + reuse one persistent connection rather than one psql per poll.
 

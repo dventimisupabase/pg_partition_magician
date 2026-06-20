@@ -41,20 +41,20 @@ and the month-spread is unchanged).
 
 pgpm is **self-driving**: you call `adopt()` once and pgpm's own pg_cron maintenance
 premakes and drains the default autonomously, inside the database. So this harness does
-**not** perform the partitioning — it sets pgpm up the way an operator would, drives an
+**not** perform the partitioning: it sets pgpm up the way an operator would, drives an
 ambient workload, and *observes*. Three phases:
 
 1. **baseline**: ambient workload against the *unpartitioned* table.
 2. **convert**: fire `pgpm.adopt()` once (`p_paused => false`) and schedule
-   `pgpm.maintenance` on pg_cron — then **pgpm** premakes and drains the default on its
+   `pgpm.maintenance` on pg_cron, then **pgpm** premakes and drains the default on its
    own while the harness drives the workload and watches `pgpm.log` until the drain settles.
    The harness never calls `drain_step`; because the conversion runs server-side, a
    dropped harness connection can't stop it.
 3. **post**: ambient workload against the now-partitioned table.
 
 The report compares client tps + p50/p95/p99 latency across the three phases and summarizes
-pgpm's own conversion (drain/premake from `pgpm.log`). The system-metric time-series — WAL,
-checkpoints, `pg_stat_io`, wait/lock events — is **pg_flight_recorder's** job: it records them
+pgpm's own conversion (drain/premake from `pgpm.log`). The system-metric time-series (WAL,
+checkpoints, `pg_stat_io`, wait/lock events) is **pg_flight_recorder's** job: it records them
 continuously and server-side, and the report slices its series to the conversion window. So
 degradation *while pgpm converts the table under load* is visible without the harness
 hand-rolling gauges.
@@ -83,7 +83,7 @@ Run the driver **as close to the database as possible** (same region / a VM in t
 same network). The server-side workload design tolerates latency, but co-location
 keeps `pgbench`'s own tps/latency numbers meaningful alongside the server-side ones.
 
-Pick a scale from **[`SIZE_LADDER.md`](SIZE_LADDER.md)** and climb it rung by rung — a
+Pick a scale from **[`SIZE_LADDER.md`](SIZE_LADDER.md)** and climb it rung by rung: a
 larger run is only worth doing once the one below it has passed cleanly.
 
 ## Knobs
@@ -100,11 +100,11 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_INTERVAL` | `1 month` | partition width |
 | `BENCH_PREMAKE` | `3` | future partitions pgpm premakes (configured on adopt; pgpm's maintenance does it) |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
-| `BENCH_OPS` | `50` | server-side ops per `workload_step` call — **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
+| `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
 | `BENCH_PHASE_SECS` | `120` | baseline/post observation duration |
 | `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
-| `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step` — set on `adopt`; **pgpm** uses it when *it* drains |
-| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintenance` — how often pgpm drives premake + drain |
+| `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step`, set on `adopt`; **pgpm** uses it when *it* drains |
+| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintenance`, how often pgpm drives premake + drain |
 | `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm drains |
 | `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |
@@ -116,24 +116,24 @@ larger run is only worth doing once the one below it has passed cleanly.
 
 ## Profiles (one engine, different questions)
 
-A single benchmark can't be everything at once — *aggressive* (to find limits and bugs) and
+A single benchmark can't be everything at once, *aggressive* (to find limits and bugs) and
 *gentle* (to show the conversion is unnoticeable) and *complete-in-a-window* and *at-scale* are
 contradictory demands. So `bench/run_rung.sh <rung> [profile]` runs the same engine under named
 profiles that bundle drive-intensity + how we observe:
 
-- **`stress`** (default) — aggressive drain (2 s maintenance, large batch), **run to completion**
+- **`stress`** (default), aggressive drain (2 s maintenance, large batch), **run to completion**
   (`BENCH_OBSERVE_MODE=settle`): drive the drain hard so it finishes within the run, then confirm
-  it settled. This is the *stress test* — it deliberately exceeds production load to surface
+  it settled. This is the *stress test*, it deliberately exceeds production load to surface
   bugs and limits, and it's how most of pgpm's drain/premake hardening was found.
-- **`gentle`** — representative drain (20 s maintenance, small batch sized **under `work_mem`** so
+- **`gentle`**, representative drain (20 s maintenance, small batch sized **under `work_mem`** so
   it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the drain is
-  steadily running, then measure the workload over a fixed window and compare it to baseline —
+  steadily running, then measure the workload over a fixed window and compare it to baseline, 
   *without* waiting for completion (a gentle drain of a large table takes hours/days and doesn't
   need to finish to answer "is it unnoticeable?"). Kept under the instance's I/O baseline, so the
   EBS burst never depletes and the measurement is reproducible.
 
 The two are complementary, not competing: throttling needs no pgpm change (it's just `drain_batch`
-+ the maintenance cadence — pgpm's intended gentle mode), and the stress arm earns its keep as a
++ the maintenance cadence, pgpm's intended gentle mode), and the stress arm earns its keep as a
 bug-finder. Profiles compose with the size ladder as a *rung × profile* matrix; results land in
 `results/<rung>-<profile>/`.
 
@@ -172,16 +172,16 @@ to cut that on repeat runs, with an honest caveat on each:
 
 ## Output (`bench/results/`)
 
-- `report.md`: the before/during/after comparison — client tps + latency percentiles per
+- `report.md`: the before/during/after comparison, client tps + latency percentiles per
   phase, a summary of pgpm's own conversion (drain/premake counts, rows moved, closed-tail
   remaining, from `pgpm.log`), and a pointer to the pgfr system-metric series sliced to the
   conversion window.
 - `<phase>.pgbench.txt`: raw pgbench summary (tps, latency average).
 - `<phase>.pctiles.txt`: client p50/p95/p99/max from the per-transaction log.
 - `<phase>.pgss.csv`: top server-side workload statements per phase (a scoped
-  `pg_stat_statements` reset/dump — WAN-free timing for the workload itself).
+  `pg_stat_statements` reset/dump, WAN-free timing for the workload itself).
 - `drain.progress.csv`: the default-partition drain curve under load (observed_s,
-  default_rows, partitions, drain_ops) — pgpm's own conversion progress.
+  default_rows, partitions, drain_ops), pgpm's own conversion progress.
 - **pg_flight_recorder** (when `BENCH_PGFR=1`): `pgfr_report.md`, the `pgfr_analyze`
   narrative for the conversion window (anomalies, wait-event summary, WAL/checkpoint/IO
   snapshots over time).
@@ -191,27 +191,27 @@ to cut that on repeat runs, with an honest caveat on each:
 ### System metrics are pg_flight_recorder's job
 
 The harness does **not** hand-roll WAL/checkpoint/health gauges. pgfr already records the full
-server-side time-series continuously — WAL bytes + write/sync time, checkpoints, `pg_stat_io`
-(client/checkpointer/autovacuum/bgwriter reads+writes+fsyncs), wait/lock events, table sizes —
+server-side time-series continuously, WAL bytes + write/sync time, checkpoints, `pg_stat_io`
+(client/checkpointer/autovacuum/bgwriter reads+writes+fsyncs), wait/lock events, table sizes, 
 so the harness records the phase-boundary timestamps and the report slices pgfr's series to the
 conversion window (`pgfr_analyze.incident_timeline`). pgfr needs `pg_cron` + `pg_stat_statements`
 preloaded (both true on Supabase). With `BENCH_PGFR=0` you get client-side latency + the pgpm
-conversion summary, but no system-metric time-series — set `BENCH_PGFR=1` for the full picture.
+conversion summary, but no system-metric time-series; set `BENCH_PGFR=1` for the full picture.
 
 ## Interpreting the results
 
 - **convert** is the window that matters: pgpm is premaking + draining the default while
-  the ambient workload runs. p50/p95 should stay close to baseline — the conversion is
+  the ambient workload runs. p50/p95 should stay close to baseline; the conversion is
   online. Expect occasional `max` blips: the brief `ACCESS EXCLUSIVE` on the adopt cutover,
   and pgpm's partition `ATTACH`es. If `max` is large or sustained, that's a real finding
   worth chasing (e.g. the adopt's prep wasn't done, so the PK index built in-transaction).
 - **drain progress** is in `drain.progress.csv`: the default shrinks as pgpm drains the
   closed months, then *grows* once they're gone (the open/current month stays in the
-  default and the ambient workload keeps filling it) — that's the drain reaching "settled."
+  default and the ambient workload keeps filling it): that's the drain reaching "settled."
 - **post** reflects the post-conversion steady state; pgpm tuned autovacuum aggressively on
   the default at adopt, so dead tuples from the drain reclaim over time. The table is larger
   than at baseline (the workload kept inserting), so compare latency *shape*, not just tps.
-- The conversion runs **server-side via pg_cron** — the harness only observes, so a dropped
+- The conversion runs **server-side via pg_cron** (the harness only observes), so a dropped
   observer connection is harmless (it retries; pgpm keeps draining).
 
 > Re-running against the **same** database needs a reset first

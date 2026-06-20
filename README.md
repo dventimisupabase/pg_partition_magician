@@ -143,19 +143,19 @@ Two hard facts drive the design:
    and **attaches the old table as the `DEFAULT` partition**: no rows move, the app
    sees no change. The PK has to widen to include the partition key (e.g.
    `(created_at, id)`), and *how that index gets built* is what decides whether the
-   cutover is actually online — there are two paths:
-   - **Recommended — pre-build it online.** Run `build_pk_concurrently()` first; it
+   cutover is actually online, there are two paths:
+   - **Recommended, pre-build it online.** Run `build_pk_concurrently()` first; it
      issues a `CREATE UNIQUE INDEX CONCURRENTLY` on the live table through a `pg_cron`
      worker (no blocking). `adopt()` then *promotes that ready index* to the default's
-     PK and the parent's PK reuses it — **metadata only**, so adopt holds its
+     PK and the parent's PK reuses it, **metadata only**, so adopt holds its
      `ACCESS EXCLUSIVE` lock only briefly.
-   - **Fallback — build it during the cutover.** If no matching index exists, `adopt()`
+   - **Fallback, build it during the cutover.** If no matching index exists, `adopt()`
      builds it in-transaction while holding `ACCESS EXCLUSIVE`: correct, but `O(rows)`
-     — a multi-minute write-blocking window on a large table (~28 min at 300M rows).
+, a multi-minute write-blocking window on a large table (~28 min at 300M rows).
      Fine for small tables, not "online."
 
    (Either way, creating the parent *with* a PK and then attaching would instead rebuild
-   that index across the whole default under `ACCESS EXCLUSIVE` — so pgpm establishes the
+   that index across the whole default under `ACCESS EXCLUSIVE`, so pgpm establishes the
    default's PK first and has the parent reuse it.) Identity moves to the parent; non-unique
    secondary indexes are carried over by attaching the default's existing index.
 2. **Adding a partition while the `DEFAULT` holds data forces a full scan of the
