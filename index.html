@@ -439,7 +439,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>adopt</code></span>
             <h3>The table you query is swapped for an identical one &mdash; mid-show.</h3>
-            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows, same indexes. The app keeps querying <code>events</code> and never sees the hand move &mdash; the swap is catalog-only and holds the lock for a blink.</p>
+            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows &mdash; the app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the primary key has to widen to include the partition key (move 3), non-key-aligned unique indexes can't be carried, and an incoming foreign key can't follow a table across a repartition &mdash; so <code>adopt</code> resolves those up front, or refuses outright.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -457,7 +457,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">3</span> Palming the index &middot; <code>build_pk_concurrently</code></span>
             <h3>The hard part is built <em>before</em> the switch, in plain sight.</h3>
-            <p>A partitioned table's primary key must contain the partition key, so the key widens from <code>(id)</code> to <code>(created_at,&nbsp;id)</code> &mdash; and building that index is the expensive move. <code>build_pk_concurrently</code> does it ahead of time with <code>CREATE INDEX CONCURRENTLY</code> on the live table, driven by <code>pg_cron</code>: no lock, app still serving. When the switch comes, the index is already in hand and <code>adopt</code> just promotes it. Skip this and the index gets built <em>inside</em> the cutover, under <code>ACCESS EXCLUSIVE</code> &mdash; <code>O(rows)</code>, about 28&nbsp;minutes at 300M rows.</p>
+            <p>A partitioned table's primary key must contain the partition key, so the key widens from <code>(id)</code> to <code>(created_at,&nbsp;id)</code> &mdash; and building that index is the expensive move. <code>build_pk_concurrently</code> does it ahead of time with <code>CREATE INDEX CONCURRENTLY</code> on the live table, driven by <code>pg_cron</code>: no blocking lock, the app still serving. When the switch comes, the index is already in hand and <code>adopt</code> just promotes it. Skip this and the index gets built <em>inside</em> the cutover, under <code>ACCESS EXCLUSIVE</code> &mdash; <code>O(rows)</code>, about 28&nbsp;minutes at 300M rows.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-prepare">
