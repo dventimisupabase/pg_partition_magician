@@ -6,10 +6,19 @@
 # rung's config through bench/run.sh. The conversion runs on green so the run exercises the
 # real path (managed PG, pgfr, the NAT'd connection) -- which is where the surprises live.
 #
-#   bench/run_rung.sh R0|R1|R2|R3
+#   bench/run_rung.sh R0|R1|R2|R3 [stress|gentle]
+#
+# PROFILE (2nd arg, default stress) selects the drain intensity + how we observe:
+#   stress -- aggressive drain (2s maintenance, large batch), run-to-completion (observe until the
+#             closed tail fully drains). The bug-finder / correctness-and-settle arm.
+#   gentle -- representative drain (slow maintenance, small batch sized under work_mem), windowed
+#             observation (warm up, then measure the workload over a fixed window without waiting
+#             for the drain to finish). The "is the drain unnoticeable?" arm -- it stays under the
+#             instance's I/O baseline, so the disk never tires and the measurement is reproducible.
 set -euo pipefail
 
-RUNG="${1:?usage: run_rung.sh R0|R1|R2|R3}"
+RUNG="${1:?usage: run_rung.sh R0|R1|R2|R3 [stress|gentle]}"
+PROFILE="${2:-stress}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 set -a
@@ -18,10 +27,10 @@ source ~/.pgpm-bench.env            # BENCH_DSN (never echoed) + project metadat
 set +a
 : "${BENCH_DSN:?BENCH_DSN must come from ~/.pgpm-bench.env}"
 
-# ---- shared knobs (same workload + pgfr across the ladder) ----
+# ---- shared knobs (same workload + pgfr across rungs and profiles) ----
 export BENCH_MONTHS=2 BENCH_GEN_JOBS=8 BENCH_CHUNK=2000000
 export BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_OPS=10
-export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_INTERVAL=10
+export BENCH_OBSERVE_INTERVAL=10
 export BENCH_PREPARE_ADOPT=1 BENCH_PGFR=1
 
 # ---- per-rung scale (see bench/SIZE_LADDER.md) ----
@@ -33,9 +42,20 @@ case "$RUNG" in
   *)  echo "unknown rung '$RUNG' (want R0|R1|R2|R3)"; exit 2 ;;
 esac
 
-export RESULTS="${RESULTS:-$DIR/results/$RUNG}"
+# ---- per-profile drain intensity + observe mode (overrides the rung's stress defaults) ----
+case "$PROFILE" in
+  stress) export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle ;;
+  gentle) # small batch (fits work_mem -> no temp spill), slow cron (stays under I/O baseline),
+          # windowed observe (warm up, then measure -- don't wait for the drain to finish).
+          export BENCH_MAINT_INTERVAL='20 seconds' BENCH_OBSERVE_MODE=window \
+                 BENCH_DRAIN_BATCH=20000 BENCH_CONVERT_WARMUP_SECS=60 \
+                 BENCH_CONVERT_WINDOW_SECS=300 BENCH_DRAIN_MAX_SECS=900 ;;
+  *)      echo "unknown profile '$PROFILE' (want stress|gentle)"; exit 2 ;;
+esac
 
-printf '\n==== run_rung %s : %s rows, %s months ====\n' "$RUNG" "$BENCH_ROWS" "$BENCH_MONTHS"
+export RESULTS="${RESULTS:-$DIR/results/$RUNG-$PROFILE}"
+
+printf '\n==== run_rung %s [%s] : %s rows, %s months ====\n' "$RUNG" "$PROFILE" "$BENCH_ROWS" "$BENCH_MONTHS"
 
 # ---- reset to a clean slate (idempotent) ----
 pkill -f 'bench/workload.pgbench' 2>/dev/null || true   # any orphaned local pgbench

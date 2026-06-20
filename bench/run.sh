@@ -47,6 +47,18 @@ BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule fo
 BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm drains
 BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # drain is "settled" after this long with no pgpm drain activity
 
+# How the convert phase decides it's done observing:
+#   settle  -- run until pgpm fully drains the closed tail (the aggressive/"stress" arm: drive the
+#              drain hard so it completes within the run, then confirm it settled). Default.
+#   window  -- the GENTLE/steady-state arm: a gentle drain on a large table never finishes inside a
+#              benchmark window, and it doesn't need to. Warm up until the drain is steadily running,
+#              then measure the workload for a fixed window and compare it to baseline -- the question
+#              is "is the drain unnoticeable?", not "is it done yet?". Convert metrics are restricted
+#              to the measurement window (the one-time adopt cutover is excluded by the warm-up).
+BENCH_OBSERVE_MODE="${BENCH_OBSERVE_MODE:-settle}"          # settle | window
+BENCH_CONVERT_WARMUP_SECS="${BENCH_CONVERT_WARMUP_SECS:-30}"  # window mode: let the drain reach steady state before measuring
+BENCH_CONVERT_WINDOW_SECS="${BENCH_CONVERT_WINDOW_SECS:-300}" # window mode: measure the workload for this long
+
 BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (best-effort; needs elevated privs, PG15-17)
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
@@ -143,14 +155,16 @@ EVENTS_SIZE_SUB="(select pg_size_pretty(coalesce((select sum(pg_total_relation_s
 # can't: client-side pgbench latency (pctiles), per-phase workload statement latency (pgss),
 # and pgpm's own conversion progress (the convert loop).
 
-# percentiles (µs -> ms) from pgbench --log files for a label
+# percentiles (µs -> ms) from pgbench --log files for a label. Optional epoch window [lo,hi]
+# (args 2,3) restricts to transactions logged in that range -- used by window mode to measure
+# only the steady-state slice (col 5 is the epoch second); 0/absent means "all transactions".
 pctiles() {
-  local label="$1" files
+  local label="$1" lo="${2:-0}" hi="${3:-0}" files
   # pgbench --log-prefix=X writes "X.<pid>" and "X.<pid>.<thread>" (no .log suffix)
   files=$(ls "$RESULTS/pgb_$label".* 2>/dev/null || true)
   [ -n "$files" ] || { echo "n/a"; return 0; }
   # shellcheck disable=SC2086
-  awk '{print $3}' $files | sort -n | awk '
+  awk -v lo="$lo" -v hi="$hi" 'lo==0 || ($5+0 >= lo && $5+0 <= hi) {print $3}' $files | sort -n | awk '
     function pct(p,   i){ i=int(p*n); if(i>=n)i=n-1; return a[i]/1000.0 }
     { a[n++]=$1 }
     END {
@@ -159,19 +173,19 @@ pctiles() {
     }'
 }
 
-# tps + avg-latency for a label DERIVED from the pgbench --log. The convert-phase pgbench is
-# killed when the drain settles, so it never prints its own summary -- we recover throughput
-# from its per-transaction log instead. Emits "tps = ...|latency average = ... ms".
+# tps + avg-latency for a label DERIVED from the pgbench --log (the convert pgbench is killed
+# and prints no summary). Optional epoch window [lo,hi] (args 2,3) restricts to that slice, so
+# window mode measures only steady-state draining. Emits "tps = ...|latency average = ... ms".
 pgbench_log_summary() {
-  local label="$1" files
+  local label="$1" lo="${2:-0}" hi="${3:-0}" files
   files=$(ls "$RESULTS/pgb_$label".* 2>/dev/null || true)
   [ -n "$files" ] || { echo "n/a|n/a"; return 0; }
-  # col3 = per-txn latency (us); cols 5,6 = epoch seconds + us-within-second. The convert
-  # pgbench is killed, so its final log line can be truncated (empty/garbage epoch) -- guard
-  # on a real epoch in $5 so a partial line can't poison the min timestamp (which would make
-  # the elapsed span ~1.7e9 and the tps read as ~0).
+  # col3 = per-txn latency (us); cols 5,6 = epoch seconds + us-within-second. Require a real
+  # epoch in $5 so a truncated final line can't poison the elapsed span (-> tps ~0); the same
+  # guard naturally drops out-of-window rows. tps is over the window's own min..max span.
   # shellcheck disable=SC2086
-  awk '$5+0 > 1000000000 { n++; lat+=$3; t=$5+$6/1e6; if(mn==0||t<mn)mn=t; if(t>mx)mx=t }
+  awk -v lo="$lo" -v hi="$hi" '$5+0 > 1000000000 && (lo==0 || ($5+0 >= lo && $5+0 <= hi)) {
+         n++; lat+=$3; t=$5+$6/1e6; if(mn==0||t<mn)mn=t; if(t>mx)mx=t }
        END{ if(n==0){print "n/a|n/a"; exit}
             el=mx-mn; if(el<=0)el=1;
             printf "tps = %.1f (from --log)|latency average = %.1f ms", n/el, (lat/n)/1000.0 }' $files
@@ -349,16 +363,17 @@ q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'"
 q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintenance_all()')" >/dev/null
 echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now draining itself"
 
-# 4d. OBSERVE (passive): sample + watch pgpm.log until pgpm's drain settles. A failed poll
-#     is non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless.
-#     "Settled" requires the drain to have actually STARTED (>=1 drain op) and THEN gone quiet:
-#     a bare "time since last drain op" can't tell "never started" from "finished long ago"
-#     (an empty pgpm.log reads as idle-forever), so we gate the idle test on real progress and
-#     surface a stall -- with the maintenance cron's own errors -- if the drain never starts.
+# 4d. OBSERVE. settle mode -> watch pgpm.log until the drain STARTS (>=1 op) and then goes quiet
+#     for BENCH_DRAIN_IDLE_SECS (closed tail fully drained). window mode -> warm up until the
+#     drain is steadily running (>=1 op and BENCH_CONVERT_WARMUP_SECS elapsed), then measure for
+#     BENCH_CONVERT_WINDOW_SECS without waiting for completion; convert metrics are restricted to
+#     [conv_win_lo,conv_win_hi] so the one-time adopt cutover is excluded. A failed poll is
+#     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
+#     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
 echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
-drain_started=0; warned_stall=0
+drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
   # ONE round-trip per poll (fewer fresh connections over the NAT'd path = less churn/risk):
@@ -373,28 +388,52 @@ while :; do
   IFS='|' read -r now_s drows nparts moves age <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
   printf '%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" >> "$RESULTS/drain.progress.csv"
-  printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
   if [ "$moves" -ge 1 ]; then drain_started=1; fi
-  if [ "$drain_started" = 1 ] && [ "$age" != '?' ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
-    echo; echo "  pgpm drain settled -- $moves drain ops, none for ${age}s (default drained to the open interval)"; break
+
+  if [ "$BENCH_OBSERVE_MODE" = window ]; then
+    if [ "$window_start" = 0 ] && [ "$drain_started" = 1 ] && [ "$elapsed" -ge "$BENCH_CONVERT_WARMUP_SECS" ]; then
+      window_start="$now_s"; conv_win_lo="$now_s"
+      echo; echo "  warmed up ($moves drain ops in ${elapsed}s) -- measuring a ${BENCH_CONVERT_WINDOW_SECS}s steady-state window"
+    fi
+    if [ "$window_start" != 0 ]; then
+      win_el=$(awk -v a="$window_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
+      printf '\r  measuring: window %ss/%ss, default~%s rows, %s drain ops   ' "$win_el" "$BENCH_CONVERT_WINDOW_SECS" "$drows" "$moves"
+      if [ "$win_el" -ge "$BENCH_CONVERT_WINDOW_SECS" ]; then
+        conv_win_hi="$now_s"
+        echo; echo "  measurement window complete (${win_el}s steady-state; $moves drain ops; drain left running server-side)"; break
+      fi
+    else
+      printf '\r  warming up: %ss, default~%s rows, %s drain ops   ' "$elapsed" "$drows" "$moves"
+    fi
+  else
+    printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
+    if [ "$drain_started" = 1 ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
+      echo; echo "  pgpm drain settled -- $moves drain ops, none for ${age}s (default drained to the open interval)"; break
+    fi
   fi
-  # Stall detector: maintenance was scheduled but no drain op has landed -- maintenance is failing.
-  if [ "$drain_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" != '?' ] && [ "$elapsed" -ge 60 ]; then
+
+  # Stall detector (both modes): maintenance was scheduled but no drain op has landed.
+  if [ "$drain_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" -ge 60 ]; then
     warned_stall=1
     echo; echo "  WARNING: no drain activity after ${elapsed}s -- pgpm.maintenance may be failing. Recent cron runs:"
     q "select start_time::time(0)||' '||status||' '||left(coalesce(return_message,''),80)
          from cron.job_run_details where jobid in (select jobid from cron.job where jobname='pgpm_maint_bench')
          order by start_time desc limit 3" 2>/dev/null | sed 's/^/    /' || true
   fi
+  # Cap backstop (both modes).
   if awk -v e="$elapsed" -v m="$BENCH_DRAIN_MAX_SECS" 'BEGIN{exit !(e+0 > m+0)}'; then
-    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping (drain_started=$drain_started, $moves ops)"; break
+    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping (mode=$BENCH_OBSERVE_MODE, drain_started=$drain_started, $moves ops)"
+    if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$window_start" != 0 ]; then conv_win_hi="$now_s"; fi
+    break
   fi
 done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
+# if window mode never closed a window (drain never warmed up), fall back to whole-convert metrics
+if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$conv_win_hi" = 0 ]; then conv_win_lo=0; fi
 pgss_snapshot convert; temp_snapshot convert
-printf '%s\n' "$(pctiles convert)" > "$RESULTS/convert.pctiles.txt"
+printf '%s\n' "$(pctiles convert "$conv_win_lo" "$conv_win_hi")" > "$RESULTS/convert.pctiles.txt"
 echo "  ambient-workload latency through the conversion: $(cat "$RESULTS/convert.pctiles.txt")"
 
 # ---- 5. post (partitioned, under load) -------------------------------------
@@ -419,18 +458,33 @@ say "report"
   for ph in baseline convert post; do
     tps=$(grep -h 'tps =' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
     lat=$(grep -h 'latency average' "$RESULTS/$ph.pgbench.txt" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
-    # convert's pgbench is killed at settle and prints no summary -> derive tps/avg from its log
-    if [ -z "$tps" ]; then s=$(pgbench_log_summary "$ph"); tps=${s%%|*}; lat=${s##*|}; fi
+    # convert's pgbench is killed and prints no summary -> derive tps/avg from its log; in window
+    # mode restrict it to the same steady-state slice the pctiles use (conv_win_lo..conv_win_hi).
+    if [ -z "$tps" ]; then
+      if [ "$ph" = convert ]; then s=$(pgbench_log_summary convert "$conv_win_lo" "$conv_win_hi"); else s=$(pgbench_log_summary "$ph"); fi
+      tps=${s%%|*}; lat=${s##*|}
+    fi
     pct=$(cat "$RESULTS/$ph.pctiles.txt" 2>/dev/null || echo "n/a")
     printf '| %s | %s | %s | %s |\n' "$ph" "${tps:-n/a}" "${lat:-n/a}" "$pct"
   done
   echo
   echo "## conversion (pgpm self-driven, from pgpm.log)"
   echo
+  if [ "$BENCH_OBSERVE_MODE" = window ]; then
+    echo "- mode: **gentle / steady-state window** -- measured ~${BENCH_CONVERT_WINDOW_SECS}s of draining"
+    echo "  after a ${BENCH_CONVERT_WARMUP_SECS}s warm-up; the drain was deliberately NOT run to completion."
+    echo "  Read it by comparing the **convert** row above to **baseline**: if they track, the drain is unnoticeable."
+  else
+    echo "- mode: **stress / run-to-completion** -- drove the drain until the closed tail fully drained."
+  fi
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
   echo "- drain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_attach'") partition attaches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") rows moved"
   echo "- premake: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake_skip'") deferred under lock contention"
-  echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (0 = closed tail fully converted)"
+  if [ "$BENCH_OBSERVE_MODE" = window ]; then
+    echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (still draining -- not expected to be 0 in a windowed run)"
+  else
+    echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (0 = closed tail fully converted)"
+  fi
   echo "- drain rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, drain_ops)"
   echo
   if [ "$have_pgfr" = "1" ]; then
