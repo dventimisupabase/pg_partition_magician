@@ -53,16 +53,17 @@ BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
 BENCH_PREPARE_ADOPT="${BENCH_PREPARE_ADOPT:-0}"  # 1 = build the PK index CONCURRENTLY (online, under load) before adopt, so adopt is metadata-only (essential at scale)
 
-# TCP keepalives on every connection (libpq defaults them OFF). The bulk generators and the
-# long convert-phase pgbench sit idle on the wire for tens of seconds at a stretch (the server
-# backend is busy inserting/draining, not talking to the client). Over a NAT'd path -- e.g.
-# Tailscale to a managed endpoint -- an idle flow gets reaped with no RST, leaving the client
-# half-open: psql/pgbench then block forever on a dead socket while the server-side work has
-# already finished, and the whole run hangs. Keepalives keep the mapping warm (probe after 30s
-# idle) and surface a genuinely dead peer in ~80s instead of ~2h. Append if the DSN lacks them.
+# TCP keepalives on every connection (libpq defaults them OFF). Synchronous server-side calls
+# sit idle ON THE WIRE while the backend works -- build_pk_concurrently polls for ~tens of s,
+# adopt's cutover, the bulk generators, the convert-phase pgbench between rows. Over a NAT'd
+# path (e.g. Tailscale to a managed endpoint) an idle flow gets reaped, killing the call mid-way
+# (observed: "server closed the connection unexpectedly" during the ~17s build_pk call).
+# keepalives_idle MUST be SHORTER than those calls -- a probe has to fire DURING them to keep
+# the NAT/proxy mapping warm; a longer idle (e.g. 30s) means a sub-30s call gets zero probes and
+# is reaped. So probe every 5s of idle, and surface a genuinely dead peer in ~35s.
 if [ -n "$BENCH_DSN" ] && [[ "$BENCH_DSN" != *keepalives=* ]]; then
   if [[ "$BENCH_DSN" == *\?* ]]; then BENCH_DSN="$BENCH_DSN&"; else BENCH_DSN="$BENCH_DSN?"; fi
-  BENCH_DSN="${BENCH_DSN}keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+  BENCH_DSN="${BENCH_DSN}keepalives=1&keepalives_idle=5&keepalives_interval=5&keepalives_count=6"
 fi
 
 mkdir -p "$RESULTS"
