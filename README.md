@@ -5,11 +5,11 @@
 [![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://dventimisupabase.github.io/improved-octo-happiness/)
 
 A lightweight, **pure-SQL** RANGE-partition manager for PostgreSQL whose only
-runtime dependency is **pg_cron**, and even that only for scheduling. No compiled
+runtime dependency is **pg_cron**, and even that only to run its background jobs. No compiled
 extension, no superuser beyond what running a SQL script needs. Install it by
 running one file.
 
-It partitions on any **monotonic** key: time, integer/bigint ids (including
+It partitions on three kinds of **monotonic** key: time, integer/bigint ids (including
 Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids). It then manages the
 full lifecycle of native `RANGE`-partitioned tables:
 
