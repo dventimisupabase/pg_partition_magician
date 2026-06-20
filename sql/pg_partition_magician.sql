@@ -432,6 +432,7 @@ declare
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
   v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name;
+  v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -482,6 +483,21 @@ begin
   select conname into v_pkname from pg_constraint where conrelid = p_parent and contype = 'p';
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a','d') and not a.attisdropped;
+
+  -- Capture max(identity) NOW, while the table's ORIGINAL indexes still exist. We drop the old PK
+  -- below (step 2) and swap to the composite (control, id) PK (step 4); after that the only index
+  -- covering the identity column no longer leads with it, so a later max(id) would seq-scan the
+  -- whole (large) DEFAULT under adopt's ACCESS EXCLUSIVE lock -- turning the metadata-only cutover
+  -- into an O(rows) blocking operation (minutes on a 100GB+ table). Here, with the original id PK
+  -- index intact, it is an index lookup. The captured value advances the (freshly recreated) parent
+  -- identity sequence in step 8b. (Falls back to whatever plan the original indexes allow if the
+  -- identity column wasn't index-leading -- no worse than before, and index-fast in the common case.)
+  if v_idcols is not null then
+    foreach v_col in array v_idcols loop
+      execute format('select coalesce(max(%I), 0)::bigint from %s', v_col, p_parent::text) into v_m;
+      v_idmax := array_append(v_idmax, v_m);
+    end loop;
+  end if;
 
   -- new PK columns: partition key first, then the rest of the old PK
   if v_oldpk is not null then
@@ -597,11 +613,14 @@ begin
                    (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
   end if;
 
-  -- 8b. advance identity sequences past the largest existing value
+  -- 8b. advance each identity sequence past the largest existing value -- using the max captured
+  -- up front (index lookup), NOT a fresh max() here (which would seq-scan the default now that the
+  -- id-leading index is gone). The parent's identity sequence was freshly created in step 6, so
+  -- this advance is REQUIRED: without it the next insert would collide at id = 1.
   if v_idcols is not null then
-    foreach v_col in array v_idcols loop
-      execute format('select setval(pg_get_serial_sequence(%L, %L), coalesce((select max(%I) from %s), 0) + 1, false)',
-                     v_parent::text, v_col, v_col, v_defreg::text);
+    for v_i in 1 .. array_length(v_idcols, 1) loop
+      execute format('select setval(pg_get_serial_sequence(%L, %L), %s, false)',
+                     v_parent::text, v_idcols[v_i], v_idmax[v_i] + 1);
     end loop;
   end if;
 

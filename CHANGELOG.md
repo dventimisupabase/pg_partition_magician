@@ -38,6 +38,13 @@
   batch) work, and while the default is not all-visible mid-drain the planner seq-scans the
   range each step (a sequential-scan storm that dominates I/O at scale). `EXISTS` stops at the
   first row (index scan), which is all the drain needs to decide between draining and attaching.
+- `adopt` no longer scans the table to advance identity sequences. After the cutover it advances
+  each identity sequence past the largest existing value -- but adopt has just swapped the PK to
+  `(control, id)`, leaving no id-leading index, so the old `select max(id)` seq-scanned the whole
+  DEFAULT under adopt's `ACCESS EXCLUSIVE` lock: O(rows), a multi-minute blocking step at 100GB+
+  scale that undercut the metadata-only cutover. `adopt` now captures `max(identity)` up front --
+  while the table's original id index still exists, so it is an index lookup -- and reuses it to
+  advance the (freshly recreated) parent sequence. The cutover stays metadata-only at any size.
 
 ## [0.1.0] - 2026-06-19
 

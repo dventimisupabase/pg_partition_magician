@@ -7,7 +7,7 @@
 create extension if not exists pgtap;
 
 begin;
-select plan(6);
+select plan(7);
 
 -- 1. the cron-driven online builder is installed as a procedure
 select ok(
@@ -70,6 +70,16 @@ select pgpm.premake('public.pa');
 select ok(
   (select count(*) from pg_inherits where inhparent = 'public.pa'::regclass) > 1,
   'premake() (run after adopt) adds the future partitions'
+);
+
+-- 7. adopt advanced the freshly-recreated parent identity sequence past the existing data,
+-- using the max(id) captured BEFORE the original id index was dropped -- so a post-adopt insert
+-- to the parent gets max+1 (5001), with no collision and no full-table scan at the cutover.
+insert into public.pa (created_at, payload) values (now(), 'seqtest');
+select is(
+  (select id from public.pa where payload = 'seqtest')::bigint,
+  5001::bigint,
+  'post-adopt insert gets id = max(id)+1 from the advanced identity sequence (captured pre-PK-swap)'
 );
 
 select * from finish();
