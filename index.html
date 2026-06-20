@@ -271,13 +271,13 @@
       <div class="section-head reveal">
         <span class="eyebrow">The trick</span>
         <h2 class="display">No data moves. At first.</h2>
-        <p>The whole conversion is one well-behaved background job, not a maintenance window. Four moves:</p>
+        <p>The heavy lifting runs later, as paced background work, not a big up-front migration. Four moves:</p>
       </div>
       <div class="acts">
         <div class="act reveal">
           <div class="act-no">I</div>
           <h3>Adopt</h3>
-          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the app sees no change.</p>
+          <p>Rename the table aside, create the partitioned parent under the same name, and attach the original as the <code>DEFAULT</code> partition. Zero rows move; the swap takes a lock, then the app carries on against the same table.</p>
         </div>
         <div class="act reveal">
           <div class="act-no">II</div>
