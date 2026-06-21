@@ -40,11 +40,16 @@ minute to minute. "Unnoticeable" means living within the leftover.
 
 **Demand is two cost centers, and they have different shapes:**
 
-- **Setup (one-time): the `build_pk` CIC.** Widening the primary key to include the partition key
-  is a lump that must be paid once. The whole design works to make the lumpy parts *non-blocking*
-  so they don't violate the invariant below: build the index `CONCURRENTLY` (off the blocking
-  lock), attach partitions with the scan-skip trick (`NOT VALID` CHECK then `VALIDATE` under a
-  gentle lock), and keep the cutover itself catalog-only and brief.
+- **Setup (one-time, and conditional): the `build_pk` CIC.** A partitioned table's primary key must
+  include the partition key, so when the existing PK doesn't already, it has to widen (e.g. `(id)` to
+  `(created_at, id)`), a lump paid once. The design makes the lumpy parts *non-blocking* so they
+  don't violate the invariant below: build the index `CONCURRENTLY` (off the blocking lock), attach
+  partitions with the scan-skip trick (`NOT VALID` CHECK then `VALIDATE` under a gentle lock), and
+  keep the cutover catalog-only and brief. **This cost is conditional, not inherent.** When the
+  partition key is already covered by the existing PK (partitioning on a monotonic `id`, or on a
+  `uuidv7` / ULID key, where the key *is* the PK), Postgres's rule is already satisfied and no
+  widening is needed; see section 8. In that common case this cost center collapses to zero and only
+  the drain remains.
 - **Steady (ongoing): the drain** (plus tiny, periodic premake and retention). Moving the closed
   tail out of `DEFAULT` in microbatches is **infinitely divisible**: a batch can be made
   arbitrarily small and spaced arbitrarily far apart.
@@ -152,6 +157,31 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   the RAM crossing and the honest output is a *range* with its regime assumption stated. It is a
   forecast, not a promise: other tenants on shared substrate, run-to-run variance, and the soft
   disk-bound number all mean the window should carry slack.
+- **Reuse the existing PK when the partition key already covers it (drop a whole cost center).** Today
+  `adopt` always drops the old PK and re-establishes one on the computed columns; when the partition
+  key is already in the PK (the `id` and `uuidv7` / ULID cases), those computed columns equal the
+  existing PK, so it rebuilds an index identical to the one it just dropped, paying the setup cost
+  center for nothing. The optimization is to detect that case and reuse the existing PK index to back
+  the parent's PK instead of rebuilding it. The wrinkle: Postgres won't let you drop a constraint
+  while keeping its index, so the reuse needs the attach-reconcile path (let `ATTACH PARTITION` match
+  the existing index, or `ALTER INDEX parent ATTACH PARTITION child`) rather than the current
+  drop-then-rebuild, and it wants a test matrix across PG 15 to 18. The payoff: in the common case the
+  setup cost center disappears and only the drain remains.
+- **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
+  axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
+  A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
+  previous bullet) and still express calendar retention. The bridge comes in three fidelities: (1)
+  **exact**, when time is encoded in the key (`uuidv7` / ULID, which `adopt_by_uuidv7` already
+  decodes, and Snowflake bigints if the operator supplies the encoding): no approximation, no
+  widening, exact calendar retention; (2) **approximate**, for a plain serial `id` alongside a
+  co-monotonic timestamp column: record each partition's observed `min`/`max` of that column as its
+  id-range closes, then map a cutoff to the nearest boundary and drop only partitions fully below it
+  (round toward keeping). Partition-granular retention is already approximate, so this adds just one
+  clearly labeled layer; (3) **impossible**, when the table carries no time information at all, so
+  retention is by id-range only. Tier 2 is sound only when `id` and the timestamp are co-monotonic
+  (backfills, event-time, and out-of-order arrival break it), so it needs a correlation check and an
+  honest warning, exactly analogous to `check_uuidv7`'s plausibility sampling and the rejection of
+  float keys.
 
 ## What already exists toward all this
 
