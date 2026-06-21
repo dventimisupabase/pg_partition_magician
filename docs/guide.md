@@ -209,8 +209,29 @@ so for very large cold partitions you may prefer to detach them concurrently by 
 ## Incoming foreign keys
 
 If other tables reference the table you are adopting (e.g. `reactions(message_id) -> messages(id)`),
-partitioning forces a reckoning, because a partitioned table's only unique key is one that includes
-the partition key:
+what partitioning does to that FK depends on whether you partition on the same column the FK
+references. The governing rule: a unique or primary key on a partitioned table must include every
+partition-key column.
+
+### When the partition key already is the referenced key (id / uuidv7)
+
+If you adopt on the table's own single-column primary key (the `adopt_by_id` / `adopt_by_uuidv7`
+happy path, where the partition key equals the PK), that single-column PK is legal on the partitioned
+parent, because its columns already include the partition key. The incoming FK stays valid against
+the new parent's `id`: no composite key, no denormalization.
+
+There is one mechanical wrinkle. The drain moves the closed tail through a standalone, not-yet-attached
+child table, so a referenced row is briefly outside the parent while it is moved, which a `NO ACTION`
+FK rejects. The FK therefore cannot ride through the conversion in place. The clean path today is:
+drop and record the FK at adopt (the `'drop'` mode below), let the drain finish, then re-add the same
+single-column FK against the new parent (`NOT VALID` + `VALIDATE`); the referencing table is untouched.
+Automating this is a planned feature (see DESIGN.md section 8).
+
+### When you partition on a different column (time)
+
+If you partition on a column other than the referenced key (the typical `time` case: partition on
+`created_at` while the FK references `id`), the PK must widen to include the partition key, e.g.
+`(created_at, id)`. The single-column unique on `(id)` no longer exists, so:
 
 - A single-column FK like `-> messages(id)` becomes impossible (`there is no unique constraint
   matching given keys`), and the old PK cannot even be dropped while a dependent FK exists.
@@ -219,21 +240,24 @@ the partition key:
   parent survives the drain, because a row keeps its `(created_at, id)` as it moves between
   partitions.
 
-There is no "move the FK" trick, so `adopt` does not do it silently. It offers two modes:
+### Adopt does not change your data model silently
+
+Either way, `adopt` offers two modes for incoming FKs:
 
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
 - **`p_incoming_fks => 'drop'`:** drop each incoming FK, record its original definition in
-  `pgpm.dropped_fk`, then proceed. You then re-enforce integrity in the app, or rebuild composite
-  FKs after denormalizing the referencing tables.
+  `pgpm.dropped_fk`, then proceed. You then re-add the FK against the new parent (id / uuidv7 happy
+  path), re-enforce integrity in the app, or rebuild composite FKs after denormalizing the
+  referencing tables (time case).
 
 ```sql
 select pgpm.adopt('public.messages', 'created_at', '1 month', p_incoming_fks => 'drop');
 select * from pgpm.dropped_fk;   -- what was dropped, for reconstruction
 ```
 
-To rebuild as composite FKs, `generate_fk_recovery` emits a ready-to-review script per dropped FK:
-add the partition-key companion column, backfill it, and rebuild the FK with `NOT VALID` + `VALIDATE`
-(to avoid a long lock). It is generated, not executed:
+For the widening (time) case, rebuild as composite FKs: `generate_fk_recovery` emits a
+ready-to-review script per dropped FK that adds the partition-key companion column, backfills it, and
+rebuilds the FK with `NOT VALID` + `VALIDATE` (to avoid a long lock). It is generated, not executed:
 
 ```sql
 select sql from pgpm.generate_fk_recovery('public.messages');
