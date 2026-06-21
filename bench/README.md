@@ -127,13 +127,13 @@ profiles that bundle drive-intensity + how we observe:
   bugs and limits, and it's how most of pgpm's drain/premake hardening was found.
 - **`gentle`**, representative drain (20 s maintenance, small batch sized **under `work_mem`** so
   it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the drain is
-  steadily running, then measure the workload over a fixed window and compare it to baseline, 
+  steadily running, then measure the workload over a fixed window and compare it to baseline,
   *without* waiting for completion (a gentle drain of a large table takes hours/days and doesn't
   need to finish to answer "is it unnoticeable?"). Kept under the instance's I/O baseline, so the
   EBS burst never depletes and the measurement is reproducible.
 
-The two are complementary, not competing: throttling needs no pgpm change (it's just `drain_batch`
-+ the maintenance cadence, pgpm's intended gentle mode), and the stress arm earns its keep as a
+The two are complementary, not competing: throttling needs no pgpm change (it's just `drain_batch` and
+the maintenance cadence, pgpm's intended gentle mode), and the stress arm earns its keep as a
 bug-finder. Profiles compose with the size ladder as a *rung × profile* matrix; results land in
 `results/<rung>-<profile>/`.
 
@@ -192,7 +192,7 @@ to cut that on repeat runs, with an honest caveat on each:
 
 The harness does **not** hand-roll WAL/checkpoint/health gauges. pgfr already records the full
 server-side time-series continuously, WAL bytes + write/sync time, checkpoints, `pg_stat_io`
-(client/checkpointer/autovacuum/bgwriter reads+writes+fsyncs), wait/lock events, table sizes, 
+(client/checkpointer/autovacuum/bgwriter reads+writes+fsyncs), wait/lock events, table sizes,
 so the harness records the phase-boundary timestamps and the report slices pgfr's series to the
 conversion window (`pgfr_analyze.incident_timeline`). pgfr needs `pg_cron` + `pg_stat_statements`
 preloaded (both true on Supabase). With `BENCH_PGFR=0` you get client-side latency + the pgpm

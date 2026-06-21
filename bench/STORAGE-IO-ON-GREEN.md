@@ -7,6 +7,7 @@ compute-addon metadata shows a baseline/burst gap, a direct conflict only a meas
 Tooling: `bench/io_burst_probe.sh` (`MODE=throughput|iops`).
 
 ## The two IO layers (don't conflate them)
+
 1. **Volume**, `gp3` (provisioned IOPS ≤16000 + throughput ≤1000 MiB/s; `POST .../config/disk`;
    ~6 h modification cooldown) or **`io2`** (IOPS-only, *no* `throughput_mibps` field; max ratio
    500:1). Neither has volume-level burst; the provisioned rate is steady.
@@ -17,6 +18,7 @@ Tooling: `bench/io_burst_probe.sh` (`MODE=throughput|iops`).
    the sustained baseline; it only widens the burst headroom.
 
 ## What we measured (4XL)
+
 | axis | gp3 (12000 IOPS / 1000 MiB/s) | io2 (32000 IOPS) |
 |------|-------------------------------|------------------|
 | **Throughput** | stable ~1 GB/s (volume-bound; the gp3 cap ≈ the 1048 instance baseline, so a throughput probe can't even reach the instance-burst regime) | unchanged (~1 GB/s; io2 is IOPS-only and the instance baseline still binds bandwidth) |
@@ -27,6 +29,7 @@ was observable.** The docs' "provisioned" claim held. io2's concrete payoff is a
 ceiling** (~2.5× gp3), *not* removing a burst; there wasn't a clean one to remove.
 
 ## Confounds that fooled earlier attempts (so the methodology is reusable)
+
 - **The 322 s CIC that started this** was on a *2XL*, end-of-day, over the pooler; never reproduced
   on 4XL (CIC was 31 s there). Likely the smaller 2XL instance-bandwidth layer, heavily confounded.
 - **A first IOPS probe read "BURSTING" (20k→8k), false.** That was **cache-cooldown** (the build
@@ -37,6 +40,7 @@ ceiling** (~2.5× gp3), *not* removing a burst; there wasn't a clean one to remo
   during a long scan then one meaningless spike. **Measure by timing bounded units directly.**
 
 ### How to probe IOPS/throughput honestly here
+
 - Lake **must exceed RAM** (64 GB) so reads hit disk, not cache.
 - **Many readers** for IOPS (aggregate ≈ readers÷latency) and **time bounded chunks** (ctid-range
   for throughput, single-block ctid fetches for IOPS), never rely on `pg_stat_io` rate for long ops.
@@ -46,6 +50,7 @@ ceiling** (~2.5× gp3), *not* removing a burst; there wasn't a clean one to remo
   Balance" chart** (the Management API doesn't expose it).
 
 ## Does io2 speed the pgpm conversion? No, on 4XL gp3 was already enough
+
 Ran the gentle R3 (40 M-row) online conversion on gp3-4XL and again on io2-4XL:
 
 | | gp3-4XL | io2-4XL @32000 |
@@ -61,6 +66,7 @@ one-time conversion doesn't generate it.** The 322 s CIC that originally motivat
 sufficient for the pgpm online conversion; io2 is overkill for this workload.**
 
 ## Practical guidance
+
 - For **IOPS-bound** work (online `CREATE INDEX CONCURRENTLY`, random access, the pgpm drain under
   scattered IO), **io2 is a real upgrade**, ~2.5× the sustained IOPS of gp3 at the same tier.
 - For **throughput-bound** work, gp3 and io2 are the same on 4XL (~1 GB/s, instance-baseline-bound).

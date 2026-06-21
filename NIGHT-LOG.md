@@ -6,6 +6,7 @@ rungs, torn down at the end). Climb a rung only on a clean pass; stop and fix on
 This file is my running journal; the final state is summarized at the bottom.
 
 ## Scope decision (priority order)
+
 1. **Reuse the existing PK when the partition key already covers it** (skip the redundant
    drop-then-rebuild for the id / uuidv7 cases). Crisp spec, clear correctness tests, removes a
    cost center. DOING FIRST.
@@ -18,15 +19,18 @@ This file is my running journal; the final state is summarized at the bottom.
    blind-implementing it overnight would be irresponsible. Documented why, not faked.
 
 ## Methodology
+
 - TDD: write pgtap tests first, then implement, then `./test.sh 17 --channel=psql` green.
 - Ladder: local Docker (R0/R1) before at-scale; provision Supabase only after small rungs pass;
   tear the project down before stopping so it can't bill overnight; watchdog every long run.
 - Commit per feature once green; keep main untouched (all work on the branch).
 
 ## Status log
+
 - [start] Branch created. Verifying green pgtap baseline on PG17 before any change.
 
 ### Feature 1: reuse existing PK (covered case) -- DONE on PG17, validating cross-version
+
 - Verified the PG mechanism empirically: parent `ADD PRIMARY KEY` reconciles the default's existing
   PK index in place (relfilenode/oid preserved, no rebuild). Holds on PG17.
 - TDD: added `tests/15_pk_reuse_test.sql` (asserts the PK index oid is preserved across adopt).
@@ -43,6 +47,7 @@ This file is my running journal; the final state is summarized at the bottom.
   Committing.
 
 ### Feature 3: check_time_monotonic (retention-bridge tier-2 safety) -- DONE
+
 - Additive read-only function `pgpm.check_time_monotonic(table, id, time, sample)`: samples rows,
   orders by id, returns the fraction of adjacent pairs whose time is non-decreasing (~1.0 = id and
   time co-increase; backfills/out-of-order drive it down). Modeled on check_uuidv7.
@@ -53,6 +58,7 @@ This file is my running journal; the final state is summarized at the bottom.
   per-feature ./test.sh up/down. Cross-version ./test.sh sweep reserved for end-of-batch.)
 
 ### Feature 2: block-budgeted batching -- DONE on PG17 (cross-version sweep running)
+
 - New config `drain_max_blocks` (null = off, backward compatible). When set, drain_step caps the
   microbatch at ~that many heap+TOAST blocks, translated to a row limit via the default's avg
   bytes/row (pg_table_size / reltuples), taking min(row cap, block-derived limit).
@@ -61,6 +67,7 @@ This file is my running journal; the final state is summarized at the bottom.
 - Full pgtap suite green on PG17 (17 files / 73 tests), no drain regressions. Committing.
 
 ### Deferred / not done (honest)
+
 - Window estimator (sec 8): a trivial version (work/rate) is low-value and the honest version needs
   the calibration probe + regime model. Skipped in favor of higher-value work.
 - Adaptive closed-loop feathering (sec 8 / mode 2): DEFERRED by design -- an under-specified
@@ -71,6 +78,7 @@ This file is my running journal; the final state is summarized at the bottom.
   block budget = bounded batch). Ready to run with you around.
 
 ### Final state (morning)
+
 - All 3 features GREEN across PG 15/16/17/18 (full pgtap suite, 73 tests). Branch pushed.
   - F1 reuse-existing-PK (5fd3f22) -- headline, cross-version.
   - F2 block-budgeted batching / drain_max_blocks (c90e2a3) -- cross-version.
@@ -81,6 +89,7 @@ This file is my running journal; the final state is summarized at the bottom.
   implemented (left as-is for now so this branch is pure feature+test).
 
 ### 2026-06-21: F2 "dup-key at 2M-wide" diagnosed -- NOT a drain bug; adopt-time guard added
+
 - A `drain_step` at 2M wide rows (`repeat('x',2000)` storage plain, `drain_max_blocks=50` -> 149-row
   batches) failed with `duplicate key ... Key (id)=(30)` on `<part>_pkey`. Reproduced on the local
   Docker pg17 container (no Supabase needed).
