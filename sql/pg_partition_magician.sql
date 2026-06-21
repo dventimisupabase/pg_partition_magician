@@ -82,23 +82,15 @@ create table if not exists pgpm.dropped_fk (
   referencing_table   regclass    not null,
   constraint_name     name        not null,
   definition          text        not null,
-  referencing_columns text[]      not null default '{}',
-  referenced_columns  text[]      not null default '{}',
-  -- true when adopt dropped this FK with p_incoming_fks => 'preserve': the partitioned parent keeps
-  -- a unique key matching the FK's referenced columns (the id/uuidv7 happy path), so it can be
-  -- re-added verbatim against the parent by restore_incoming_fks once the table is drained. false
-  -- (the 'drop' mode) means it needs the composite-FK rebuild via generate_fk_recovery instead.
-  restorable          boolean     not null default false,
-  -- lifecycle marker for a restorable (preserve-managed) FK: null = currently DROPPED (awaiting
-  -- restore), set = currently LIVE on the parent. maintenance keeps the invariant "a managed FK is
-  -- live iff the closed tail is empty": it suspends (drops, restored_at -> null) before a drain that
-  -- would move referenced rows, and restores (re-adds, restored_at -> now()) once the drain is idle.
-  -- This is why the row is kept after restore rather than deleted. Irrelevant for 'drop'-mode rows.
+  -- lifecycle marker for a preserve-managed incoming FK: null = currently DROPPED (awaiting restore),
+  -- set = currently LIVE on the parent. maintenance keeps the invariant "a managed FK is live iff the
+  -- closed tail is empty": it suspends (drops, restored_at -> null) before a drain that would move
+  -- referenced rows, and restores (re-adds, restored_at -> now()) once the drain is idle. The row is
+  -- kept after restore (rather than deleted) so the suspend/restore cycle can repeat.
   restored_at         timestamptz,
   dropped_at          timestamptz not null default now()
 );
--- upgrade path for installs that predate these columns
-alter table pgpm.dropped_fk add column if not exists restorable boolean not null default false;
+-- upgrade path for installs that predate this column
 alter table pgpm.dropped_fk add column if not exists restored_at timestamptz;
 
 -- =============================== adapter layer ===============================
@@ -470,7 +462,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
-  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name; v_pk_reuse boolean := false;
+  v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
@@ -551,14 +543,10 @@ begin
   select array_agg(a.attname order by a.attnum) into v_idcols
     from pg_attribute a where a.attrelid = p_parent and a.attidentity in ('a','d') and not a.attisdropped;
 
-  -- Capture max(identity) NOW, while the table's ORIGINAL indexes still exist. We drop the old PK
-  -- below (step 2) and swap to the composite (control, id) PK (step 4); after that the only index
-  -- covering the identity column no longer leads with it, so a later max(id) would seq-scan the
-  -- whole (large) DEFAULT under adopt's ACCESS EXCLUSIVE lock -- turning the metadata-only cutover
-  -- into an O(rows) blocking operation (minutes on a 100GB+ table). Here, with the original id PK
-  -- index intact, it is an index lookup. The captured value advances the (freshly recreated) parent
-  -- identity sequence in step 8b. (Falls back to whatever plan the original indexes allow if the
-  -- identity column wasn't index-leading -- no worse than before, and index-fast in the common case.)
+  -- Capture max(identity) to seed the parent's freshly-recreated identity sequence below: identity is
+  -- moved from the default to the parent (whose sequence restarts at 1), so without this the next
+  -- insert would collide. The PK is kept (never dropped), so the id index is intact and this is an
+  -- index lookup, not a seq-scan, even on a large default.
   if v_idcols is not null then
     foreach v_col in array v_idcols loop
       execute format('select coalesce(max(%I), 0)::bigint from %s', v_col, p_parent::text) into v_m;
@@ -566,65 +554,65 @@ begin
     end loop;
   end if;
 
-  -- new PK columns: partition key first, then the rest of the old PK
+  -- pgpm NEVER rewrites the primary key (DESIGN.md sec 8). Postgres only requires a partitioned
+  -- table's PK to INCLUDE the partition key (column order is irrelevant), so when the control column
+  -- is already a member of the existing PK we reuse that PK verbatim -- the parent's PRIMARY KEY
+  -- (step 8) reconciles the default's kept index in place, no drop, no O(rows) rebuild. If the table
+  -- has a PK that does NOT include the control column (the classic id-PK table that wants time
+  -- partitioning), we refuse with guidance rather than widen the key behind the operator's back. A
+  -- table with no PK at all is fine (there is nothing to preserve).
   if v_oldpk is not null then
-    v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
-    -- If the new PK equals the existing PK in the same order, the partition key is already covered
-    -- by the PK (partitioning on a monotonic id, a uuidv7/ULID key, or a PK already led by the
-    -- control column). Keep and REUSE the existing index instead of dropping and rebuilding an
-    -- identical one: step 2's drop and step 4's build are skipped, and step 8's parent PRIMARY KEY
-    -- reconciles the existing index in place (no O(rows) build). See DESIGN.md section 8.
-    v_pk_reuse := (v_pkcols = v_oldpk);
+    if not (p_control::text = any(v_oldpk)) then
+      raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run adopt: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
+        p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control, p_control;
+    end if;
+    v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
   end if;
 
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
     from pg_index i join pg_class c on c.oid = i.indexrelid
    where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
-  -- count unique secondary indexes we can't carry over -- but EXCLUDE a pre-built
-  -- index whose columns match the new PK (pgpm.build_pk_concurrently's index, promoted in step 4).
+  -- a unique secondary index (not the PK) can't be carried to a partitioned table unless it includes
+  -- the partition key, and pgpm doesn't carry unique secondaries at all -- warn so the operator can
+  -- recreate any it needs on the parent by hand.
   select count(*) into v_skipped from pg_index i
-   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
-     and (v_pkcols is null or (select array_agg(a.attname::text order by k.ord)
-            from unnest(i.indkey) with ordinality as k(attnum, ord)
-            join pg_attribute a on a.attrelid = p_parent and a.attnum = k.attnum) is distinct from v_pkcols);
+   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary;
   if v_skipped > 0 then
     raise notice 'pg_partition_magician: skipped % unique secondary index(es) on %; recreate on the parent manually (must include the partition key)', v_skipped, p_parent;
   end if;
 
-  -- 0. incoming FKs (capture before the rename; record after the new parent exists)
+  -- 0. incoming FKs (capture before the rename; record after the new parent exists). pgpm never
+  -- rewrites the PK, so the referenced unique key (the reused PK) always survives and an incoming FK
+  -- can be re-pointed at the new parent verbatim once the drain is idle -- the 'preserve' lifecycle.
+  -- We refuse by default (the operator opts into the drop-and-restore dance).
   if exists (select 1 from pg_constraint where confrelid = p_parent and contype = 'f') then
     if p_incoming_fks = 'error' then
       raise exception
-        'pg_partition_magician: % has incoming foreign key(s) (%). If the partition key is the referenced key (the id/uuidv7 case), keep them with p_incoming_fks => ''preserve''; otherwise the PK widens and they must become composite FKs (p_incoming_fks => ''drop'', then generate_fk_recovery).',
+        'pg_partition_magician: % has incoming foreign key(s) (%). Re-run with p_incoming_fks => ''preserve'' to keep them: pgpm drops each for the conversion and re-adds it against the new parent once the drain is idle.',
         p_parent,
         (select string_agg(conname || ' on ' || conrelid::regclass::text, ', ')
            from pg_constraint where confrelid = p_parent and contype = 'f');
-    else
+    else   -- 'preserve'
       for v_fk in
         select c.conrelid::regclass as reltbl, c.conname, pg_get_constraintdef(c.oid) as def,
-               (select array_agg(a.attname::text order by k.ord) from unnest(c.conkey) with ordinality as k(attnum, ord)
-                  join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum) as lcols,
                (select array_agg(a.attname::text order by k.ord) from unnest(c.confkey) with ordinality as k(attnum, ord)
                   join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) as rcols
           from pg_constraint c where c.confrelid = p_parent and c.contype = 'f'
       loop
-        -- Eligible to PRESERVE iff the partitioned parent will keep a unique key on EXACTLY this
-        -- FK's referenced columns. That key is the parent's PK (v_pkcols); on the id/uuidv7 happy
-        -- path it is the single partition-key column, so a single-column FK to it survives verbatim.
-        -- In the widening (time) case v_pkcols gains the partition key, no single-column unique
-        -- remains, and the FK can only become composite (generate_fk_recovery).
+        -- Preservable iff the parent keeps a unique key on EXACTLY this FK's referenced columns.
+        -- Since the PK is reused verbatim, that means the FK must reference the primary key. The only
+        -- way it can't is an FK referencing a non-PK unique key that cannot survive partitioning (a
+        -- unique secondary not including the partition key) -- refuse with guidance.
         v_fk_eligible := v_pkcols is not null
           and (select array_agg(x order by x) from unnest(v_fk.rcols) x)
             = (select array_agg(x order by x) from unnest(v_pkcols) x);
-        if p_incoming_fks = 'preserve' and not v_fk_eligible then
-          raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the partitioned parent will keep a unique key only on (%). Re-point it as a composite FK instead (p_incoming_fks => ''drop'', then generate_fk_recovery).',
+        if not v_fk_eligible then
+          raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the parent''s primary key is (%). An incoming FK must reference the primary key to be preserved.',
             v_fk.conname, v_fk.reltbl, array_to_string(v_fk.rcols, ', '), array_to_string(coalesce(v_pkcols, '{}'), ', ');
         end if;
         v_dropped := v_dropped || jsonb_build_object(
-          'reltbl', v_fk.reltbl::text, 'conname', v_fk.conname::text, 'def', v_fk.def,
-          'lcols', to_jsonb(v_fk.lcols), 'rcols', to_jsonb(v_fk.rcols),
-          'restorable', (p_incoming_fks = 'preserve'));
+          'reltbl', v_fk.reltbl::text, 'conname', v_fk.conname::text, 'def', v_fk.def);
         execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
       end loop;
     end if;
@@ -634,11 +622,9 @@ begin
   execute format('alter table %s rename to %I', p_parent::text, v_default);
   v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
-  -- 2. drop the old (sub-)PK -- UNLESS the partition key is already covered by it (v_pk_reuse): then
-  -- keep it and reuse its index in place (step 4 is skipped; step 8's parent PK reconciles it).
-  if v_pkname is not null and not v_pk_reuse then
-    execute format('alter table %s drop constraint %I', v_defreg::text, v_pkname);
-  end if;
+  -- 2. the existing PK is KEPT in place -- pgpm never drops or rebuilds it. The default carries its
+  -- original PK index forward; step 8's parent PRIMARY KEY reconciles that index (metadata-only, no
+  -- O(rows) build). (When the table had no PK there is nothing to keep, and the parent gets none.)
 
   -- 3. drop identity on the default; key columns NOT NULL
   if v_idcols is not null then
@@ -651,33 +637,6 @@ begin
     foreach v_col in array v_pkcols loop
       execute format('alter table %s alter column %I set not null', v_defreg::text, v_col);
     end loop;
-  end if;
-
-  -- 4. establish the default's PK on (partition key, rest of old PK). If a matching
-  -- unique index was pre-built online (pgpm.build_pk_concurrently -> CREATE UNIQUE INDEX
-  -- CONCURRENTLY, run by the operator before adopt), promote THAT -- a metadata-only
-  -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
-  -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
-  -- a multi-minute write-blocking window on very large ones -- prefer build_pk_concurrently).
-  -- Skipped entirely when v_pk_reuse: the default kept its original PK in step 2.
-  if v_pkcols is not null and not v_pk_reuse then
-    select c.relname into v_prebuilt
-      from pg_index i join pg_class c on c.oid = i.indexrelid
-     where i.indrelid = v_defreg and i.indisunique and i.indisvalid and not i.indisprimary
-       and i.indpred is null and i.indexprs is null
-       and (select array_agg(a.attname::text order by k.ord)
-              from unnest(i.indkey) with ordinality as k(attnum, ord)
-              join pg_attribute a on a.attrelid = v_defreg and a.attnum = k.attnum) = v_pkcols
-     limit 1;
-    if v_prebuilt is null then
-      v_prebuilt := (v_default || '_pk_tmp')::name;
-      execute format('create unique index %I on %s (%s)', v_prebuilt, v_defreg::text,
-                     (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x));
-    else
-      raise notice 'pg_partition_magician: reusing pre-built unique index % as the PK (adopt stays metadata-only)', v_prebuilt;
-    end if;
-    execute format('alter table %s add constraint %I primary key using index %I',
-                   v_defreg::text, (v_default || '_pkey'), v_prebuilt);
   end if;
 
   -- 5. create the partitioned parent under the original name (no PK yet)
@@ -743,14 +702,11 @@ begin
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'adopt');
 
-  -- record any dropped incoming FKs (now pointing at the new parent)
+  -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
+  -- always preserve-managed now, re-added by restore_incoming_fks once the drain is idle.
   for v_e in select value from jsonb_array_elements(v_dropped) loop
-    insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition,
-                                 referencing_columns, referenced_columns, restorable)
-    values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def',
-            array(select jsonb_array_elements_text(v_e->'lcols')),
-            array(select jsonb_array_elements_text(v_e->'rcols')),
-            coalesce((v_e->>'restorable')::boolean, false));
+    insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
+    values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def');
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
@@ -767,110 +723,42 @@ begin
 end;
 $$;
 
--- build_pk_concurrently: build the default's composite PK index ONLINE before adopt,
--- so the adopt cutover stays metadata-only. Building it inside adopt() would be O(rows)
--- under ACCESS EXCLUSIVE -- a multi-minute write-blocking window on a large table.
--- CREATE INDEX CONCURRENTLY can't run inside a function/procedure, but it CAN run from
--- a pg_cron background worker (pgpm already requires pg_cron) -- so this schedules the
--- CIC as a cron job, polls until the index is valid (committing between polls to see
--- the worker's progress), then unschedules. The operator just calls this, then adopt()
--- -- which finds the pre-built index by its columns and promotes it. No DDL hand-off.
---   call pgpm.build_pk_concurrently('public.events','created_at');
---   select pgpm.adopt('public.events','created_at', interval '1 month');
-create or replace procedure pgpm.build_pk_concurrently(
-  p_parent regclass, p_control name, p_timeout interval default '6 hours', p_poll interval default '5 seconds'
-) language plpgsql as $$
-declare
-  v_nsp name; v_rel name; v_oldpk text[]; v_pkcols text[]; v_idxname name; v_cols text;
-  v_idreg regclass; v_job text; v_deadline timestamptz; v_valid boolean; v_status text; v_msg text;
-begin
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  select array_agg(a.attname::text order by k.ord) into v_oldpk
-    from pg_constraint con
-    cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
-    join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
-   where con.conrelid = p_parent and con.contype = 'p';
-  if v_oldpk is null then
-    raise notice 'pg_partition_magician: % has no primary key; adopt() builds none -- nothing to pre-build', p_parent;
-    return;
-  end if;
-  -- same PK derivation as _adopt: partition key first, then the rest of the old PK
-  v_pkcols  := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
-  v_idxname := (v_rel || '_pgpm_pkey_pre')::name;
-  v_cols    := (select string_agg(quote_ident(x), ', ') from unnest(v_pkcols) x);
+-- One adopt, two type-safe overloads on the width parameter (DESIGN.md sec 8). The integer-grid and
+-- time-grid families used to be three functions (adopt / adopt_by_id / adopt_by_uuidv7); they collapse
+-- into a single `adopt` whose overload is chosen by the width type, with the kind read from the
+-- control column. The old by_ names are removed (hard replace).
+drop function if exists pgpm.adopt_by_id(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text);
+drop function if exists pgpm.adopt_by_uuidv7(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text);
+-- removed in the redesign (no PK rewrite -> no online PK build, no composite-FK recovery)
+drop procedure if exists pgpm.build_pk_concurrently(regclass, name, interval, interval);
+drop function if exists pgpm.generate_fk_recovery(regclass);
 
-  v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
-  if v_idreg is not null and (select indisvalid from pg_index where indexrelid = v_idreg) then
-    raise notice 'pg_partition_magician: %.% already built and valid -- run adopt() next', v_nsp, v_idxname;
-    return;
-  elsif v_idreg is not null then
-    execute format('drop index if exists %I.%I', v_nsp, v_idxname);  -- invalid leftover from a prior attempt
-  end if;
-
-  -- CIC from a pg_cron worker (top-level, so it's allowed). IF NOT EXISTS makes re-fires
-  -- no-ops; we unschedule the moment the index goes valid.
-  v_job := 'pgpm_build_' || v_nsp || '_' || v_rel;
-  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
-  -- pg_cron's sub-minute form is 'N seconds' (not an interval's '00:00:05' text)
-  perform cron.schedule(v_job, format('%s seconds', greatest(1, extract(epoch from p_poll)::int)),
-    format('create unique index concurrently if not exists %I on %I.%I (%s)', v_idxname, v_nsp, v_rel, v_cols));
-  raise notice 'pg_partition_magician: building % concurrently via pg_cron job % ...', v_idxname, v_job;
-
-  v_deadline := clock_timestamp() + p_timeout;
-  loop
-    commit;                       -- observe the cron worker's committed catalog changes
-    perform pg_sleep(extract(epoch from p_poll));
-    v_idreg := to_regclass(format('%I.%I', v_nsp, v_idxname));
-    if v_idreg is not null then
-      select indisvalid into v_valid from pg_index where indexrelid = v_idreg;
-      exit when v_valid;
-    end if;
-    select status, return_message into v_status, v_msg from cron.job_run_details
-      where jobid = (select jobid from cron.job where jobname = v_job)
-      order by start_time desc limit 1;
-    if v_status = 'failed' and coalesce(v_msg, '') not ilike '%already exists%' then
-      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
-      raise exception 'pg_partition_magician: concurrent index build failed: %', v_msg;
-    end if;
-    if clock_timestamp() > v_deadline then
-      perform cron.unschedule(jobid) from cron.job where jobname = v_job;
-      raise exception 'pg_partition_magician: concurrent index build did not finish within %', p_timeout;
-    end if;
-  end loop;
-  perform cron.unschedule(jobid) from cron.job where jobname = v_job;
-  raise notice 'pg_partition_magician: % is valid -- run adopt() now (it reuses this index, metadata-only)', v_idxname;
-end;
-$$;
-
--- typed entry points (thin wrappers over _adopt)
+-- Time grid: interval width. The control column's type selects the kind -- a uuid column is uuidv7
+-- (ULIDs stored as uuid included), anything else is time (timestamptz/timestamp/date; _adopt rejects
+-- a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
+-- callers cast: adopt(t, c, interval '1 month').
 create or replace function pgpm.adopt(
   p_parent regclass, p_control name, p_interval interval,
   p_premake int default 4, p_retention interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
-  select pgpm._adopt(p_parent, p_control, 'time', p_interval::text, p_anchor::text, p_premake,
-                     p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
+  select pgpm._adopt(p_parent, p_control,
+    case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
+                 where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
+         then 'uuidv7' else 'time' end,
+    p_interval::text, p_anchor::text, p_premake,
+    p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
-create or replace function pgpm.adopt_by_id(
+-- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
+create or replace function pgpm.adopt(
   p_parent regclass, p_control name, p_step bigint,
   p_premake int default 4, p_retention bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
   select pgpm._adopt(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_premake,
-                     p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
-$$;
-
-create or replace function pgpm.adopt_by_uuidv7(
-  p_parent regclass, p_control name, p_interval interval,
-  p_premake int default 4, p_retention interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true, p_incoming_fks text default 'error'
-) returns regclass language sql as $$
-  select pgpm._adopt(p_parent, p_control, 'uuidv7', p_interval::text, p_anchor::text, p_premake,
                      p_retention::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
@@ -1074,7 +962,7 @@ declare
   r pgpm.dropped_fk%rowtype; v_n int := 0;
 begin
   if not exists (select 1 from pgpm.dropped_fk
-                  where parent_table = p_parent and restorable and restored_at is null) then
+                  where parent_table = p_parent and restored_at is null) then
     return 0;
   end if;
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -1104,7 +992,7 @@ begin
   -- safe: re-add each preserved FK against the parent. The recorded definition already names the
   -- parent (it was captured before the rename, and that name is now the parent).
   for r in select * from pgpm.dropped_fk
-            where parent_table = p_parent and restorable and restored_at is null order by id loop
+            where parent_table = p_parent and restored_at is null order by id loop
     if (select relkind from pg_class where oid = r.referencing_table) = 'p' then
       -- The referencing side is itself partitioned (a self-referential FK is now on the parent).
       -- Postgres does not support NOT VALID foreign keys on a partitioned referencing table, so add
@@ -1141,90 +1029,19 @@ returns int language plpgsql as $$
 declare v_closed bigint; r pgpm.dropped_fk%rowtype; v_n int := 0;
 begin
   if not exists (select 1 from pgpm.dropped_fk
-                  where parent_table = p_parent and restorable and restored_at is not null) then
+                  where parent_table = p_parent and restored_at is not null) then
     return 0;
   end if;
   select closed_rows into v_closed from pgpm.check_default(p_parent);
   if coalesce(v_closed, 0) = 0 then return 0; end if;   -- no drain work => leave live FKs in place
   for r in select * from pgpm.dropped_fk
-            where parent_table = p_parent and restorable and restored_at is not null order by id loop
+            where parent_table = p_parent and restored_at is not null order by id loop
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
     update pgpm.dropped_fk set restored_at = null where id = r.id;
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'suspend_incoming_fk', r.constraint_name);
     v_n := v_n + 1;
   end loop;
   return v_n;
-end;
-$$;
-
--- generate_fk_recovery(): per dropped incoming FK, emit a ready-to-review script
--- that rebuilds it against the partitioned parent. Targets the parent's actual PK:
--- reuses the existing local column for any PK column the old FK already referenced,
--- and adds a companion column only for the partition key it didn't. So id-by-id
--- partitioning degenerates to a trivial same-column re-point; time/uuid get a
--- composite FK with a backfilled companion. Generated, NOT executed.
-create or replace function pgpm.generate_fk_recovery(p_parent regclass)
-returns table (referencing_table regclass, sql text)
-language plpgsql as $$
-declare
-  v_pkcols text[]; v_pktypes text[]; r pgpm.dropped_fk%rowtype;
-  v_fk_cols text; v_ref_cols text; v_adds text; v_sets text; v_join text; v_companions text[];
-  v_newcol text; pkc text; pos int; i int; sep text;
-begin
-  select array_agg(a.attname::text order by k.ord), array_agg(format_type(a.atttypid, a.atttypmod) order by k.ord)
-    into v_pkcols, v_pktypes
-    from pg_constraint c
-    cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
-    join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
-   where c.conrelid = p_parent and c.contype = 'p';
-  if v_pkcols is null then return; end if;
-
-  -- 'restorable' rows are preserve-managed (re-added verbatim by restore_incoming_fks); only the
-  -- 'drop'-mode rows need the composite-FK rebuild emitted here.
-  for r in select * from pgpm.dropped_fk where parent_table = p_parent and not restorable order by id loop
-    v_fk_cols := ''; v_ref_cols := ''; v_adds := ''; v_sets := ''; v_companions := array[]::text[]; sep := '';
-    -- backfill join from the original FK mapping (parent cols = referencing cols)
-    v_join := '';
-    for i in 1 .. coalesce(array_length(r.referenced_columns, 1), 0) loop
-      v_join := v_join || case when i > 1 then ' and ' else '' end
-             || format('p.%I = r.%I', r.referenced_columns[i], r.referencing_columns[i]);
-    end loop;
-
-    for i in 1 .. array_length(v_pkcols, 1) loop
-      pkc := v_pkcols[i];
-      pos := array_position(r.referenced_columns, pkc);
-      if pos is not null then
-        v_fk_cols := v_fk_cols || sep || quote_ident(r.referencing_columns[pos]);
-      else
-        v_newcol := regexp_replace(r.referencing_columns[1], '_id$', '') || '_' || pkc;
-        v_companions := v_companions || v_newcol;
-        v_fk_cols := v_fk_cols || sep || quote_ident(v_newcol);
-        v_adds := v_adds || format(E'ALTER TABLE %s ADD COLUMN %I %s;\n', r.referencing_table::text, v_newcol, v_pktypes[i]);
-        v_sets := v_sets || case when v_sets <> '' then ', ' else '' end || format('%I = p.%I', v_newcol, pkc);
-      end if;
-      v_ref_cols := v_ref_cols || sep || quote_ident(pkc);
-      sep := ', ';
-    end loop;
-
-    referencing_table := r.referencing_table;
-    sql := format(E'-- Recover FK %I on %s ->%s %s.\n', r.constraint_name, r.referencing_table::text,
-                  case when array_length(v_companions, 1) is null then ' (re-point)' else ' composite' end,
-                  p_parent::text);
-    sql := sql || v_adds;
-    if v_sets <> '' then
-      sql := sql || format(E'UPDATE %s r SET %s FROM %s p WHERE %s;\n', r.referencing_table::text, v_sets, p_parent::text, v_join);
-    end if;
-    for i in 1 .. coalesce(array_length(v_companions, 1), 0) loop
-      sql := sql || format(E'ALTER TABLE %s ALTER COLUMN %I SET NOT NULL;\n', r.referencing_table::text, v_companions[i]);
-    end loop;
-    sql := sql || format(E'ALTER TABLE %s ADD CONSTRAINT %I\n  FOREIGN KEY (%s) REFERENCES %s (%s) NOT VALID;\n',
-                  r.referencing_table::text, r.constraint_name, v_fk_cols, p_parent::text, v_ref_cols);
-    sql := sql || format(E'ALTER TABLE %s VALIDATE CONSTRAINT %I;', r.referencing_table::text, r.constraint_name);
-    if array_length(v_companions, 1) is not null then
-      sql := sql || format(E'\n-- Then populate the new column(s) from the application: %s', array_to_string(v_companions, ', '));
-    end if;
-    return next;
-  end loop;
 end;
 $$;
 

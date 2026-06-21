@@ -440,7 +440,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>adopt</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the primary key has to widen to include the partition key (move 3), non-key-aligned unique indexes can't be carried, and an incoming foreign key can't follow when the key widens like this, so <code>adopt</code> resolves those up front, or refuses outright. (Partition on the key the FK already references and it's simply kept, see below.)</p>
+            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the partition key must already be part of the primary key (pgpm never rewrites it, move 3), non-key-aligned unique indexes can't be carried, and incoming foreign keys are kept against the new parent. If the table isn't shaped for that, <code>adopt</code> refuses up front and tells you how to fix it, rather than mangling it.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -456,15 +456,15 @@
         <!-- 3 -->
         <div class="beat reveal">
           <div class="beat-copy">
-            <span class="move"><span class="move-n">3</span> Palming the index &middot; <code>build_pk_concurrently</code></span>
-            <h3>The hard part is built <em>before</em> the switch, in plain sight.</h3>
-            <p>A partitioned table's primary key must contain the partition key, so the key widens from <code>(id)</code> to <code>(created_at,&nbsp;id)</code>, and building that index is the expensive move. <code>build_pk_concurrently</code> does it ahead of time with <code>CREATE INDEX CONCURRENTLY</code> on the live table, driven by <code>pg_cron</code>: no blocking lock, the app still serving. When the switch comes, the index is already in hand and <code>adopt</code> just promotes it. Skip this and the index gets built <em>inside</em> the cutover, under <code>ACCESS EXCLUSIVE</code>: <code>O(rows)</code>, about 28&nbsp;minutes at 300M rows.</p>
+            <span class="move"><span class="move-n">3</span> The index is already in hand</span>
+            <h3>There's no hard part to hide.</h3>
+            <p>A partitioned table's primary key must contain the partition key. pgpm's bet is that it already does, because the modern data model makes a time-ordered key (a Snowflake <code>bigint</code>, a UUIDv7, a ULID) the primary key. So there's nothing to widen and no index to rebuild: <code>adopt</code> reuses the existing key in place and the cutover is pure metadata, online at any size. If the partition key <em>isn't</em> part of your primary key, <code>adopt</code> says so up front and points you at the one-time migration, rather than quietly rebuilding the key under an <code>ACCESS EXCLUSIVE</code> lock (<code>O(rows)</code>, about 28&nbsp;minutes at 300M rows). Predictable beats clever.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-prepare">
-              <div class="lane"><span class="lane-lbl">pgpm &middot; offstage</span><b class="bar ok fill"></b><span class="lockbadge s">no lock</span></div>
-              <div class="op tiny"><span class="tick">&check;</span> <code>adopt</code>: promote &middot; metadata</div>
-              <div class="lane ghost"><span class="lane-lbl">the clumsy way &middot; in cutover</span><b class="bar block fill2"></b><span class="lockbadge x">ACCESS EXCLUSIVE</span></div>
+              <div class="lane"><span class="lane-lbl">pgpm &middot; the cutover</span><b class="bar ok fill"></b><span class="lockbadge s">metadata only</span></div>
+              <div class="op tiny"><span class="tick">&check;</span> <code>adopt</code>: reuse the PK &middot; a blink</div>
+              <div class="lane ghost"><span class="lane-lbl">rewriting the key &middot; the cost we refuse</span><b class="bar block fill2"></b><span class="lockbadge x">ACCESS EXCLUSIVE</span></div>
             </div>
           </figure>
         </div>
@@ -567,13 +567,13 @@
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly: any interval.</p>
           <pre><code><span class="k">select</span> pgpm.adopt(
   'public.events',
-  'created_at', '1 month');</code></pre>
+  'created_at', <span class="k">interval</span> '1 month');</code></pre>
         </div>
         <div class="suit-card reveal">
           <div class="glyph">♣</div>
           <h3>id</h3>
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence, including Snowflake-style ids, where time lives in the high bits.</p>
-          <pre><code><span class="k">select</span> pgpm.adopt_by_id(
+          <pre><code><span class="k">select</span> pgpm.adopt(
   'public.events',
   'id', 10000000);</code></pre>
         </div>
@@ -581,9 +581,9 @@
           <div class="glyph">♠</div>
           <h3>uuidv7</h3>
           <p>Time-ordered uuids, and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
-          <pre><code><span class="k">select</span> pgpm.adopt_by_uuidv7(
+          <pre><code><span class="k">select</span> pgpm.adopt(
   'public.events',
-  'id', '1 day');</code></pre>
+  'id', <span class="k">interval</span> '1 day');</code></pre>
         </div>
       </div>
     </div>
@@ -603,7 +603,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>Partition on the key an incoming FK references (the id/uuidv7 case) and <code>adopt</code> keeps it, re-pointed at the new parent, no denormalization. When the key must widen instead (time), it records the FK and emits a composite-FK recovery script. Either way, never silently broken.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is your primary key and pgpm never rewrites it, an incoming FK still references a key that survives, so <code>adopt</code> keeps it, re-pointed at the new parent, no denormalization. A table whose primary key doesn't include the partition key is refused up front, never silently mangled.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>

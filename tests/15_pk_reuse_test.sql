@@ -15,7 +15,7 @@ create temporary table _pk_before on commit drop as
   select i.indexrelid::oid as idx_oid
     from pg_index i where i.indrelid = 'public.reuse_pk'::regclass and i.indisprimary;
 
-select pgpm.adopt_by_id('public.reuse_pk', 'id', 100000);
+select pgpm.adopt('public.reuse_pk', 'id', 100000);
 
 select is(
   (select relkind::text from pg_class where oid = 'public.reuse_pk'::regclass),

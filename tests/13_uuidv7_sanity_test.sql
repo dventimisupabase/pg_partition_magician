@@ -23,8 +23,8 @@ select cmp_ok(
 
 -- warn-by-default: adopt still proceeds on the suspect column (operator's call)
 select lives_ok(
-  $$ select pgpm.adopt_by_uuidv7('public.rnd_uuid', 'id', '1 month') $$,
-  'adopt_by_uuidv7 warns but proceeds on a random-uuid column'
+  $$ select pgpm.adopt('public.rnd_uuid', 'id', interval '1 month') $$,
+  'adopt (uuidv7 inferred from the uuid column) warns but proceeds on a random-uuid column'
 );
 
 select * from finish();

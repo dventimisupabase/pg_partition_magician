@@ -19,7 +19,8 @@ create table public.messages (
   tenant_id   uuid        not null,
   created_at  timestamptz not null default now(),
   body        text        not null,
-  constraint messages_pkey primary key (id)
+  -- the partition key (created_at) is part of the PK, so adopt reuses it in place (no rewrite)
+  constraint messages_pkey primary key (created_at, id)
 );
 create index messages_tenant_created_idx on public.messages (tenant_id, created_at desc);
 
@@ -47,7 +48,7 @@ $$;
 select public.generate_messages(coalesce(current_setting('poc.seed_count', true)::int, 50000), 6);
 analyze public.messages;
 
-select pgpm.adopt('public.messages', 'created_at', '1 month',
+select pgpm.adopt('public.messages', 'created_at', interval '1 month',
                   p_premake => 4, p_retention => null, p_drain_batch => 5000, p_paused => true);
 -- adopt() does the cutover only; premake the future partitions separately (online)
 select pgpm.premake('public.messages');
@@ -60,7 +61,7 @@ create table public.events_id (
 insert into public.events_id (payload)
   select 'evt ' || g from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g;
 analyze public.events_id;
-select pgpm.adopt_by_id('public.events_id', 'id', p_step => 10000, p_premake => 2, p_drain_batch => 5000);
+select pgpm.adopt('public.events_id', 'id', 10000, p_premake => 2, p_drain_batch => 5000);
 select pgpm.premake('public.events_id');
 
 -- ---- uuidv7 dimension: events_uuid -----------------------------------------
@@ -84,5 +85,5 @@ from (
   from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g
 ) s;
 analyze public.events_uuid;
-select pgpm.adopt_by_uuidv7('public.events_uuid', 'id', p_interval => '1 month', p_premake => 2, p_drain_batch => 5000);
+select pgpm.adopt('public.events_uuid', 'id', interval '1 month', p_premake => 2, p_drain_batch => 5000);
 select pgpm.premake('public.events_uuid');

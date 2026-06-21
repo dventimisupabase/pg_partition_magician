@@ -30,11 +30,12 @@ dependency is `pg_cron`, and only to run the background job.
 **Control kinds.** A table is partitioned on one monotonic key, of one of three kinds:
 
 - `time`: a `timestamptz` / `timestamp` / `date` column, on an interval grid (calendar-aligned for
-  whole months/years, fixed-duration otherwise). Adopt with `pgpm.adopt`.
+  whole months/years, fixed-duration otherwise). Adopt with `pgpm.adopt(..., interval '...')`.
 - `id`: an `int` / `bigint` / `numeric` column, on an integer step. Covers Snowflake-style ids.
-  Adopt with `pgpm.adopt_by_id`.
+  Adopt with `pgpm.adopt(..., <bigint step>)`.
 - `uuidv7`: a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values, on a time grid
-  with uuid-encoded bounds. Adopt with `pgpm.adopt_by_uuidv7`.
+  with uuid-encoded bounds. Adopt with `pgpm.adopt(..., interval '...')` (uuidv7 is inferred from the
+  uuid column).
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
 ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a
@@ -101,43 +102,42 @@ partitioned parent under the original name, and attaches the old table as the `D
 
 ### Pick the kind
 
+There is one `pgpm.adopt`, with two type-safe overloads chosen by the width parameter: an `interval`
+selects the time grid, a `bigint` step selects the integer grid. The kind (time vs uuidv7) is
+auto-detected from the control column's type. A bare interval string literal is ambiguous between the
+overloads, so interval calls must cast (`interval '...'`); an integer width needs no cast.
+
 ```sql
--- time
-select pgpm.adopt('public.events', 'created_at', '1 month');
+-- time (timestamp/timestamptz/date control column)
+select pgpm.adopt('public.events', 'created_at', interval '1 month');
 
 -- id (bigint/numeric), 10M ids per partition
-select pgpm.adopt_by_id('public.events', 'id', 10000000);
+select pgpm.adopt('public.events', 'id', 10000000);
 
--- uuidv7 / ULID-as-uuid
-select pgpm.adopt_by_uuidv7('public.events', 'id', '1 day');
+-- uuidv7 / ULID-as-uuid (uuid control column; inferred from the column type)
+select pgpm.adopt('public.events', 'id', interval '1 day');
 ```
 
 Adoption registers the table **paused** by default: it is converted, but scheduled maintenance does
 nothing until you unpause (see [Run it](#run-it)). All parameters are documented in the
 [reference](reference.md#adoption).
 
-### Keep the cutover online: build the PK first
+### The cutover is always metadata-only
 
-Adoption must widen the primary key to include the partition key (e.g. `(created_at, id)`). How that
-index is built decides whether the cutover is truly online:
+`adopt` never rewrites the primary key. It reuses the existing PK in place, so the cutover holds its
+`ACCESS EXCLUSIVE` lock only briefly (no `O(rows)` index build, ever).
 
-- **Recommended on a large table:** build the index online first, then adopt.
+The one requirement is that the control column already be part of the primary key. Postgres only
+requires a partitioned PK to *include* the partition key, not lead it, so a single-column PK on the
+control column qualifies, and so does a composite PK that contains it (e.g. `(tenant_id, id)`
+partitioned by `id`). A table with no primary key at all is fine too.
 
-  ```sql
-  call pgpm.build_pk_concurrently('public.events', 'created_at');
-  select pgpm.adopt('public.events', 'created_at', '1 month');
-  ```
-
-  `build_pk_concurrently` issues a `CREATE UNIQUE INDEX CONCURRENTLY` through a `pg_cron` worker (no
-  blocking) and waits for it to finish. `adopt` then promotes that ready index, so it holds its
-  `ACCESS EXCLUSIVE` lock only briefly (metadata-only).
-
-- **Fallback:** if no matching index exists, `adopt` builds it in-transaction under
-  `ACCESS EXCLUSIVE`. Correct, but `O(rows)`: roughly a 28-minute write-blocking window at 300M rows.
-  Fine for small tables only.
-
-When the `id` key is already the table's single-column primary key, the partition key already covers
-it, so adopt reuses the existing index in place and the build cost disappears entirely.
+If the table has a PK that *excludes* the control column (the classic `events(id PRIMARY KEY,
+created_at)` wanting time partitioning), `adopt` refuses with a clear error: make the control column
+part of the PK first, then re-adopt. Either give the table a single-column time-ordered key, or widen
+the PK yourself (`CREATE UNIQUE INDEX CONCURRENTLY`, then `ALTER TABLE ... ADD PRIMARY KEY USING
+INDEX`). pgpm only partitions tables whose key is already the partition key: the modern
+time-ordered-PK data model (bigint/Snowflake, UUIDv7, ULID).
 
 ## Run it
 
@@ -209,96 +209,44 @@ so for very large cold partitions you may prefer to detach them concurrently by 
 ## Incoming foreign keys
 
 If other tables reference the table you are adopting (e.g. `reactions(message_id) -> messages(id)`),
-what partitioning does to that FK depends on whether you partition on the same column the FK
-references. The governing rule: a unique or primary key on a partitioned table must include every
-partition-key column.
+those FKs are handled, not ignored. Because `adopt` never rewrites the primary key, the referenced
+unique key always survives partitioning, so an incoming FK to the primary key is always preservable:
+no composite key, no denormalization, ever.
 
-### When the partition key already is the referenced key (id / uuidv7)
+There is one mechanical wrinkle. The drain moves the closed tail through a standalone,
+not-yet-attached child table, so a referenced row is briefly outside the parent while it is moved,
+which a `NO ACTION` FK rejects. The FK therefore cannot ride through the conversion in place: it is
+dropped for the duration and re-added against the new parent once the drain is done.
 
-If you adopt on the table's own single-column primary key (the `adopt_by_id` / `adopt_by_uuidv7`
-happy path, where the partition key equals the PK), that single-column PK is legal on the partitioned
-parent, because its columns already include the partition key. The incoming FK stays valid against
-the new parent's `id`: no composite key, no denormalization.
+`adopt` offers two modes for incoming FKs:
 
-There is one mechanical wrinkle. The drain moves the closed tail through a standalone, not-yet-attached
-child table, so a referenced row is briefly outside the parent while it is moved, which a `NO ACTION`
-FK rejects. The FK therefore cannot ride through the conversion in place: it is dropped for the
-duration and re-added against the new parent once the drain is done.
+- **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
+- **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the
+  referencing table is otherwise untouched), then re-add it against the new parent once the drain is
+  idle.
 
-`p_incoming_fks => 'preserve'` automates this. At adopt it records and drops each eligible incoming FK
-(eligible = the parent will keep a unique key on exactly the FK's referenced columns, which holds on
-the id/uuidv7 happy path); the referencing table is otherwise untouched. Once the closed tail has
-fully drained, `pgpm.restore_incoming_fks(parent)` re-adds each FK against the new parent
-(`NOT VALID` + `VALIDATE`). `maintenance` calls `restore_incoming_fks` automatically, so on the
-scheduled path you do nothing; on the synchronous path, call it yourself after `drain_all`:
+With `'preserve'`, once the closed tail has fully drained, `pgpm.restore_incoming_fks(parent)` re-adds
+each FK against the new parent (`NOT VALID` + `VALIDATE`). `maintenance` calls `restore_incoming_fks`
+automatically, so on the scheduled path you do nothing; on the synchronous path, call it yourself
+after `drain_all`:
 
 ```sql
-select pgpm.adopt_by_id('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
+select pgpm.adopt('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
 select pgpm.drain_all('public.events', p_include_open => true);
 select pgpm.restore_incoming_fks('public.events');   -- maintenance does this for you on the cron path
 ```
 
 `restore_incoming_fks` is a no-op until the drain is quiescent (no closed rows in the DEFAULT, no
-in-flight child partition), so it is safe to call early or repeatedly. `'preserve'` refuses up front
-if any incoming FK is not eligible (the widening time case below); use `'drop'` for those.
+in-flight child partition), so it is safe to call early or repeatedly. An incoming FK that references
+a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
 
 After it is restored, `maintenance` keeps a managed FK on a leash: a preserve-managed FK is live only
 while the closed tail is empty. If a later drain appears (for example premake falls behind and rows
 land in the DEFAULT for an interval that then closes), `maintenance` suspends the FK before draining
-and restores it afterward, so the catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK)
-silently deletes or nulls the referencing rows. Referential actions, `DEFERRABLE`-ness, and
-self-referential FKs are all preserved across this cycle.
-
-### When you partition on a different column (time)
-
-If you partition on a column other than the referenced key (the typical `time` case: partition on
-`created_at` while the FK references `id`), the PK must widen to include the partition key, e.g.
-`(created_at, id)`. The single-column unique on `(id)` no longer exists, so:
-
-- A single-column FK like `-> messages(id)` becomes impossible (`there is no unique constraint
-  matching given keys`), and the old PK cannot even be dropped while a dependent FK exists.
-- The only way to keep database-enforced referential integrity is a composite FK: the referencing
-  table must also carry `created_at` and reference `messages(created_at, id)`. A composite FK to the
-  parent survives the drain, because a row keeps its `(created_at, id)` as it moves between
-  partitions.
-
-### Adopt does not change your data model silently
-
-Either way, `adopt` offers two modes for incoming FKs:
-
-- **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
-- **`p_incoming_fks => 'drop'`:** drop each incoming FK, record its original definition in
-  `pgpm.dropped_fk`, then proceed. You then re-add the FK against the new parent (id / uuidv7 happy
-  path), re-enforce integrity in the app, or rebuild composite FKs after denormalizing the
-  referencing tables (time case).
-
-```sql
-select pgpm.adopt('public.messages', 'created_at', '1 month', p_incoming_fks => 'drop');
-select * from pgpm.dropped_fk;   -- what was dropped, for reconstruction
-```
-
-For the widening (time) case, rebuild as composite FKs: `generate_fk_recovery` emits a
-ready-to-review script per dropped FK that adds the partition-key companion column, backfills it, and
-rebuilds the FK with `NOT VALID` + `VALIDATE` (to avoid a long lock). It is generated, not executed:
-
-```sql
-select sql from pgpm.generate_fk_recovery('public.messages');
-```
-
-```sql
--- e.g. for reactions(message_id) -> messages(id):
-ALTER TABLE public.reactions ADD COLUMN message_created_at timestamp with time zone;
-UPDATE public.reactions r SET message_created_at = p.created_at
-  FROM public.messages p WHERE p.id = r.message_id;
-ALTER TABLE public.reactions ALTER COLUMN message_created_at SET NOT NULL;
-ALTER TABLE public.reactions ADD CONSTRAINT reactions_message_id_fkey
-  FOREIGN KEY (message_created_at, message_id) REFERENCES public.messages (created_at, id) NOT VALID;
-ALTER TABLE public.reactions VALIDATE CONSTRAINT reactions_message_id_fkey;
-```
-
-Review it (the companion column name is a suggestion; batch the backfill for large tables) and update
-the app to populate the new column going forward. (`pg_partman` reaches the same conclusion: incoming
-FKs require dropping and recreating against the new partitioned table.)
+(`pgpm.suspend_incoming_fks` keeps them safe across that drain) and restores it afterward, so the
+catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK) silently deletes or nulls the
+referencing rows. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved
+across this cycle.
 
 ## Secondary indexes
 
@@ -364,6 +312,10 @@ scan-skip attach 0.43 ms. The full rationale is in [DESIGN.md](../DESIGN.md).
 - **Retention uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
 - **Unique secondary indexes** are not auto-propagated (a partitioned unique index must include the
   partition key); recreate them on the parent by hand.
-- **Incoming foreign keys** require dropping and recreating as composite FKs; see above.
+- **The primary key is never rewritten.** The control column must already be part of the table's
+  primary key (a table with no PK is fine); a PK that excludes the control column is refused. See
+  [adopt a table](#adopt-a-table).
+- **Incoming foreign keys**: refused by default, or preserved (dropped for the conversion and re-added
+  against the new parent) with `p_incoming_fks => 'preserve'`; see above.
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by
   default).

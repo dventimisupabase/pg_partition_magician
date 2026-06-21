@@ -2,31 +2,28 @@
 
 ## [Unreleased]
 
-- `adopt(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks(parent)`: preserve incoming
-  foreign keys on the id/uuidv7 happy path. When the partition key already is the referenced
-  single-column PK, the partitioned parent keeps that unique key, so an incoming FK need not be
-  denormalized into a composite FK (unlike the widening time case). The drain moves rows through an
-  unattached child, which a live `NO ACTION` FK would reject, so `'preserve'` records and drops each
-  eligible incoming FK at adopt, and `restore_incoming_fks` re-adds it verbatim against the new parent
-  (`NOT VALID` + `VALIDATE`) once the drain is quiescent. `maintenance` calls the restore
-  automatically; the synchronous `drain_all` path calls it by hand. `'preserve'` refuses the widening
-  case (use `'drop'` + `generate_fk_recovery`). New `pgpm.dropped_fk.restorable` column distinguishes
-  the two. Referential actions (`CASCADE` / `SET NULL` / `RESTRICT`), `DEFERRABLE`-ness, and
-  self-referential FKs are preserved (the self-referential re-add is validating, not online, since
-  Postgres rejects a `NOT VALID` FK on a partitioned referencing table). The lifecycle is managed: a
-  preserve-managed FK is live only while the closed tail is empty. `pgpm.suspend_incoming_fks` re-drops
-  a live managed FK before a drain that would move referenced rows, and `maintenance` (and `drain_all`)
-  call it so a later premake-miss catch-up drain neither stalls (`NO ACTION`) nor silently
-  deletes/nulls the referencing rows (`CASCADE` / `SET NULL`). New `pgpm.dropped_fk.restored_at` tracks
+- **The `adopt` redesign: one function, metadata-only, never rewrites the primary key.** The three
+  entry points (`adopt` / `adopt_by_id` / `adopt_by_uuidv7`) collapse into a single overloaded `adopt`:
+  a `bigint` width selects the integer grid, an `interval` width the time grid, with `time` vs `uuidv7`
+  inferred from the control column's type. Bare interval literals must cast: `adopt(t, c, interval '1
+  month')`. `adopt` no longer drops or rebuilds the primary key, so the cutover is always metadata-only:
+  it reuses the existing PK when the control column is a member of it (Postgres requires only that a
+  partitioned PK include the partition key, not lead it, so `PK (tenant_id, id)` partitioned by `id`
+  qualifies), works with a no-PK table, and refuses (with a suggested migration) a table whose PK
+  excludes the control column, betting on a time-ordered primary key (Snowflake bigint / UUIDv7 / ULID)
+  as the data model. Forbidding PK rewrites removed `build_pk_concurrently`, the composite-FK recovery
+  path (`generate_fk_recovery`, the `'drop'` incoming-FK mode, the `dropped_fk` composite columns), and
+  the build-path complexity; every incoming FK is now the `preserve` path. (tests/25)
+- `adopt(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
+  keep incoming foreign keys across the conversion. Since `adopt` never rewrites the PK, the referenced
+  unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in
+  `pgpm.dropped_fk`, and re-adds it verbatim against the new parent (`NOT VALID` + `VALIDATE`) once the
+  drain is idle. `maintenance` manages the lifecycle: a managed FK is live only while the closed tail is
+  empty, so it suspends (re-drops) a live FK before a drain that would move referenced rows and restores
+  it after, and a later premake-miss drain neither stalls (`NO ACTION`) nor silently deletes/nulls the
+  referencing rows (`CASCADE` / `SET NULL`). Referential actions, `DEFERRABLE`-ness, and self-referential
+  FKs are preserved (the self-ref re-add is validating, not online). `pgpm.dropped_fk.restored_at` tracks
   the live/dropped state. (tests/19-24)
-- `build_pk_concurrently(parent, control)`: a procedure that builds the default's
-  composite PK index ONLINE before `adopt`, so the cutover stays metadata-only even on
-  very large tables (at ~300M rows the previous in-transaction build was a ~28-minute
-  write-blocking window). `CREATE INDEX CONCURRENTLY` can't run inside a function, but it
-  can from a pg_cron worker, so this schedules the CIC as a cron job, polls until the
-  index is valid, then unschedules. Entirely inside pgpm (no DDL handed to the operator),
-  using the existing pg_cron dependency. `adopt` then detects the pre-built index by its
-  columns and promotes it; it falls back to the in-transaction build when none exists.
 - `adopt` no longer runs `premake` inside its transaction. Attaching a partition to a
   parent whose DEFAULT already holds data makes Postgres scan the default, and inside
   adopt's `ACCESS EXCLUSIVE` transaction that scan blocked all access for its duration

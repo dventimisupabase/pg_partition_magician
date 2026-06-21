@@ -153,8 +153,11 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
 
 ## 8. Future directions (raw material, not commitments)
 
-- **The `adopt` redesign: one function, metadata-only, never rewrites the PK (decided; next up, not
-  raw material).** Two changes that compose into a sharper, smaller tool.
+- **The `adopt` redesign: one function, metadata-only, never rewrites the PK (IMPLEMENTED).** Two
+  changes that compose into a sharper, smaller tool. Shipped: the two-overload `adopt`, the no-rewrite
+  gate with its ∈-PK reuse and helpful rejection, and the removal of `build_pk_concurrently` and the
+  composite-FK recovery path. Tests in `tests/25` (the PK rule) and across the reworked suite;
+  cross-version PG 15 to 18.
 
   *One front door.* The three wrappers (`adopt` / `adopt_by_id` / `adopt_by_uuidv7`) collapse into a
   single `adopt` with two type-safe overloads on the width parameter: `bigint` selects the integer

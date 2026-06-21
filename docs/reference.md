@@ -18,11 +18,12 @@ see [DESIGN.md](../DESIGN.md).
 
 ## Adoption
 
-These convert an existing, unpartitioned table into a native `RANGE`-partitioned one, online. They
-differ only in the partition kind and therefore in the step/retention/anchor types; all other
-parameters are identical.
+`adopt` converts an existing, unpartitioned table into a native `RANGE`-partitioned one, online and
+metadata-only. It is one function with two type-safe overloads chosen by the width parameter; the
+partition kind is read from the control column. pgpm never rewrites the primary key (see
+[No PK rewrite](#no-pk-rewrite)).
 
-### `pgpm.adopt` (time)
+### `pgpm.adopt` (time grid: time / uuidv7)
 
 ```sql
 pgpm.adopt(
@@ -39,37 +40,27 @@ pgpm.adopt(
 ) returns regclass
 ```
 
-Adopts `p_control` (a `timestamptz` / `timestamp` / `date` column) on an interval grid. Returns the
-parent's `regclass`.
+The interval overload. The kind is inferred from the control column's type: a `uuid` column is
+`uuidv7` (ULID-as-uuid included), a `timestamptz` / `timestamp` / `date` column is `time`. A bare
+interval literal is ambiguous against the bigint overload, so cast it: `adopt(t, c, interval '1 month')`.
 
 | Parameter | Meaning |
 |---|---|
-| `p_parent` | The table to convert. Must currently be a plain (unpartitioned) table. |
+| `p_parent` | The table to convert: a plain (unpartitioned) table whose primary key already includes `p_control`, or which has no primary key. |
 | `p_control` | The column to range-partition on. |
-| `p_interval` | Partition width. Whole-month (`'1 month'`, `'1 year'`) aligns to the calendar; fixed-duration (`'1 day'`, `'6 hours'`) tiles from `p_anchor`. Mixing month and duration is rejected. |
+| `p_interval` | Partition width. Whole-month (`interval '1 month'`, `'1 year'`) aligns to the calendar; fixed-duration (`'1 day'`, `'6 hours'`) tiles from `p_anchor`. Mixing month and duration is rejected. For a `uuid` column it is the time width of each partition. |
 | `p_premake` | How many partitions to keep created ahead of the frontier. |
-| `p_retention` | Drop partitions whose upper bound is older than this interval before `now()`. `null` keeps everything. |
+| `p_retention` | Drop partitions whose upper bound is older than this interval before the frontier. `null` keeps everything. |
 | `p_keep_default` | Keep an (expected-empty) `DEFAULT` partition as a safety net. Leave `true`. |
 | `p_drain_batch` | Default rows moved per drain microbatch (see `drain_step`). |
 | `p_anchor` | Grid origin for fixed-duration intervals. Calendar-aligned months ignore it. |
 | `p_paused` | When `true` (default), register but do not let scheduled `maintenance` act until you unpause. |
-| `p_incoming_fks` | How to handle FKs that other tables have pointing at `p_parent`. `'error'` (default) refuses; `'drop'` drops and records them for composite-FK rebuild (`generate_fk_recovery`); `'preserve'` records and drops them but marks them for verbatim restoration against the new parent (`restore_incoming_fks`), valid only when every incoming FK is happy-path eligible (its referenced columns equal the parent's surviving unique key). See [incoming FKs](guide.md#incoming-foreign-keys). |
+| `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'preserve'` drops each for the conversion, records it, and re-adds it against the new parent once the drain is idle ([`restore_incoming_fks`](#pgpmrestore_incoming_fks)). See [incoming FKs](guide.md#incoming-foreign-keys). |
 
-What it does: renames the live table to `<name>_default`, creates a partitioned parent under the
-original name, and attaches the old table as the `DEFAULT` partition. No rows move. The primary key
-widens to `(control, id)`; if a matching unique index was pre-built with
-[`build_pk_concurrently`](#pgpmbuild_pk_concurrently), adopt promotes it (metadata-only cutover),
-otherwise it builds the index in-transaction under `ACCESS EXCLUSIVE` (`O(rows)`, fine for small
-tables only). Non-unique secondary indexes are carried onto the parent; unique secondary indexes are
-skipped (recreate by hand). Identity moves to the parent.
-
-The adopted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused; nothing is
-drained until you run `maintenance`/`drain_*` or unpause.
-
-### `pgpm.adopt_by_id` (id)
+### `pgpm.adopt` (integer grid: id)
 
 ```sql
-pgpm.adopt_by_id(
+pgpm.adopt(
   p_parent regclass, p_control name, p_step bigint,
   p_premake int default 4, p_retention bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
@@ -77,48 +68,32 @@ pgpm.adopt_by_id(
 ) returns regclass
 ```
 
-Same as `adopt`, for an integer/`bigint`/`numeric` key (including Snowflake-style ids). Differences:
+The bigint overload, for an integer / `bigint` / `numeric` key (including Snowflake-style ids). An
+integer literal selects it with no cast: `adopt(t, c, 10000000)`. Differences from the interval form:
 
-- `p_step` (`bigint`) is the partition width in key units, e.g. `10000000` ids per partition.
+- `p_step` is the partition width in key units (e.g. `10000000` ids per partition).
 - `p_retention` is a `bigint` count of intervals to keep, not an interval.
 - `p_anchor` is a `bigint` grid origin (default `0`).
 - The frontier is `max(control)`.
 
-When the id key is already the table's single-column PK, the partition key covers it, so adopt
-reuses the existing PK index in place rather than rebuilding it.
+### What adopt does
 
-### `pgpm.adopt_by_uuidv7` (uuidv7 / ULID)
+Renames the live table to `<name>_default`, creates a partitioned parent under the original name, and
+attaches the old table as the `DEFAULT` partition. No rows move. Identity moves to the parent.
+Non-unique secondary indexes are carried onto the parent; unique secondary indexes are skipped
+(recreate by hand). The adopted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused;
+nothing drains until you run `maintenance` / `drain_*` or unpause.
 
-```sql
-pgpm.adopt_by_uuidv7(
-  p_parent regclass, p_control name, p_interval interval,
-  p_premake int default 4, p_retention interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true, p_incoming_fks text default 'error'
-) returns regclass
-```
+### No PK rewrite
 
-Same as `adopt`, for a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values. Uses a
-time grid; bounds are encoded as uuids via a pure-SQL `uuid <-> ms` codec. The column type cannot
-prove the values are time-ordered, so adopt samples them and raises a `notice` if they look random
-(likely UUIDv4); see [`check_uuidv7`](#pgpmcheck_uuidv7).
-
-### `pgpm.build_pk_concurrently`
-
-```sql
-call pgpm.build_pk_concurrently(
-  p_parent  regclass,
-  p_control name,
-  p_timeout interval default '6 hours',
-  p_poll    interval default '5 seconds'
-)
-```
-
-A procedure (call it, do not `select` it). Builds the default's composite PK index online, before
-`adopt`, so the cutover stays metadata-only even on a very large table. `CREATE INDEX CONCURRENTLY`
-cannot run inside a function, so this schedules the CIC on a `pg_cron` worker, polls until the index
-is valid (up to `p_timeout`, every `p_poll`), then unschedules. Run it first, then `adopt`; adopt
-detects the ready index and promotes it.
+`adopt` never drops or rebuilds the primary key, so the cutover is always metadata-only (no `O(rows)`
+index build, ever). It reuses the existing PK in place when `p_control` is already a member of it
+(Postgres requires a partitioned PK only to *include* the partition key, not lead it, so a composite
+`PK (tenant_id, id)` partitioned by `id` qualifies), and a table with no PK is fine. If the table has
+a primary key that does NOT include `p_control` (the classic `events(id PRIMARY KEY, created_at)` that
+wants time partitioning), adopt refuses with guidance: make `p_control` part of the primary key first
+(a single-column time-ordered key is simplest; or widen the PK yourself via
+`CREATE UNIQUE INDEX CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-adopt.
 
 ## Maintenance
 
@@ -276,8 +251,8 @@ that bridge.
 pgpm.restore_incoming_fks(p_parent regclass) returns int
 ```
 
-Re-adds the incoming FKs that `adopt(..., p_incoming_fks => 'preserve')` recorded (the `restorable`
-rows of [`pgpm.dropped_fk`](#pgpmdropped_fk) that are currently dropped), pointing them back at the new
+Re-adds the incoming FKs that `adopt(..., p_incoming_fks => 'preserve')` recorded (the
+[`pgpm.dropped_fk`](#pgpmdropped_fk) rows that are currently dropped), pointing them back at the new
 partitioned parent with `NOT VALID` + `VALIDATE` (so the re-add is online; a self-referential FK, whose
 referencing side is the partitioned parent, is added validating in one step since Postgres rejects
 `NOT VALID` there). Returns the number restored. It self-gates on quiescence: a no-op (returns 0) while
@@ -300,20 +275,6 @@ drain never moves referenced rows past a live FK, which a `NO ACTION` FK would b
 `CASCADE` / `SET NULL` FK would silently honour (deleting or nulling the referencing rows). Returns the
 number suspended; a no-op (returns 0) when the closed tail is empty. `maintenance` calls it before each
 drain step (and `drain_all` at its start); you rarely call it directly.
-
-### `pgpm.generate_fk_recovery`
-
-```sql
-pgpm.generate_fk_recovery(p_parent regclass)
-  returns table (referencing_table regclass, sql text)
-```
-
-For each incoming FK that `adopt(..., p_incoming_fks => 'drop')` recorded in
-[`pgpm.dropped_fk`](#pgpmdropped_fk), emits a ready-to-review script that denormalizes the partition
-key onto the referencing table and rebuilds the FK as a composite FK (`NOT VALID` + `VALIDATE`, to
-avoid a long lock). Generated, not executed: review it (the companion column name is a suggestion;
-batch the backfill for large tables) before running. See the
-[incoming FKs guide](guide.md#incoming-foreign-keys).
 
 ## Catalog objects
 
@@ -356,12 +317,9 @@ Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g
 
 ### `pgpm.dropped_fk`
 
-Incoming FKs dropped by `adopt(..., p_incoming_fks => 'drop' | 'preserve')`, kept for
-reconstruction. Columns: `id`, `parent_table`, `referencing_table`, `constraint_name`, `definition`,
-`referencing_columns`, `referenced_columns`, `restorable`, `restored_at`, `dropped_at`. When
-`restorable` is true (the `'preserve'` mode), the FK is re-added verbatim against the parent by
-[`restore_incoming_fks`](#pgpmrestore_incoming_fks) and the row is kept as a managed record, with
-`restored_at` tracking its lifecycle state (null = currently dropped/suspended, set = currently live);
-[`suspend_incoming_fks`](#pgpmsuspend_incoming_fks) flips it back when a later drain needs the FK gone.
-When `restorable` is false (the `'drop'` mode), feed it to
-[`generate_fk_recovery`](#pgpmgenerate_fk_recovery) for the composite rebuild.
+Incoming FKs dropped by `adopt(..., p_incoming_fks => 'preserve')`, kept as managed records so they
+can be re-added against the new parent. Columns: `id`, `parent_table`, `referencing_table`,
+`constraint_name`, `definition`, `restored_at`, `dropped_at`. `restored_at` tracks lifecycle state
+(null = currently dropped/suspended, set = currently live): [`restore_incoming_fks`](#pgpmrestore_incoming_fks)
+re-adds the FK and sets it, [`suspend_incoming_fks`](#pgpmsuspend_incoming_fks) re-drops it before a
+later drain and clears it. The row persists for the life of the managed FK.

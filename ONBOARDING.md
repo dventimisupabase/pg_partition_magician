@@ -117,10 +117,12 @@ rollback;
   every kind; cast per kind (`::timestamptz` / `::numeric` / `::uuid`) when comparing.
 - **float/double are rejected** as control columns (imprecise boundaries; NaN/Inf
   poison the frontier).
-- **UUIDv7/ULID can't be verified by type**: `adopt_by_uuidv7` samples and *warns* if
-  the values look random (v4); `pgpm.check_uuidv7(table, col)` runs the check on demand.
-- **Incoming FKs**: `adopt` refuses by default; `p_incoming_fks => 'drop'` records +
-  drops them; `generate_fk_recovery()` emits the rebuild script.
+- **UUIDv7/ULID can't be verified by type**: the uuidv7 kind is inferred from a `uuid`
+  control column; `adopt` samples and *warns* if the values look random (v4);
+  `pgpm.check_uuidv7(table, col)` runs the check on demand.
+- **Incoming FKs**: `adopt` refuses by default; `p_incoming_fks => 'preserve'` records +
+  drops them for the conversion, and `restore_incoming_fks` re-adds them against the new
+  parent once the drain is idle.
 
 ## Releasing and publishing
 

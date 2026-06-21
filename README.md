@@ -12,18 +12,22 @@ It partitions on three kinds of **monotonic** key: time, integer/bigint ids (inc
 Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids). It then manages the full lifecycle
 of native `RANGE`-partitioned tables:
 
-- **`adopt()` / `adopt_by_id()` / `adopt_by_uuidv7()`**: convert an existing (possibly huge, *live*)
-  unpartitioned table into a partitioned one **online**, with no up-front data movement.
+- **`adopt()`**: convert an existing (possibly huge, *live*) unpartitioned table into a partitioned
+  one **online**, with no up-front data movement. One function, two type-safe overloads picked by the
+  width parameter (an `interval` for the time grid, a `bigint` step for the integer grid); the kind
+  (time vs uuidv7) is read from the control column's type.
 - **premake**: keep N partitions ahead of the write frontier so live writes always have a real
   partition.
 - **drain**: move the `DEFAULT` partition's closed tail into proper partitions in paced microbatches.
 - **retention**: drop partitions older than a policy.
 - **maintenance**: the single procedure `pg_cron` calls (premake + retention + drain).
 
-**Incoming foreign keys** are handled, not ignored: when you partition on the key they reference (the
-`id` / `uuidv7` case) `adopt` keeps them against the new parent with no schema change to the
-referencing tables; when the key widens (the `time` case) it records them and emits a composite-FK
-recovery script. See the [guide](docs/guide.md#incoming-foreign-keys).
+**Incoming foreign keys** are handled, not ignored. `adopt` never rewrites the primary key, so the
+referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records
+and drops each incoming FK for the conversion, then re-adds it against the new parent once the drain
+is idle (no composite-FK story, ever). A table whose primary key excludes the control column is
+refused: partition on a key that is already your PK. See the
+[guide](docs/guide.md#incoming-foreign-keys).
 
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
 
@@ -53,7 +57,7 @@ and uninstall. `pg_cron` must be enabled to run scheduled maintenance.
 select pgpm.adopt(
   p_parent    => 'public.events',
   p_control   => 'created_at',   -- the timestamp to range-partition on
-  p_interval  => '1 month',      -- daily / weekly / monthly / yearly ...
+  p_interval  => interval '1 month', -- daily / weekly / monthly / yearly ...
   p_premake   => 7,              -- keep 7 partitions ahead
   p_retention => '90 days',      -- drop partitions older than this (null = keep)
   p_paused    => false           -- let scheduled maintenance run
@@ -67,9 +71,9 @@ select * from pgpm.status();
 ```
 
 That is it. Maintenance premakes ahead, drains the adopted table's closed tail into partitions, and
-applies retention. On a large table, build the widened PK online first with
-`build_pk_concurrently()` so the cutover stays metadata-only; see the
-[adopt walkthrough](docs/guide.md#adopt-a-table).
+applies retention. `adopt` never rewrites the primary key, so the cutover is always metadata-only; it
+just requires the control column to already be part of the table's primary key (else it refuses). See
+the [adopt walkthrough](docs/guide.md#adopt-a-table).
 
 ## Documentation
 
