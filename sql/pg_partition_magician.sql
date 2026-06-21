@@ -1083,9 +1083,20 @@ begin
   -- safe: re-add each preserved FK against the parent. The recorded definition already names the
   -- parent (it was captured before the rename, and that name is now the parent).
   for r in select * from pgpm.dropped_fk where parent_table = p_parent and restorable order by id loop
-    execute format('alter table %s add constraint %I %s not valid',
-                   r.referencing_table::text, r.constraint_name, r.definition);
-    execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+    if (select relkind from pg_class where oid = r.referencing_table) = 'p' then
+      -- The referencing side is itself partitioned (a self-referential FK is now on the parent).
+      -- Postgres does not support NOT VALID foreign keys on a partitioned referencing table, so add
+      -- it validating in one step. This single re-add is not online (it scans and takes a stronger
+      -- lock), acceptable as a one-time conversion step; self-referential / partitioned-referencer
+      -- FKs are typically on smaller hierarchy tables. The referential action and DEFERRABLE
+      -- attributes ride along in the recorded definition either way.
+      execute format('alter table %s add constraint %I %s',
+                     r.referencing_table::text, r.constraint_name, r.definition);
+    else
+      execute format('alter table %s add constraint %I %s not valid',
+                     r.referencing_table::text, r.constraint_name, r.definition);
+      execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+    end if;
     delete from pgpm.dropped_fk where id = r.id;
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
     v_n := v_n + 1;

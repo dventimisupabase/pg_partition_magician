@@ -11,7 +11,9 @@
   (`NOT VALID` + `VALIDATE`) once the drain is quiescent. `maintenance` calls the restore
   automatically; the synchronous `drain_all` path calls it by hand. `'preserve'` refuses the widening
   case (use `'drop'` + `generate_fk_recovery`). New `pgpm.dropped_fk.restorable` column distinguishes
-  the two. (tests/19-21)
+  the two. Referential actions (`CASCADE` / `SET NULL` / `RESTRICT`), `DEFERRABLE`-ness, and
+  self-referential FKs are preserved (the self-referential re-add is validating, not online, since
+  Postgres rejects a `NOT VALID` FK on a partitioned referencing table). (tests/19-23)
 - `build_pk_concurrently(parent, control)`: a procedure that builds the default's
   composite PK index ONLINE before `adopt`, so the cutover stays metadata-only even on
   very large tables (at ~300M rows the previous in-transaction build was a ~28-minute
