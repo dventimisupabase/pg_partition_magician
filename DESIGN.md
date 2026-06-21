@@ -231,11 +231,15 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   drain never completes (the FK stays dropped and recorded, surfaced by `status`). **Implemented**:
   `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at adopt (and refuses the
   widening case), and `pgpm.restore_incoming_fks(parent)` re-adds them against the new parent once the
-  drain is quiescent; `maintenance` calls it automatically. Tests in `tests/19`-`tests/21`,
-  cross-version PG 15 to 18. Single and multiple `NO ACTION` FKs on the id/uuidv7 happy path are
-  covered; non-`NO ACTION` referential actions, `DEFERRABLE`, and self-referential FKs remain future
-  work, as does re-dropping a restored FK when a later premake-miss drain must move referenced rows
-  (today that drain simply defers, surfaced by `check_default`).
+  drain is quiescent; `maintenance` calls it automatically. Tests in `tests/19`-`tests/23`,
+  cross-version PG 15 to 18. Covered on the id/uuidv7 happy path: single and multiple incoming FKs,
+  their referential actions (`CASCADE` / `SET NULL` / `RESTRICT`) and `DEFERRABLE`-ness (both ride
+  along in the recorded definition), and self-referential FKs (verified: a single-column FK to a
+  partitioned-by-id table is legal and enforced). The self-referential re-add is validating, not
+  online, because the referencing side is then the partitioned parent and Postgres rejects a
+  `NOT VALID` FK there; acceptable as a one-time step. Still future work: re-dropping a restored FK
+  when a later premake-miss drain must move referenced rows (today that drain simply defers, surfaced
+  by `check_default`).
 - **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
