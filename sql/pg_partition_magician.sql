@@ -431,7 +431,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb;
-  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name;
+  v_uchk_n bigint; v_uchk_frac numeric; v_prebuilt name; v_pk_reuse boolean := false;
   v_idmax bigint[]; v_m bigint; v_i int;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
@@ -502,6 +502,12 @@ begin
   -- new PK columns: partition key first, then the rest of the old PK
   if v_oldpk is not null then
     v_pkcols := array[p_control::text] || array(select x from unnest(v_oldpk) x where x <> p_control::text);
+    -- If the new PK equals the existing PK in the same order, the partition key is already covered
+    -- by the PK (partitioning on a monotonic id, a uuidv7/ULID key, or a PK already led by the
+    -- control column). Keep and REUSE the existing index instead of dropping and rebuilding an
+    -- identical one: step 2's drop and step 4's build are skipped, and step 8's parent PRIMARY KEY
+    -- reconciles the existing index in place (no O(rows) build). See DESIGN.md section 8.
+    v_pk_reuse := (v_pkcols = v_oldpk);
   end if;
 
   -- secondary (non-PK, non-unique) indexes to recreate on the parent
@@ -548,8 +554,9 @@ begin
   execute format('alter table %s rename to %I', p_parent::text, v_default);
   v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
-  -- 2. drop the old (sub-)PK
-  if v_pkname is not null then
+  -- 2. drop the old (sub-)PK -- UNLESS the partition key is already covered by it (v_pk_reuse): then
+  -- keep it and reuse its index in place (step 4 is skipped; step 8's parent PK reconciles it).
+  if v_pkname is not null and not v_pk_reuse then
     execute format('alter table %s drop constraint %I', v_defreg::text, v_pkname);
   end if;
 
@@ -572,7 +579,8 @@ begin
   -- step, so adopt holds its ACCESS EXCLUSIVE lock only briefly. Otherwise build the
   -- index in-transaction: correct, but O(rows) under the lock (fine for small tables,
   -- a multi-minute write-blocking window on very large ones -- prefer build_pk_concurrently).
-  if v_pkcols is not null then
+  -- Skipped entirely when v_pk_reuse: the default kept its original PK in step 2.
+  if v_pkcols is not null and not v_pk_reuse then
     select c.relname into v_prebuilt
       from pg_index i join pg_class c on c.oid = i.indexrelid
      where i.indrelid = v_defreg and i.indisunique and i.indisvalid and not i.indisprimary
