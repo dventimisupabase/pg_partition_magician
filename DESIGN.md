@@ -153,6 +153,46 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
 
 ## 8. Future directions (raw material, not commitments)
 
+- **The `adopt` redesign: one function, metadata-only, never rewrites the PK (decided; next up, not
+  raw material).** Two changes that compose into a sharper, smaller tool.
+
+  *One front door.* The three wrappers (`adopt` / `adopt_by_id` / `adopt_by_uuidv7`) collapse into a
+  single `adopt` with two type-safe overloads on the width parameter: `bigint` selects the integer
+  grid (`id`), `interval` selects the time grid, with `time` versus `uuidv7` auto-detected from the
+  control column's type (a `uuid` column is uuidv7, otherwise time; the `check_uuidv7` plausibility
+  sampling stays a warning). The kind argument disappears, the column type carries the meaning. The
+  price of type safety is that a bare interval literal is ambiguous between the two overloads, so
+  callers write `adopt(t, c, interval '1 month')` (an integer width needs no cast); that is the right
+  trade against string parameters that secretly carry meaning. The `_adopt` engine (text params plus a
+  kind) is unchanged; the `by_` functions are removed outright (hard replace, acceptable pre-1.0).
+
+  *Never rewrites the primary key.* `adopt` reuses the existing PK when the control column is already
+  a **member** of it (Postgres requires a partitioned table's PK only to *include* the partition key,
+  not to lead it, so `PK (tenant_id, id)` partitioned by `id` qualifies with zero rebuild, broader
+  than today's control-must-lead test), and it works with a table that has no PK at all. If the table
+  has a PK that *excludes* the control column, the classic `events(id PRIMARY KEY, created_at)` that
+  wants time partitioning, `adopt` refuses and emits a suggested migration (how to get the control
+  column into the PK) rather than just erroring. The widening that today's drop-and-rebuild performs
+  becomes the operator's deliberate job, not something `adopt` attempts online behind their back.
+
+  *Why this is a net subtraction.* Forbidding widening lets whole subsystems be deleted, not merely
+  guarded: the PK drop/rebuild, `build_pk_concurrently` and its `pg_cron` `CREATE INDEX CONCURRENTLY`
+  polling, the in-transaction-versus-online build choice, most of the capture-max-identity dance, and,
+  because a primary key that never changes means an incoming FK's referenced unique key always
+  survives, the entire composite-FK recovery path (`generate_fk_recovery`, the `'drop'` mode's
+  denormalization, `dropped_fk`'s composite columns). Every incoming FK becomes the `preserve` happy
+  path: the suspend/restore lifecycle stays, the composite path goes. The guarantees become absolute,
+  every `adopt` is metadata-only and every incoming FK is preservable, with no "depends whether the PK
+  widens" branch anywhere in the tool.
+
+  *The bet.* This cedes the most common legacy case, a `bigint` or UUIDv4 `id` PK alongside a separate
+  `created_at`, partitioned on time, which is pg_partman's territory. The trade is deliberate: in the
+  era of Snowflake bigints, UUIDv7, and ULID, a single-column time-ordered primary key is the better
+  data model, and the gymnastics to retrofit a legacy table onto it belong to the operator (with
+  pgpm's guidance) rather than hidden inside an `adopt` that quietly pays an `O(rows)` cost. pgpm
+  becomes opinionated and predictable: bring a time-ordered key that *is* your primary key and it
+  partitions flawlessly, always online, always cheap. Less ambitious, more reliable, the right trade
+  for a background steward.
 - **Adaptive closed-loop feathering (mode 2).** Sense leftover supply (wait events, checkpoint
   pressure, recent latency of the ambient workload, replication lag) and adjust the drain rate to
   ride just under it. The bench already shows the symptoms to watch for: forced checkpoints, temp
