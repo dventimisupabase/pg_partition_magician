@@ -911,6 +911,29 @@ begin
 end;
 $$;
 
+-- check_time_monotonic: how co-monotonic is an id column with a timestamp column? Samples p_sample
+-- rows at random, orders them by the id, and reports the fraction of adjacent pairs whose time is
+-- non-decreasing. ~1.0 means id and time co-increase; backfills and out-of-order arrival drive it
+-- down. This is the tier-2 safety check for time-based retention expressed against an id partition
+-- key (DESIGN.md section 8): mapping "older than T" to an id boundary is only sound when id and
+-- time co-increase. Heuristic, not a proof -- mirrors check_uuidv7's plausibility sampling.
+create or replace function pgpm.check_time_monotonic(
+  p_table regclass, p_id name, p_time name, p_sample int default 1000
+) returns table (sampled bigint, monotonic bigint, fraction numeric)
+language plpgsql as $$
+begin
+  return query execute format($q$
+    with s as (select %2$I::timestamptz as t, %1$I as idv from %3$s order by random() limit %4$s),
+         o as (select t, lag(t) over (order by idv) as prev from s)
+    select count(*) filter (where prev is not null)::bigint,
+           count(*) filter (where prev is not null and t >= prev)::bigint,
+           round(coalesce(count(*) filter (where prev is not null and t >= prev)::numeric
+                          / nullif(count(*) filter (where prev is not null), 0), 0), 4)
+    from o
+  $q$, p_id, p_time, p_table::text, p_sample);
+end;
+$$;
+
 create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, premake int, retention text,

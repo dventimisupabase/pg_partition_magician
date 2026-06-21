@@ -41,3 +41,13 @@ This file is my running journal; the final state is summarized at the bottom.
   path. Cosmetic note: reuse path keeps the original PK constraint name (e.g. events_id_pkey on
   events_id_default) rather than <default>_pkey; nothing reads that name, so cosmetic only.
   Committing.
+
+### Feature 3: check_time_monotonic (retention-bridge tier-2 safety) -- DONE
+- Additive read-only function `pgpm.check_time_monotonic(table, id, time, sample)`: samples rows,
+  orders by id, returns the fraction of adjacent pairs whose time is non-decreasing (~1.0 = id and
+  time co-increase; backfills/out-of-order drive it down). Modeled on check_uuidv7.
+- TDD: tests/16_time_correlation_test.sql (co-monotonic -> 1.0; decorrelated -> < 0.95; empty ->
+  0 sampled, no crash). RED (function missing) then GREEN.
+- Full suite green on PG17 (16 files / 70 tests). Additive, no regressions. Committed.
+- (Switched regression gate to the persistent container + pg_prove all tests: much faster than
+  per-feature ./test.sh up/down. Cross-version ./test.sh sweep reserved for end-of-batch.)
