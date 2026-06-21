@@ -96,7 +96,6 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_CHUNK` | `2000000` | generator commit chunk |
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions: set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after; avoids scattered per-row index maintenance across hundreds of millions of inserts |
-| `BENCH_PREPARE_ADOPT` | `0` | run `pgpm.build_pk_concurrently()` (online PK index, cron-driven inside pgpm) before `adopt`, so the cutover is metadata-only. **Essential at scale**: otherwise `adopt` builds the index in-transaction under `ACCESS EXCLUSIVE` (a multi-minute write-blocking window on a 100GB+ table) |
 | `BENCH_INTERVAL` | `1 month` | partition width |
 | `BENCH_PREMAKE` | `3` | future partitions pgpm premakes (configured on adopt; pgpm's maintenance does it) |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
@@ -143,13 +142,13 @@ The expensive setup is **generation** (~minutes/10s-of-GB, CPU-bound on `md5()`)
 **online PK index build** (`prepare` phase, ~tens of minutes on a 100GB+ table). Two ways
 to cut that on repeat runs, with an honest caveat on each:
 
-- **Scale the instance up for setup, down to measure (the bigger lever).** Generation and
-  the index build are CPU/IO/`maintenance_work_mem`-bound, so a larger compute tier builds
-  both far faster, and they're *setup*, not the measurement, so speeding them up doesn't
-  affect the >RAM realism. The drain (the long pole) is the measurement and must stay on the
-  target tier. Compute resize is a **restart**, so this can't happen mid-run: do it as
-  *scale up → generate + `build_pk_concurrently` → scale down (restart) → `BENCH_SKIP_GENERATE=1`
-  measurement run*. The measurement run's `adopt` reuses the already-built index automatically.
+- **Scale the instance up for setup, down to measure (the bigger lever).** Generation is
+  CPU/IO/`maintenance_work_mem`-bound, so a larger compute tier builds it far faster, and it is
+  *setup*, not the measurement, so speeding it up doesn't affect the >RAM realism. The drain (the
+  long pole) is the measurement and must stay on the target tier. Compute resize is a **restart**, so
+  this can't happen mid-run: do it as *scale up -> generate -> scale down (restart) ->
+  `BENCH_SKIP_GENERATE=1` measurement run*. adopt itself is always a metadata-only cutover (it never
+  rewrites the PK), so there is nothing to pre-build.
 
 - **Reuse the generated data (`BENCH_SKIP_GENERATE=1`).** Keep an untouched seed copy of the
   rows so you don't pay `md5()` generation again:

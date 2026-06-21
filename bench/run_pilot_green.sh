@@ -28,7 +28,7 @@ export BENCH_OPS=10               # cached -> a few ms/txn, safely under stateme
 export BENCH_PHASE_SECS=45        # baseline / post (short -- enough for stable tps)
 
 # ---- conversion (pgpm self-drives; harness only observes) ----
-export BENCH_PREPARE_ADOPT=1      # build the composite PK index CONCURRENTLY before adopt
+# (no PK pre-build: adopt never rewrites the PK, so the cutover is always metadata-only)
 export BENCH_DRAIN_BATCH=100000   # rows per drain_step (~15 batches for the tail)
 export BENCH_MAINT_INTERVAL='2 seconds'   # pg_cron tick for pgpm.maintenance
 export BENCH_OBSERVE_INTERVAL=10

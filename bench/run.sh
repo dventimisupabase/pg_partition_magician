@@ -66,11 +66,10 @@ BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (be
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
-BENCH_PREPARE_ADOPT="${BENCH_PREPARE_ADOPT:-0}"  # 1 = build the PK index CONCURRENTLY (online, under load) before adopt, so adopt is metadata-only (essential at scale)
 
 # TCP keepalives on every connection (libpq defaults them OFF). Synchronous server-side calls
-# sit idle ON THE WIRE while the backend works -- build_pk_concurrently polls for ~tens of s,
-# adopt's cutover, the bulk generators, the convert-phase pgbench between rows. Over a NAT'd
+# sit idle ON THE WIRE while the backend works -- adopt's cutover (metadata-only),
+# the bulk generators, the convert-phase pgbench between rows. Over a NAT'd
 # path (e.g. Tailscale to a managed endpoint) an idle flow gets reaped, killing the call mid-way
 # (observed: "server closed the connection unexpectedly" during the ~17s build_pk call).
 # keepalives_idle MUST be SHORTER than those calls -- a probe has to fire DURING them to keep
@@ -355,16 +354,10 @@ fi
 load_pid=$!; BG_PIDS+=("$load_pid")
 convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
 
-# 4a. operator prep (online): build the PK index concurrently so adopt stays metadata-only
-if [ "$BENCH_PREPARE_ADOPT" = "1" ]; then
-  echo "  pgpm.build_pk_concurrently (online PK index, cron-driven inside pgpm)..."
-  t0=$(q "select extract(epoch from clock_timestamp())")
-  q "call pgpm.build_pk_concurrently('bench.events','created_at')" >/dev/null
-  awk -v a="$t0" -v b="$(q "select extract(epoch from clock_timestamp())")" 'BEGIN{printf "  PK index built online in %.1fs\n", b-a}'
-fi
-
-# 4b. the single operator trigger: adopt() unpaused. pgpm takes it from here.
-echo "  firing pgpm.adopt('bench.events','created_at','$BENCH_INTERVAL', paused=>false)..."
+# 4. the single operator trigger: adopt() unpaused. pgpm takes it from here. No PK pre-build is
+# needed any more -- pgpm never rewrites the PK (the partition key leads the PK, so it is reused in
+# place), so the cutover is always metadata-only. See DESIGN.md section 8.
+echo "  firing pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
 adopt_t0=$(q "select extract(epoch from clock_timestamp())")
 q "select pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_PREMAKE, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 adopt_t1=$(q "select extract(epoch from clock_timestamp())")
