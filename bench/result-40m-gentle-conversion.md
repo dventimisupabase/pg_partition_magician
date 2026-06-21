@@ -15,6 +15,7 @@ PostgreSQL 17.6, staging "green"). Same engine and same 40M-row workload as the
   a large table runs for hours/days in the background by design; it needn't complete in a benchmark).
 
 ## Setup
+
 - **39.9 M rows**, ~2 months of history → ~12 GB heap+indexes unpartitioned. Generated server-side
   by 8 parallel sessions, then **`VACUUM (FREEZE, ANALYZE)`** so the post-bulk-load freeze WAL
   settles *before* measurement (`BENCH_PREFREEZE=1`; see "I/O attribution").
@@ -27,6 +28,7 @@ PostgreSQL 17.6, staging "green"). Same engine and same 40M-row workload as the
   the long window could never be captured. The public pooler path holds it (see "Connection path").
 
 ## Result: the gentle drain is unnoticeable to the workload, at scale
+
 The 300 s steady-state window was **captured in full (n = 36 100 transactions)** and the workload
 latency **tracks baseline at every percentile** while pgpm drains the closed tail underneath it:
 
@@ -53,6 +55,7 @@ n = 28 805) and an earlier R3 over the flaky path whose window survived long eno
 (convert p50 91.3 / p95 146.5 / p99 186.4, all ≤ baseline).
 
 ## I/O attribution: the drain is not the I/O stressor
+
 pgfr (server-side, continuous) over the window flagged 2 forced checkpoints, a checkpoint, and
 1.05 GB temp. **None is the drain**, established three ways:
 
@@ -74,6 +77,7 @@ without an exclusive lock, and it happens **once**, before the table is partitio
 steady-state drain itself stays under the instance's I/O baseline, which is the design goal.
 
 ## Connection path: Tailscale was the measurement blocker, not pgpm or the disk
+
 Over the direct `.red` endpoint (Postgres over a Tailscale/NAT CGNAT route) the **workload
 connection dropped ~80 s into convert on all 3 runs**, truncating the window (n=8662 or n/a). The
 server was unaffected every time, pgpm kept draining straight through the client blackout

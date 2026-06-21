@@ -7,6 +7,7 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
 (`bench/SIZE_LADDER.md`); it is the rung that first passed end to end.
 
 ## Setup
+
 - **40 M rows**, spread over the last 2 months (~Apr 20 → Jun 20) → ~12 GB heap+indexes
   unpartitioned. Generated server-side by 8 parallel sessions.
 - Conversion: `build_pk_concurrently` (online PK) → `adopt(p_paused => false)` →
@@ -14,6 +15,7 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
   the harness only observes. Drain batch 150 000.
 
 ## Result: converted online, workload never stopped
+
 - **Online PK build: 51.8 s** (`CREATE INDEX CONCURRENTLY` via a pg_cron worker).
 - **`adopt()`: 8.3 s metadata cutover**, reused the pre-built index (no in-txn rebuild).
 - **Drain: 27.4 M closed-tail rows moved** in 184 microbatches, attaching 2 closed
@@ -25,6 +27,7 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
   premake deadlock aborted the whole maintenance run and the drain never started.
 
 ## Throughput / latency by phase
+
 | phase | tps | avg latency | server-side p50 / p95 / p99 / max |
 |-------|-----|-------------|-----------------------------------|
 | baseline (unpartitioned) | 140.7 | 113.7 ms | 108 / 160 / 178 / 316 ms |
@@ -38,6 +41,7 @@ now hit the right partition). The 13.4 s max during convert is lock-contention t
 partition attaches.
 
 ## Health by phase
+
 | phase | events size | partitions | bench dead tup | active backends |
 |-------|-------------|------------|----------------|-----------------|
 | baseline | 12 GB | 0 | 714 | 2 |
@@ -45,6 +49,7 @@ partition attaches.
 | post | 21 GB | 6 | 5 404 | 1 |
 
 ## WAL / checkpoint by phase (deltas)
+
 | phase | WAL bytes | WAL records | WAL FPI | checkpoints | ckpt buffers |
 |-------|-----------|-------------|---------|-------------|--------------|
 | baseline | 2.7 GB | 317 052 | 32 218 | 1 | 206 141 |
@@ -56,6 +61,7 @@ after each of the 34 checkpoints it forced). This is the dominant cost of the on
 and the thing that scales painfully (see the ladder's disk-bound rungs).
 
 ## Wall-clock & a known harness issue
+
 Total run ~58 min (05:43 → 06:41). Of that, the **server-side drain itself was ~30 min**;
 generation ~6 min; phases ~3 min. The remainder is a harness artifact: the observer's
 progress sampling had a **single ~46-min-equivalent gap** (`drain.progress.csv` jumps from
@@ -67,6 +73,7 @@ poll stall is not yet established from the evidence; candidate fix: give each ob
 bounded `statement_timeout` + reuse one persistent connection rather than one psql per poll.
 
 ## Bugs this rung's path surfaced (all fixed before this pass)
+
 1. Observer falsely declared "settled" before the drain started (`coalesce(age, 999999)`).
 2. `maintenance()` let a premake deadlock abort the drain (the hardening above).
 3. Convert-phase pgbench was orphaned (harness killed the subshell wrapper, not pgbench).
