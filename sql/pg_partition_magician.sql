@@ -484,6 +484,34 @@ begin
     raise exception 'pg_partition_magician: control_kind uuidv7 needs a uuid column (got %)', v_typname;
   end if;
 
+  -- Orphaned-child guard (DESIGN.md sec 8): a drain creates each child partition as a standalone
+  -- table (CREATE TABLE ... LIKE) and only ATTACHes it at the END of that child's drain. An
+  -- interrupted drain therefore leaves an un-attached child -- which DROP TABLE <parent> CASCADE
+  -- does NOT remove (an un-attached table has no dependency on the parent). If the table is later
+  -- recreated/reloaded and re-adopted, the next drain reuses the orphan by name and INSERTs rows
+  -- whose keys already live in it: a cryptic mid-drain "duplicate key" deep inside drain_step.
+  -- Refuse up front -- any standalone (un-attached) table in this schema whose name matches this
+  -- parent's child-partition naming (<rel>_p<digits...>) is an orphan. starts_with handles the
+  -- (un-escaped) rel prefix; the regex only constrains the data-independent suffix.
+  declare v_orphan name;
+  begin
+    select c.relname into v_orphan
+      from pg_class c
+     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
+       and c.relkind = 'r'
+       and starts_with(c.relname, v_rel || '_p')
+       and case when p_control_kind = 'id'
+                then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
+                else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$'
+           end
+       and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
+     limit 1;
+    if v_orphan is not null then
+      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted drain. Drop it (drop table %.%) and retry adopt.',
+        v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
+    end if;
+  end;
+
   -- uuidv7 sanity check: the type can't tell us the values are time-ordered, so
   -- sample them -- random (UUIDv4) columns decode to implausible timestamps.
   if p_control_kind = 'uuidv7' then
