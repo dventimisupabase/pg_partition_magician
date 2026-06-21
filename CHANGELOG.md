@@ -45,6 +45,27 @@
   scale that undercut the metadata-only cutover. `adopt` now captures `max(identity)` up front --
   while the table's original id index still exists, so it is an index lookup -- and reuses it to
   advance the (freshly recreated) parent sequence. The cutover stays metadata-only at any size.
+- `adopt` reuses the existing PK when the partition key already covers it. For `id` / `uuidv7`
+  tables the computed PK columns equal the existing PK, so adopt no longer drops and rebuilds an
+  identical index -- it reuses the index in place. In the common case the one-time setup cost center
+  collapses to zero and only the drain remains. Flat (single-digit ms) to ~40M rows. (tests/15)
+- `drain_max_blocks` config: block-budgeted drain batching. Batching by a fixed row count is unsafe
+  when row width varies (20 000 rows each carrying a 2 MB document is tens of GB rewritten in one
+  microbatch). When set, `drain_step` caps each microbatch at roughly that many heap+TOAST blocks
+  (translated to a row limit via the default's average bytes/row) and takes the smaller of that and
+  `drain_batch`; when null it falls back to the row cap unchanged. (tests/17)
+- `pgpm.check_time_monotonic(parent, key_col, time_col)`: an additive, read-only co-monotonicity
+  check, the tier-2 safety gate for a future key-to-time retention bridge (calendar retention on an
+  id-partitioned table). It samples whether the id and timestamp rise together and reports the
+  fraction in order, analogous to `check_uuidv7`'s plausibility sampling. (tests/16)
+- `adopt` now refuses up front when an orphaned child-partition table exists. A drain creates each
+  child as a standalone table (`CREATE TABLE ... LIKE`) and ATTACHes it only at the end of that
+  child's drain, so an interrupted drain leaves an un-attached child -- which `DROP TABLE <parent>
+  CASCADE` does not remove (no dependency on the parent). Re-adopting the recreated table would let
+  the next drain reuse the orphan by name and collide on its stale keys, surfacing as a cryptic
+  mid-drain "duplicate key" deep inside `drain_step`. `adopt` now detects any standalone
+  (un-attached) table whose name matches this parent's child-partition naming and raises a clear,
+  actionable error instead. (tests/18)
 
 ## [0.1.0] - 2026-06-19
 

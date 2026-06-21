@@ -145,7 +145,10 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   document is tens of gigabytes rewritten in one microbatch, a spike that breaks the unnoticeable
   invariant and can blow `statement_timeout`. Budgeting a batch by blocks (or bytes) instead bounds
   its I/O footprint regardless of the data model, which is the practical reason for measuring demand
-  in blocks (section 2).
+  in blocks (section 2). **Implemented** as the `drain_max_blocks` config knob: `drain_step` caps
+  each microbatch at roughly that many heap+TOAST blocks (translated to a row limit via the default's
+  average bytes/row) and falls back to the old row cap when unset. Tests in `tests/17`; cross-version
+  PG 15 to 18.
 - **A maintenance-window estimator (mode 3's helper).** Tell the operator how long a window to book,
   reckoned in blocks rather than rows. It needs two inputs: the **work size**, which pgpm can read
   from the catalog (the `DEFAULT`'s heap + TOAST + index `relpages`, scaled by the closed-tail
@@ -166,7 +169,9 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   while keeping its index, so the reuse needs the attach-reconcile path (let `ATTACH PARTITION` match
   the existing index, or `ALTER INDEX parent ATTACH PARTITION child`) rather than the current
   drop-then-rebuild, and it wants a test matrix across PG 15 to 18. The payoff: in the common case the
-  setup cost center disappears and only the drain remains.
+  setup cost center disappears and only the drain remains. **Implemented**: `adopt` detects when the
+  partition key already covers the PK (the `id` / `uuidv7` cases) and reuses the existing index in
+  place, skipping the drop+rebuild. Tests in `tests/15`; validated flat (single-digit ms) to ~40M rows.
 - **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
@@ -181,11 +186,21 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   retention is by id-range only. Tier 2 is sound only when `id` and the timestamp are co-monotonic
   (backfills, event-time, and out-of-order arrival break it), so it needs a correlation check and an
   honest warning, exactly analogous to `check_uuidv7`'s plausibility sampling and the rejection of
-  float keys.
+  float keys. **Implemented** for tier 2: `pgpm.check_time_monotonic` is the additive, read-only
+  co-monotonicity check (tests in `tests/16`); recording per-partition min/max and the cutoff-to-key
+  mapping remain future work.
 
 ## What already exists toward all this
 
 - The **throttle primitives** are in the product today: `drain_batch` + the maintenance cron cadence.
+- **Three of the directions above are now shipped**: PK reuse (`tests/15`), block-budgeted batching
+  via `drain_max_blocks` (`tests/17`), and the tier-2 co-monotonicity check `check_time_monotonic`
+  (`tests/16`). Validating block-budgeted batching at 2M wide rows also surfaced an operational
+  footgun, now guarded: a drain creates each child partition as a standalone table and attaches it
+  only at the end, so an interrupted drain leaves an un-attached child that `DROP TABLE <parent>
+  CASCADE` does not remove. Re-adopting the recreated table would let the next drain reuse that orphan
+  by name and collide on its stale keys. `adopt` now refuses up front when such an orphan exists
+  (`tests/18`).
 - The **bench** (`bench/`) is the instrument that measures the supply side and pgpm's demand against
   it; the **size ladder** (`bench/SIZE_LADDER.md`) is the beginnings of the calibration curve; the
   **storage-IO note** (`bench/STORAGE-IO-ON-GREEN.md`) is the AWS worked example of the substrate

@@ -79,3 +79,26 @@ This file is my running journal; the final state is summarized at the bottom.
 - Outstanding: the Supabase at-scale ladder (deferred -- see above); adaptive feathering (deferred
   by design); window estimator (skipped). DESIGN.md sec 8 should later be updated to mark F1/F2/F3
   implemented (left as-is for now so this branch is pure feature+test).
+
+### 2026-06-21: F2 "dup-key at 2M-wide" diagnosed -- NOT a drain bug; adopt-time guard added
+- A `drain_step` at 2M wide rows (`repeat('x',2000)` storage plain, `drain_max_blocks=50` -> 149-row
+  batches) failed with `duplicate key ... Key (id)=(30)` on `<part>_pkey`. Reproduced on the local
+  Docker pg17 container (no Supabase needed).
+- Isolation (the critical un-run test): ran the SAME 149-row batch via the plain row path (no block
+  budget, `drain_batch=150`) vs the block-budget path. Same-batch-size A/B. Result: whichever variant
+  ran SECOND on a re-`adopt`ed table failed; whichever ran FIRST on a pristine fixture was clean.
+  Block budget exonerated.
+- Root cause: `drain_step` creates each child partition as a standalone table (`CREATE TABLE ... LIKE`)
+  and ATTACHes it only at the END of that child's drain. While mid-drain it is un-attached, so
+  `DROP TABLE <parent> CASCADE` (my fixture rebuild) does NOT drop it -- an un-attached child has no
+  dependency on the parent. The next campaign re-`adopt`ed the recreated table, the next drain found
+  the orphan by name and re-INSERTed rows whose ids already lived in it -> dup-key. Proof: dropping
+  the orphan made the exact failing config drain cleanly (149/step, overlap=0), and running the
+  block-budget variant FIRST on a pristine fixture was clean. F2's logic is correct and shippable.
+- Fix (adopt-time guard): `_adopt` now refuses when a standalone (un-attached) table matching this
+  parent's child-partition naming exists, with an actionable "drop the orphan" message -- turning a
+  cryptic mid-drain dup-key into a clear up-front error. TDD via tests/18 (RED->GREEN). Full suite
+  green PG 15/16/17/18 x psql/bundle/dbdev (18 files / 79 tests), clean uninstall.
+- Note: the committed bench teardown (`bench/run_rung.sh`) uses `DROP SCHEMA bench CASCADE`, which
+  DOES drop orphaned children (they live in the schema), so it was never affected; the footgun is
+  table-level `DROP TABLE <parent> CASCADE`, which the guard now covers.
