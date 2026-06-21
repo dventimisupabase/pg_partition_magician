@@ -111,3 +111,43 @@ This file is my running journal; the final state is summarized at the bottom.
 - Note: the committed bench teardown (`bench/run_rung.sh`) uses `DROP SCHEMA bench CASCADE`, which
   DOES drop orphaned children (they live in the schema), so it was never affected; the footgun is
   table-level `DROP TABLE <parent> CASCADE`, which the guard now covers.
+
+### 2026-06-21: at-scale ladder R0 -> R3 on green (closes the deferred ladder item)
+
+Ran the full `bench/SIZE_LADDER.md` ladder, stress profile, on a fresh 2XL green project
+(`dtpxdpabdkxykypteelm`, 100GB gp3/12k IOPS) via the Supavisor session-mode pooler, post the
+adopt redesign. `bench/run_rung.sh R0|R1|R2|R3 stress`, graduating only on a clean rung. Result:
+**correctness GREEN at all four rungs.**
+
+| rung | rows | events size | drain (moves / rows moved / closed tail) | workload fails | latency baseline -> convert -> post |
+|------|------|-------------|------------------------------------------|----------------|--------------------------------------|
+| R0 | 1M | ~0.5 GB | 8 / 659,571 / **0** | 0 | 77 -> 80 -> 77 ms |
+| R1 | 3M | 1.6 GB | 21 / 1,974,216 / **0** | 0 | 79 -> 83.5 -> 79.6 ms |
+| R2 | 10M | 5.4 GB | 67 / 6,586,876 / **0** | 0 | 80.7 -> 92.1 -> 79.2 ms |
+| R3 | 40M | 21 GB | 177 / 26,351,213 / **0** | 0 | 94.3 -> 142.7 -> 92.7 ms |
+
+Invariants that held at every rung: adopt is always a metadata-only cutover (the redesign removed
+the old O(rows) `max(id)` sequence-reset, since it never rewrites the PK); the self-driven drain
+always settles the closed tail to **exactly 0**; **zero** workload statements errored (no
+ERROR/FATAL/ABORT anywhere); post-phase latency fully recovers to baseline. The redesign holds
+under load up the whole ladder.
+
+R3 latency tail (the one thing to flag, NOT a code defect): convert p99 313 ms but max 38.3 s on a
+single statement out of 188,118. Evidence (pgfr, convert window): FORCED_CHECKPOINT x12 (drain WAL
+> `max_wal_size` 4GB), checkpoint flush write 1090s / sync 574s cumulative, TEMP_FILE_SPILLS 5.64GB
+(drain CTE batch materialization), DEAD_TUPLE 41.5% on `events_default` (autovacuum trailing 26M
+deletes), SEQUENTIAL_SCAN_STORM 480M tuples (inherent online-attach VALIDATE; `lock_timeout` is now
+100ms so premake fast-fails with no wasted long lock-waits, 43 deferred). Workload waits in-window
+were dominated by IO:DataFileRead 54%, LWLock:WALWrite 36%, IO:WalSync 18%. The 38s max is one
+statement caught behind a forced-checkpoint I/O storm on a burst-limited 2XL disk. `drain.progress.csv`
+shows the matching plateaus (~30 to 45s) where `default_rows` flatlines and `last_drain_age_s` climbs
+to 40-52s. This is the same inherent heavy-conversion physics plus EBS-burst ceiling that the
+pre-redesign overnight run already characterized at R3 (it saw convert max 43-56s then), not a
+regression.
+
+This is exactly the empirical case for the deferred adaptive-control / feathering work: a closed-loop
+controller that backs the drain cadence/batch off when it detects rising checkpoint pressure or
+workload latency would flatten that tail, turning the fixed-aggressive "stress" tradeoff (fast drain,
+fat tail) into the "gentle" one (unnoticeable drain) automatically. The benchmark now provides the
+signal that controller needs to act on. Detailed scratch journal plus all artifacts (gitignored)
+live under `bench/results/R{0,1,2,3}-stress/`.
