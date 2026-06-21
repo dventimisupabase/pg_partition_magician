@@ -45,7 +45,7 @@ fi
 export BENCH_MONTHS=2 BENCH_GEN_JOBS=8 BENCH_CHUNK=2000000
 export BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_OPS=10
 export BENCH_OBSERVE_INTERVAL=10
-export BENCH_PREPARE_ADOPT=1 BENCH_PGFR=1
+export BENCH_PGFR=1   # no PK pre-build: adopt never rewrites the PK, so the cutover is always metadata-only
 
 # ---- per-rung scale (see bench/SIZE_LADDER.md) ----
 case "$RUNG" in
