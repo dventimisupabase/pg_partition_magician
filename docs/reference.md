@@ -277,13 +277,29 @@ pgpm.restore_incoming_fks(p_parent regclass) returns int
 ```
 
 Re-adds the incoming FKs that `adopt(..., p_incoming_fks => 'preserve')` recorded (the `restorable`
-rows of [`pgpm.dropped_fk`](#pgpmdropped_fk)), pointing them back at the new partitioned parent with
-`NOT VALID` + `VALIDATE` (so the re-add is online). Returns the number restored. It self-gates on
-quiescence: a no-op (returns 0) while the closed tail still has rows or an in-flight child partition
-exists, because the drain moves rows through an unattached child that a `NO ACTION` FK would reject.
-Safe to call early or repeatedly; `maintenance` calls it automatically once the drain is idle, so you
-only call it by hand on the synchronous `drain_all` path. See the
+rows of [`pgpm.dropped_fk`](#pgpmdropped_fk) that are currently dropped), pointing them back at the new
+partitioned parent with `NOT VALID` + `VALIDATE` (so the re-add is online; a self-referential FK, whose
+referencing side is the partitioned parent, is added validating in one step since Postgres rejects
+`NOT VALID` there). Returns the number restored. It self-gates on quiescence: a no-op (returns 0) while
+the closed tail still has rows or an in-flight child partition exists. The record is kept after
+restore, marked live (`restored_at` set), not deleted, so the FK can be suspended again before a later
+drain. Safe to call early or repeatedly; `maintenance` calls it automatically once the drain is idle,
+so you only call it by hand on the synchronous `drain_all` path. See the
 [guide](guide.md#incoming-foreign-keys).
+
+### `pgpm.suspend_incoming_fks`
+
+```sql
+pgpm.suspend_incoming_fks(p_parent regclass) returns int
+```
+
+The inverse of `restore_incoming_fks`, and the other half of the managed-FK invariant *a preserve-managed
+FK is live if and only if the closed tail is empty*. When the closed tail has drain work pending, it
+re-drops any preserve-managed FK that is currently live (setting `restored_at` back to null) so the
+drain never moves referenced rows past a live FK, which a `NO ACTION` FK would block and a
+`CASCADE` / `SET NULL` FK would silently honour (deleting or nulling the referencing rows). Returns the
+number suspended; a no-op (returns 0) when the closed tail is empty. `maintenance` calls it before each
+drain step (and `drain_all` at its start); you rarely call it directly.
 
 ### `pgpm.generate_fk_recovery`
 
@@ -342,8 +358,10 @@ Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g
 
 Incoming FKs dropped by `adopt(..., p_incoming_fks => 'drop' | 'preserve')`, kept for
 reconstruction. Columns: `id`, `parent_table`, `referencing_table`, `constraint_name`, `definition`,
-`referencing_columns`, `referenced_columns`, `restorable`, `dropped_at`. When `restorable` is true
-(the `'preserve'` mode), the FK is re-added verbatim against the parent by
-[`restore_incoming_fks`](#pgpmrestore_incoming_fks) and that row is consumed; when false (the
-`'drop'` mode), feed it to [`generate_fk_recovery`](#pgpmgenerate_fk_recovery) for the composite
-rebuild.
+`referencing_columns`, `referenced_columns`, `restorable`, `restored_at`, `dropped_at`. When
+`restorable` is true (the `'preserve'` mode), the FK is re-added verbatim against the parent by
+[`restore_incoming_fks`](#pgpmrestore_incoming_fks) and the row is kept as a managed record, with
+`restored_at` tracking its lifecycle state (null = currently dropped/suspended, set = currently live);
+[`suspend_incoming_fks`](#pgpmsuspend_incoming_fks) flips it back when a later drain needs the FK gone.
+When `restorable` is false (the `'drop'` mode), feed it to
+[`generate_fk_recovery`](#pgpmgenerate_fk_recovery) for the composite rebuild.

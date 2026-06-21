@@ -89,10 +89,17 @@ create table if not exists pgpm.dropped_fk (
   -- re-added verbatim against the parent by restore_incoming_fks once the table is drained. false
   -- (the 'drop' mode) means it needs the composite-FK rebuild via generate_fk_recovery instead.
   restorable          boolean     not null default false,
+  -- lifecycle marker for a restorable (preserve-managed) FK: null = currently DROPPED (awaiting
+  -- restore), set = currently LIVE on the parent. maintenance keeps the invariant "a managed FK is
+  -- live iff the closed tail is empty": it suspends (drops, restored_at -> null) before a drain that
+  -- would move referenced rows, and restores (re-adds, restored_at -> now()) once the drain is idle.
+  -- This is why the row is kept after restore rather than deleted. Irrelevant for 'drop'-mode rows.
+  restored_at         timestamptz,
   dropped_at          timestamptz not null default now()
 );
--- upgrade path for installs that predate the restorable column
+-- upgrade path for installs that predate these columns
 alter table pgpm.dropped_fk add column if not exists restorable boolean not null default false;
+alter table pgpm.dropped_fk add column if not exists restored_at timestamptz;
 
 -- =============================== adapter layer ===============================
 
@@ -402,6 +409,11 @@ create or replace function pgpm.drain_all(
 returns int language plpgsql as $$
 declare v_status text; v_iter int := 0;
 begin
+  -- Suspend any live preserve-managed FK before draining: moving referenced rows past a live
+  -- CASCADE/SET NULL FK would silently mutate the referencing side (a NO ACTION FK would block). A
+  -- no-op unless a managed FK is live with closed-tail work. drain_all stays a pure drainer otherwise;
+  -- restoration is left to maintenance or an explicit restore_incoming_fks call.
+  perform pgpm.suspend_incoming_fks(p_parent);
   loop
     v_status := pgpm.drain_step(p_parent, p_batch, p_include_open);
     exit when v_status = 'idle';
@@ -868,7 +880,7 @@ create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
 declare
   cfg pgpm.config;
-  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0;
+  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
   v_note text := '';
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -922,6 +934,13 @@ begin
   -- workload); only the brief final ATTACH needs a stronger lock.
   perform set_config('lock_timeout', '3s', true);
   begin
+    -- Suspend (re-drop) any preserve-managed FK that is currently live BEFORE draining: the drain
+    -- moves referenced rows out of the parent through an un-attached child, which a live NO ACTION FK
+    -- blocks and a live CASCADE/SET NULL FK silently honours (deleting/nulling the referencing rows).
+    -- suspend_incoming_fks is a no-op when the closed tail is empty. It shares this subtransaction with
+    -- the drain on purpose: if it cannot drop a live FK, the drain_step below never runs (the whole
+    -- block rolls back), so the drain never moves rows past a live FK -- it just defers and retries.
+    v_suspended := pgpm.suspend_incoming_fks(p_parent);
     v_drain := pgpm.drain_step(p_parent);
   exception when others then
     v_drain := 'deferred';
@@ -940,7 +959,8 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('premade=%s dropped=%s drain=%s restored_fk=%s%s', v_made, v_dropped, v_drain, v_restored, v_note);
+  return format('premade=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
+                v_made, v_dropped, v_drain, v_suspended, v_restored, v_note);
 end;
 $$;
 
@@ -1053,7 +1073,8 @@ declare
   cfg pgpm.config; v_nsp name; v_rel name; v_closed bigint; v_inflight name;
   r pgpm.dropped_fk%rowtype; v_n int := 0;
 begin
-  if not exists (select 1 from pgpm.dropped_fk where parent_table = p_parent and restorable) then
+  if not exists (select 1 from pgpm.dropped_fk
+                  where parent_table = p_parent and restorable and restored_at is null) then
     return 0;
   end if;
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -1082,7 +1103,8 @@ begin
 
   -- safe: re-add each preserved FK against the parent. The recorded definition already names the
   -- parent (it was captured before the rename, and that name is now the parent).
-  for r in select * from pgpm.dropped_fk where parent_table = p_parent and restorable order by id loop
+  for r in select * from pgpm.dropped_fk
+            where parent_table = p_parent and restorable and restored_at is null order by id loop
     if (select relkind from pg_class where oid = r.referencing_table) = 'p' then
       -- The referencing side is itself partitioned (a self-referential FK is now on the parent).
       -- Postgres does not support NOT VALID foreign keys on a partitioned referencing table, so add
@@ -1097,8 +1119,38 @@ begin
                      r.referencing_table::text, r.constraint_name, r.definition);
       execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
     end if;
-    delete from pgpm.dropped_fk where id = r.id;
+    -- keep the record, marked LIVE: maintenance may need to suspend (re-drop) it again before a
+    -- later drain, so pgpm must remember which incoming FKs it manages even after restoring them.
+    update pgpm.dropped_fk set restored_at = now() where id = r.id;
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
+    v_n := v_n + 1;
+  end loop;
+  return v_n;
+end;
+$$;
+
+-- suspend_incoming_fks(): the inverse of restore. When the closed tail has drain work pending, re-drop
+-- any preserve-managed FK that is currently live, so the drain never moves a referenced row past a
+-- live FK. That matters beyond a mere stall: a live ON DELETE CASCADE / SET NULL FK would silently
+-- delete or null the referencing rows as the drain removes their referent from the DEFAULT (verified
+-- on PG 17). maintenance calls this before each drain step; restore_incoming_fks re-adds once the
+-- tail is drained, maintaining the invariant "a managed FK is live iff the closed tail is empty".
+-- A no-op (returns 0) when the closed tail is empty, so it is safe to call every tick.
+create or replace function pgpm.suspend_incoming_fks(p_parent regclass)
+returns int language plpgsql as $$
+declare v_closed bigint; r pgpm.dropped_fk%rowtype; v_n int := 0;
+begin
+  if not exists (select 1 from pgpm.dropped_fk
+                  where parent_table = p_parent and restorable and restored_at is not null) then
+    return 0;
+  end if;
+  select closed_rows into v_closed from pgpm.check_default(p_parent);
+  if coalesce(v_closed, 0) = 0 then return 0; end if;   -- no drain work => leave live FKs in place
+  for r in select * from pgpm.dropped_fk
+            where parent_table = p_parent and restorable and restored_at is not null order by id loop
+    execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
+    update pgpm.dropped_fk set restored_at = null where id = r.id;
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'suspend_incoming_fk', r.constraint_name);
     v_n := v_n + 1;
   end loop;
   return v_n;

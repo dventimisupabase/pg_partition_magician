@@ -237,9 +237,14 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   along in the recorded definition), and self-referential FKs (verified: a single-column FK to a
   partitioned-by-id table is legal and enforced). The self-referential re-add is validating, not
   online, because the referencing side is then the partitioned parent and Postgres rejects a
-  `NOT VALID` FK there; acceptable as a one-time step. Still future work: re-dropping a restored FK
-  when a later premake-miss drain must move referenced rows (today that drain simply defers, surfaced
-  by `check_default`).
+  `NOT VALID` FK there; acceptable as a one-time step. The lifecycle is managed: a preserve-managed FK
+  is **live if and only if the closed tail is empty**. `maintenance` suspends (re-drops) a live managed
+  FK before any drain that would move referenced rows and restores it once the tail is drained, so a
+  later premake-miss drain neither stalls (`NO ACTION`) nor silently mutates the referencing side
+  (`CASCADE` / `SET NULL`, verified on PG 17). `suspend_incoming_fks` shares the drain's subtransaction:
+  if it cannot drop a live FK the drain is skipped that tick rather than run past it. `drain_all`
+  suspends too. The `dropped_fk` record persists after restore (marked live via `restored_at`) so the
+  cycle can repeat.
 - **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the

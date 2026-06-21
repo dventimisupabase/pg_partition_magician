@@ -13,7 +13,12 @@
   case (use `'drop'` + `generate_fk_recovery`). New `pgpm.dropped_fk.restorable` column distinguishes
   the two. Referential actions (`CASCADE` / `SET NULL` / `RESTRICT`), `DEFERRABLE`-ness, and
   self-referential FKs are preserved (the self-referential re-add is validating, not online, since
-  Postgres rejects a `NOT VALID` FK on a partitioned referencing table). (tests/19-23)
+  Postgres rejects a `NOT VALID` FK on a partitioned referencing table). The lifecycle is managed: a
+  preserve-managed FK is live only while the closed tail is empty. `pgpm.suspend_incoming_fks` re-drops
+  a live managed FK before a drain that would move referenced rows, and `maintenance` (and `drain_all`)
+  call it so a later premake-miss catch-up drain neither stalls (`NO ACTION`) nor silently
+  deletes/nulls the referencing rows (`CASCADE` / `SET NULL`). New `pgpm.dropped_fk.restored_at` tracks
+  the live/dropped state. (tests/19-24)
 - `build_pk_concurrently(parent, control)`: a procedure that builds the default's
   composite PK index ONLINE before `adopt`, so the cutover stays metadata-only even on
   very large tables (at ~300M rows the previous in-transaction build was a ~28-minute

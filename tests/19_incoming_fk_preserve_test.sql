@@ -47,8 +47,9 @@ select throws_ok(
   '23503', NULL, 'the restored FK is enforced (a dangling reference is rejected)');
 
 select is(
-  (select count(*)::int from pgpm.dropped_fk where parent_table = 'public.m'::regclass),
-  0, 'the restored FK is no longer pending in pgpm.dropped_fk');
+  (select count(*)::int from pgpm.dropped_fk
+     where parent_table = 'public.m'::regclass and restorable and restored_at is null),
+  0, 'no preserved FK left pending (the record is kept, marked live)');
 
 select * from finish();
 rollback;

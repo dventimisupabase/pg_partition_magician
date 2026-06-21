@@ -43,8 +43,9 @@ select throws_ok(
   $$ insert into public.ref (m_id) values (999999999) $$,
   '23503', NULL, 'the auto-restored FK is enforced');
 select is(
-  (select count(*)::int from pgpm.dropped_fk where parent_table = 'public.m'::regclass),
-  0, 'no preserved FK left pending after the auto-restore');
+  (select count(*)::int from pgpm.dropped_fk
+     where parent_table = 'public.m'::regclass and restorable and restored_at is null),
+  0, 'no preserved FK left pending after the auto-restore (record kept, marked live)');
 
 select * from finish();
 rollback;

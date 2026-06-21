@@ -242,6 +242,13 @@ select pgpm.restore_incoming_fks('public.events');   -- maintenance does this fo
 in-flight child partition), so it is safe to call early or repeatedly. `'preserve'` refuses up front
 if any incoming FK is not eligible (the widening time case below); use `'drop'` for those.
 
+After it is restored, `maintenance` keeps a managed FK on a leash: a preserve-managed FK is live only
+while the closed tail is empty. If a later drain appears (for example premake falls behind and rows
+land in the DEFAULT for an interval that then closes), `maintenance` suspends the FK before draining
+and restores it afterward, so the catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK)
+silently deletes or nulls the referencing rows. Referential actions, `DEFERRABLE`-ness, and
+self-referential FKs are all preserved across this cycle.
+
 ### When you partition on a different column (time)
 
 If you partition on a column other than the referenced key (the typical `time` case: partition on
