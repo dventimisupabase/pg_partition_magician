@@ -110,6 +110,23 @@ The model gives the operator an honest, two-sided message:
   *temporarily* relax the unnoticeable constraint to spend more budget and converge faster. The
   operator chooses where to sit on the tradeoff; pgpm defaults to unnoticeable.
 
+A quieter clause in the same contract: **pgpm does not leave.** It is tempting to picture it as a
+one-shot converter that adopts a table, drains it, and exits stage left, but the drain is only the
+*backlog*. Keeping live writes landing in real partitions means creating partitions ahead of the
+frontier *forever* (premake), and PostgreSQL ships no mechanism to do that: declarative partitioning
+hands you the partition primitives but no policy engine to create, retain, and drop partitions on a
+schedule. Someone has to run that loop, whether `pg_partman`, an operator's own cron, or pgpm, so
+once you adopt, pgpm stays on as a standing companion, the way `pg_partman` would. Less Houdini than
+Merlin: not a travelling act that performs the trick and departs, but a resident steward who keeps
+the kingdom's partitions in order long after the coronation. That standing role is also why pgpm,
+not the operator, is the natural place to absorb the awkward edges of this corner of PostgreSQL, the
+incoming-foreign-key dance of section 8 among them. If a future PostgreSQL ever folded scheduled
+partition management into core (which would first want something like `pg_cron` in core, long
+discussed among its hackers), the standing job would vanish and the steward, pgpm or `pg_partman`
+alike, could step off the stage. On the versions pgpm targets, 15 through 18 and, on the current
+trajectory, 19, that day has not come: future partitions do not make themselves, and it might as
+well be pgpm that makes them.
+
 ## 7. Modes: one dial, three settings
 
 The operator controls two knobs the model exposes: **the supply** (whether to clear the field of
@@ -196,12 +213,19 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   or by an explicit `restore_incoming_fks(parent)` the operator runs after `drain_all`. Gating is
   exact: this path applies only when the FK's referenced columns equal the parent's surviving unique
   key; anything else (a different referenced column, a multi-column referenced key, the widening
-  `time` case) falls back to the composite-FK recovery. The simpler-looking alternatives do not hold
-  up: a `DEFERRABLE INITIALLY DEFERRED` FK does not help, because the child is attached in a *later*
-  transaction than the move, not the same commit; moving rows only between *attached* partitions hits
-  a chicken-and-egg (you cannot attach a partition for `[lo,hi)` while the default still holds rows in
-  that range); and draining a whole range in one deferred transaction defeats the paced design for
-  large ranges. Open questions for the test matrix (PG 15 to 18): non-`NO ACTION` referential actions
+  `time` case) falls back to the composite-FK recovery. This is a PostgreSQL compositional
+  gap, not a pgpm shortcut: declarative partitioning offers FKs that reference a partitioned parent
+  and a `DEFAULT` that accumulates rows, but no online, FK-preserving way to relocate those rows into
+  dedicated partitions on *any* version pgpm targets. Every alternative was tested and fails. There is
+  no in-place `SPLIT PARTITION` (the SPLIT/MERGE feature was reverted before PG 17 and is still absent
+  in 17 and 18, verified). `ATTACH`-first is a chicken-and-egg: you cannot attach a partition for
+  `[lo,hi)` while the `DEFAULT` still holds rows in that range. And a `DEFERRABLE INITIALLY DEFERRED`
+  FK does not rescue it: even a single transaction that moves the row into the child and attaches it
+  before commit still fails the deferred check (verified on PG 17), because the row's reappearance via
+  a mid-transaction attach of a formerly-standalone child does not satisfy the queued check. So the
+  unattached-intermediate move is the only online drain, and dropping the FK around it is the only way
+  to keep that move legal, which is exactly what a vanilla operator converting a table with incoming
+  FKs is already forced to do by hand. These negative results hold on PG 17 and 18. Open questions for the test matrix (PG 15 to 18): non-`NO ACTION` referential actions
   (`CASCADE` / `RESTRICT` / `SET NULL`) and `DEFERRABLE` FKs, self-referential FKs, several incoming
   FKs on one parent, the `VALIDATE` scan cost on a large referencing table, and the contract when a
   drain never completes (the FK stays dropped and recorded, surfaced by `status`).
