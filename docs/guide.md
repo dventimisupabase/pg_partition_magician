@@ -222,10 +222,25 @@ the new parent's `id`: no composite key, no denormalization.
 
 There is one mechanical wrinkle. The drain moves the closed tail through a standalone, not-yet-attached
 child table, so a referenced row is briefly outside the parent while it is moved, which a `NO ACTION`
-FK rejects. The FK therefore cannot ride through the conversion in place. The clean path today is:
-drop and record the FK at adopt (the `'drop'` mode below), let the drain finish, then re-add the same
-single-column FK against the new parent (`NOT VALID` + `VALIDATE`); the referencing table is untouched.
-Automating this is a planned feature (see DESIGN.md section 8).
+FK rejects. The FK therefore cannot ride through the conversion in place: it is dropped for the
+duration and re-added against the new parent once the drain is done.
+
+`p_incoming_fks => 'preserve'` automates this. At adopt it records and drops each eligible incoming FK
+(eligible = the parent will keep a unique key on exactly the FK's referenced columns, which holds on
+the id/uuidv7 happy path); the referencing table is otherwise untouched. Once the closed tail has
+fully drained, `pgpm.restore_incoming_fks(parent)` re-adds each FK against the new parent
+(`NOT VALID` + `VALIDATE`). `maintenance` calls `restore_incoming_fks` automatically, so on the
+scheduled path you do nothing; on the synchronous path, call it yourself after `drain_all`:
+
+```sql
+select pgpm.adopt_by_id('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
+select pgpm.drain_all('public.events', p_include_open => true);
+select pgpm.restore_incoming_fks('public.events');   -- maintenance does this for you on the cron path
+```
+
+`restore_incoming_fks` is a no-op until the drain is quiescent (no closed rows in the DEFAULT, no
+in-flight child partition), so it is safe to call early or repeatedly. `'preserve'` refuses up front
+if any incoming FK is not eligible (the widening time case below); use `'drop'` for those.
 
 ### When you partition on a different column (time)
 

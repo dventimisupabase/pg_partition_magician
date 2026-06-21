@@ -53,7 +53,7 @@ parent's `regclass`.
 | `p_drain_batch` | Default rows moved per drain microbatch (see `drain_step`). |
 | `p_anchor` | Grid origin for fixed-duration intervals. Calendar-aligned months ignore it. |
 | `p_paused` | When `true` (default), register but do not let scheduled `maintenance` act until you unpause. |
-| `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'drop'` drops and records them. See [incoming FKs](guide.md#incoming-foreign-keys). |
+| `p_incoming_fks` | How to handle FKs that other tables have pointing at `p_parent`. `'error'` (default) refuses; `'drop'` drops and records them for composite-FK rebuild (`generate_fk_recovery`); `'preserve'` records and drops them but marks them for verbatim restoration against the new parent (`restore_incoming_fks`), valid only when every incoming FK is happy-path eligible (its referenced columns equal the parent's surviving unique key). See [incoming FKs](guide.md#incoming-foreign-keys). |
 
 What it does: renames the live table to `<name>_default`, creates a partitioned parent under the
 original name, and attaches the old table as the `DEFAULT` partition. No rows move. The primary key
@@ -270,6 +270,21 @@ that bridge.
 
 ## Foreign-key helpers
 
+### `pgpm.restore_incoming_fks`
+
+```sql
+pgpm.restore_incoming_fks(p_parent regclass) returns int
+```
+
+Re-adds the incoming FKs that `adopt(..., p_incoming_fks => 'preserve')` recorded (the `restorable`
+rows of [`pgpm.dropped_fk`](#pgpmdropped_fk)), pointing them back at the new partitioned parent with
+`NOT VALID` + `VALIDATE` (so the re-add is online). Returns the number restored. It self-gates on
+quiescence: a no-op (returns 0) while the closed tail still has rows or an in-flight child partition
+exists, because the drain moves rows through an unattached child that a `NO ACTION` FK would reject.
+Safe to call early or repeatedly; `maintenance` calls it automatically once the drain is idle, so you
+only call it by hand on the synchronous `drain_all` path. See the
+[guide](guide.md#incoming-foreign-keys).
+
 ### `pgpm.generate_fk_recovery`
 
 ```sql
@@ -325,6 +340,10 @@ Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g
 
 ### `pgpm.dropped_fk`
 
-Incoming FKs dropped by `adopt(..., p_incoming_fks => 'drop')`, kept for reconstruction. Columns:
-`id`, `parent_table`, `referencing_table`, `constraint_name`, `definition`, `referencing_columns`,
-`referenced_columns`, `dropped_at`. Feed it to [`generate_fk_recovery`](#pgpmgenerate_fk_recovery).
+Incoming FKs dropped by `adopt(..., p_incoming_fks => 'drop' | 'preserve')`, kept for
+reconstruction. Columns: `id`, `parent_table`, `referencing_table`, `constraint_name`, `definition`,
+`referencing_columns`, `referenced_columns`, `restorable`, `dropped_at`. When `restorable` is true
+(the `'preserve'` mode), the FK is re-added verbatim against the parent by
+[`restore_incoming_fks`](#pgpmrestore_incoming_fks) and that row is consumed; when false (the
+`'drop'` mode), feed it to [`generate_fk_recovery`](#pgpmgenerate_fk_recovery) for the composite
+rebuild.

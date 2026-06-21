@@ -228,7 +228,14 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   FKs is already forced to do by hand. These negative results hold on PG 17 and 18. Open questions for the test matrix (PG 15 to 18): non-`NO ACTION` referential actions
   (`CASCADE` / `RESTRICT` / `SET NULL`) and `DEFERRABLE` FKs, self-referential FKs, several incoming
   FKs on one parent, the `VALIDATE` scan cost on a large referencing table, and the contract when a
-  drain never completes (the FK stays dropped and recorded, surfaced by `status`).
+  drain never completes (the FK stays dropped and recorded, surfaced by `status`). **Implemented**:
+  `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at adopt (and refuses the
+  widening case), and `pgpm.restore_incoming_fks(parent)` re-adds them against the new parent once the
+  drain is quiescent; `maintenance` calls it automatically. Tests in `tests/19`-`tests/21`,
+  cross-version PG 15 to 18. Single and multiple `NO ACTION` FKs on the id/uuidv7 happy path are
+  covered; non-`NO ACTION` referential actions, `DEFERRABLE`, and self-referential FKs remain future
+  work, as does re-dropping a restored FK when a later premake-miss drain must move referenced rows
+  (today that drain simply defers, surfaced by `check_default`).
 - **Retention on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
