@@ -1,5 +1,5 @@
 -- Verifies the uuidv7 sanity heuristic: genuine time-ordered uuids pass, random
--- (v4) columns are flagged, and adopt warns-but-proceeds on a suspect column.
+-- (v4) columns are flagged, and transmute warns-but-proceeds on a suspect column.
 create extension if not exists pgtap;
 
 begin;
@@ -21,10 +21,10 @@ select cmp_ok(
   'random (v4) column is flagged by the sanity check'
 );
 
--- warn-by-default: adopt still proceeds on the suspect column (operator's call)
+-- warn-by-default: transmute still proceeds on the suspect column (operator's call)
 select lives_ok(
-  $$ select pgpm.adopt('public.rnd_uuid', 'id', interval '1 month') $$,
-  'adopt (uuidv7 inferred from the uuid column) warns but proceeds on a random-uuid column'
+  $$ select pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
+  'transmute (uuidv7 inferred from the uuid column) warns but proceeds on a random-uuid column'
 );
 
 select * from finish();

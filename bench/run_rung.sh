@@ -45,7 +45,7 @@ fi
 export BENCH_MONTHS=2 BENCH_GEN_JOBS=8 BENCH_CHUNK=2000000
 export BENCH_CLIENTS=16 BENCH_JOBS=8 BENCH_OPS=10
 export BENCH_OBSERVE_INTERVAL=10
-export BENCH_PGFR=1   # no PK pre-build: adopt never rewrites the PK, so the cutover is always metadata-only
+export BENCH_PGFR=1   # no PK pre-build: transmute never rewrites the PK, so the cutover is always metadata-only
 
 # ---- per-rung scale (see bench/SIZE_LADDER.md) ----
 case "$RUNG" in
@@ -60,7 +60,7 @@ esac
 case "$PROFILE" in
   stress) # Pre-freeze too: VACUUM (FREEZE, ANALYZE) after the bulk load settles the post-load
           # autovacuum/FPI storm out of the measurement window, so the convert-phase latency reflects
-          # the drain against a steady-state table (the realistic adopt) rather than load aftermath.
+          # the drain against a steady-state table (the realistic transmute) rather than load aftermath.
           # Without it, post-bulk-load autovacuum on the 40M default drove forced-checkpoint I/O freezes
           # that dominated the tail and had nothing to do with the drain (see bench-gentle-window confound).
           export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle BENCH_PREFREEZE=1 ;;

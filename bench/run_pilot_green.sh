@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pilot run of the pure-observer harness against the provisioned green 2xlarge.
 # Small scale on purpose: validate the full pipeline end-to-end (install, pg_cron,
-# online PK build, online adopt, pgpm self-driven drain, settle detection, pgfr,
+# online PK build, online transmute, pgpm self-driven drain, settle detection, pgfr,
 # WAL/checkpoint gauges, report) before any at-scale run. NOT committed.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ set +a
 # A pilot exists to validate the PIPELINE quickly, not to test at scale. Keep the
 # closed tail tiny so the whole run is ~5 min and we can iterate fast and often:
 # 3M rows over 2 months -> ~1.5M-row closed tail -> ~1-2 min drain. Concurrency
-# (16 clients) is kept high so adopt/attain/drain still run under real contention.
+# (16 clients) is kept high so transmute/attain/drain still run under real contention.
 # (For an at-scale confirmation run, bump BENCH_ROWS to 40M+ and the caps below.)
 export BENCH_ROWS=3000000         # ~1 GB; ~1.5M rows in the closed tail to drain
 export BENCH_MONTHS=2             # current (open) + prior (closed)
@@ -28,7 +28,7 @@ export BENCH_OPS=10               # cached -> a few ms/txn, safely under stateme
 export BENCH_PHASE_SECS=45        # baseline / post (short -- enough for stable tps)
 
 # ---- conversion (pgpm self-drives; harness only observes) ----
-# (no PK pre-build: adopt never rewrites the PK, so the cutover is always metadata-only)
+# (no PK pre-build: transmute never rewrites the PK, so the cutover is always metadata-only)
 export BENCH_DRAIN_BATCH=100000   # rows per drain_step (~15 batches for the tail)
 export BENCH_MAINT_INTERVAL='2 seconds'   # pg_cron tick for pgpm.maintenance
 export BENCH_OBSERVE_INTERVAL=10

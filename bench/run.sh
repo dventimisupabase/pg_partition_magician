@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # At-scale load test for pg_partition_magician.
 #
-# pgpm is self-driving: you call adopt() once and pgpm's own pg_cron maintenance
+# pgpm is self-driving: you call transmute() once and pgpm's own pg_cron maintenance
 # attains + drains the default autonomously, inside the database. So this harness only
 # (1) generates the bulk data SERVER-SIDE, (2) drives an ambient OLTP workload that has
-# nothing to do with pgpm, (3) triggers the conversion once (adopt + schedule
+# nothing to do with pgpm, (3) triggers the conversion once (transmute + schedule
 # pgpm.maintenance) and marks the phase boundaries, and (4) writes a report. It never
 # drives drain_step/attain itself; the conversion runs server-side.
 #
@@ -41,10 +41,10 @@ BENCH_CLIENTS="${BENCH_CLIENTS:-16}"        # pgbench concurrent clients
 BENCH_JOBS="${BENCH_JOBS:-4}"               # pgbench worker threads
 BENCH_OPS="${BENCH_OPS:-50}"                # server-side ops per workload_step call
 BENCH_PHASE_SECS="${BENCH_PHASE_SECS:-120}" # per-phase load duration (baseline/post)
-BENCH_ADOPT_WARM="${BENCH_ADOPT_WARM:-15}"  # load lead-in before firing adopt
+BENCH_TRANSMUTE_WARM="${BENCH_TRANSMUTE_WARM:-15}"  # load lead-in before firing transmute
 BENCH_MAX_FAIL_PCT="${BENCH_MAX_FAIL_PCT:-5}"  # abort if baseline workload exceeds this failure % (mis-calibrated BENCH_OPS)
 
-BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step (configured on adopt; pgpm uses it)
+BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step (configured on transmute; pgpm uses it)
 BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the observation window
 BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for pgpm.maintenance (pgpm self-drives the drain)
 BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm drains
@@ -57,7 +57,7 @@ BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # drain is "settled" 
 #              benchmark window, and it doesn't need to. Warm up until the drain is steadily running,
 #              then measure the workload for a fixed window and compare it to baseline -- the question
 #              is "is the drain unnoticeable?", not "is it done yet?". Convert metrics are restricted
-#              to the measurement window (the one-time adopt cutover is excluded by the warm-up).
+#              to the measurement window (the one-time transmute cutover is excluded by the warm-up).
 BENCH_OBSERVE_MODE="${BENCH_OBSERVE_MODE:-settle}"          # settle | window
 BENCH_CONVERT_WARMUP_SECS="${BENCH_CONVERT_WARMUP_SECS:-30}"  # window mode: let the drain reach steady state before measuring
 BENCH_CONVERT_WINDOW_SECS="${BENCH_CONVERT_WINDOW_SECS:-300}" # window mode: measure the workload for this long
@@ -79,7 +79,7 @@ BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
 
 # TCP keepalives on every connection (libpq defaults them OFF). Synchronous server-side calls
-# sit idle ON THE WIRE while the backend works -- adopt's cutover (metadata-only),
+# sit idle ON THE WIRE while the backend works -- transmute's cutover (metadata-only),
 # the bulk generators, the convert-phase pgbench between rows. Over a NAT'd
 # path (e.g. Tailscale to a managed endpoint) an idle flow gets reaped, killing the call mid-way
 # (observed: "server closed the connection unexpectedly" during the ~17s build_pk call).
@@ -103,7 +103,7 @@ trap cleanup EXIT INT TERM
 # Managed Postgres (e.g. Supabase) injects a per-connection statement_timeout
 # (2min) that ALTER DATABASE/ROLE can't override and the pooler drops startup
 # `options`, so disable it (+ lock_timeout) in-session on every connection. The
-# long statements here -- bulk generate, adopt's index build, the drain's
+# long statements here -- bulk generate, transmute's index build, the drain's
 # VALIDATE CONSTRAINT scan, the final VACUUM -- all exceed a 2min cap. The SETs
 # go in their OWN -c so the actual command runs in its own implicit transaction:
 # folding them into one -c string would wrap everything in a single transaction,
@@ -338,19 +338,19 @@ echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_si
 
 # ---- 3. baseline (unpartitioned, under load) -------------------------------
 run_phase baseline "$BENCH_PHASE_SECS"
-assert_workload_healthy baseline   # bail now if the workload is timing out, before adopt/drain/post
+assert_workload_healthy baseline   # bail now if the workload is timing out, before transmute/drain/post
 
 # ---- 4. conversion: trigger pgpm ONCE, then OBSERVE it self-drive -----------
 # The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator
-# does -- fire adopt() once (unpaused) and schedule pgpm.maintenance on pg_cron -- and then
+# does -- fire transmute() once (unpaused) and schedule pgpm.maintenance on pg_cron -- and then
 # pgpm's OWN cron jobs attain + drain the default autonomously, inside the database. The
 # harness only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the
 # drain settles. Nothing here calls drain_step or attain; a dropped observer connection
 # can't stop the conversion, because the conversion isn't running on this connection.
-say "conversion: trigger pgpm.adopt, then observe pgpm self-drive (pg_cron) under load"
+say "conversion: trigger pgpm.transmute, then observe pgpm self-drive (pg_cron) under load"
 pgss_reset
 rm -f "$RESULTS/pgb_convert".*
-# one continuous ambient workload spanning the whole conversion (prep + adopt + drain).
+# one continuous ambient workload spanning the whole conversion (prep + transmute + drain).
 # Background pgbench DIRECTLY (not inside a `( ... ) &` subshell): $! must be the pgbench pid
 # itself, or cleanup() kills only the subshell wrapper and pgbench is reparented and orphaned --
 # left hammering the server (holding connections/locks) and corrupting the next run.
@@ -365,14 +365,14 @@ fi
 load_pid=$!; BG_PIDS+=("$load_pid")
 convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
 
-# 4. the single operator trigger: adopt() unpaused. pgpm takes it from here. No PK pre-build is
+# 4. the single operator trigger: transmute() unpaused. pgpm takes it from here. No PK pre-build is
 # needed any more -- pgpm never rewrites the PK (the partition key leads the PK, so it is reused in
 # place), so the cutover is always metadata-only. See DESIGN.md section 8.
-echo "  firing pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
-adopt_t0=$(q "select extract(epoch from clock_timestamp())")
-q "select pgpm.adopt('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_ATTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
-adopt_t1=$(q "select extract(epoch from clock_timestamp())")
-awk -v a="$adopt_t0" -v b="$adopt_t1" 'BEGIN{printf "  adopt() returned in %.1fs (metadata cutover)\n", b-a}'
+echo "  firing pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
+transmute_t0=$(q "select extract(epoch from clock_timestamp())")
+q "select pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_ATTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+transmute_t1=$(q "select extract(epoch from clock_timestamp())")
+awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 
 # 4b. adaptive feathering (DESIGN.md sec 8, mode 2): let the drain ride its budget against checkpoint
 #     pressure (AIMD) instead of the fixed drain_batch. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
@@ -406,7 +406,7 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 #     for BENCH_DRAIN_IDLE_SECS (closed tail fully drained). window mode -> warm up until the
 #     drain is steadily running (>=1 op and BENCH_CONVERT_WARMUP_SECS elapsed), then measure for
 #     BENCH_CONVERT_WINDOW_SECS without waiting for completion; convert metrics are restricted to
-#     [conv_win_lo,conv_win_hi] so the one-time adopt cutover is excluded. A failed poll is
+#     [conv_win_lo,conv_win_hi] so the one-time transmute cutover is excluded. A failed poll is
 #     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
 #     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
@@ -516,7 +516,7 @@ echo "  ambient-workload latency through the conversion: $(cat "$RESULTS/convert
 
 # ---- 5. post (partitioned, under load) -------------------------------------
 # Pure observer: no operator VACUUM here. pgpm tuned autovacuum aggressively on the
-# default at adopt, so post observes the real post-conversion steady state as it settles.
+# default at transmute, so post observes the real post-conversion steady state as it settles.
 run_phase post "$BENCH_PHASE_SECS"
 
 # ---- 7. report -------------------------------------------------------------

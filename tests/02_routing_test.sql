@@ -4,7 +4,7 @@ create extension if not exists pgtap;
 begin;
 select plan(2);
 
--- A future-dated insert falls in a partition premade by adopt()/maintenance.
+-- A future-dated insert falls in a partition premade by transmute()/maintenance.
 insert into public.messages (tenant_id, created_at, body)
 values (
   '00000000-0000-0000-0000-0000000000a1',

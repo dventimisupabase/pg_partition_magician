@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
-- **The `adopt` redesign: one function, metadata-only, never rewrites the primary key.** The three
-  entry points (`adopt` / `adopt_by_id` / `adopt_by_uuidv7`) collapse into a single overloaded `adopt`:
+- **The `transmute` redesign: one function, metadata-only, never rewrites the primary key.** The three
+  entry points (`transmute` / `transmute_by_id` / `transmute_by_uuidv7`) collapse into a single overloaded `transmute`:
   a `bigint` width selects the integer grid, an `interval` width the time grid, with `time` vs `uuidv7`
-  inferred from the control column's type. Bare interval literals must cast: `adopt(t, c, interval '1
-  month')`. `adopt` no longer drops or rebuilds the primary key, so the cutover is always metadata-only:
+  inferred from the control column's type. Bare interval literals must cast: `transmute(t, c, interval '1
+  month')`. `transmute` no longer drops or rebuilds the primary key, so the cutover is always metadata-only:
   it reuses the existing PK when the control column is a member of it (Postgres requires only that a
   partitioned PK include the partition key, not lead it, so `PK (tenant_id, id)` partitioned by `id`
   qualifies), works with a no-PK table, and refuses (with a suggested migration) a table whose PK
@@ -14,8 +14,8 @@
   as the data model. Forbidding PK rewrites removed `build_pk_concurrently`, the composite-FK recovery
   path (`generate_fk_recovery`, the `'drop'` incoming-FK mode, the `dropped_fk` composite columns), and
   the build-path complexity; every incoming FK is now the `preserve` path. (tests/25)
-- `adopt(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
-  keep incoming foreign keys across the conversion. Since `adopt` never rewrites the PK, the referenced
+- `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
+  keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in
   `pgpm.dropped_fk`, and re-adds it verbatim against the new parent (`NOT VALID` + `VALIDATE`) once the
   drain is idle. `maintenance` manages the lifecycle: a managed FK is live only while the closed tail is
@@ -24,10 +24,10 @@
   referencing rows (`CASCADE` / `SET NULL`). Referential actions, `DEFERRABLE`-ness, and self-referential
   FKs are preserved (the self-ref re-add is validating, not online). `pgpm.dropped_fk.restored_at` tracks
   the live/dropped state. (tests/19-24)
-- `adopt` no longer runs `attain` inside its transaction. Attaching a partition to a
+- `transmute` no longer runs `attain` inside its transaction. Attaching a partition to a
   parent whose DEFAULT already holds data makes Postgres scan the default, and inside
-  adopt's `ACCESS EXCLUSIVE` transaction that scan blocked all access for its duration
-  (~minutes per premade partition at scale). `adopt` now does the metadata-only cutover
+  transmute's `ACCESS EXCLUSIVE` transaction that scan blocked all access for its duration
+  (~minutes per premade partition at scale). `transmute` now does the metadata-only cutover
   only (a fresh parent with just the DEFAULT attached scans nothing), so it stays online
   even on a 100GB+ table. Run `pgpm.attain()` / `pgpm.maintenance()` afterward to build
   the future partitions online (their `VALIDATE` scans run under a non-blocking lock).
@@ -52,15 +52,15 @@
   batch) work, and while the default is not all-visible mid-drain the planner seq-scans the
   range each step (a sequential-scan storm that dominates I/O at scale). `EXISTS` stops at the
   first row (index scan), which is all the drain needs to decide between draining and attaching.
-- `adopt` no longer scans the table to advance identity sequences. After the cutover it advances
-  each identity sequence past the largest existing value -- but adopt has just swapped the PK to
+- `transmute` no longer scans the table to advance identity sequences. After the cutover it advances
+  each identity sequence past the largest existing value -- but transmute has just swapped the PK to
   `(control, id)`, leaving no id-leading index, so the old `select max(id)` seq-scanned the whole
-  DEFAULT under adopt's `ACCESS EXCLUSIVE` lock: O(rows), a multi-minute blocking step at 100GB+
-  scale that undercut the metadata-only cutover. `adopt` now captures `max(identity)` up front --
+  DEFAULT under transmute's `ACCESS EXCLUSIVE` lock: O(rows), a multi-minute blocking step at 100GB+
+  scale that undercut the metadata-only cutover. `transmute` now captures `max(identity)` up front --
   while the table's original id index still exists, so it is an index lookup -- and reuses it to
   advance the (freshly recreated) parent sequence. The cutover stays metadata-only at any size.
-- `adopt` reuses the existing PK when the partition key already covers it. For `id` / `uuidv7`
-  tables the computed PK columns equal the existing PK, so adopt no longer drops and rebuilds an
+- `transmute` reuses the existing PK when the partition key already covers it. For `id` / `uuidv7`
+  tables the computed PK columns equal the existing PK, so transmute no longer drops and rebuilds an
   identical index -- it reuses the index in place. In the common case the one-time setup cost center
   collapses to zero and only the drain remains. Flat (single-digit ms) to ~40M rows. (tests/15)
 - `drain_max_blocks` config: block-budgeted drain batching. Batching by a fixed row count is unsafe
@@ -72,12 +72,12 @@
   check, the tier-2 safety gate for a future key-to-time retention bridge (calendar retention on an
   id-partitioned table). It samples whether the id and timestamp rise together and reports the
   fraction in order, analogous to `check_uuidv7`'s plausibility sampling. (tests/16)
-- `adopt` now refuses up front when an orphaned child-partition table exists. A drain creates each
+- `transmute` now refuses up front when an orphaned child-partition table exists. A drain creates each
   child as a standalone table (`CREATE TABLE ... LIKE`) and ATTACHes it only at the end of that
   child's drain, so an interrupted drain leaves an un-attached child -- which `DROP TABLE <parent>
-  CASCADE` does not remove (no dependency on the parent). Re-adopting the recreated table would let
+  CASCADE` does not remove (no dependency on the parent). Re-transmuting the recreated table would let
   the next drain reuse the orphan by name and collide on its stale keys, surfacing as a cryptic
-  mid-drain "duplicate key" deep inside `drain_step`. `adopt` now detects any standalone
+  mid-drain "duplicate key" deep inside `drain_step`. `transmute` now detects any standalone
   (un-attached) table whose name matches this parent's child-partition naming and raises a clear,
   actionable error instead. (tests/18)
 
@@ -87,7 +87,7 @@ Initial release of pg_partition_magician.
 
 - Pure-SQL online RANGE-partition manager (schema `pgpm`); only runtime dependency is pg_cron.
 - Partition dimensions: `time`, `id` (bigint/numeric, incl. Snowflake-style), `uuidv7`/ULID-as-uuid. float/double rejected.
-- `adopt` / `adopt_by_id` / `adopt_by_uuidv7`: online conversion of an existing table (attach as DEFAULT, no rebuild of the default's PK index).
+- `transmute` / `transmute_by_id` / `transmute_by_uuidv7`: online conversion of an existing table (attach as DEFAULT, no rebuild of the default's PK index).
 - attain ahead of the write frontier; paced microbatch drain of the DEFAULT's closed tail (scan-skip attach); retain; maintenance via pg_cron.
 - Incoming-FK handling: refuse by default, opt-in drop+record, and `generate_fk_recovery()`.
 - Three install channels (psql / bundle / dbdev-TLE) built from one source; PG 15-18 channel test matrix; 53 pgTAP tests.

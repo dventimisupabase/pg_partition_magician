@@ -33,9 +33,9 @@ This file is my running journal; the final state is summarized at the bottom.
 
 - Verified the PG mechanism empirically: parent `ADD PRIMARY KEY` reconciles the default's existing
   PK index in place (relfilenode/oid preserved, no rebuild). Holds on PG17.
-- TDD: added `tests/15_pk_reuse_test.sql` (asserts the PK index oid is preserved across adopt).
+- TDD: added `tests/15_pk_reuse_test.sql` (asserts the PK index oid is preserved across transmute).
   RED on old code (rebuilt: oid changed), GREEN after the change.
-- Change in `_adopt`: compute `v_pk_reuse := (v_pkcols = v_oldpk)` (new PK equals old PK in order);
+- Change in `_transmute`: compute `v_pk_reuse := (v_pkcols = v_oldpk)` (new PK equals old PK in order);
   when true, skip step 2 (drop old PK) and step 4 (build/promote), keep + reuse the existing index.
   Step 8's parent PK reconciles it (unchanged). The setup cost center collapses to zero in this case.
 - Next: full pgtap suite PG17 (regression), then cross-version 15/16/18, then commit, then ladder.
@@ -74,7 +74,7 @@ This file is my running journal; the final state is summarized at the bottom.
   control-loop problem, not safe to blind-implement overnight. Documented, not faked.
 - Supabase at-scale LADDER: NOT run. Prioritized implementation + cross-version pgtap (the thorough
   correctness signal) and did not provision a fresh paid project unattended for a confirmatory
-  at-scale pass. The scale benefits follow from the unit proofs (reuse-PK = no rebuild = fast adopt;
+  at-scale pass. The scale benefits follow from the unit proofs (reuse-PK = no rebuild = fast transmute;
   block budget = bounded batch). Ready to run with you around.
 
 ### Final state (morning)
@@ -88,23 +88,23 @@ This file is my running journal; the final state is summarized at the bottom.
   by design); window estimator (skipped). DESIGN.md sec 8 should later be updated to mark F1/F2/F3
   implemented (left as-is for now so this branch is pure feature+test).
 
-### 2026-06-21: F2 "dup-key at 2M-wide" diagnosed -- NOT a drain bug; adopt-time guard added
+### 2026-06-21: F2 "dup-key at 2M-wide" diagnosed -- NOT a drain bug; transmute-time guard added
 
 - A `drain_step` at 2M wide rows (`repeat('x',2000)` storage plain, `drain_max_blocks=50` -> 149-row
   batches) failed with `duplicate key ... Key (id)=(30)` on `<part>_pkey`. Reproduced on the local
   Docker pg17 container (no Supabase needed).
 - Isolation (the critical un-run test): ran the SAME 149-row batch via the plain row path (no block
   budget, `drain_batch=150`) vs the block-budget path. Same-batch-size A/B. Result: whichever variant
-  ran SECOND on a re-`adopt`ed table failed; whichever ran FIRST on a pristine fixture was clean.
+  ran SECOND on a re-`transmute`ed table failed; whichever ran FIRST on a pristine fixture was clean.
   Block budget exonerated.
 - Root cause: `drain_step` creates each child partition as a standalone table (`CREATE TABLE ... LIKE`)
   and ATTACHes it only at the END of that child's drain. While mid-drain it is un-attached, so
   `DROP TABLE <parent> CASCADE` (my fixture rebuild) does NOT drop it -- an un-attached child has no
-  dependency on the parent. The next campaign re-`adopt`ed the recreated table, the next drain found
+  dependency on the parent. The next campaign re-`transmute`ed the recreated table, the next drain found
   the orphan by name and re-INSERTed rows whose ids already lived in it -> dup-key. Proof: dropping
   the orphan made the exact failing config drain cleanly (149/step, overlap=0), and running the
   block-budget variant FIRST on a pristine fixture was clean. F2's logic is correct and shippable.
-- Fix (adopt-time guard): `_adopt` now refuses when a standalone (un-attached) table matching this
+- Fix (transmute-time guard): `_transmute` now refuses when a standalone (un-attached) table matching this
   parent's child-partition naming exists, with an actionable "drop the orphan" message -- turning a
   cryptic mid-drain dup-key into a clear up-front error. TDD via tests/18 (RED->GREEN). Full suite
   green PG 15/16/17/18 x psql/bundle/dbdev (18 files / 79 tests), clean uninstall.
@@ -116,7 +116,7 @@ This file is my running journal; the final state is summarized at the bottom.
 
 Ran the full `bench/SIZE_LADDER.md` ladder, stress profile, on a fresh 2XL green project
 (`dtpxdpabdkxykypteelm`, 100GB gp3/12k IOPS) via the Supavisor session-mode pooler, post the
-adopt redesign. `bench/run_rung.sh R0|R1|R2|R3 stress`, graduating only on a clean rung. Result:
+transmute redesign. `bench/run_rung.sh R0|R1|R2|R3 stress`, graduating only on a clean rung. Result:
 **correctness GREEN at all four rungs.**
 
 | rung | rows | events size | drain (moves / rows moved / closed tail) | workload fails | latency baseline -> convert -> post |
@@ -126,7 +126,7 @@ adopt redesign. `bench/run_rung.sh R0|R1|R2|R3 stress`, graduating only on a cle
 | R2 | 10M | 5.4 GB | 67 / 6,586,876 / **0** | 0 | 80.7 -> 92.1 -> 79.2 ms |
 | R3 | 40M | 21 GB | 177 / 26,351,213 / **0** | 0 | 94.3 -> 142.7 -> 92.7 ms |
 
-Invariants that held at every rung: adopt is always a metadata-only cutover (the redesign removed
+Invariants that held at every rung: transmute is always a metadata-only cutover (the redesign removed
 the old O(rows) `max(id)` sequence-reset, since it never rewrites the PK); the self-driven drain
 always settles the closed tail to **exactly 0**; **zero** workload statements errored (no
 ERROR/FATAL/ABORT anywhere); post-phase latency fully recovers to baseline. The redesign holds

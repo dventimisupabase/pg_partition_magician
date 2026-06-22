@@ -1,7 +1,7 @@
 -- Uninstall pg_partition_magician.
 --
 -- Removes the MANAGER (schema pgpm) and its scheduled maintenance, but NOT your
--- data: tables that were adopted remain partitioned tables; their partitions and
+-- data: tables that were transmuted remain partitioned tables; their partitions and
 -- rows are untouched. Only the tooling (config, registry, functions, views, the
 -- pg_cron job) goes away.
 --

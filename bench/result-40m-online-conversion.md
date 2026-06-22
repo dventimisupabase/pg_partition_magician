@@ -10,14 +10,14 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
 
 - **40 M rows**, spread over the last 2 months (~Apr 20 → Jun 20) → ~12 GB heap+indexes
   unpartitioned. Generated server-side by 8 parallel sessions.
-- Conversion: `build_pk_concurrently` (online PK) → `adopt(p_paused => false)` →
+- Conversion: `build_pk_concurrently` (online PK) → `transmute(p_paused => false)` →
   `pgpm.maintenance` scheduled on pg_cron every 2 s. pgpm self-drives attain + drain;
   the harness only observes. Drain batch 150 000.
 
 ## Result: converted online, workload never stopped
 
 - **Online PK build: 51.8 s** (`CREATE INDEX CONCURRENTLY` via a pg_cron worker).
-- **`adopt()`: 8.3 s metadata cutover**, reused the pre-built index (no in-txn rebuild).
+- **`transmute()`: 8.3 s metadata cutover**, reused the pre-built index (no in-txn rebuild).
 - **Drain: 27.4 M closed-tail rows moved** in 184 microbatches, attaching 2 closed
   partitions; default drained to the open-month residue (`closed_rows = 0`). 6 partitions
   total (default + 3 premade-ahead + 2 drained). **40 M rows conserved.**

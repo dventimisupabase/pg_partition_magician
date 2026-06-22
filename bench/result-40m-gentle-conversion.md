@@ -19,10 +19,10 @@ PostgreSQL 17.6, staging "green"). Same engine and same 40M-row workload as the
 - **39.9 M rows**, ~2 months of history → ~12 GB heap+indexes unpartitioned. Generated server-side
   by 8 parallel sessions, then **`VACUUM (FREEZE, ANALYZE)`** so the post-bulk-load freeze WAL
   settles *before* measurement (`BENCH_PREFREEZE=1`; see "I/O attribution").
-- Conversion: `build_pk_concurrently` (online PK) → `adopt()` → `pgpm.maintenance` on pg_cron
+- Conversion: `build_pk_concurrently` (online PK) → `transmute()` → `pgpm.maintenance` on pg_cron
   **every 20 s**, **drain batch 20 000**. pgpm self-drives attain + drain; the harness observes.
 - Observe mode: **window**, 60 s warm-up to steady-state draining, then a 300 s measurement window.
-  Convert metrics are restricted to that window (the one-time adopt cutover is excluded).
+  Convert metrics are restricted to that window (the one-time transmute cutover is excluded).
 - **Connection path: Supavisor session-mode pooler (port 5432), `BENCH_USE_POOLER=1`**, over the
   direct `.red`/Tailscale path the workload connection dropped mid-window on every at-scale run, so
   the long window could never be captured. The public pooler path holds it (see "Connection path").
@@ -48,7 +48,7 @@ the live insert workload, exactly as intended). Closed tail intentionally left d
 - `build_pk_concurrently`: online PK index built in **322.9 s** (no table lock; workload unaffected).
   Slow here because the instance's EBS burst was depleted from a day of runs, an environment
   confound that lengthens the *one-time* index build but does not touch the drain-window verdict.
-- `adopt()`: **1.5 s metadata cutover** (reused the pre-built index; no in-txn rebuild).
+- `transmute()`: **1.5 s metadata cutover** (reused the pre-built index; no in-txn rebuild).
 
 This corroborates a clean R0 over the same path (convert p50 75.82 ms = baseline 75.80 ms,
 n = 28 805) and an earlier R3 over the flaky path whose window survived long enough to aggregate
@@ -61,7 +61,7 @@ pgfr (server-side, continuous) over the window flagged 2 forced checkpoints, a c
 
 1. **Temp spill is the one-time PK index build.** `convert.temp.csv` attributes all 1.05 GB to a
    single statement, `create unique index concurrently … events_pgpm_pkey_pre (created_at, id)`
-   (`build_pk_concurrently` sorting ~40M rows during adopt **prep**). The drain's 20k-row batches
+   (`build_pk_concurrently` sorting ~40M rows during transmute **prep**). The drain's 20k-row batches
    fit in `work_mem` and spill nothing. (Identical attribution on the `.red` run, reproducible.)
 2. **Forced checkpoints are rate-independent → not the drain.** Gentle R0 uses the *identical* drain
    rate and produces **zero** forced checkpoints; only the large rung does. A symptom that scales

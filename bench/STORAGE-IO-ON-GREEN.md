@@ -56,7 +56,7 @@ Ran the gentle R3 (40 M-row) online conversion on gp3-4XL and again on io2-4XL:
 | | gp3-4XL | io2-4XL @32000 |
 |---|---------|----------------|
 | `build_pk` CIC (online PK) | 31.4 s | **31.4 s (identical)** |
-| `adopt()` cutover | 1.5 s | 1.5 s |
+| `transmute()` cutover | 1.5 s | 1.5 s |
 | convert latency vs baseline | tracks baseline | tracks baseline (p50 75.81 vs 75.54; p99 99.8 vs 79.8; n=53816, full window, no stall) |
 
 The CIC time is **identical**, the one-time index build was never IOPS-starved by gp3's 12000, so

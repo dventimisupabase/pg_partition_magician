@@ -12,7 +12,7 @@ It partitions on three kinds of **monotonic** key: time, integer/bigint ids (inc
 Snowflake-style ids), or **UUIDv7 / ULID** (time-ordered uuids). It then manages the full lifecycle
 of native `RANGE`-partitioned tables:
 
-- **`adopt()`**: convert an existing (possibly huge, *live*) unpartitioned table into a partitioned
+- **`transmute()`**: convert an existing (possibly huge, *live*) unpartitioned table into a partitioned
   one **online**, with no up-front data movement. One function, two type-safe overloads picked by the
   width parameter (an `interval` for the time grid, a `bigint` step for the integer grid); the kind
   (time vs uuidv7) is read from the control column's type.
@@ -24,7 +24,7 @@ of native `RANGE`-partitioned tables:
 - **retain**: drop partitions older than a policy.
 - **maintenance**: the single procedure `pg_cron` calls (attain + retain + drain).
 
-**Incoming foreign keys** are handled, not ignored. `adopt` never rewrites the primary key, so the
+**Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the
 referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records
 and drops each incoming FK for the conversion, then re-adds it against the new parent once the drain
 is idle (no composite-FK story, ever). A table whose primary key excludes the control column is
@@ -56,7 +56,7 @@ and uninstall. `pg_cron` must be enabled to run scheduled maintenance.
 
 ```sql
 -- 1. Convert a live table online and register it (no data moves here):
-select pgpm.adopt(
+select pgpm.transmute(
   p_parent    => 'public.events',
   p_control   => 'created_at',   -- the timestamp to range-partition on
   p_interval  => interval '1 month', -- daily / weekly / monthly / yearly ...
@@ -72,14 +72,14 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 select * from pgpm.status();
 ```
 
-That is it. Maintenance attains ahead, drains the adopted table's closed tail into partitions, and
-applies retention. `adopt` never rewrites the primary key, so the cutover is always metadata-only; it
+That is it. Maintenance attains ahead, drains the transmuted table's closed tail into partitions, and
+applies retention. `transmute` never rewrites the primary key, so the cutover is always metadata-only; it
 just requires the control column to already be part of the table's primary key (else it refuses). See
-the [adopt walkthrough](docs/guide.md#adopt-a-table).
+the [transmute walkthrough](docs/guide.md#transmute-a-table).
 
 ## Documentation
 
-- **[User guide](docs/guide.md)**: concepts, install, adopting a table, scheduling, monitoring,
+- **[User guide](docs/guide.md)**: concepts, install, transmuting a table, scheduling, monitoring,
   retain, incoming foreign keys, operations and troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object (signatures, parameters,
   returns, examples).
