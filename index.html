@@ -682,10 +682,13 @@
       const update = () => {
         ticking = false;
         const vh = window.innerHeight || document.documentElement.clientHeight;
+        const lo = vh * 2 / 3;   // figure center here: p = 0 (the animation begins)
+        const hi = vh / 3;       // figure center here: p = 1 (the animation is done)
         for (const f of figs) {
           const r = f.getBoundingClientRect();
           if (r.bottom < -40 || r.top > vh + 40) continue;                 // off-screen: leave as-is
-          const p = (vh * 0.88 - r.top) / ((r.height * 0.62) || 1);        // 0 as it enters, 1 once well in view
+          const c = r.top + r.height / 2;                                  // the figure's own center
+          const p = (lo - c) / (lo - hi);                                  // linear scrub as the center crosses the middle third
           f.style.setProperty('--p', Math.max(0, Math.min(1, p)).toFixed(3));
         }
       };
