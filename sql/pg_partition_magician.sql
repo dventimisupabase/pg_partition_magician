@@ -53,11 +53,17 @@ create table if not exists pgpm.config (
   -- checkpoint pressure each tick and rides the per-tick drain budget just under supply via AIMD
   -- (additive-increase when calm, halve on a forced checkpoint), instead of the fixed drain_batch.
   -- off = mode 1 (today's fixed gentle rate). drain_budget is the controller's current row budget
-  -- (null until the first adaptive tick seeds it from drain_batch); drain_ckpt_seen is the last
-  -- forced-checkpoint counter it observed (null = uninitialized, so the first tick can't be congested).
-  drain_adaptive   boolean not null default false,
-  drain_budget     int,
-  drain_ckpt_seen  bigint
+  -- (null until the first adaptive tick seeds it from drain_batch). The controller's signal is the WAL
+  -- generation rate vs the sustainable rate (max_wal_size/checkpoint_timeout): drain_wal_lsn/drain_wal_at
+  -- are the previous tick's WAL position + time (to compute the rate), drain_wal_high_water is the
+  -- fraction of the sustainable rate at which to start backing off (leading), and drain_ckpt_seen is the
+  -- last forced-checkpoint counter (a reactive backstop). All null = uninitialized (first tick is calm).
+  drain_adaptive       boolean not null default false,
+  drain_budget         int,
+  drain_ckpt_seen      bigint,
+  drain_wal_lsn        pg_lsn,
+  drain_wal_at         timestamptz,
+  drain_wal_high_water numeric not null default 0.7
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
@@ -65,6 +71,9 @@ alter table pgpm.config add column if not exists drain_max_blocks int;
 alter table pgpm.config add column if not exists drain_adaptive boolean not null default false;
 alter table pgpm.config add column if not exists drain_budget int;
 alter table pgpm.config add column if not exists drain_ckpt_seen bigint;
+alter table pgpm.config add column if not exists drain_wal_lsn pg_lsn;
+alter table pgpm.config add column if not exists drain_wal_at timestamptz;
+alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 0.7;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -778,11 +787,37 @@ $$;
 
 -- ===================== adaptive closed-loop feathering (DESIGN.md sec 8, mode 2) =====================
 
--- The congestion sensor: the cluster's forced/requested-checkpoint counter. A *requested* checkpoint
--- means WAL hit max_wal_size (or an explicit CHECKPOINT) -- i.e. writes outran what the checkpointer
--- absorbs, the exact symptom the bench saw over-driving the drain produce at 40M (FORCED_CHECKPOINT x12,
--- the I/O storm behind the latency tail). *Timed* checkpoints (the checkpoint_timeout rhythm) are normal
--- and deliberately NOT counted. The counter moved from pg_stat_bgwriter to pg_stat_checkpointer in PG 17.
+-- The LEADING congestion signal: the WAL generation rate vs the rate the checkpointer can sustain.
+-- A forced checkpoint fires when WAL written since the last checkpoint reaches ~max_wal_size before
+-- the checkpoint_timeout timer does; the I/O storm of that checkpoint flush is the latency tail the
+-- bench saw at 40M. So the sustainable WAL rate is max_wal_size / checkpoint_timeout: generate WAL
+-- faster than that and a forced checkpoint (and its storm) is coming. Sensing the RATE lets the drain
+-- ease off BEFORE the checkpoint fires -- unlike the forced-checkpoint counter, which only moves once
+-- the storm is already underway (that counter is kept below only as a reactive backstop). Reads
+-- pg_current_wal_lsn() + settings, all available to a non-superuser (pg_control_checkpoint(), which
+-- would give the exact distance-to-threshold, is superuser-gated on managed Postgres, so we use rate).
+create or replace function pgpm._wal_sustainable_bps()
+returns numeric language sql stable as $$
+  select pg_size_bytes(current_setting('max_wal_size'))::numeric
+         / greatest(1, extract(epoch from current_setting('checkpoint_timeout')::interval));
+$$;
+
+-- The decision (pure, unit-tested): are we over-driving the disk? True if the observed WAL rate exceeds
+-- p_high_water of the sustainable rate (the LEADING trigger), OR a forced checkpoint already fired since
+-- the last tick (the reactive backstop). Null observed rate (first tick) or unknown sustainable rate
+-- (guard against divide-by-zero) => not congested.
+create or replace function pgpm._feather_congested(
+  p_observed_bps numeric, p_sustainable_bps numeric, p_high_water numeric, p_forced boolean
+) returns boolean language sql immutable as $$
+  select coalesce(p_forced, false)
+      or (p_observed_bps is not null and coalesce(p_sustainable_bps, 0) > 0
+          and p_observed_bps / p_sustainable_bps > p_high_water);
+$$;
+
+-- The reactive backstop sensor: the cluster's forced/requested-checkpoint counter. A *requested*
+-- checkpoint means WAL hit max_wal_size (or an explicit CHECKPOINT). *Timed* checkpoints (the
+-- checkpoint_timeout rhythm) are normal and deliberately NOT counted. The counter moved from
+-- pg_stat_bgwriter to pg_stat_checkpointer in PG 17, so this is version-aware.
 create or replace function pgpm._forced_checkpoints()
 returns bigint language plpgsql stable as $$
 declare v bigint;
@@ -809,13 +844,14 @@ create or replace function pgpm._aimd_next(
 $$;
 
 -- Operator switch for mode 2. Off (default) keeps today's fixed gentle rate (drain_batch); on lets the
--- controller above ride the budget against checkpoint pressure. Resets the controller state so a toggle
--- starts cleanly from drain_batch.
+-- controller ride the budget under the WAL supply (leading signal above). Resets all controller state so
+-- a toggle starts cleanly from drain_batch with no stale rate/checkpoint baseline.
 create or replace function pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true)
 returns void language plpgsql as $$
 begin
   update pgpm.config
-     set drain_adaptive = p_enabled, drain_budget = null, drain_ckpt_seen = null
+     set drain_adaptive = p_enabled, drain_budget = null, drain_ckpt_seen = null,
+         drain_wal_lsn = null, drain_wal_at = null
    where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 end;
@@ -828,6 +864,7 @@ declare
   v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
+  v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -875,9 +912,12 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'retention_skip', left(sqlerrm, 200));
   end;
 
-  -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under supply.
-  -- Sense whether a forced checkpoint fired since the last tick (over-driving the disk), take one AIMD
-  -- step on the budget, and drain that many rows this tick instead of the fixed drain_batch.
+  -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under the WAL
+  -- supply. Measure the WAL generation rate since the last tick and compare it to the sustainable rate
+  -- (max_wal_size/checkpoint_timeout); if we are outrunning a fraction (drain_wal_high_water) of that, a
+  -- forced checkpoint and its I/O storm are coming -- so back off NOW, before the storm (the LEADING
+  -- signal). A forced checkpoint that slips through anyway is a reactive backstop. Then take one AIMD
+  -- step and drain that many rows this tick instead of the fixed drain_batch.
   --   ceiling = drain_batch. CRITICAL: the budget never exceeds the operator's tuned rate. A bigger
   --     per-tick budget means a bigger single DELETE+INSERT, hence a bigger WAL spike per tick -- i.e.
   --     MORE checkpoint pressure, the very thing we are throttling. So adaptive only ever feathers DOWN
@@ -889,8 +929,19 @@ begin
   -- Off => v_batch stays null => drain_step uses the fixed drain_batch exactly as before. drain_max_blocks
   -- (if set) still caps wide rows on top. Computed here; committed below only if the drain does work.
   if cfg.drain_adaptive then
+    v_now_lsn := pg_current_wal_lsn();
+    v_now_ts  := clock_timestamp();
+    v_obs_bps := null;                                   -- first tick (no prior sample) => no rate yet
+    if cfg.drain_wal_lsn is not null and cfg.drain_wal_at is not null then
+      v_secs := extract(epoch from (v_now_ts - cfg.drain_wal_at));
+      if v_secs > 0 then
+        v_obs_bps := pg_wal_lsn_diff(v_now_lsn, cfg.drain_wal_lsn)::numeric / v_secs;
+      end if;
+    end if;
     v_ckpt      := pgpm._forced_checkpoints();
-    v_congested := cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen;
+    v_congested := pgpm._feather_congested(
+                     v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
+                     cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
     v_budget    := pgpm._aimd_next(
                      coalesce(cfg.drain_budget, cfg.drain_batch),       -- start optimistic at the ceiling
                      v_congested,
@@ -924,7 +975,9 @@ begin
   -- Leaving the ckpt baseline stale across an idle gap just makes the next active tick treat any
   -- idle-period checkpoints as congestion and back off once -- the safe direction.
   if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%') then
-    update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt where parent_table = p_parent;
+    update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
+                           drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts
+      where parent_table = p_parent;
     v_note := v_note || format(' adaptive[%s%s]', v_budget, case when v_congested then ' backoff' else '' end);
     insert into pgpm.log (parent_table, action, rows, method)
       values (p_parent, 'drain_budget', v_budget, case when v_congested then 'backoff' else 'probe' end);
