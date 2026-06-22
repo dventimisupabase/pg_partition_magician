@@ -402,7 +402,7 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 #     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
 #     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
-echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,surge_active" >> "$RESULTS/drain.progress.csv"
+echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,ambient_waiters,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
 drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 warned_stall_settle=0; last_closed_check=0
@@ -417,9 +417,10 @@ while :; do
             ||'|'|| (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
                               from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)
-            ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)" 2>/dev/null) \
+            ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)
+            ||'|'|| coalesce(pgpm._ambient_io_waiters(),-1)" 2>/dev/null) \
     || { echo "  (observe poll failed -- retrying)"; continue; }
-  IFS='|' read -r now_s drows nparts moves age budget <<<"$poll"
+  IFS='|' read -r now_s drows nparts moves age budget waiters <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
 
   # ambient write-surge: launch a write-heavy pgbench burst BENCH_SURGE_AFTER_SECS into the observe
@@ -440,7 +441,7 @@ while :; do
     fi
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$surge_active" >> "$RESULTS/drain.progress.csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$waiters" "$surge_active" >> "$RESULTS/drain.progress.csv"
   if [ "$moves" -ge 1 ]; then drain_started=1; fi
 
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
