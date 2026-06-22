@@ -58,7 +58,12 @@ esac
 
 # ---- per-profile drain intensity + observe mode (overrides the rung's stress defaults) ----
 case "$PROFILE" in
-  stress) export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle ;;
+  stress) # Pre-freeze too: VACUUM (FREEZE, ANALYZE) after the bulk load settles the post-load
+          # autovacuum/FPI storm out of the measurement window, so the convert-phase latency reflects
+          # the drain against a steady-state table (the realistic adopt) rather than load aftermath.
+          # Without it, post-bulk-load autovacuum on the 40M default drove forced-checkpoint I/O freezes
+          # that dominated the tail and had nothing to do with the drain (see bench-gentle-window confound).
+          export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle BENCH_PREFREEZE=1 ;;
   gentle) # small batch (fits work_mem -> no temp spill), slow cron (stays under I/O baseline),
           # windowed observe (warm up, then measure -- don't wait for the drain to finish).
           # Pre-freeze settles the post-bulk-load autovacuum WAL out of the window so the windowed
