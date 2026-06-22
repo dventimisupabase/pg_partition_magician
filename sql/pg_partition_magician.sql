@@ -877,20 +877,26 @@ begin
 
   -- Adaptive feathering (mode 2, DESIGN.md sec 8): ride the per-tick drain budget just under supply.
   -- Sense whether a forced checkpoint fired since the last tick (over-driving the disk), take one AIMD
-  -- step on the budget, and drain that many rows this tick instead of the fixed drain_batch. The floor
-  -- and ceiling bracket drain_batch (the nominal operating point) at /8 and x8; the additive increment
-  -- is ~the floor, so it probes up gently and halves hard. Off => v_batch stays null => drain_step uses
-  -- the fixed drain_batch exactly as before. drain_max_blocks (if set) still caps wide rows on top of
-  -- whichever row target applies. Computed here; committed below only if the drain actually does work.
+  -- step on the budget, and drain that many rows this tick instead of the fixed drain_batch.
+  --   ceiling = drain_batch. CRITICAL: the budget never exceeds the operator's tuned rate. A bigger
+  --     per-tick budget means a bigger single DELETE+INSERT, hence a bigger WAL spike per tick -- i.e.
+  --     MORE checkpoint pressure, the very thing we are throttling. So adaptive only ever feathers DOWN
+  --     from drain_batch; it can never drive harder than fixed mode, so it cannot worsen the tail.
+  --     "Faster when there's slack" is delivered by the operator setting drain_batch to their optimistic
+  --     slack rate -- adaptive then automatically backs off from it under pressure.
+  --   floor = drain_batch/16: the gentlest sustained rate that still makes forward progress.
+  --   recovery = drain_batch/8 per calm tick: a few ticks to climb back to the ceiling after a halve.
+  -- Off => v_batch stays null => drain_step uses the fixed drain_batch exactly as before. drain_max_blocks
+  -- (if set) still caps wide rows on top. Computed here; committed below only if the drain does work.
   if cfg.drain_adaptive then
     v_ckpt      := pgpm._forced_checkpoints();
     v_congested := cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen;
     v_budget    := pgpm._aimd_next(
-                     coalesce(cfg.drain_budget, cfg.drain_batch),       -- seed from the nominal rate
+                     coalesce(cfg.drain_budget, cfg.drain_batch),       -- start optimistic at the ceiling
                      v_congested,
-                     greatest(1, cfg.drain_batch / 8),                  -- floor: keep forward progress
-                     greatest(cfg.drain_batch, cfg.drain_batch * 8),    -- ceiling: bound the probe
-                     greatest(1, cfg.drain_batch / 8));                 -- additive increment (~floor)
+                     greatest(1, cfg.drain_batch / 16),                 -- floor: minimum forward progress
+                     cfg.drain_batch,                                   -- ceiling: never exceed the tuned rate
+                     greatest(1, cfg.drain_batch / 8));                 -- additive recovery step
     v_batch := v_budget;
   end if;
 

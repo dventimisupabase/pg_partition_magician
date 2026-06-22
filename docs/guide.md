@@ -173,12 +173,14 @@ select pgpm.set_drain_adaptive('public.events', true);
 ```
 
 Now each maintenance tick watches for checkpoint pressure (a forced checkpoint means the drain is
-pushing more write traffic than the database can absorb) and adjusts the per-tick budget: it eases up
-gently when there is slack and backs off sharply when it detects pressure, the same
-additive-increase / halve-on-congestion idea TCP uses to ride just under a link's capacity. It still
-respects `drain_max_blocks`, and `drain_batch` becomes the nominal rate it explores around (roughly
-one-eighth to eight times). This keeps the drain unnoticeable without you having to find the right
-fixed `drain_batch` for your hardware. It is off by default; turn it back off with
+pushing more write traffic than the database can absorb) and adjusts the per-tick budget: it backs off
+sharply when it detects pressure and recovers gently when there is slack, the same
+additive-increase / halve-on-congestion idea TCP uses to ride just under a link's capacity. Your
+`drain_batch` is the ceiling (a bigger batch would mean a bigger write spike, so the controller never
+goes above your tuned rate); it only ever feathers *down* from there, as far as one-sixteenth of
+`drain_batch` under sustained pressure. So set `drain_batch` to the rate you want when there is plenty
+of slack and let pgpm back off automatically under load, instead of hand-tuning a safe fixed rate. It
+still respects `drain_max_blocks`. Off by default; turn it back off with
 `pgpm.set_drain_adaptive('public.events', false)`.
 
 ## Monitor

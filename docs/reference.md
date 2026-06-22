@@ -192,9 +192,11 @@ pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true) retur
 Turns adaptive feathering (DESIGN.md section 8, mode 2) on or off for one table. When on, each
 `maintenance` tick senses checkpoint pressure (a forced/requested checkpoint since the last tick means
 the drain is over-driving the disk) and rides the per-tick drain budget just under supply via AIMD:
-it probes the budget up by a small step on a calm tick and halves it on a forced checkpoint. The
-budget is bracketed at `drain_batch`/8 to `drain_batch`x8, so `drain_batch` stays the single
-operating-point knob. Off (the default) keeps the fixed `drain_batch` rate. Toggling resets the
+it recovers the budget up by a small step on a calm tick and halves it on a forced checkpoint. The
+ceiling is `drain_batch` itself (a bigger batch means a bigger WAL spike, so the budget never exceeds
+your tuned rate); adaptive only ever feathers *down* from it, as far as `drain_batch`/16 under sustained
+pressure. So set `drain_batch` to your optimistic "when there's slack" rate and let the controller back
+off automatically under load. Off (the default) keeps the fixed `drain_batch` rate. Toggling resets the
 controller state so it restarts cleanly from `drain_batch`.
 
 ## Inspection

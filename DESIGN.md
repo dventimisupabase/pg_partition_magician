@@ -212,15 +212,20 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   sampling; the others are natural future refinements.
 
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
-  under a link's capacity: a calm tick probes the budget up by a small increment, a tick that saw a
+  under a link's capacity: a calm tick recovers the budget up by a small step, a tick that saw a
   forced checkpoint halves it. It is a pure function (`pgpm._aimd_next`), unit-tested directly. The
-  floor and ceiling bracket `drain_batch` at /8 and x8, so `drain_batch` stays the one operating-point
-  knob and the controller just explores around it; the floor guarantees forward progress, the ceiling
-  bounds the probe. It composes with `drain_max_blocks` (the controller sets the row target; the block
-  budget still caps wide rows on top). The controller state advances only on a tick that did work, so
-  a fully-drained idle table (the standing-steward state) never churns config or bloats the log. Tests
-  in `tests/26`; cross-version PG 15 to 18. Left off by default: it is mode 2, a deliberate posture,
-  not a silent change to every existing managed table.
+  **ceiling is `drain_batch` itself**, and this is the crux: a bigger per-tick budget is a bigger
+  single `DELETE`+`INSERT`, hence a bigger WAL spike per tick, hence *more* checkpoint pressure (the
+  very thing being throttled), so the controller must never exceed the operator's tuned rate. Adaptive
+  therefore only ever feathers *down* from `drain_batch`; it can never drive harder than fixed mode and
+  so cannot worsen the tail. The "faster when there's slack" half of the dial is delivered by the
+  operator setting `drain_batch` to their optimistic slack rate, with adaptive automatically backing
+  off from it under pressure (the floor, `drain_batch`/16, is the gentlest sustained rate that still
+  makes progress; recovery is `drain_batch`/8 per calm tick). It composes with `drain_max_blocks` (the
+  controller sets the row target; the block budget still caps wide rows on top). The controller state
+  advances only on a tick that did work, so a fully-drained idle table (the standing-steward state)
+  never churns config or bloats the log. Tests in `tests/26`; cross-version PG 15 to 18. Left off by
+  default: it is mode 2, a deliberate posture, not a silent change to every existing managed table.
 - **Block-budgeted batching.** Today the drain batches by row count (`drain_batch`), which is unsafe
   when TOAST width varies: 20 000 narrow rows is nothing, but 20 000 rows each carrying a 2 MB
   document is tens of gigabytes rewritten in one microbatch, a spike that breaks the unnoticeable

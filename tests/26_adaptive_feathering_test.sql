@@ -41,28 +41,30 @@ select pgpm.set_drain_adaptive('public.evt', true);
 select is((select drain_adaptive from pgpm.config where parent_table = 'public.evt'::regclass),
           true, 'set_drain_adaptive(true) turns mode 2 on');
 
--- ---- a calm tick (baseline == current counter => no congestion) probes the budget UP ---------------
-update pgpm.config set drain_budget = 10000, drain_ckpt_seen = pgpm._forced_checkpoints()
+-- ---- a calm tick (baseline == current counter => no congestion) recovers the budget UP toward the
+--      ceiling (start below it; drain_batch=8000 is the ceiling, recovery step is 8000/8=1000) --------
+update pgpm.config set drain_budget = 4000, drain_ckpt_seen = pgpm._forced_checkpoints()
   where parent_table = 'public.evt'::regclass;
 select pgpm.maintenance('public.evt');
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
-              '>', 10000, 'calm tick: the controller probes the budget upward');
+              '>', 4000, 'calm tick: the controller recovers the budget upward toward the ceiling');
 
--- ---- a congested tick (baseline below current counter => +delta) backs the budget OFF --------------
-update pgpm.config set drain_budget = 64000, drain_ckpt_seen = pgpm._forced_checkpoints() - 1
+-- ---- a congested tick (baseline below current counter => +delta) backs the budget OFF (halves) -----
+update pgpm.config set drain_budget = 8000, drain_ckpt_seen = pgpm._forced_checkpoints() - 1
   where parent_table = 'public.evt'::regclass;
 select pgpm.maintenance('public.evt');
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
-              '<', 64000, 'congested tick: the controller backs the budget off (forced checkpoint sensed)');
+              '<', 8000, 'congested tick: the controller backs the budget off (forced checkpoint sensed)');
 
 -- ---- correctness is preserved: adaptive still drains the closed tail to zero -----------------------
 do $$ begin for i in 1..40 loop perform pgpm.maintenance('public.evt'); end loop; end $$;
 select is((select closed_rows from pgpm.check_default('public.evt')),
           0::bigint, 'adaptive mode still drains the closed tail to zero');
 
--- ---- the budget stays within [floor, ceiling] derived from drain_batch (8000 => [1000, 64000]) -----
+-- ---- the safety invariant: the budget NEVER exceeds drain_batch (the ceiling). A bigger batch would
+--      mean a bigger WAL spike, so adaptive only ever feathers DOWN from the operator's tuned rate. ---
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
-              '>=', 1000, 'budget never drops below the floor (drain_batch/8)');
+              '<=', 8000, 'budget never exceeds drain_batch: adaptive only throttles down (cannot worsen the tail)');
 
 select * from finish();
 rollback;
