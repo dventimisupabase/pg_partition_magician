@@ -16,6 +16,7 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 - [Incoming foreign keys](#incoming-foreign-keys)
 - [Secondary indexes](#secondary-indexes)
 - [How the conversion stays online](#how-the-conversion-stays-online)
+- [WAL and checkpoint sizing](#wal-and-checkpoint-sizing)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Caveats and v1 scope](#caveats-and-v1-scope)
 
@@ -303,6 +304,49 @@ The one rule that keeps this safe: never exclude the interval currently receivin
 the DEFAULT). So the active interval simply lives in the DEFAULT until it closes, then drains as a
 closed tail. Measured on PG 15 (4M-row default): plain attach 101 ms under `ACCESS EXCLUSIVE` vs
 scan-skip attach 0.43 ms. The full rationale is in [DESIGN.md](../DESIGN.md).
+
+## WAL and checkpoint sizing
+
+The drain rewrites rows (a cross-partition `DELETE` + `INSERT`), so a conversion is a burst of WAL
+concentrated over the drain window. If `max_wal_size` is small relative to that WAL rate (plus your
+ambient write load), Postgres fires *requested* (forced) checkpoints whenever WAL hits the limit,
+rather than the gentle *timed* checkpoints paced by `checkpoint_timeout`. A forced checkpoint flushes
+a burst of dirty buffers; on a throughput-limited disk that flush can stall the workload for seconds.
+At scale this, not the drain's row movement, is usually the worst latency you will see.
+
+How to tell, during or after a conversion:
+
+```sql
+-- PG 17+; on 15/16 use pg_stat_bgwriter.checkpoints_req / checkpoints_timed
+select num_requested, num_timed from pg_stat_checkpointer;
+```
+
+A meaningful and growing `num_requested` means `max_wal_size` is too small for your write rate.
+
+What to do:
+
+- **Raise `max_wal_size`** so checkpoints are time-driven, not size-driven. Rough target:
+  `max_wal_size >= peak_WAL_rate x checkpoint_timeout`, with headroom. This makes checkpoints regular
+  and spread (by `checkpoint_completion_target`, default 0.9) instead of bursty, and cuts WAL
+  write-amplification (fewer checkpoints means fewer full-page images). The cost is longer crash
+  recovery and more `pg_wal` disk.
+- **`checkpoint_timeout` is a secondary, situational knob.** Raising it cuts checkpoint frequency
+  further but trades more recovery time, and only helps when paired with a large enough `max_wal_size`.
+- **Scaling compute is the natural moment to revisit `max_wal_size`.** A bigger instance usually means
+  a higher write rate (fills `max_wal_size` faster) and, on managed platforms, a higher disk-throughput
+  ceiling that absorbs checkpoint flushes better. On Supabase, `max_wal_size` and `checkpoint_timeout`
+  are not scaled by compute tier (both stay at the 4GB / 5min defaults); set them yourself via the CLI,
+  which reloads without a restart:
+
+  ```bash
+  supabase --experimental --project-ref <ref> postgres-config update --config max_wal_size=16GB
+  ```
+
+- **Or let pgpm throttle the producer instead.** `pgpm.set_drain_adaptive(parent, true)` paces the
+  drain's own WAL down when it outruns what the checkpointer can sustain (see
+  [Adaptive feathering](#adaptive-feathering-let-the-drain-tune-itself)). It is the complementary lever
+  when you cannot raise `max_wal_size` enough or the disk simply cannot keep up; raising `max_wal_size`
+  is the better fix when you can, and the two compose (raise the budget, keep adaptive as a safety net).
 
 ## Operations and troubleshooting
 

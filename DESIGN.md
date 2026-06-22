@@ -217,6 +217,22 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   `pg_stat_checkpointer.num_requested` in PG 17) is kept only as a reactive backstop. Wait events and
   ambient latency are further refinements.
 
+  *A known limitation of the threshold (raw material for the next iteration).* The sustainable rate is
+  derived from settings (`max_wal_size / checkpoint_timeout`), not from the disk's real capacity. On a
+  well-provisioned tier the disk absorbs WAL far faster than that settings-rate implies, so the
+  controller throttles to protect a budget the hardware would shrug off, and at the default
+  `drain_wal_high_water = 1.0` it can pin the drain to the floor and never finish even when fixed mode
+  is perfectly clean (measured directly: a 4XL banished the storms for fixed mode at the stock 4GB
+  `max_wal_size`, max 60.7s -> 7.2s, while adaptive over-throttled). Two consequences. (1) The right
+  operator move on bigger or write-heavy hardware is to raise `max_wal_size` so the computed sustainable
+  rate reflects the disk (which also lifts the controller's threshold and reduces forced checkpoints for
+  everyone); on Supabase that GUC is not scaled by compute tier (pegged 4GB) and must be set via the
+  CLI. `drain_wal_high_water` is the manual stand-in to widen the threshold per-hardware. (2) A better
+  future signal would key off *observed* I/O saturation (checkpoint sync duration, IO-wait) rather than
+  the settings proxy, so it self-calibrates to the hardware. A natural companion is for `adopt` to
+  inspect `max_wal_size` against the expected drain WAL rate and advise raising it -- the steward
+  surfacing the relevant GUC, not just throttling around it.
+
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
   under a link's capacity: a calm tick recovers the budget up by a small step, a tick whose WAL rate is
   over the high-water mark (or that saw a forced checkpoint) halves it. It is a pure function
