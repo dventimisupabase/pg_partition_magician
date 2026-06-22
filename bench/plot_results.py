@@ -16,11 +16,11 @@ Figures (each picks the best-suited run; override on the CLI: plot_results.py <f
   3 adaptive-feathering  drain_budget riding down under pressure (AIMD), ceiling/floor marked
   4 ambient-surge        drain_budget yielding to a write surge; waiters vs the learned baseline
 """
-import csv, glob, os, sys, statistics
+import csv, glob, os, re, sys, statistics
+from datetime import datetime
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "results")
@@ -96,6 +96,94 @@ def binned_pctiles(pts, bin_s=10):
         p95.append(v[min(len(v) - 1, int(0.95 * len(v)))])
         p99.append(v[min(len(v) - 1, int(0.99 * len(v)))])
     return mins, p50, p95, p99
+
+
+def load_report(run):
+    """Authoritative per-run outcome from report.md: conversion duration, rows moved, backoffs."""
+    p = os.path.join(RESULTS, run, "report.md")
+    if not os.path.exists(p):
+        return None
+    txt = open(p).read()
+    win = re.search(r"conversion window: `([\d\- :]+)` -> `([\d\- :]+)`", txt)
+    moved = re.search(r"([\d]+) rows moved", txt)
+    rem = re.search(r"closed-tail rows remaining: (-?\d+)", txt)
+    backoffs = re.search(r"(\d+) backoffs", txt)
+    dur = None
+    if win:
+        a = datetime.strptime(win.group(1).strip(), "%Y-%m-%d %H:%M:%S")
+        b = datetime.strptime(win.group(2).strip(), "%Y-%m-%d %H:%M:%S")
+        dur = (b - a).total_seconds()
+    return dict(dur=dur,
+                moved=int(moved.group(1)) if moved else None,
+                remaining=int(rem.group(1)) if rem else None,
+                backoffs=int(backoffs.group(1)) if backoffs else 0,
+                adaptive="adaptive feathering (mode 2)" in txt)
+
+
+# canonical scale ladder; the -stress runs are the run-to-completion (adaptive) arm that drained to zero.
+LADDER = [("R0-stress", 1_000_000), ("R1-stress", 3_000_000),
+          ("R2-stress", 10_000_000), ("R3-stress", 40_000_000)]
+
+
+def fig_scale_ladder():
+    pts = []
+    for run, rows in LADDER:
+        r = load_report(run)
+        if r and r["dur"]:
+            pts.append((rows, r["dur"], r["moved"]))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    xs = [r / 1e6 for r, _, _ in pts]
+    ys = [d / 60.0 for _, d, _ in pts]
+    ax.plot(xs, ys, color=GREEN, lw=2.4, marker="o", ms=9, zorder=5)
+    ax.set_xscale("log")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"{x:g}M" for x in xs])
+    ax.set_xlim(0.7, 60)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("table size (rows, log scale)")
+    ax.set_ylabel("online conversion time (minutes)")
+    for (rows, dur, moved), x, y in zip(pts, xs, ys):
+        thru = moved / dur
+        ax.annotate(f"{y:.1f} min\n{thru/1000:.0f}k rows/s", (x, y),
+                    textcoords="offset points", xytext=(10, -2), fontsize=8.5, color=INK,
+                    va="center")
+    ax.set_title("Scale ladder: online conversion time vs table size (1M -> 40M)\n"
+                 "the full closed tail drained to zero at every rung", fontsize=11)
+    ax.grid(True, alpha=0.25, which="both")
+    _save(fig, "05-scale-ladder")
+
+
+def fig_fixed_vs_adaptive(run="R3-stress", fixed_run="R3"):
+    rows, col = load_progress(run)
+    t = [s / 60.0 for s in col("observed_s")]
+    budget = col("drain_budget")
+    tb = [(x, b) for x, b in zip(t, budget) if b is not None]
+    xs = [x for x, _ in tb]
+    bs = [b for _, b in tb]
+    ceiling = max(bs)
+    ra, rf = load_report(run), load_report(fixed_run)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.axhline(ceiling, color=GREY, lw=2.4,
+               label=f"fixed mode: constant drain_batch ({ceiling:,.0f}/tick)")
+    ax.fill_between(xs, bs, ceiling, color=GREEN, alpha=0.12)
+    ax.plot(xs, bs, color=GREEN, lw=1.6, marker="o", ms=2.5,
+            label="adaptive: measured per-tick budget")
+    ax.set_ylim(0, ceiling * 1.13)
+    ax.set_xlim(left=0)
+    ax.set_xlabel("elapsed (minutes)")
+    ax.set_ylabel("per-tick drain budget (rows)")
+    if ra and rf and ra["dur"] and rf["dur"]:
+        pct = 100 * (ra["dur"] - rf["dur"]) / rf["dur"]
+        txt = (f"40M closed tail, drained to zero both ways:\n"
+               f"  fixed:    {rf['dur']/60:4.0f} min,  {rf['backoffs']} backoffs\n"
+               f"  adaptive: {ra['dur']/60:4.0f} min,  {ra['backoffs']} backoffs  (+{pct:.0f}% time)")
+        ax.text(0.025, 0.04, txt, transform=ax.transAxes, fontsize=8.5, va="bottom",
+                family="monospace", bbox=dict(boxstyle="round", fc="white", ec=GREY, alpha=0.9))
+    ax.set_title("Fixed vs adaptive (40M): adaptive feathers the budget below the fixed rate\n"
+                 "under WAL/checkpoint pressure, trading some speed for gentleness", fontsize=11)
+    ax.legend(loc="upper right", frameon=False)
+    ax.grid(True, alpha=0.25)
+    _save(fig, "06-fixed-vs-adaptive")
 
 
 def fig_online_conversion(run="R3-stress"):
@@ -230,6 +318,8 @@ FIGS = {
     "latency-unnoticeable": fig_latency_unnoticeable,
     "adaptive-feathering": fig_adaptive_feathering,
     "ambient-surge": fig_ambient_surge,
+    "scale-ladder": fig_scale_ladder,
+    "fixed-vs-adaptive": fig_fixed_vs_adaptive,
 }
 
 if __name__ == "__main__":
