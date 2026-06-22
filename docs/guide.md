@@ -9,7 +9,7 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 
 - [Concepts](#concepts)
 - [Install](#install)
-- [Adopt a table](#adopt-a-table)
+- [Transmute a table](#transmute-a-table)
 - [Run it](#run-it)
 - [Monitor](#monitor)
 - [Retain](#retain)
@@ -22,7 +22,7 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 
 ## Concepts
 
-**What it manages.** pg_partition_magician adopts an existing, unpartitioned table into a native
+**What it manages.** pg_partition_magician transmutes an existing, unpartitioned table into a native
 `RANGE`-partitioned table and then keeps it healthy: it creates future partitions ahead of your
 writes, moves old rows out of a holding area into their proper partitions in small steps, and drops
 partitions past your retention policy. Everything is pure SQL in the `pgpm` schema; the only runtime
@@ -31,11 +31,11 @@ dependency is `pg_cron`, and only to run the background job.
 **Control kinds.** A table is partitioned on one monotonic key, of one of three kinds:
 
 - `time`: a `timestamptz` / `timestamp` / `date` column, on an interval grid (calendar-aligned for
-  whole months/years, fixed-duration otherwise). Adopt with `pgpm.adopt(..., interval '...')`.
+  whole months/years, fixed-duration otherwise). Transmute with `pgpm.transmute(..., interval '...')`.
 - `id`: an `int` / `bigint` / `numeric` column, on an integer step. Covers Snowflake-style ids.
-  Adopt with `pgpm.adopt(..., <bigint step>)`.
+  Transmute with `pgpm.transmute(..., <bigint step>)`.
 - `uuidv7`: a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values, on a time grid
-  with uuid-encoded bounds. Adopt with `pgpm.adopt(..., interval '...')` (uuidv7 is inferred from the
+  with uuid-encoded bounds. Transmute with `pgpm.transmute(..., interval '...')` (uuidv7 is inferred from the
   uuid column).
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
@@ -46,7 +46,7 @@ companion column instead.
 `max(control)` for `id` and `uuidv7`. An interval is "open" while the frontier is inside it (it is
 still receiving writes) and "closed" once the frontier moves past its upper bound.
 
-**The DEFAULT is a safety net.** Adoption attaches your original table as the `DEFAULT` partition, so
+**The DEFAULT is a safety net.** Transmutation attaches your original table as the `DEFAULT` partition, so
 any row that does not match a real partition still has a home (no lost writes, ever). In steady state
 attain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
 and otherwise stays empty. `check_default()` tells you if anything is stuck there.
@@ -96,36 +96,36 @@ intact:
 psql "$DATABASE_URL" -f sql/uninstall.sql
 ```
 
-## Adopt a table
+## Transmute a table
 
-Adoption is online and moves no data up front: it renames your table to `<name>_default`, creates a
+Transmutation is online and moves no data up front: it renames your table to `<name>_default`, creates a
 partitioned parent under the original name, and attaches the old table as the `DEFAULT` partition.
 
 ### Pick the kind
 
-There is one `pgpm.adopt`, with two type-safe overloads chosen by the width parameter: an `interval`
+There is one `pgpm.transmute`, with two type-safe overloads chosen by the width parameter: an `interval`
 selects the time grid, a `bigint` step selects the integer grid. The kind (time vs uuidv7) is
 auto-detected from the control column's type. A bare interval string literal is ambiguous between the
 overloads, so interval calls must cast (`interval '...'`); an integer width needs no cast.
 
 ```sql
 -- time (timestamp/timestamptz/date control column)
-select pgpm.adopt('public.events', 'created_at', interval '1 month');
+select pgpm.transmute('public.events', 'created_at', interval '1 month');
 
 -- id (bigint/numeric), 10M ids per partition
-select pgpm.adopt('public.events', 'id', 10000000);
+select pgpm.transmute('public.events', 'id', 10000000);
 
 -- uuidv7 / ULID-as-uuid (uuid control column; inferred from the column type)
-select pgpm.adopt('public.events', 'id', interval '1 day');
+select pgpm.transmute('public.events', 'id', interval '1 day');
 ```
 
-Adoption registers the table **paused** by default: it is converted, but scheduled maintenance does
+Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does
 nothing until you unpause (see [Run it](#run-it)). All parameters are documented in the
-[reference](reference.md#adoption).
+[reference](reference.md#transmutation).
 
 ### The cutover is always metadata-only
 
-`adopt` never rewrites the primary key. It reuses the existing PK in place, so the cutover holds its
+`transmute` never rewrites the primary key. It reuses the existing PK in place, so the cutover holds its
 `ACCESS EXCLUSIVE` lock only briefly (no `O(rows)` index build, ever).
 
 The one requirement is that the control column already be part of the primary key. Postgres only
@@ -134,8 +134,8 @@ control column qualifies, and so does a composite PK that contains it (e.g. `(te
 partitioned by `id`). A table with no primary key at all is fine too.
 
 If the table has a PK that *excludes* the control column (the classic `events(id PRIMARY KEY,
-created_at)` wanting time partitioning), `adopt` refuses with a clear error: make the control column
-part of the PK first, then re-adopt. Either give the table a single-column time-ordered key, or widen
+created_at)` wanting time partitioning), `transmute` refuses with a clear error: make the control column
+part of the PK first, then re-transmute. Either give the table a single-column time-ordered key, or widen
 the PK yourself (`CREATE UNIQUE INDEX CONCURRENTLY`, then `ALTER TABLE ... ADD PRIMARY KEY USING
 INDEX`). pgpm only partitions tables whose key is already the partition key: the modern
 time-ordered-PK data model (bigint/Snowflake, UUIDv7, ULID).
@@ -150,7 +150,7 @@ update pgpm.config set paused = false where parent_table = 'public.events'::regc
 ```
 
 From there, each tick attains ahead, drains a microbatch of the closed tail, and applies retention.
-You can also adopt with `p_paused => false` to skip the manual unpause.
+You can also transmute with `p_paused => false` to skip the manual unpause.
 
 To convert a table synchronously (tests, one-shot migrations) instead of waiting for the paced cron,
 drive the drain to completion yourself. `p_include_open => true` also drains and attaches the current
@@ -229,7 +229,7 @@ select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
 
 ## Retain
 
-Set a policy at adopt time (`p_retain`) or later via `config.retain`, and maintenance drops
+Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops
 partitions past it. Retain is an interval for `time`/`uuidv7` and a count of intervals for `id`.
 `null` keeps everything.
 
@@ -242,8 +242,8 @@ so for very large cold partitions you may prefer to detach them concurrently by 
 
 ## Incoming foreign keys
 
-If other tables reference the table you are adopting (e.g. `reactions(message_id) -> messages(id)`),
-those FKs are handled, not ignored. Because `adopt` never rewrites the primary key, the referenced
+If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
+those FKs are handled, not ignored. Because `transmute` never rewrites the primary key, the referenced
 unique key always survives partitioning, so an incoming FK to the primary key is always preservable:
 no composite key, no denormalization, ever.
 
@@ -252,7 +252,7 @@ not-yet-attached child table, so a referenced row is briefly outside the parent 
 which a `NO ACTION` FK rejects. The FK therefore cannot ride through the conversion in place: it is
 dropped for the duration and re-added against the new parent once the drain is done.
 
-`adopt` offers two modes for incoming FKs:
+`transmute` offers two modes for incoming FKs:
 
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
 - **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the
@@ -265,7 +265,7 @@ automatically, so on the scheduled path you do nothing; on the synchronous path,
 after `drain_all`:
 
 ```sql
-select pgpm.adopt('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
+select pgpm.transmute('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
 select pgpm.drain_all('public.events', p_include_open => true);
 select pgpm.restore_incoming_fks('public.events');   -- maintenance does this for you on the cron path
 ```
@@ -284,7 +284,7 @@ across this cycle.
 
 ## Secondary indexes
 
-`adopt` copies the old table's non-unique secondary indexes onto the parent as partitioned indexes
+`transmute` copies the old table's non-unique secondary indexes onto the parent as partitioned indexes
 (attaching the default's existing index, no rebuild), so they propagate to every partition. Unique
 secondary indexes are skipped, because a partitioned unique index must include the partition key;
 recreate those on the parent by hand.
@@ -293,7 +293,7 @@ recreate those on the parent by hand.
 
 Two facts about Postgres drive the design:
 
-1. You cannot convert a table to partitioned in place, so adopt renames the live table, creates a
+1. You cannot convert a table to partitioned in place, so transmute renames the live table, creates a
    partitioned parent under the original name, and attaches the old table as the `DEFAULT`. No rows
    move; the app sees no change.
 2. Adding a partition while the DEFAULT holds data forces a full scan of the DEFAULT under
@@ -366,11 +366,11 @@ What to do:
 - **The closed tail is growing.** `check_default()` shows `closed_rows > 0`: the table is unpaused
   but the drain is not keeping up. Raise `drain_batch`, run the cron more often, or run
   `drain_all()` once to catch up.
-- **Re-adopting a table fails with an "orphan" error.** A drain creates each child partition as a
+- **Re-transmuting a table fails with an "orphan" error.** A drain creates each child partition as a
   standalone table and attaches it only when that interval finishes draining. If a drain is
   interrupted and you then `DROP TABLE <parent> CASCADE` and recreate the table, the un-attached
-  child survives the cascade (it has no dependency on the parent) and a re-adopt would collide on its
-  stale keys. `adopt` detects this and refuses up front; drop the named orphan table and retry.
+  child survives the cascade (it has no dependency on the parent) and a re-transmute would collide on its
+  stale keys. `transmute` detects this and refuses up front; drop the named orphan table and retry.
 - **Finishing the current period.** Normal maintenance never drains the open interval. To convert a
   table completely (including the in-progress interval), run
   `drain_all(parent, p_include_open => true)`; the open interval attaches via a brief blocking
@@ -391,7 +391,7 @@ What to do:
   partition key); recreate them on the parent by hand.
 - **The primary key is never rewritten.** The control column must already be part of the table's
   primary key (a table with no PK is fine); a PK that excludes the control column is refused. See
-  [adopt a table](#adopt-a-table).
+  [transmute a table](#transmute-a-table).
 - **Incoming foreign keys**: refused by default, or preserved (dropped for the conversion and re-added
   against the new parent) with `p_incoming_fks => 'preserve'`; see above.
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by

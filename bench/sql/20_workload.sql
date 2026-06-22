@@ -3,12 +3,12 @@
 -- the network (essential when the driver isn't co-located with the DB). Latency
 -- per operation = call latency / p_ops; pg_stat_statements records server-side
 -- timing WAN-free. References bench.events by name, so it's identical before and
--- after adoption.
+-- after transmutation.
 --
 -- Every query is the kind you'd actually run against a time-partitioned events
 -- table: it filters by user_id (the lookup index) AND a recent created_at window,
 -- so post-conversion the planner prunes to the newest partition(s). The cost is
--- therefore ~stable before and after -- which is the point: it lets adopt()/drain
+-- therefore ~stable before and after -- which is the point: it lets transmute()/drain
 -- degradation show up as the signal instead of being masked by partition fan-out.
 -- (A bare "WHERE id = ?" lookup is deliberately avoided: id is not the partition
 -- key, so post-conversion it would fan out across every partition and dominate.)

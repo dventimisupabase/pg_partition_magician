@@ -1,4 +1,4 @@
--- Verifies adopt() registered the table and premade partitions ahead of the
+-- Verifies transmute() registered the table and premade partitions ahead of the
 -- write frontier, while leaving the active (current) interval in the DEFAULT.
 create extension if not exists pgtap;
 

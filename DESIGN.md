@@ -111,12 +111,12 @@ The model gives the operator an honest, two-sided message:
   operator chooses where to sit on the tradeoff; pgpm defaults to unnoticeable.
 
 A quieter clause in the same contract: **pgpm does not leave.** It is tempting to picture it as a
-one-shot converter that adopts a table, drains it, and exits stage left, but the drain is only the
+one-shot converter that transmutes a table, drains it, and exits stage left, but the drain is only the
 *backlog*. Keeping live writes landing in real partitions means creating partitions ahead of the
 frontier *forever* (attain), and PostgreSQL ships no mechanism to do that: declarative partitioning
 hands you the partition primitives but no policy engine to create, retain, and drop partitions on a
 schedule. Someone has to run that loop, whether `pg_partman`, an operator's own cron, or pgpm, so
-once you adopt, pgpm stays on as a standing companion, the way `pg_partman` would. Less Houdini than
+once you transmute, pgpm stays on as a standing companion, the way `pg_partman` would. Less Houdini than
 Merlin: not a travelling act that performs the trick and departs, but a resident steward who keeps
 the kingdom's partitions in order long after the coronation. That standing role is also why pgpm,
 not the operator, is the natural place to absorb the awkward edges of this corner of PostgreSQL, the
@@ -149,35 +149,35 @@ at different points on the same dial.
    pgpm requires it.
 
 The fixed gentle rate we ship today is just one arbitrary point on this dial. The throttle
-primitives that move along it already exist: `drain_batch` (set at `adopt`) and the
+primitives that move along it already exist: `drain_batch` (set at `transmute`) and the
 `pgpm.maintenance` cron cadence. "Gentle" versus "aggressive" is nothing more than those two knobs.
 
 ## 8. Future directions (raw material, not commitments)
 
-- **The `adopt` redesign: one function, metadata-only, never rewrites the PK (IMPLEMENTED).** Two
-  changes that compose into a sharper, smaller tool. Shipped: the two-overload `adopt`, the no-rewrite
+- **The `transmute` redesign: one function, metadata-only, never rewrites the PK (IMPLEMENTED).** Two
+  changes that compose into a sharper, smaller tool. Shipped: the two-overload `transmute`, the no-rewrite
   gate with its ∈-PK reuse and helpful rejection, and the removal of `build_pk_concurrently` and the
   composite-FK recovery path. Tests in `tests/25` (the PK rule) and across the reworked suite;
   cross-version PG 15 to 18.
 
-  *One front door.* The three wrappers (`adopt` / `adopt_by_id` / `adopt_by_uuidv7`) collapse into a
-  single `adopt` with two type-safe overloads on the width parameter: `bigint` selects the integer
+  *One front door.* The three wrappers (`transmute` / `transmute_by_id` / `transmute_by_uuidv7`) collapse into a
+  single `transmute` with two type-safe overloads on the width parameter: `bigint` selects the integer
   grid (`id`), `interval` selects the time grid, with `time` versus `uuidv7` auto-detected from the
   control column's type (a `uuid` column is uuidv7, otherwise time; the `check_uuidv7` plausibility
   sampling stays a warning). The kind argument disappears, the column type carries the meaning. The
   price of type safety is that a bare interval literal is ambiguous between the two overloads, so
-  callers write `adopt(t, c, interval '1 month')` (an integer width needs no cast); that is the right
-  trade against string parameters that secretly carry meaning. The `_adopt` engine (text params plus a
+  callers write `transmute(t, c, interval '1 month')` (an integer width needs no cast); that is the right
+  trade against string parameters that secretly carry meaning. The `_transmute` engine (text params plus a
   kind) is unchanged; the `by_` functions are removed outright (hard replace, acceptable pre-1.0).
 
-  *Never rewrites the primary key.* `adopt` reuses the existing PK when the control column is already
+  *Never rewrites the primary key.* `transmute` reuses the existing PK when the control column is already
   a **member** of it (Postgres requires a partitioned table's PK only to *include* the partition key,
   not to lead it, so `PK (tenant_id, id)` partitioned by `id` qualifies with zero rebuild, broader
   than today's control-must-lead test), and it works with a table that has no PK at all. If the table
   has a PK that *excludes* the control column, the classic `events(id PRIMARY KEY, created_at)` that
-  wants time partitioning, `adopt` refuses and emits a suggested migration (how to get the control
+  wants time partitioning, `transmute` refuses and emits a suggested migration (how to get the control
   column into the PK) rather than just erroring. The widening that today's drop-and-rebuild performs
-  becomes the operator's deliberate job, not something `adopt` attempts online behind their back.
+  becomes the operator's deliberate job, not something `transmute` attempts online behind their back.
 
   *Why this is a net subtraction.* Forbidding widening lets whole subsystems be deleted, not merely
   guarded: the PK drop/rebuild, `build_pk_concurrently` and its `pg_cron` `CREATE INDEX CONCURRENTLY`
@@ -186,14 +186,14 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   survives, the entire composite-FK recovery path (`generate_fk_recovery`, the `'drop'` mode's
   denormalization, `dropped_fk`'s composite columns). Every incoming FK becomes the `preserve` happy
   path: the suspend/restore lifecycle stays, the composite path goes. The guarantees become absolute,
-  every `adopt` is metadata-only and every incoming FK is preservable, with no "depends whether the PK
+  every `transmute` is metadata-only and every incoming FK is preservable, with no "depends whether the PK
   widens" branch anywhere in the tool.
 
   *The bet.* This cedes the most common legacy case, a `bigint` or UUIDv4 `id` PK alongside a separate
   `created_at`, partitioned on time, which is pg_partman's territory. The trade is deliberate: in the
   era of Snowflake bigints, UUIDv7, and ULID, a single-column time-ordered primary key is the better
   data model, and the gymnastics to retrofit a legacy table onto it belong to the operator (with
-  pgpm's guidance) rather than hidden inside an `adopt` that quietly pays an `O(rows)` cost. pgpm
+  pgpm's guidance) rather than hidden inside an `transmute` that quietly pays an `O(rows)` cost. pgpm
   becomes opinionated and predictable: bring a time-ordered key that *is* your primary key and it
   partitions flawlessly, always online, always cheap. Less ambitious, more reliable, the right trade
   for a background steward.
@@ -229,7 +229,7 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   everyone); on Supabase that GUC is not scaled by compute tier (pegged 4GB) and must be set via the
   CLI. `drain_wal_high_water` is the manual stand-in to widen the threshold per-hardware. (2) A better
   future signal would key off *observed* I/O saturation (checkpoint sync duration, IO-wait) rather than
-  the settings proxy, so it self-calibrates to the hardware. A natural companion is for `adopt` to
+  the settings proxy, so it self-calibrates to the hardware. A natural companion is for `transmute` to
   inspect `max_wal_size` against the expected drain WAL rate and advise raising it -- the steward
   surfacing the relevant GUC, not just throttling around it.
 
@@ -314,7 +314,7 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   forecast, not a promise: other tenants on shared substrate, run-to-run variance, and the soft
   disk-bound number all mean the window should carry slack.
 - **Reuse the existing PK when the partition key already covers it (drop a whole cost center).** Today
-  `adopt` always drops the old PK and re-establishes one on the computed columns; when the partition
+  `transmute` always drops the old PK and re-establishes one on the computed columns; when the partition
   key is already in the PK (the `id` and `uuidv7` / ULID cases), those computed columns equal the
   existing PK, so it rebuilds an index identical to the one it just dropped, paying the setup cost
   center for nothing. The optimization is to detect that case and reuse the existing PK index to back
@@ -322,10 +322,10 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   while keeping its index, so the reuse needs the attach-reconcile path (let `ATTACH PARTITION` match
   the existing index, or `ALTER INDEX parent ATTACH PARTITION child`) rather than the current
   drop-then-rebuild, and it wants a test matrix across PG 15 to 18. The payoff: in the common case the
-  setup cost center disappears and only the drain remains. **Implemented**: `adopt` detects when the
+  setup cost center disappears and only the drain remains. **Implemented**: `transmute` detects when the
   partition key already covers the PK (the `id` / `uuidv7` cases) and reuses the existing index in
   place, skipping the drop+rebuild. Tests in `tests/15`; validated flat (single-digit ms) to ~40M rows.
-- **Preserve incoming foreign keys on the happy path (no denormalization).** Today `adopt` treats
+- **Preserve incoming foreign keys on the happy path (no denormalization).** Today `transmute` treats
   every incoming FK the same: refuse (`'error'`) or drop-and-record (`'drop'`), and recovery means
   denormalizing the partition key into the referencing table and rebuilding a composite FK
   (`generate_fk_recovery`). That cost is only real when the PK *widens away* from the referenced key,
@@ -342,7 +342,7 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   child table, so a referenced row is transiently *outside* the parent while it is moved, and a
   `NO ACTION` FK rejects the move (verified: `update or delete ... violates foreign key constraint ...
   still referenced`). So the FK cannot ride through the conversion in place. The design that fits the
-  paced, online drain is **drop-at-adopt, re-add-at-completion**: record the incoming single-column
+  paced, online drain is **drop-at-transmute, re-add-at-completion**: record the incoming single-column
   FKs (as `'drop'` does), run the drain, then re-create each FK against the new parent with
   `NOT VALID` + `VALIDATE` once its referenced ranges are attached, leaving the referencing table
   untouched. Restoration is driven either by `maintenance` noticing the closed tail has fully drained,
@@ -365,7 +365,7 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   (`CASCADE` / `RESTRICT` / `SET NULL`) and `DEFERRABLE` FKs, self-referential FKs, several incoming
   FKs on one parent, the `VALIDATE` scan cost on a large referencing table, and the contract when a
   drain never completes (the FK stays dropped and recorded, surfaced by `status`). **Implemented**:
-  `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at adopt (and refuses the
+  `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at transmute (and refuses the
   widening case), and `pgpm.restore_incoming_fks(parent)` re-adds them against the new parent once the
   drain is quiescent; `maintenance` calls it automatically. Tests in `tests/19`-`tests/23`,
   cross-version PG 15 to 18. Covered on the id/uuidv7 happy path: single and multiple incoming FKs,
@@ -385,7 +385,7 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the
   previous bullet) and still express calendar retention. The bridge comes in three fidelities: (1)
-  **exact**, when time is encoded in the key (`uuidv7` / ULID, which `adopt_by_uuidv7` already
+  **exact**, when time is encoded in the key (`uuidv7` / ULID, which `transmute_by_uuidv7` already
   decodes, and Snowflake bigints if the operator supplies the encoding): no approximation, no
   widening, exact calendar retention; (2) **approximate**, for a plain serial `id` alongside a
   co-monotonic timestamp column: record each partition's observed `min`/`max` of that column as its
@@ -407,8 +407,8 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   (`tests/16`). Validating block-budgeted batching at 2M wide rows also surfaced an operational
   footgun, now guarded: a drain creates each child partition as a standalone table and attaches it
   only at the end, so an interrupted drain leaves an un-attached child that `DROP TABLE <parent>
-  CASCADE` does not remove. Re-adopting the recreated table would let the next drain reuse that orphan
-  by name and collide on its stale keys. `adopt` now refuses up front when such an orphan exists
+  CASCADE` does not remove. Re-transmuting the recreated table would let the next drain reuse that orphan
+  by name and collide on its stale keys. `transmute` now refuses up front when such an orphan exists
   (`tests/18`).
 - The **bench** (`bench/`) is the instrument that measures the supply side and pgpm's demand against
   it; the **size ladder** (`bench/SIZE_LADDER.md`) is the beginnings of the calibration curve; the

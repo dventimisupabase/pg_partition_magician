@@ -1,4 +1,4 @@
--- Verifies adopt() carried the old table's secondary index onto the parent as a
+-- Verifies transmute() carried the old table's secondary index onto the parent as a
 -- partitioned index (no duplicate/rebuild on the default), and that it propagates
 -- to premade and drained partitions.
 create extension if not exists pgtap;

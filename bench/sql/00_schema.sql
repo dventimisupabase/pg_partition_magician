@@ -16,7 +16,7 @@ create table if not exists bench.events (
   user_id    int      not null,
   kind       smallint not null,
   payload    text     not null,
-  -- the partition key (created_at) is part of the PK, so pgpm reuses it in place at adopt (no PK
+  -- the partition key (created_at) is part of the PK, so pgpm reuses it in place at transmute (no PK
   -- rewrite; see DESIGN.md section 8). A bare id PK would be refused for time partitioning now.
   primary key (created_at, id)
 );

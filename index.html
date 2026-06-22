@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>pg_partition_magician: partition a live Postgres table online</title>
-  <meta name="description" content="A pure-SQL Postgres partition manager. Adopt an existing live table into a native RANGE-partitioned table online (on a time, bigint id, or UUIDv7 key), with no maintenance window, driven by pg_cron." />
+  <meta name="description" content="A pure-SQL Postgres partition manager. Transmute an existing live table into a native RANGE-partitioned table online (on a time, bigint id, or UUIDv7 key), with no maintenance window, driven by pg_cron." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -387,7 +387,7 @@
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
         <h1 class="display">Now a table. Now partitions.<br>It only looks like <em>magic</em>.</h1>
-        <p class="lede">pg_partition_magician adopts an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
+        <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>
           <a class="btn btn-ghost" href="https://github.com/dventimisupabase/pg_partition_magician" target="_blank" rel="noopener">
@@ -440,9 +440,9 @@
         <!-- 2 -->
         <div class="beat reveal">
           <div class="beat-copy">
-            <span class="move"><span class="move-n">2</span> The switch &middot; <code>adopt</code></span>
+            <span class="move"><span class="move-n">2</span> The switch &middot; <code>transmute</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>adopt()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the partition key must already be part of the primary key (pgpm never rewrites it, move 3), non-key-aligned unique indexes can't be carried, and incoming foreign keys are kept against the new parent. If the table isn't shaped for that, <code>adopt</code> refuses up front and tells you how to fix it, rather than mangling it.</p>
+            <p><code>transmute()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>), creates a partitioned parent under the <em>very same name</em>, and attaches the old table to it as the <code>DEFAULT</code> partition. Same name, same rows. The app keeps querying <code>events</code> and never sees the hand move, and the swap is catalog-only, the lock held for a blink. What <em>does</em> change is small and declared: the partition key must already be part of the primary key (pgpm never rewrites it, move 3), non-key-aligned unique indexes can't be carried, and incoming foreign keys are kept against the new parent. If the table isn't shaped for that, <code>transmute</code> refuses up front and tells you how to fix it, rather than mangling it.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -460,12 +460,12 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">3</span> The index is already in hand</span>
             <h3>There's no hard part to hide.</h3>
-            <p>A partitioned table's primary key must contain the partition key. pgpm's bet is that it already does, because the modern data model makes a time-ordered key (a Snowflake <code>bigint</code>, a UUIDv7, a ULID) the primary key. So there's nothing to widen and no index to rebuild: <code>adopt</code> reuses the existing key in place and the cutover is pure metadata, online at any size. If the partition key <em>isn't</em> part of your primary key, <code>adopt</code> says so up front and points you at the one-time migration, rather than quietly rebuilding the key under an <code>ACCESS EXCLUSIVE</code> lock (<code>O(rows)</code>, about 28&nbsp;minutes at 300M rows). Predictable beats clever.</p>
+            <p>A partitioned table's primary key must contain the partition key. pgpm's bet is that it already does, because the modern data model makes a time-ordered key (a Snowflake <code>bigint</code>, a UUIDv7, a ULID) the primary key. So there's nothing to widen and no index to rebuild: <code>transmute</code> reuses the existing key in place and the cutover is pure metadata, online at any size. If the partition key <em>isn't</em> part of your primary key, <code>transmute</code> says so up front and points you at the one-time migration, rather than quietly rebuilding the key under an <code>ACCESS EXCLUSIVE</code> lock (<code>O(rows)</code>, about 28&nbsp;minutes at 300M rows). Predictable beats clever.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-prepare">
               <div class="lane"><span class="lane-lbl">pgpm &middot; the cutover</span><b class="bar ok fill"></b><span class="lockbadge s">metadata only</span></div>
-              <div class="op tiny"><span class="tick">&check;</span> <code>adopt</code>: reuse the PK &middot; a blink</div>
+              <div class="op tiny"><span class="tick">&check;</span> <code>transmute</code>: reuse the PK &middot; a blink</div>
               <div class="lane ghost"><span class="lane-lbl">rewriting the key &middot; the cost we refuse</span><b class="bar block fill2"></b><span class="lockbadge x">ACCESS EXCLUSIVE</span></div>
             </div>
           </figure>
@@ -567,7 +567,7 @@
           <div class="glyph">♦</div>
           <h3>time</h3>
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly: any interval.</p>
-          <pre><code><span class="k">select</span> pgpm.adopt(
+          <pre><code><span class="k">select</span> pgpm.transmute(
   'public.events',
   'created_at', <span class="k">interval</span> '1 month');</code></pre>
         </div>
@@ -575,7 +575,7 @@
           <div class="glyph">♣</div>
           <h3>id</h3>
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence, including Snowflake-style ids, where time lives in the high bits.</p>
-          <pre><code><span class="k">select</span> pgpm.adopt(
+          <pre><code><span class="k">select</span> pgpm.transmute(
   'public.events',
   'id', 10000000);</code></pre>
         </div>
@@ -583,7 +583,7 @@
           <div class="glyph">♠</div>
           <h3>uuidv7</h3>
           <p>Time-ordered uuids, and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
-          <pre><code><span class="k">select</span> pgpm.adopt(
+          <pre><code><span class="k">select</span> pgpm.transmute(
   'public.events',
   'id', <span class="k">interval</span> '1 day');</code></pre>
         </div>
@@ -605,7 +605,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is your primary key and pgpm never rewrites it, an incoming FK still references a key that survives, so <code>adopt</code> keeps it, re-pointed at the new parent, no denormalization. A table whose primary key doesn't include the partition key is refused up front, never silently mangled.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is your primary key and pgpm never rewrites it, an incoming FK still references a key that survives, so <code>transmute</code> keeps it, re-pointed at the new parent, no denormalization. A table whose primary key doesn't include the partition key is refused up front, never silently mangled.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>

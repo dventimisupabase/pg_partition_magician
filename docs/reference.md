@@ -7,7 +7,7 @@ see [DESIGN.md](../DESIGN.md).
 ## Conventions
 
 - Everything lives in the `pgpm` schema.
-- `p_parent` is always a `regclass` (the partitioned parent, or the table being adopted). Pass a
+- `p_parent` is always a `regclass` (the partitioned parent, or the table being transmuted). Pass a
   schema-qualified name like `'public.events'`; it is resolved against the current `search_path`.
 - "Native" values are a partition kind's internal grid units: `timestamptz` for `time` and
   `uuidv7`, `numeric` for `id`. Partition bounds (`lo`/`hi`) are stored as text in those units.
@@ -16,17 +16,17 @@ see [DESIGN.md](../DESIGN.md).
   closed intervals are drained.
 - Functions raise `pg_partition_magician: ...` (SQLSTATE `P0001`) on misuse.
 
-## Adoption
+## Transmutation
 
-`adopt` converts an existing, unpartitioned table into a native `RANGE`-partitioned one, online and
+`transmute` converts an existing, unpartitioned table into a native `RANGE`-partitioned one, online and
 metadata-only. It is one function with two type-safe overloads chosen by the width parameter; the
 partition kind is read from the control column. pgpm never rewrites the primary key (see
 [No PK rewrite](#no-pk-rewrite)).
 
-### `pgpm.adopt` (time grid: time / uuidv7)
+### `pgpm.transmute` (time grid: time / uuidv7)
 
 ```sql
-pgpm.adopt(
+pgpm.transmute(
   p_parent       regclass,
   p_control      name,
   p_interval     interval,
@@ -42,7 +42,7 @@ pgpm.adopt(
 
 The interval overload. The kind is inferred from the control column's type: a `uuid` column is
 `uuidv7` (ULID-as-uuid included), a `timestamptz` / `timestamp` / `date` column is `time`. A bare
-interval literal is ambiguous against the bigint overload, so cast it: `adopt(t, c, interval '1 month')`.
+interval literal is ambiguous against the bigint overload, so cast it: `transmute(t, c, interval '1 month')`.
 
 | Parameter | Meaning |
 |---|---|
@@ -57,10 +57,10 @@ interval literal is ambiguous against the bigint overload, so cast it: `adopt(t,
 | `p_paused` | When `true` (default), register but do not let scheduled `maintenance` act until you unpause. |
 | `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'preserve'` drops each for the conversion, records it, and re-adds it against the new parent once the drain is idle ([`restore_incoming_fks`](#pgpmrestore_incoming_fks)). See [incoming FKs](guide.md#incoming-foreign-keys). |
 
-### `pgpm.adopt` (integer grid: id)
+### `pgpm.transmute` (integer grid: id)
 
 ```sql
-pgpm.adopt(
+pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_attain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
@@ -69,31 +69,31 @@ pgpm.adopt(
 ```
 
 The bigint overload, for an integer / `bigint` / `numeric` key (including Snowflake-style ids). An
-integer literal selects it with no cast: `adopt(t, c, 10000000)`. Differences from the interval form:
+integer literal selects it with no cast: `transmute(t, c, 10000000)`. Differences from the interval form:
 
 - `p_step` is the partition width in key units (e.g. `10000000` ids per partition).
 - `p_retain` is a `bigint` count of intervals to keep, not an interval.
 - `p_anchor` is a `bigint` grid origin (default `0`).
 - The frontier is `max(control)`.
 
-### What adopt does
+### What transmute does
 
 Renames the live table to `<name>_default`, creates a partitioned parent under the original name, and
 attaches the old table as the `DEFAULT` partition. No rows move. Identity moves to the parent.
 Non-unique secondary indexes are carried onto the parent; unique secondary indexes are skipped
-(recreate by hand). The adopted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused;
+(recreate by hand). The transmuted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused;
 nothing drains until you run `maintenance` / `drain_*` or unpause.
 
 ### No PK rewrite
 
-`adopt` never drops or rebuilds the primary key, so the cutover is always metadata-only (no `O(rows)`
+`transmute` never drops or rebuilds the primary key, so the cutover is always metadata-only (no `O(rows)`
 index build, ever). It reuses the existing PK in place when `p_control` is already a member of it
 (Postgres requires a partitioned PK only to *include* the partition key, not lead it, so a composite
 `PK (tenant_id, id)` partitioned by `id` qualifies), and a table with no PK is fine. If the table has
 a primary key that does NOT include `p_control` (the classic `events(id PRIMARY KEY, created_at)` that
-wants time partitioning), adopt refuses with guidance: make `p_control` part of the primary key first
+wants time partitioning), transmute refuses with guidance: make `p_control` part of the primary key first
 (a single-column time-ordered key is simplest; or widen the PK yourself via
-`CREATE UNIQUE INDEX CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-adopt.
+`CREATE UNIQUE INDEX CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-transmute.
 
 ## Maintenance
 
@@ -294,7 +294,7 @@ that bridge.
 pgpm.restore_incoming_fks(p_parent regclass) returns int
 ```
 
-Re-adds the incoming FKs that `adopt(..., p_incoming_fks => 'preserve')` recorded (the
+Re-adds the incoming FKs that `transmute(..., p_incoming_fks => 'preserve')` recorded (the
 [`pgpm.dropped_fk`](#pgpmdropped_fk) rows that are currently dropped), pointing them back at the new
 partitioned parent with `NOT VALID` + `VALIDATE` (so the re-add is online; a self-referential FK, whose
 referencing side is the partitioned parent, is added validating in one step since Postgres rejects
@@ -339,7 +339,7 @@ One row per managed table; the source of truth for its policy. Editable (e.g.
 | `drain_batch` | `int` | Default rows per drain microbatch. |
 | `default_table` | `name` | Name of the DEFAULT partition (`<parent>_default`). |
 | `paused` | `boolean` | Whether scheduled maintenance acts on this table. |
-| `created_at` | `timestamptz` | When adopted. |
+| `created_at` | `timestamptz` | When transmuted. |
 | `attain_retry_after` | `timestamptz` | Internal attain back-off window; null = attempt now. |
 | `drain_max_blocks` | `int` | Optional block budget per drain batch; null = cap by `drain_batch` rows only. |
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
@@ -371,7 +371,7 @@ Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g
 
 ### `pgpm.dropped_fk`
 
-Incoming FKs dropped by `adopt(..., p_incoming_fks => 'preserve')`, kept as managed records so they
+Incoming FKs dropped by `transmute(..., p_incoming_fks => 'preserve')`, kept as managed records so they
 can be re-added against the new parent. Columns: `id`, `parent_table`, `referencing_table`,
 `constraint_name`, `definition`, `restored_at`, `dropped_at`. `restored_at` tracks lifecycle state
 (null = currently dropped/suspended, set = currently live): [`restore_incoming_fks`](#pgpmrestore_incoming_fks)

@@ -23,7 +23,7 @@ the env vars directly for `bench/run.sh`.
 - **closed-tail fraction ≈ 0.69** at `BENCH_MONTHS=2` (mid-month run; see the months knob).
 - **drain throughput ≈ 15.4k rows/s cache-resident** (R3, measured). **~3k rows/s disk-bound
   is a soft estimate** from earlier project runs; R4 is the first rung that would *measure* it.
-- adopt ≈ 8 s metadata cutover (size-independent); online PK build ≈ 1.3 s per 1M rows.
+- transmute ≈ 8 s metadata cutover (size-independent); online PK build ≈ 1.3 s per 1M rows.
 
 ## The regime change is the whole point
 

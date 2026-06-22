@@ -1,4 +1,4 @@
--- adopt() refuses a table with incoming foreign keys by default; p_incoming_fks => 'preserve' drops
+-- transmute() refuses a table with incoming foreign keys by default; p_incoming_fks => 'preserve' drops
 -- and records them so the conversion can proceed (restore_incoming_fks re-adds them later). The table
 -- partitions on its own id primary key -- pgpm never rewrites the PK, so the FK is preservable.
 create extension if not exists pgtap;
@@ -17,11 +17,11 @@ create table public.fk_child (
   parent_id bigint references public.fk_parent (id)
 );
 
--- (1) default: adopt refuses while the incoming FK exists (RAISE => SQLSTATE P0001)
+-- (1) default: transmute refuses while the incoming FK exists (RAISE => SQLSTATE P0001)
 select throws_ok(
-  $$ select pgpm.adopt('public.fk_parent', 'id', 100000) $$,
+  $$ select pgpm.transmute('public.fk_parent', 'id', 100000) $$,
   'P0001', null,
-  'adopt() refuses a table with incoming foreign keys by default'
+  'transmute() refuses a table with incoming foreign keys by default'
 );
 
 -- (2) the refusal mutated nothing: the FK is still there
@@ -33,8 +33,8 @@ select ok(
 
 -- (3) with p_incoming_fks => preserve: the conversion succeeds
 select lives_ok(
-  $$ select pgpm.adopt('public.fk_parent', 'id', 100000, p_incoming_fks => 'preserve') $$,
-  'adopt(..., p_incoming_fks => ''preserve'') succeeds'
+  $$ select pgpm.transmute('public.fk_parent', 'id', 100000, p_incoming_fks => 'preserve') $$,
+  'transmute(..., p_incoming_fks => ''preserve'') succeeds'
 );
 
 -- (4) the incoming FK was dropped for the conversion

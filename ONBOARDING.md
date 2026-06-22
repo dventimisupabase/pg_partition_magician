@@ -2,7 +2,7 @@
 
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
-It adopts an existing (possibly huge, live) table into a native partitioned table
+It transmutes an existing (possibly huge, live) table into a native partitioned table
 *online*, then manages the lifecycle (attain → drain → retain) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
@@ -42,17 +42,17 @@ docker compose --profile pg15 down -v
 | `extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
 | `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
-| `fixtures/demo.sql` | Builds + adopts the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
+| `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `README.md` | Overview, quickstart, and links into the docs |
-| `docs/guide.md` | User guide: concepts, install, adopt, schedule, monitor, retain, FKs, ops |
+| `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
 | `DESIGN.md` | The operating model and design rationale |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
 
 ## The mental model (in one breath)
 
-You can't convert a table to partitioned in place, so `adopt()` renames it aside,
+You can't convert a table to partitioned in place, so `transmute()` renames it aside,
 makes a partitioned parent under the original name, and attaches the old table as
 the **`DEFAULT` partition** (zero data movement). New writes route to premade
 partitions; the `DEFAULT`'s **closed tail** drains into proper partitions in paced
@@ -118,9 +118,9 @@ rollback;
 - **float/double are rejected** as control columns (imprecise boundaries; NaN/Inf
   poison the frontier).
 - **UUIDv7/ULID can't be verified by type**: the uuidv7 kind is inferred from a `uuid`
-  control column; `adopt` samples and *warns* if the values look random (v4);
+  control column; `transmute` samples and *warns* if the values look random (v4);
   `pgpm.check_uuidv7(table, col)` runs the check on demand.
-- **Incoming FKs**: `adopt` refuses by default; `p_incoming_fks => 'preserve'` records +
+- **Incoming FKs**: `transmute` refuses by default; `p_incoming_fks => 'preserve'` records +
   drops them for the conversion, and `restore_incoming_fks` re-adds them against the new
   parent once the drain is idle.
 

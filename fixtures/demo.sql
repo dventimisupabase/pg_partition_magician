@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Test/demo fixtures for pg_partition_magician.
 --
--- Builds three unpartitioned tables and adopts one of each kind, so the pgTAP
+-- Builds three unpartitioned tables and transmutes one of each kind, so the pgTAP
 -- suite has realistic data to exercise. Load it AFTER the module is installed:
 --
 --   psql -f sql/pg_partition_magician.sql        # (or any install channel)
@@ -19,7 +19,7 @@ create table public.messages (
   tenant_id   uuid        not null,
   created_at  timestamptz not null default now(),
   body        text        not null,
-  -- the partition key (created_at) is part of the PK, so adopt reuses it in place (no rewrite)
+  -- the partition key (created_at) is part of the PK, so transmute reuses it in place (no rewrite)
   constraint messages_pkey primary key (created_at, id)
 );
 create index messages_tenant_created_idx on public.messages (tenant_id, created_at desc);
@@ -48,9 +48,9 @@ $$;
 select public.generate_messages(coalesce(current_setting('poc.seed_count', true)::int, 50000), 6);
 analyze public.messages;
 
-select pgpm.adopt('public.messages', 'created_at', interval '1 month',
+select pgpm.transmute('public.messages', 'created_at', interval '1 month',
                   p_attain => 4, p_retain => null, p_drain_batch => 5000, p_paused => true);
--- adopt() does the cutover only; attain the future partitions separately (online)
+-- transmute() does the cutover only; attain the future partitions separately (online)
 select pgpm.attain('public.messages');
 
 -- ---- integer/id dimension: events_id ---------------------------------------
@@ -61,7 +61,7 @@ create table public.events_id (
 insert into public.events_id (payload)
   select 'evt ' || g from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g;
 analyze public.events_id;
-select pgpm.adopt('public.events_id', 'id', 10000, p_attain => 2, p_drain_batch => 5000);
+select pgpm.transmute('public.events_id', 'id', 10000, p_attain => 2, p_drain_batch => 5000);
 select pgpm.attain('public.events_id');
 
 -- ---- uuidv7 dimension: events_uuid -----------------------------------------
@@ -85,5 +85,5 @@ from (
   from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g
 ) s;
 analyze public.events_uuid;
-select pgpm.adopt('public.events_uuid', 'id', interval '1 month', p_attain => 2, p_drain_batch => 5000);
+select pgpm.transmute('public.events_uuid', 'id', interval '1 month', p_attain => 2, p_drain_batch => 5000);
 select pgpm.attain('public.events_uuid');

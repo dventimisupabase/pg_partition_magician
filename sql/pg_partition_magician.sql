@@ -3,7 +3,7 @@
 --
 --   * Only runtime dependency: pg_cron (and only for scheduling). No compiled
 --     extension. Install with: psql -f this_file.sql.  Schema: pgpm.
---   * Manages the full lifecycle of native RANGE-partitioned tables: adopt an
+--   * Manages the full lifecycle of native RANGE-partitioned tables: transmute an
 --     existing (possibly huge, live) table online, attain ahead of the write
 --     frontier, drain the DEFAULT's closed tail, retain, all via maintenance.
 --
@@ -391,7 +391,7 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
 
-  -- ORDER BY the control column: the default's PK leads with the control column (adopt builds
+  -- ORDER BY the control column: the default's PK leads with the control column (transmute builds
   -- it that way), so this makes the batch select an INDEX SCAN that reads exactly p_batch rows
   -- in order. Without it the planner SEQ-SCANs the (large) default to find a batch -- every
   -- drain_step re-scanning the whole default, a SEQUENTIAL_SCAN_STORM at scale. The index scan
@@ -490,9 +490,9 @@ begin
 end;
 $$;
 
--- ============================== adopt ==============================
+-- ============================== transmute ==============================
 
-create or replace function pgpm._adopt(
+create or replace function pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_attain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text
@@ -540,7 +540,7 @@ begin
   -- table (CREATE TABLE ... LIKE) and only ATTACHes it at the END of that child's drain. An
   -- interrupted drain therefore leaves an un-attached child -- which DROP TABLE <parent> CASCADE
   -- does NOT remove (an un-attached table has no dependency on the parent). If the table is later
-  -- recreated/reloaded and re-adopted, the next drain reuses the orphan by name and INSERTs rows
+  -- recreated/reloaded and re-transmuted, the next drain reuses the orphan by name and INSERTs rows
   -- whose keys already live in it: a cryptic mid-drain "duplicate key" deep inside drain_step.
   -- Refuse up front -- any standalone (un-attached) table in this schema whose name matches this
   -- parent's child-partition naming (<rel>_p<digits...>) is an orphan. starts_with handles the
@@ -559,7 +559,7 @@ begin
        and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
      limit 1;
     if v_orphan is not null then
-      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted drain. Drop it (drop table %.%) and retry adopt.',
+      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted drain. Drop it (drop table %.%) and retry transmute.',
         v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
     end if;
   end;
@@ -604,7 +604,7 @@ begin
   -- table with no PK at all is fine (there is nothing to preserve).
   if v_oldpk is not null then
     if not (p_control::text = any(v_oldpk)) then
-      raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run adopt: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
+      raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite primary keys, and the primary key (%) does not include %. Make % part of the primary key first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen the PK to include % via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
         p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control, p_control;
     end if;
     v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
@@ -741,7 +741,7 @@ begin
     attain = excluded.attain, retain = excluded.retain, keep_default = excluded.keep_default,
     drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused;
 
-  insert into pgpm.log (parent_table, action) values (v_parent, 'adopt');
+  insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
 
   -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
   -- always preserve-managed now, re-added by restore_incoming_fks once the drain is idle.
@@ -751,40 +751,40 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  -- NOTE: attain is intentionally NOT run inside adopt. It attaches future partitions,
+  -- NOTE: attain is intentionally NOT run inside transmute. It attaches future partitions,
   -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
   -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
-  -- for the whole scan (O(default), minutes on a large table). adopt() therefore does the
+  -- for the whole scan (O(default), minutes on a large table). transmute() therefore does the
   -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
   -- so it stays online even at scale. Run pgpm.attain(parent) (or pgpm.maintenance, or the
-  -- scheduled maintenance job) AFTER adopt to build the future partitions online -- its
+  -- scheduled maintenance job) AFTER transmute to build the future partitions online -- its
   -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until attain
   -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
   return v_parent;
 end;
 $$;
 
--- One adopt, two type-safe overloads on the width parameter (DESIGN.md sec 8). The integer-grid and
--- time-grid families used to be three functions (adopt / adopt_by_id / adopt_by_uuidv7); they collapse
--- into a single `adopt` whose overload is chosen by the width type, with the kind read from the
+-- One transmute, two type-safe overloads on the width parameter (DESIGN.md sec 8). The integer-grid and
+-- time-grid families used to be three functions (transmute / transmute_by_id / transmute_by_uuidv7); they collapse
+-- into a single `transmute` whose overload is chosen by the width type, with the kind read from the
 -- control column. The old by_ names are removed (hard replace).
-drop function if exists pgpm.adopt_by_id(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text);
-drop function if exists pgpm.adopt_by_uuidv7(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text);
+drop function if exists pgpm.transmute_by_id(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text);
+drop function if exists pgpm.transmute_by_uuidv7(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text);
 -- removed in the redesign (no PK rewrite -> no online PK build, no composite-FK recovery)
 drop procedure if exists pgpm.build_pk_concurrently(regclass, name, interval, interval);
 drop function if exists pgpm.generate_fk_recovery(regclass);
 
 -- Time grid: interval width. The control column's type selects the kind -- a uuid column is uuidv7
--- (ULIDs stored as uuid included), anything else is time (timestamptz/timestamp/date; _adopt rejects
+-- (ULIDs stored as uuid included), anything else is time (timestamptz/timestamp/date; _transmute rejects
 -- a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
--- callers cast: adopt(t, c, interval '1 month').
-create or replace function pgpm.adopt(
+-- callers cast: transmute(t, c, interval '1 month').
+create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
   p_attain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
-  select pgpm._adopt(p_parent, p_control,
+  select pgpm._transmute(p_parent, p_control,
     case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
          then 'uuidv7' else 'time' end,
@@ -793,13 +793,13 @@ create or replace function pgpm.adopt(
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
-create or replace function pgpm.adopt(
+create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_attain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
-  select pgpm._adopt(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_attain,
+  select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_attain,
                      p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
@@ -1095,7 +1095,7 @@ begin
       values (p_parent, 'drain_budget', v_budget, v_reason);
   end if;
 
-  -- Once the closed tail is drained, re-add any incoming FKs that adopt(..., 'preserve') dropped, now
+  -- Once the closed tail is drained, re-add any incoming FKs that transmute(..., 'preserve') dropped, now
   -- against the new parent. restore_incoming_fks self-gates on quiescence (no closed rows, no in-flight
   -- child), so it is a no-op until the drain is idle and harmless to attempt every tick. Isolated like
   -- the steps above: a hiccup here never aborts the drain's progress.
@@ -1205,7 +1205,7 @@ begin
 end;
 $$;
 
--- restore_incoming_fks(): re-add the incoming FKs that adopt(..., p_incoming_fks => 'preserve')
+-- restore_incoming_fks(): re-add the incoming FKs that transmute(..., p_incoming_fks => 'preserve')
 -- recorded, pointing them back at the new partitioned parent (`NOT VALID` then `VALIDATE`, so the
 -- re-add is online), but only once it is SAFE. Safe = the conversion is quiescent: the closed tail is
 -- fully drained (no closed rows linger in the DEFAULT) and no in-flight, not-yet-attached child
@@ -1234,7 +1234,7 @@ begin
   select closed_rows into v_closed from pgpm.check_default(p_parent);
   if coalesce(v_closed, 0) > 0 then return 0; end if;
 
-  -- gate 2: no in-flight (un-attached) child partition mid-drain (same shape as adopt's orphan guard).
+  -- gate 2: no in-flight (un-attached) child partition mid-drain (same shape as transmute's orphan guard).
   select c.relname into v_inflight
     from pg_class c
    where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
