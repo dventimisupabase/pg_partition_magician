@@ -240,13 +240,28 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   own (they are *starved*, not writing), so the WAL signal stays quiet and the drain keeps hogging the
   disk. The fix is a *consumer-priority* signal that sees the contention directly: `pgpm._ambient_io_waiters()`
   counts non-pgpm client backends currently stuck on IO/Lock/LWLock/BufferPin waits, and the controller
-  backs off when that exceeds `drain_ambient_max_waiters` (default 0 = off). The two signals are
-  **OR'd, not exchanged** -- they cover disjoint failure modes (over-driving WAL vs starving the
-  workload), so the drain feathers down if *either* fires and recovers when *both* are clear. Further
-  supply signals (replication lag, an ambient-latency delta, a self-calibrating waiter baseline instead
-  of a fixed threshold) plug in as additional OR'd terms; the waiter count is a coarse, point-in-time
-  first cut, smoothed by AIMD across ticks. Tests in `tests/26`; cross-version PG 15 to 18. (Cross-role
-  visibility of `wait_event` needs `pg_monitor`; same-role backends are always visible.)
+  backs off when they spike. The two signals are **OR'd, not exchanged** -- they cover disjoint failure
+  modes (over-driving WAL vs starving the workload), so the drain feathers down if *either* fires and
+  recovers when *both* are clear.
+
+  *Self-calibrating the ambient signal (IMPLEMENTED).* A *fixed* waiter threshold is the wrong shape: the
+  "normal" waiter count is box- and workload-dependent (near zero on an idle box, double digits on a busy
+  one where every client occasionally IO-waits), so one constant fires everywhere or nowhere -- two bench
+  demos confirmed a fixed threshold could not separate a surge from the baseline. So the signal learns its
+  own normal: `drain_ambient_baseline` is an EWMA (smoothing `drain_ambient_alpha`, default 0.2) of the
+  per-tick waiter count, and `_ambient_surge` fires when the current count exceeds `drain_ambient_factor`
+  times that learned baseline (default factor 0 = off; a typical on-value is 2.0), floored at
+  `drain_ambient_floor` (default 2) so an idle box does not back off on a couple of transient waiters. The
+  baseline's smoothing is damped 10x during a surge, so a transient spike barely moves it (the surge stays
+  visible for its whole duration) while a *sustained* regime shift is still relearned over many ticks --
+  and the AIMD floor guarantees forward progress throughout. The old fixed `drain_ambient_max_waiters`
+  remains as an optional absolute cap, OR'd on top (0 = off). Both are set with `set_drain_ambient(parent,
+  factor, alpha, floor)`. This is the *self-calibrates to the hardware* idea applied to the consumer
+  signal, mirroring the WAL signal's settings-derived proxy. Further supply signals (replication lag, an
+  ambient-latency delta) plug in as additional OR'd terms; the waiter count is a coarse, point-in-time
+  sample, smoothed by AIMD and now the EWMA baseline across ticks. Tests in `tests/26`; cross-version PG
+  15 to 18. (Cross-role visibility of `wait_event` needs `pg_monitor`; same-role backends are always
+  visible.)
 
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
   under a link's capacity: a calm tick recovers the budget up by a small step, a tick whose WAL rate is

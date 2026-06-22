@@ -64,9 +64,21 @@ create table if not exists pgpm.config (
   drain_wal_lsn        pg_lsn,
   drain_wal_at         timestamptz,
   drain_wal_high_water numeric not null default 1.0,
-  -- ambient-contention signal: back off when more than this many non-pgpm client backends are stuck on
-  -- IO/lock waits (the drain is starving the workload). 0 = disabled (pure WAL behaviour). See sec 8.
-  drain_ambient_max_waiters int not null default 0
+  -- ambient-contention signal (consumer priority): back off when non-pgpm client backends are stuck on
+  -- IO/lock waits (the drain is starving the workload). Two complementary triggers, OR'd:
+  --   * SELF-CALIBRATING (primary): a fixed waiter threshold is the wrong shape -- "normal" waiter count
+  --     is box/workload-dependent (~0 idle, double digits busy). So we learn the recent normal as an EWMA
+  --     (drain_ambient_baseline, smoothing drain_ambient_alpha) and back off on a RELATIVE surge: current
+  --     waiters > drain_ambient_factor * baseline, floored at drain_ambient_floor so an idle box does not
+  --     fire on a couple of transient waiters. drain_ambient_factor = 0 disables it (the default).
+  --   * ABSOLUTE cap (optional backstop): back off when more than drain_ambient_max_waiters are contended,
+  --     regardless of baseline. 0 = disabled. Useful as a hard ceiling on top of the relative trigger.
+  -- 0/0 = ambient signal fully off (pure WAL behaviour). See DESIGN.md section 8.
+  drain_ambient_max_waiters int     not null default 0,
+  drain_ambient_factor      numeric not null default 0,
+  drain_ambient_alpha       numeric not null default 0.2,
+  drain_ambient_floor       int     not null default 2,
+  drain_ambient_baseline    numeric
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
@@ -78,6 +90,10 @@ alter table pgpm.config add column if not exists drain_wal_lsn pg_lsn;
 alter table pgpm.config add column if not exists drain_wal_at timestamptz;
 alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 1.0;
 alter table pgpm.config add column if not exists drain_ambient_max_waiters int not null default 0;
+alter table pgpm.config add column if not exists drain_ambient_factor numeric not null default 0;
+alter table pgpm.config add column if not exists drain_ambient_alpha numeric not null default 0.2;
+alter table pgpm.config add column if not exists drain_ambient_floor int not null default 2;
+alter table pgpm.config add column if not exists drain_ambient_baseline numeric;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -836,11 +852,37 @@ returns int language sql stable as $$
      and coalesce(query, '') not like '%pgpm.%';
 $$;
 
--- The ambient decision (pure, unit-tested): congested if more than p_max waiters are contended.
--- p_max = 0 disables the signal (back-compatible: pure WAL behaviour).
+-- The ambient ABSOLUTE-cap decision (pure, unit-tested): congested if more than p_max waiters are
+-- contended, regardless of the learned baseline. p_max = 0 disables this backstop. An optional hard
+-- ceiling on top of the self-calibrating trigger below.
 create or replace function pgpm._ambient_congested(p_waiters int, p_max int)
 returns boolean language sql immutable as $$
   select coalesce(p_max, 0) > 0 and coalesce(p_waiters, 0) > p_max;
+$$;
+
+-- The SELF-CALIBRATING baseline (pure, unit-tested): one EWMA step toward the latest waiter sample.
+-- This is the learned "normal" ambient waiter count, which the relative surge trigger compares against.
+-- A null baseline (first observation) initialises to that observation; otherwise the standard
+-- exponential moving average alpha*observed + (1-alpha)*baseline. The caller damps alpha during a surge
+-- so a transient spike barely moves the baseline (clean detection), while a sustained regime shift is
+-- still relearned over many ticks (the AIMD floor guarantees forward progress meanwhile).
+create or replace function pgpm._ambient_baseline_next(p_baseline numeric, p_observed int, p_alpha numeric)
+returns numeric language sql immutable as $$
+  select case
+           when p_baseline is null then p_observed::numeric
+           else coalesce(p_alpha, 0) * p_observed + (1 - coalesce(p_alpha, 0)) * p_baseline
+         end;
+$$;
+
+-- The SELF-CALIBRATING surge decision (pure, unit-tested): congested if the current waiter count exceeds
+-- p_factor times the learned baseline. A fixed threshold is the wrong shape (normal is box-dependent), so
+-- this is RELATIVE to what this server has been doing. p_floor is a minimum effective baseline so an idle
+-- box (baseline ~0) does not fire on a couple of transient waiters. p_factor = 0 disables the signal.
+create or replace function pgpm._ambient_surge(p_waiters int, p_baseline numeric, p_factor numeric, p_floor int)
+returns boolean language sql immutable as $$
+  select coalesce(p_factor, 0) > 0
+     and p_waiters::numeric
+         > greatest(coalesce(p_baseline, 0), coalesce(p_floor, 0)::numeric) * p_factor;
 $$;
 
 -- The reactive backstop sensor: the cluster's forced/requested-checkpoint counter. A *requested*
@@ -880,7 +922,23 @@ returns void language plpgsql as $$
 begin
   update pgpm.config
      set drain_adaptive = p_enabled, drain_budget = null, drain_ckpt_seen = null,
-         drain_wal_lsn = null, drain_wal_at = null
+         drain_wal_lsn = null, drain_wal_at = null, drain_ambient_baseline = null
+   where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
+-- Operator switch for the self-calibrating ambient signal (DESIGN.md sec 8). p_factor > 0 turns it on:
+-- the drain backs off when live waiters exceed p_factor times the learned baseline (relative surge),
+-- p_alpha is the baseline's EWMA smoothing, p_floor the minimum effective baseline (idle-box guard).
+-- p_factor = 0 turns it off. Resets the learned baseline so it re-learns cleanly from the next tick.
+create or replace function pgpm.set_drain_ambient(
+  p_parent regclass, p_factor numeric default 2.0, p_alpha numeric default 0.2, p_floor int default 2)
+returns void language plpgsql as $$
+begin
+  update pgpm.config
+     set drain_ambient_factor = p_factor, drain_ambient_alpha = p_alpha,
+         drain_ambient_floor = p_floor, drain_ambient_baseline = null
    where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 end;
@@ -895,6 +953,7 @@ declare
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
   v_waiters int; v_wal_cong boolean; v_amb_cong boolean; v_reason text;
+  v_amb_surge boolean; v_amb_abs boolean; v_amb_baseline numeric;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -975,8 +1034,22 @@ begin
     v_wal_cong := pgpm._feather_congested(
                     v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
                     cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
+    -- The ambient signal: a SELF-CALIBRATING relative surge (current waiters vs the learned baseline)
+    -- OR'd with the optional absolute cap. The baseline is an EWMA learned from the calm ticks; we damp
+    -- its smoothing by 10x during a surge so a transient spike barely moves it (keeps the surge visible),
+    -- while a sustained regime shift is still relearned over many ticks. Baseline only advances when the
+    -- signal is enabled (drain_ambient_factor > 0); otherwise it stays null (pure WAL / absolute-cap mode).
     v_waiters  := pgpm._ambient_io_waiters();
-    v_amb_cong := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
+    v_amb_surge := pgpm._ambient_surge(v_waiters, cfg.drain_ambient_baseline,
+                                       cfg.drain_ambient_factor, cfg.drain_ambient_floor);
+    v_amb_abs   := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
+    v_amb_cong := v_amb_surge or v_amb_abs;
+    v_amb_baseline := cfg.drain_ambient_baseline;
+    if cfg.drain_ambient_factor > 0 then
+      v_amb_baseline := pgpm._ambient_baseline_next(
+        cfg.drain_ambient_baseline, v_waiters,
+        case when v_amb_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
+    end if;
     v_congested := v_wal_cong or v_amb_cong;
     v_reason   := case when v_wal_cong and v_amb_cong then 'wal+ambient'
                        when v_wal_cong then 'wal' when v_amb_cong then 'ambient' else 'probe' end;
@@ -1014,7 +1087,8 @@ begin
   -- idle-period checkpoints as congestion and back off once -- the safe direction.
   if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%') then
     update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
-                           drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts
+                           drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts,
+                           drain_ambient_baseline = v_amb_baseline
       where parent_table = p_parent;
     v_note := v_note || format(' adaptive[%s %s]', v_budget, v_reason);
     insert into pgpm.log (parent_table, action, rows, method)

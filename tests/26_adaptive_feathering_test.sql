@@ -10,7 +10,7 @@
 create extension if not exists pgtap;
 
 begin;
-select plan(24);
+select plan(40);
 
 -- ---- the pure controller: AIMD arithmetic, independent of any server state -------------------------
 select is(pgpm._aimd_next(10000, false, 1000, 64000, 1000), 11000,
@@ -47,6 +47,32 @@ select is(pgpm._ambient_congested(2, 3), false,
 select is(pgpm._ambient_congested(5, 0), false,
           'threshold 0 disables the ambient signal (back-compatible default)');
 
+-- ---- the SELF-CALIBRATING ambient baseline: an EWMA of the waiter count is the learned "normal" ----
+-- A FIXED threshold is the wrong shape: "normal" waiter count is box/workload-dependent (~0 on an idle
+-- box, double digits on a busy one), so a constant fires everywhere or nowhere. Instead we learn the
+-- recent baseline (EWMA) and back off on a RELATIVE surge above it. EWMA arithmetic, pure:
+select is(pgpm._ambient_baseline_next(NULL, 5, 0.2), 5::numeric,
+          'no baseline yet => initialise to the first observation');
+select is(pgpm._ambient_baseline_next(10, 0, 0.5), 5::numeric,
+          'EWMA step: 0.5*0 + 0.5*10 = 5 (baseline decays toward a calmer sample)');
+select is(pgpm._ambient_baseline_next(10, 20, 0.25), 12.5::numeric,
+          'EWMA step: 0.25*20 + 0.75*10 = 12.5 (baseline rises toward a busier sample)');
+
+-- the relative trigger (pure): congested when current waiters exceed p_factor * the learned baseline,
+-- with a floor so an idle box (baseline ~0) does not fire on a couple of transient waiters.
+select is(pgpm._ambient_surge(10, 2, 2.0, 2), true,
+          'waiters well above factor*baseline => surge (yield to the contended workload)');
+select is(pgpm._ambient_surge(3, 2, 2.0, 2), false,
+          'a small rise still within the baseline band => calm');
+select is(pgpm._ambient_surge(10, 2, 0, 2), false,
+          'factor 0 disables the self-calibrating signal (back-compatible default)');
+select is(pgpm._ambient_surge(3, NULL, 2.0, 2), false,
+          'no baseline yet (boot) => the floor governs and small counts stay calm');
+select is(pgpm._ambient_surge(9, NULL, 2.0, 2), true,
+          'a clear surge on a fresh/idle box (no baseline) still fires via the floor');
+select is(pgpm._ambient_surge(4, 0, 2.0, 5), false,
+          'the floor stops an idle box (baseline ~0) firing on a few transient waiters');
+
 -- ---- the backstop sensor: version-aware forced-checkpoint counter ----------------------------------
 select cmp_ok(pgpm._forced_checkpoints(), '>=', 0::bigint,
               'forced-checkpoint sensor returns a non-negative counter on this PG version');
@@ -63,7 +89,15 @@ select pgpm.adopt('public.evt', 'id', 100, p_premake => 2, p_drain_batch => 8000
 select is((select drain_adaptive from pgpm.config where parent_table = 'public.evt'::regclass),
           false, 'adaptive is off by default (mode 1, fixed rate)');
 select is((select drain_ambient_max_waiters from pgpm.config where parent_table = 'public.evt'::regclass),
-          0, 'ambient signal disabled by default (drain_ambient_max_waiters = 0)');
+          0, 'ambient absolute cap disabled by default (drain_ambient_max_waiters = 0)');
+select is((select drain_ambient_factor from pgpm.config where parent_table = 'public.evt'::regclass),
+          0::numeric, 'self-calibrating ambient signal off by default (drain_ambient_factor = 0)');
+select is((select drain_ambient_alpha from pgpm.config where parent_table = 'public.evt'::regclass),
+          0.2::numeric, 'ambient baseline smoothing defaults to 0.2 (drain_ambient_alpha)');
+select is((select drain_ambient_floor from pgpm.config where parent_table = 'public.evt'::regclass),
+          2, 'ambient surge floor defaults to 2 (no false fire on a couple of transient waiters)');
+select is((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
+          NULL::numeric, 'ambient baseline starts unlearned (NULL until the first adaptive tick)');
 select lives_ok($$ select pgpm.maintenance('public.evt') $$, 'a fixed-mode maintenance tick runs');
 select is((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
           NULL, 'fixed mode never populates the adaptive budget');
@@ -72,6 +106,20 @@ select is((select drain_budget from pgpm.config where parent_table = 'public.evt
 select pgpm.set_drain_adaptive('public.evt', true);
 select is((select drain_adaptive from pgpm.config where parent_table = 'public.evt'::regclass),
           true, 'set_drain_adaptive(true) turns mode 2 on');
+
+-- ---- the self-calibrating setter turns the signal on and re-learns from scratch --------------------
+update pgpm.config set drain_ambient_baseline = 7 where parent_table = 'public.evt'::regclass;
+select pgpm.set_drain_ambient('public.evt', 2.0);
+select is((select drain_ambient_factor from pgpm.config where parent_table = 'public.evt'::regclass),
+          2.0::numeric, 'set_drain_ambient sets the surge factor (turns the self-calibrating signal on)');
+select is((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
+          NULL::numeric, 'set_drain_ambient resets the learned baseline so it re-learns from scratch');
+-- a draining adaptive tick with the signal on must LEARN a baseline (EWMA seeds from the first sample)
+select pgpm.maintenance('public.evt');
+select isnt((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
+            NULL::numeric, 'a draining adaptive tick with the ambient signal on learns a baseline');
+-- back to the WAL-only regime so the calm/congested ticks below stay deterministic
+update pgpm.config set drain_ambient_factor = 0 where parent_table = 'public.evt'::regclass;
 
 -- ---- a calm tick (baseline == current counter => no congestion) recovers the budget UP toward the
 --      ceiling (start below it; drain_batch=8000 is the ceiling, recovery step is 8000/8=1000) --------

@@ -379,10 +379,18 @@ awk -v a="$adopt_t0" -v b="$adopt_t1" 'BEGIN{printf "  adopt() returned in %.1fs
 if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
   q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
   echo "  adaptive feathering ENABLED (drain budget self-tunes around drain_batch=$BENCH_DRAIN_BATCH)"
-  # Optionally arm the ambient-contention signal: back off when > N non-pgpm backends are IO/lock-stuck.
+  # Optionally arm the SELF-CALIBRATING ambient signal: learn the recent waiter baseline (EWMA) and
+  # back off on a relative surge above it. BENCH_DRAIN_AMBIENT_FACTOR>0 turns it on (e.g. 2.0 = back off
+  # when live waiters exceed 2x the learned normal). This is the box-independent successor to the fixed
+  # threshold and is what isolates a write surge from steady-state contention.
+  if [ -n "${BENCH_DRAIN_AMBIENT_FACTOR:-}" ] && awk -v f="$BENCH_DRAIN_AMBIENT_FACTOR" 'BEGIN{exit !(f>0)}'; then
+    q "select pgpm.set_drain_ambient('bench.events', ${BENCH_DRAIN_AMBIENT_FACTOR}, ${BENCH_DRAIN_AMBIENT_ALPHA:-0.2}, ${BENCH_DRAIN_AMBIENT_FLOOR:-2})" >/dev/null
+    echo "  self-calibrating ambient signal ENABLED (back off when waiters > ${BENCH_DRAIN_AMBIENT_FACTOR}x the learned baseline, floor ${BENCH_DRAIN_AMBIENT_FLOOR:-2})"
+  fi
+  # Optionally arm the legacy absolute cap too: back off when > N non-pgpm backends are IO/lock-stuck.
   if [ "${BENCH_DRAIN_AMBIENT_WAITERS:-0}" -gt 0 ]; then
     q "update pgpm.config set drain_ambient_max_waiters = $BENCH_DRAIN_AMBIENT_WAITERS where parent_table='bench.events'::regclass" >/dev/null
-    echo "  ambient-contention signal ENABLED (yield when > $BENCH_DRAIN_AMBIENT_WAITERS workload backends are IO/lock-stuck)"
+    echo "  ambient absolute cap ENABLED (yield when > $BENCH_DRAIN_AMBIENT_WAITERS workload backends are IO/lock-stuck)"
   fi
 else
   echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
@@ -402,7 +410,7 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 #     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
 #     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
-echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,ambient_waiters,surge_active" >> "$RESULTS/drain.progress.csv"
+echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,ambient_waiters,ambient_baseline,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
 drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 warned_stall_settle=0; last_closed_check=0
@@ -418,9 +426,10 @@ while :; do
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
                               from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)
             ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)
-            ||'|'|| coalesce(pgpm._ambient_io_waiters(),-1)" 2>/dev/null) \
+            ||'|'|| coalesce(pgpm._ambient_io_waiters(),-1)
+            ||'|'|| coalesce((select round(drain_ambient_baseline,2) from pgpm.config where parent_table='bench.events'::regclass),-1)" 2>/dev/null) \
     || { echo "  (observe poll failed -- retrying)"; continue; }
-  IFS='|' read -r now_s drows nparts moves age budget waiters <<<"$poll"
+  IFS='|' read -r now_s drows nparts moves age budget waiters baseline <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
 
   # ambient write-surge: launch a write-heavy pgbench burst BENCH_SURGE_AFTER_SECS into the observe
@@ -441,7 +450,7 @@ while :; do
     fi
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$waiters" "$surge_active" >> "$RESULTS/drain.progress.csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$waiters" "$baseline" "$surge_active" >> "$RESULTS/drain.progress.csv"
   if [ "$moves" -ge 1 ]; then drain_started=1; fi
 
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
@@ -564,7 +573,7 @@ say "report"
   else
     echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (0 = closed tail fully converted)"
   fi
-  echo "- drain rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, drain_ops)"
+  echo "- drain rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, drain_ops, drain_budget, ambient_waiters, ambient_baseline, surge_active)"
   echo
   if [ "$have_pgfr" = "1" ]; then
     echo "## system metrics (pg_flight_recorder)"
