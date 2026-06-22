@@ -201,19 +201,26 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   constant: when `drain_adaptive` is on, each `pgpm.maintenance` tick senses checkpoint pressure and
   rides the per-tick row budget just under supply, instead of always draining `drain_batch` rows.
 
-  *The signal.* A *forced* (requested) checkpoint, the cluster counter that the at-scale bench pinned
-  as the cause of the R3 latency tail (a 40M drain at a fixed aggressive cadence triggered ~12 forced
-  checkpoints, and the I/O storm behind each one was the tail). It means WAL outran what the
-  checkpointer absorbs, i.e. the drain is over-driving the disk. *Timed* checkpoints (the
-  `checkpoint_timeout` rhythm) are normal and deliberately ignored. The counter moved from
-  `pg_stat_bgwriter.checkpoints_req` to `pg_stat_checkpointer.num_requested` in PG 17, so the sensor
-  (`pgpm._forced_checkpoints()`) is version-aware. Of the candidate signals (wait events, recent
-  ambient latency, replication lag), forced checkpoints are the cleanest root-cause proxy and need no
-  sampling; the others are natural future refinements.
+  *The signal (leading).* The **WAL generation rate** versus the rate the checkpointer can sustain. A
+  forced checkpoint fires when WAL written since the last checkpoint reaches ~`max_wal_size` before the
+  `checkpoint_timeout` timer does, and the I/O storm of that flush is the R3 latency tail (a 40M drain at
+  a fixed cadence triggered ~12 forced checkpoints). So the sustainable rate is
+  `max_wal_size / checkpoint_timeout`: outrun a fraction of it (`drain_wal_high_water`, default 0.7) and a
+  forced checkpoint is coming. Sensing the *rate* (`pg_current_wal_lsn()` deltas, all non-superuser, vs
+  the two settings, in `pgpm._wal_sustainable_bps()` / `pgpm._feather_congested()`) lets the drain ease
+  off *before* the checkpoint fires. This is the key correction over the first cut, which keyed on the
+  forced-checkpoint *counter*: that counter only moves once the storm is already underway, so a reactive
+  controller barely changed the tail (a clean fresh-2XL A/B measured it roughly tied with fixed). The
+  exact distance-to-threshold would come from `pg_control_checkpoint().redo_lsn`, but that is
+  superuser-gated on managed Postgres, so the rate is the accessible proxy; the forced-checkpoint counter
+  (`pgpm._forced_checkpoints()`, version-aware: `pg_stat_bgwriter.checkpoints_req` →
+  `pg_stat_checkpointer.num_requested` in PG 17) is kept only as a reactive backstop. Wait events and
+  ambient latency are further refinements.
 
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
-  under a link's capacity: a calm tick recovers the budget up by a small step, a tick that saw a
-  forced checkpoint halves it. It is a pure function (`pgpm._aimd_next`), unit-tested directly. The
+  under a link's capacity: a calm tick recovers the budget up by a small step, a tick whose WAL rate is
+  over the high-water mark (or that saw a forced checkpoint) halves it. It is a pure function
+  (`pgpm._aimd_next`), unit-tested directly. The
   **ceiling is `drain_batch` itself**, and this is the crux: a bigger per-tick budget is a bigger
   single `DELETE`+`INSERT`, hence a bigger WAL spike per tick, hence *more* checkpoint pressure (the
   very thing being throttled), so the controller must never exceed the operator's tuned rate. Adaptive

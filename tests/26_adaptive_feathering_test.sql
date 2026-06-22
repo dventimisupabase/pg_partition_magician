@@ -1,11 +1,13 @@
 -- Adaptive closed-loop feathering (DESIGN.md section 8, mode 2). The drain row budget is no longer a
--- fixed constant: when drain_adaptive is on, maintenance senses checkpoint pressure (a forced/requested
--- checkpoint since the last tick = over-driving the disk) and rides the budget just under supply via
--- AIMD -- additive-increase on a calm tick, halve on congestion. Off by default (mode 1, fixed rate).
+-- fixed constant: when drain_adaptive is on, maintenance rides the budget just under the WAL supply via
+-- AIMD. The LEADING signal is the WAL generation rate vs the sustainable rate (max_wal_size /
+-- checkpoint_timeout): outrun a fraction (drain_wal_high_water) of it and a forced checkpoint is coming,
+-- so back off before its I/O storm. A forced checkpoint that slips through is a reactive backstop.
+-- Off by default (mode 1, fixed rate).
 create extension if not exists pgtap;
 
 begin;
-select plan(13);
+select plan(19);
 
 -- ---- the pure controller: AIMD arithmetic, independent of any server state -------------------------
 select is(pgpm._aimd_next(10000, false, 1000, 64000, 1000), 11000,
@@ -17,7 +19,22 @@ select is(pgpm._aimd_next(1500, true, 1000, 64000, 1000), 1000,
 select is(pgpm._aimd_next(64000, false, 1000, 64000, 1000), 64000,
           'increase clamps at the ceiling (never over-probes)');
 
--- ---- the sensor: version-aware forced-checkpoint counter -------------------------------------------
+-- ---- the leading signal: WAL rate vs sustainable rate ----------------------------------------------
+select cmp_ok(pgpm._wal_sustainable_bps(), '>', 0::numeric,
+              'sustainable WAL rate (max_wal_size/checkpoint_timeout) is positive on this server');
+-- pure congestion decision: over high-water fraction of sustainable WAL rate, or a forced checkpoint
+select is(pgpm._feather_congested(20000000, 13600000, 0.7, false), true,
+          'WAL rate above high-water => congested (the LEADING trigger, before the storm)');
+select is(pgpm._feather_congested(5000000, 13600000, 0.7, false), false,
+          'WAL rate below high-water => calm');
+select is(pgpm._feather_congested(5000000, 13600000, 0.7, true), true,
+          'forced checkpoint => congested (the reactive backstop)');
+select is(pgpm._feather_congested(NULL, 13600000, 0.7, false), false,
+          'no WAL sample yet (first tick) => not congested');
+select is(pgpm._feather_congested(20000000, 0, 0.7, false), false,
+          'unknown sustainable rate => not congested (no divide-by-zero)');
+
+-- ---- the backstop sensor: version-aware forced-checkpoint counter ----------------------------------
 select cmp_ok(pgpm._forced_checkpoints(), '>=', 0::bigint,
               'forced-checkpoint sensor returns a non-negative counter on this PG version');
 
