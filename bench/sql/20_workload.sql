@@ -53,3 +53,21 @@ begin
   end loop;
 end;
 $$;
+
+-- Write-heavy surge step: insert p_rows wide rows into a throwaway LOGGED sink table in one call.
+-- Used by the ambient-surge injection (run.sh BENCH_SURGE_*) to add a clean burst of cluster WAL --
+-- a single round-trip emits p_rows of heap+WAL, so a few clients lift the WAL rate enough to exercise
+-- adaptive feathering's backoff, without saturating CPU the way the 50-op read/write mix would. It
+-- writes to its OWN table (not bench.events): the controller senses cluster-wide WAL regardless of
+-- target, so this is a clean stand-in for "a burst of write activity elsewhere in the database" that
+-- does not bloat bench.events or perturb the closed tail the drain is moving. (Logged, not unlogged --
+-- unlogged tables emit no WAL, which would defeat the purpose.)
+create table if not exists bench.surge_sink (id bigint generated always as identity, payload text);
+create or replace function bench.surge_step(p_rows int default 500)
+returns void language plpgsql as $$
+begin
+  insert into bench.surge_sink (payload)
+  select substr(md5(random()::text) || md5(random()::text) || md5(random()::text), 1, 200)
+  from generate_series(1, p_rows);
+end;
+$$;

@@ -62,6 +62,17 @@ BENCH_OBSERVE_MODE="${BENCH_OBSERVE_MODE:-settle}"          # settle | window
 BENCH_CONVERT_WARMUP_SECS="${BENCH_CONVERT_WARMUP_SECS:-30}"  # window mode: let the drain reach steady state before measuring
 BENCH_CONVERT_WINDOW_SECS="${BENCH_CONVERT_WINDOW_SECS:-300}" # window mode: measure the workload for this long
 
+# Ambient-surge injection (demonstrates adaptive feathering yielding to a write spike). During the
+# convert observe phase, BENCH_SURGE_AFTER_SECS in, launch a write-heavy pgbench burst for
+# BENCH_SURGE_SECS, then stop it -- the "Monday morning everybody logs in" moment. The drain_budget
+# trace in drain.progress.csv should dip while the surge is live and recover after. Write-heavy on
+# purpose: the controller senses WAL, and the drain dominates WAL, so only a WAL-heavy surge moves the
+# signal enough to trigger a clean backoff (a read/CPU-heavy surge would contend without raising WAL).
+BENCH_SURGE_CLIENTS="${BENCH_SURGE_CLIENTS:-0}"      # 0 = no surge; >0 = extra write-heavy clients
+BENCH_SURGE_AFTER_SECS="${BENCH_SURGE_AFTER_SECS:-180}"  # seconds into the observe phase to start the surge
+BENCH_SURGE_SECS="${BENCH_SURGE_SECS:-180}"         # how long the surge lasts
+BENCH_SURGE_ROWS="${BENCH_SURGE_ROWS:-500}"         # rows inserted per surge call (WAL per round-trip)
+
 BENCH_PGFR="${BENCH_PGFR:-0}"               # 1 = wire in pg_flight_recorder (best-effort; needs elevated privs, PG15-17)
 BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr checkout (pgfr_record + pgfr_analyze)
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
@@ -386,24 +397,45 @@ echo "  scheduled pgpm.maintenance on pg_cron every '$BENCH_MAINT_INTERVAL' -- p
 #     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
 #     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
-echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s" >> "$RESULTS/drain.progress.csv"
+echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
 drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 warned_stall_settle=0; last_closed_check=0
+surge_pid=""; surge_launched=0; surge_active=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
   # ONE round-trip per poll (fewer fresh connections over the NAT'd path = less churn/risk):
-  #   epoch | default n_live_tup | partition count | drain ops | secs since last drain op (-1 if none)
+  #   epoch | default n_live_tup | partition count | drain ops | secs since last drain op (-1) | drain_budget (-1 if not adaptive)
   poll=$(q "select extract(epoch from clock_timestamp())::bigint
             ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
             ||'|'|| (select count(*) from pg_inherits where inhparent='bench.events'::regclass)
             ||'|'|| (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
-                              from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)" 2>/dev/null) \
+                              from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)
+            ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)" 2>/dev/null) \
     || { echo "  (observe poll failed -- retrying)"; continue; }
-  IFS='|' read -r now_s drows nparts moves age <<<"$poll"
+  IFS='|' read -r now_s drows nparts moves age budget <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
-  printf '%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" >> "$RESULTS/drain.progress.csv"
+
+  # ambient write-surge: launch a write-heavy pgbench burst BENCH_SURGE_AFTER_SECS into the observe
+  # phase, stop it BENCH_SURGE_SECS later. The drain_budget column should dip while surge_active=1.
+  if [ "${BENCH_SURGE_CLIENTS:-0}" -gt 0 ]; then
+    if [ "$surge_launched" = 0 ] && [ "$elapsed" -ge "$BENCH_SURGE_AFTER_SECS" ]; then
+      say "AMBIENT SURGE: launching $BENCH_SURGE_CLIENTS write-heavy clients for ${BENCH_SURGE_SECS}s (rows/call=$BENCH_SURGE_ROWS)"
+      surge_args=( -n -c "$BENCH_SURGE_CLIENTS" -j "$BENCH_JOBS" -T "$BENCH_SURGE_SECS"
+                   -D "rows=$BENCH_SURGE_ROWS" -f "$BENCH_DIR/surge.pgbench" )
+      if [ -n "$BENCH_DSN" ]; then
+        "$PGBENCH" "$BENCH_DSN" "${surge_args[@]}" >"$RESULTS/surge.pgbench.txt" 2>&1 &
+      else
+        "$PGBENCH" "${surge_args[@]}" >"$RESULTS/surge.pgbench.txt" 2>&1 &
+      fi
+      surge_pid=$!; BG_PIDS+=("$surge_pid"); surge_launched=1; surge_active=1
+    elif [ "$surge_active" = 1 ] && { [ -z "$surge_pid" ] || ! kill -0 "$surge_pid" 2>/dev/null; }; then
+      surge_active=0; echo; echo "  ambient surge ended"
+    fi
+  fi
+
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$surge_active" >> "$RESULTS/drain.progress.csv"
   if [ "$moves" -ge 1 ]; then drain_started=1; fi
 
   if [ "$BENCH_OBSERVE_MODE" = window ]; then

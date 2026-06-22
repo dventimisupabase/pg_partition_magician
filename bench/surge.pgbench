@@ -1,0 +1,4 @@
+-- pgbench transaction for the ambient write-surge: one server-side insert of :rows rows into
+-- bench.events (rows-per-call injected with `pgbench -D rows=N`). Write-heavy on purpose so a few
+-- clients raise the cluster WAL rate enough to exercise adaptive feathering's backoff.
+SELECT bench.surge_step(:rows);
