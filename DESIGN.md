@@ -233,6 +233,21 @@ primitives that move along it already exist: `drain_batch` (set at `adopt`) and 
   inspect `max_wal_size` against the expected drain WAL rate and advise raising it -- the steward
   surfacing the relevant GUC, not just throttling around it.
 
+  *A second, complementary signal: ambient contention (IMPLEMENTED).* The WAL-rate signal is a
+  *producer* self-limit -- it stops the drain over-driving WAL into its own checkpoint storms. It does
+  **not** make the drain yield to ambient *workload*: a bench surge proved it. When the drain crowds the
+  workload off the disk, those backends pile up on IO/lock waits while generating little WAL of their
+  own (they are *starved*, not writing), so the WAL signal stays quiet and the drain keeps hogging the
+  disk. The fix is a *consumer-priority* signal that sees the contention directly: `pgpm._ambient_io_waiters()`
+  counts non-pgpm client backends currently stuck on IO/Lock/LWLock/BufferPin waits, and the controller
+  backs off when that exceeds `drain_ambient_max_waiters` (default 0 = off). The two signals are
+  **OR'd, not exchanged** -- they cover disjoint failure modes (over-driving WAL vs starving the
+  workload), so the drain feathers down if *either* fires and recovers when *both* are clear. Further
+  supply signals (replication lag, an ambient-latency delta, a self-calibrating waiter baseline instead
+  of a fixed threshold) plug in as additional OR'd terms; the waiter count is a coarse, point-in-time
+  first cut, smoothed by AIMD across ticks. Tests in `tests/26`; cross-version PG 15 to 18. (Cross-role
+  visibility of `wait_event` needs `pg_monitor`; same-role backends are always visible.)
+
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
   under a link's capacity: a calm tick recovers the budget up by a small step, a tick whose WAL rate is
   over the high-water mark (or that saw a forced checkpoint) halves it. It is a pure function

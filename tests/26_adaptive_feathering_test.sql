@@ -3,11 +3,14 @@
 -- AIMD. The LEADING signal is the WAL generation rate vs the sustainable rate (max_wal_size /
 -- checkpoint_timeout): outrun a fraction (drain_wal_high_water) of it and a forced checkpoint is coming,
 -- so back off before its I/O storm. A forced checkpoint that slips through is a reactive backstop.
--- Off by default (mode 1, fixed rate).
+-- A SECOND, complementary signal backs off when ambient workload is contended -- more than
+-- drain_ambient_max_waiters non-pgpm client backends stuck on IO/lock waits -- so the drain yields to
+-- workload that is being starved (which the WAL signal misses: a crowded-out writer makes little WAL).
+-- Off by default (mode 1, fixed rate; ambient signal off until drain_ambient_max_waiters > 0).
 create extension if not exists pgtap;
 
 begin;
-select plan(19);
+select plan(24);
 
 -- ---- the pure controller: AIMD arithmetic, independent of any server state -------------------------
 select is(pgpm._aimd_next(10000, false, 1000, 64000, 1000), 11000,
@@ -34,6 +37,16 @@ select is(pgpm._feather_congested(NULL, 13600000, 0.7, false), false,
 select is(pgpm._feather_congested(20000000, 0, 0.7, false), false,
           'unknown sustainable rate => not congested (no divide-by-zero)');
 
+-- ---- the ambient-contention signal: back off when workload backends are starved on IO/locks --------
+select cmp_ok(pgpm._ambient_io_waiters(), '>=', 0::int,
+              'ambient IO/lock-waiter sensor returns a non-negative count');
+select is(pgpm._ambient_congested(5, 3), true,
+          'more waiters than the threshold => congested (yield to the contended workload)');
+select is(pgpm._ambient_congested(2, 3), false,
+          'fewer waiters than the threshold => calm');
+select is(pgpm._ambient_congested(5, 0), false,
+          'threshold 0 disables the ambient signal (back-compatible default)');
+
 -- ---- the backstop sensor: version-aware forced-checkpoint counter ----------------------------------
 select cmp_ok(pgpm._forced_checkpoints(), '>=', 0::bigint,
               'forced-checkpoint sensor returns a non-negative counter on this PG version');
@@ -49,6 +62,8 @@ select pgpm.adopt('public.evt', 'id', 100, p_premake => 2, p_drain_batch => 8000
 -- ---- default is mode 1 (fixed): adaptive off, controller state untouched ---------------------------
 select is((select drain_adaptive from pgpm.config where parent_table = 'public.evt'::regclass),
           false, 'adaptive is off by default (mode 1, fixed rate)');
+select is((select drain_ambient_max_waiters from pgpm.config where parent_table = 'public.evt'::regclass),
+          0, 'ambient signal disabled by default (drain_ambient_max_waiters = 0)');
 select lives_ok($$ select pgpm.maintenance('public.evt') $$, 'a fixed-mode maintenance tick runs');
 select is((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
           NULL, 'fixed mode never populates the adaptive budget');

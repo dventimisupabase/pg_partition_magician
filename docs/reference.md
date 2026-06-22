@@ -201,6 +201,11 @@ pressure. So set `drain_batch` to your optimistic "when there's slack" rate and 
 off automatically under load. Off (the default) keeps the fixed `drain_batch` rate. Toggling resets the
 controller state so it restarts cleanly from `drain_batch`.
 
+A second, complementary backoff signal is available: set `config.drain_ambient_max_waiters` > 0 and the
+controller also feathers down when more than that many non-pgpm client backends are stuck on IO/lock
+waits, i.e. the drain is starving the workload (which the WAL-rate signal cannot see -- a crowded-out
+writer makes little WAL). The two signals are OR'd. Default 0 (ambient signal off).
+
 ## Inspection
 
 ### `pgpm.status`
@@ -320,6 +325,7 @@ One row per managed table; the source of truth for its policy. Editable (e.g.
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
 | `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
 | `drain_wal_high_water` | `numeric` | Back off when the WAL rate exceeds this fraction of the sustainable rate (`max_wal_size`/`checkpoint_timeout`); default 1.0. Lower (e.g. 0.7) is gentler on the workload but drains slower. |
+| `drain_ambient_max_waiters` | `int` | Ambient-contention signal: also back off when more than this many non-pgpm client backends are stuck on IO/lock waits (the drain is starving the workload). 0 = disabled (default). |
 | `drain_wal_lsn` | `pg_lsn` | Controller state: previous tick's WAL position (to compute the WAL rate). |
 | `drain_wal_at` | `timestamptz` | Controller state: previous tick's timestamp (to compute the WAL rate). |
 | `drain_ckpt_seen` | `bigint` | Controller state: last forced-checkpoint counter (reactive backstop); null = uninitialized. |

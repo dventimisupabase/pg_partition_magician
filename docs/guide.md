@@ -187,6 +187,13 @@ drains gentler but slower); it still
 respects `drain_max_blocks`. Off by default; turn it back off with
 `pgpm.set_drain_adaptive('public.events', false)`.
 
+That WAL signal keeps the drain from storming the checkpointer, but on its own it does not make the
+drain yield to *ambient query load* (a workload being starved generates little WAL, so the WAL signal
+stays quiet). For that, also set `config.drain_ambient_max_waiters` to a small number: the controller
+then additionally backs off when more than that many of your own client backends are stuck on IO/lock
+waits, getting the drain out of the way of a workload surge and resuming once it clears. The two
+signals are OR'd; the ambient one is off by default (0).
+
 ## Monitor
 
 ```sql

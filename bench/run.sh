@@ -379,6 +379,11 @@ awk -v a="$adopt_t0" -v b="$adopt_t1" 'BEGIN{printf "  adopt() returned in %.1fs
 if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
   q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
   echo "  adaptive feathering ENABLED (drain budget self-tunes around drain_batch=$BENCH_DRAIN_BATCH)"
+  # Optionally arm the ambient-contention signal: back off when > N non-pgpm backends are IO/lock-stuck.
+  if [ "${BENCH_DRAIN_AMBIENT_WAITERS:-0}" -gt 0 ]; then
+    q "update pgpm.config set drain_ambient_max_waiters = $BENCH_DRAIN_AMBIENT_WAITERS where parent_table='bench.events'::regclass" >/dev/null
+    echo "  ambient-contention signal ENABLED (yield when > $BENCH_DRAIN_AMBIENT_WAITERS workload backends are IO/lock-stuck)"
+  fi
 else
   echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
 fi
@@ -551,7 +556,7 @@ say "report"
   echo "- drain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_attach'") partition attaches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") rows moved"
   echo "- premake: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='premake_skip'") deferred under lock contention"
   if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
-    echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method='backoff'") checkpoint-pressure backoffs"
+    echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe'") backoffs ($(q "select coalesce(string_agg(method||':'||c,', '),'none') from (select method, count(*) c from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe' group by method order by 2 desc) s") )"
   fi
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
     echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (still draining -- not expected to be 0 in a windowed run)"

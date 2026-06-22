@@ -63,7 +63,10 @@ create table if not exists pgpm.config (
   drain_ckpt_seen      bigint,
   drain_wal_lsn        pg_lsn,
   drain_wal_at         timestamptz,
-  drain_wal_high_water numeric not null default 1.0
+  drain_wal_high_water numeric not null default 1.0,
+  -- ambient-contention signal: back off when more than this many non-pgpm client backends are stuck on
+  -- IO/lock waits (the drain is starving the workload). 0 = disabled (pure WAL behaviour). See sec 8.
+  drain_ambient_max_waiters int not null default 0
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists premake_retry_after timestamptz;
@@ -74,6 +77,7 @@ alter table pgpm.config add column if not exists drain_ckpt_seen bigint;
 alter table pgpm.config add column if not exists drain_wal_lsn pg_lsn;
 alter table pgpm.config add column if not exists drain_wal_at timestamptz;
 alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 1.0;
+alter table pgpm.config add column if not exists drain_ambient_max_waiters int not null default 0;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -814,6 +818,31 @@ create or replace function pgpm._feather_congested(
           and p_observed_bps / p_sustainable_bps > p_high_water);
 $$;
 
+-- The AMBIENT signal: how many OTHER (non-pgpm) client backends are right now stuck on an IO, lock, or
+-- buffer wait. This is the consumer-priority sensor the WAL rate misses entirely: when the drain crowds
+-- the workload off the disk, those backends pile up on IO/Lock waits while generating little WAL of
+-- their own (they are starved, not writing), so the WAL signal stays quiet. Counting the waiters sees
+-- them directly. A point-in-time sample per maintenance tick -- noisy alone, smoothed by AIMD over
+-- ticks. (Cross-role visibility of wait_event needs pg_monitor; backends of the maintenance role itself
+-- are always visible. Excludes pgpm's own maintenance statements.)
+create or replace function pgpm._ambient_io_waiters()
+returns int language sql stable as $$
+  select count(*)::int from pg_stat_activity
+   where datname = current_database()
+     and pid <> pg_backend_pid()
+     and state = 'active'
+     and backend_type = 'client backend'
+     and wait_event_type in ('IO', 'Lock', 'LWLock', 'BufferPin')
+     and coalesce(query, '') not like '%pgpm.%';
+$$;
+
+-- The ambient decision (pure, unit-tested): congested if more than p_max waiters are contended.
+-- p_max = 0 disables the signal (back-compatible: pure WAL behaviour).
+create or replace function pgpm._ambient_congested(p_waiters int, p_max int)
+returns boolean language sql immutable as $$
+  select coalesce(p_max, 0) > 0 and coalesce(p_waiters, 0) > p_max;
+$$;
+
 -- The reactive backstop sensor: the cluster's forced/requested-checkpoint counter. A *requested*
 -- checkpoint means WAL hit max_wal_size (or an explicit CHECKPOINT). *Timed* checkpoints (the
 -- checkpoint_timeout rhythm) are normal and deliberately NOT counted. The counter moved from
@@ -865,6 +894,7 @@ declare
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
+  v_waiters int; v_wal_cong boolean; v_amb_cong boolean; v_reason text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -939,9 +969,17 @@ begin
       end if;
     end if;
     v_ckpt      := pgpm._forced_checkpoints();
-    v_congested := pgpm._feather_congested(
-                     v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
-                     cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
+    -- Two complementary backoff signals, OR'd (see DESIGN sec 8): the WAL-rate signal (producer
+    -- self-limit against checkpoint storms) and the ambient signal (consumer priority -- yield when
+    -- non-pgpm backends are starved on IO/locks, which the WAL rate cannot see). Either fires => halve.
+    v_wal_cong := pgpm._feather_congested(
+                    v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
+                    cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
+    v_waiters  := pgpm._ambient_io_waiters();
+    v_amb_cong := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
+    v_congested := v_wal_cong or v_amb_cong;
+    v_reason   := case when v_wal_cong and v_amb_cong then 'wal+ambient'
+                       when v_wal_cong then 'wal' when v_amb_cong then 'ambient' else 'probe' end;
     v_budget    := pgpm._aimd_next(
                      coalesce(cfg.drain_budget, cfg.drain_batch),       -- start optimistic at the ceiling
                      v_congested,
@@ -978,9 +1016,9 @@ begin
     update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
                            drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts
       where parent_table = p_parent;
-    v_note := v_note || format(' adaptive[%s%s]', v_budget, case when v_congested then ' backoff' else '' end);
+    v_note := v_note || format(' adaptive[%s %s]', v_budget, v_reason);
     insert into pgpm.log (parent_table, action, rows, method)
-      values (p_parent, 'drain_budget', v_budget, case when v_congested then 'backoff' else 'probe' end);
+      values (p_parent, 'drain_budget', v_budget, v_reason);
   end if;
 
   -- Once the closed tail is drained, re-add any incoming FKs that adopt(..., 'preserve') dropped, now
