@@ -1060,6 +1060,26 @@ begin
 end;
 $$;
 
+-- pause/resume the scheduled lifecycle for one table. transmute registers a table paused by default
+-- (the deliberate two-step: convert, inspect, then go live), and maintenance is a no-op while paused.
+-- These are the first-class way to flip config.paused, so operators never hand-edit the catalog.
+-- drain_step/drain_all ignore the flag, so you can still drive the drain by hand while paused.
+create or replace function pgpm.resume(p_parent regclass)
+returns void language plpgsql as $$
+begin
+  update pgpm.config set paused = false where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
+create or replace function pgpm.pause(p_parent regclass)
+returns void language plpgsql as $$
+begin
+  update pgpm.config set paused = true where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
 create or replace function pgpm.maintenance(p_parent regclass)
 returns text language plpgsql as $$
 declare

@@ -54,7 +54,7 @@ interval literal is ambiguous against the bigint overload, so cast it: `transmut
 | `p_keep_default` | Keep an (expected-empty) `DEFAULT` partition as a safety net. Leave `true`. |
 | `p_drain_batch` | Default rows moved per drain microbatch (see `drain_step`). |
 | `p_anchor` | Grid origin for fixed-duration intervals. Calendar-aligned months ignore it. |
-| `p_paused` | When `true` (default), register but do not let scheduled `maintenance` act until you unpause. |
+| `p_paused` | When `true` (default), register but do not let scheduled `maintenance` act until you [`resume`](#pgpmpause--pgpmresume). |
 | `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'preserve'` drops each for the conversion, records it, and re-adds it against the new parent once the drain is idle ([`restore_incoming_fks`](#pgpmrestore_incoming_fks)). See [incoming FKs](guide.md#incoming-foreign-keys). |
 
 ### `pgpm.transmute` (integer grid: id)
@@ -82,7 +82,7 @@ Renames the live table to `<name>_default`, creates a partitioned parent under t
 attaches the old table as the `DEFAULT` partition. No rows move. Identity moves to the parent.
 Non-unique secondary indexes are carried onto the parent; unique secondary indexes are skipped
 (recreate by hand). The transmuted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused;
-nothing drains until you run `maintenance` / `drain_*` or unpause.
+nothing drains until you [`resume`](#pgpmpause--pgpmresume) it (or drive `drain_*` by hand).
 
 ### No PK rewrite
 
@@ -141,6 +141,19 @@ short text summary. Respects the `paused` flag (returns `'paused'` and does noth
 step runs in its own subtransaction under a short `lock_timeout`, so a step that loses a lock race is
 deferred to the next tick rather than aborting the others; attain additionally backs off after a
 deferral (tracked in `config.attain_retry_after`).
+
+### `pgpm.pause` / `pgpm.resume`
+
+```sql
+pgpm.pause(p_parent regclass)  returns void
+pgpm.resume(p_parent regclass) returns void
+```
+
+Flip the `paused` flag for one table. `transmute` registers a table paused by default, so going live is
+a deliberate step: convert, inspect with [`status`](#pgpmstatus), then `resume`. While paused,
+`maintenance` is a no-op (`drain_step` / `drain_all` ignore the flag, so you can still drive the drain by
+hand). These are the first-class way to set `paused`, so you never hand-edit [`pgpm.config`](#pgpmconfig).
+Both raise if the table is not managed.
 
 ### `pgpm.attain`
 
@@ -343,8 +356,10 @@ drain step (and `drain_all` at its start); you rarely call it directly.
 
 ### `pgpm.config`
 
-One row per managed table; the source of truth for its policy. Editable (e.g.
-`update pgpm.config set paused = false where parent_table = 'public.events'::regclass;`).
+One row per managed table; the source of truth for its policy. Editable directly, though prefer the
+helpers where they exist ([`pgpm.resume`](#pgpmpause--pgpmresume) / [`pgpm.pause`](#pgpmpause--pgpmresume)
+for the `paused` flag, [`set_drain_adaptive`](#pgpmset_drain_adaptive) /
+[`set_drain_ambient`](#pgpmset_drain_ambient) for the feathering knobs).
 
 | Column | Type | Meaning |
 |---|---|---|

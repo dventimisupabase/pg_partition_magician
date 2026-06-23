@@ -65,21 +65,22 @@ Faster is not always better. At 40M rows, draining flat-out (a fixed rate) finis
 ## Try it
 
 ```sql
--- 1. Convert a live table online and register it (no data moves here):
+-- 1. Convert a live table online and register it. The cutover is metadata-only (no rows move here),
+--    and the table registers PAUSED: nothing drains until you resume.
 select pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',        -- the monotonic key to range-partition on
   p_interval => interval '1 month',  -- daily / weekly / monthly / yearly ...
   p_attain   => 7,                   -- keep 7 partitions ahead of writes
-  p_retain   => '90 days',           -- drop partitions older than this (null = keep)
-  p_paused   => false                -- let scheduled maintenance run
+  p_retain   => '90 days'            -- drop partitions older than this (null = keep)
 );
 
--- 2. Schedule the one entry point (pg_cron):
+-- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
 select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 
--- 3. Watch it:
+-- 3. Inspect, then go live. Maintenance only starts attaining and draining once you resume:
 select * from pgpm.status();
+select pgpm.resume('public.events');
 ```
 
-That is the whole thing. The cutover is metadata-only, the backlog drains itself in the background without anyone noticing, and retain keeps the table trim, all from a single SQL file on any Postgres that has `pg_cron`.
+That is the whole thing. The cutover is metadata-only and paused, so you flip it live deliberately; then the backlog drains itself in the background without anyone noticing, and retain keeps the table trim, all from a single SQL file on any Postgres that has `pg_cron`.

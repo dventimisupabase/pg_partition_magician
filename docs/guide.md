@@ -120,7 +120,7 @@ select pgpm.transmute('public.events', 'id', interval '1 day');
 ```
 
 Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does
-nothing until you unpause (see [Run it](#run-it)). All parameters are documented in the
+nothing until you `resume` it (see [Run it](#run-it)). All parameters are documented in the
 [reference](reference.md#transmutation).
 
 ### The cutover is always metadata-only
@@ -142,15 +142,17 @@ time-ordered-PK data model (bigint/Snowflake, UUIDv7, ULID).
 
 ## Run it
 
-Schedule the single entry point with `pg_cron`, then unpause:
+Schedule the single entry point with `pg_cron`. It stays idle while the table is paused, so inspect
+with [`status()`](#monitor) first, then `resume` to go live:
 
 ```sql
 select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
-update pgpm.config set paused = false where parent_table = 'public.events'::regclass;
+select * from pgpm.status();              -- looks right?
+select pgpm.resume('public.events');      -- go live
 ```
 
 From there, each tick attains ahead, drains a microbatch of the closed tail, and applies retention.
-You can also transmute with `p_paused => false` to skip the manual unpause.
+You can also transmute with `p_paused => false` to go live immediately and skip the `resume` step.
 
 To convert a table synchronously (tests, one-shot migrations) instead of waiting for the paced cron,
 drive the drain to completion yourself. `p_include_open => true` also drains and attaches the current
@@ -360,7 +362,7 @@ What to do:
 
 ## Operations and troubleshooting
 
-- **Pause / unpause.** `update pgpm.config set paused = ... where parent_table = '...'::regclass;`.
+- **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`.
   A paused table is registered but untouched by `maintenance` (you can still drive `drain_*`
   manually).
 - **The closed tail is growing.** `check_default()` shows `closed_rows > 0`: the table is unpaused
