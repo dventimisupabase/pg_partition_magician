@@ -331,17 +331,27 @@ present.
 ### `pgpm.snapshot`
 
 ```sql
-pgpm.snapshot(p_parent regclass) returns regclass
+pgpm.snapshot(p_rowtype anyelement) returns setof anyelement
 ```
 
-The read-consistency escape hatch for the [drain visibility gap](guide.md#read-consistency-during-a-drain).
-Builds (or refreshes) a read-only view `<parent>_snapshot` that `UNION`s the parent with every
-in-flight, not-yet-attached drain child, then returns the view. During a multi-step drain the parent
-alone undercounts the draining interval (its moved rows sit in an unattached child); querying the
-snapshot view sees them too. Point-in-time: re-call it to refresh against the current in-flight child.
-Read-only, it does not help writes (a write through the parent that targets an already-moved row is a
-silent `0 rows` no-op until the interval attaches, with no fix). When no drain is in flight the view is
-just `select * from <parent>`. Raises if the table is not managed.
+The read-consistency escape hatch for the [drain visibility gap](guide.md#read-consistency-during-a-drain):
+a read-only set-returning function that `UNION`s the parent with every in-flight, not-yet-attached drain
+child, so a reader sees the moved rows the parent alone undercounts. Query it inline:
+
+```sql
+select count(*) from pgpm.snapshot(null::public.events);
+```
+
+You pass the table as a typed-`NULL` anchor, not a `regclass`: a function's row shape is fixed at plan
+time and cannot be inferred from a `regclass` *value*, so the anchor carries the rowtype (and `snapshot`
+recovers the table from it via `pg_typeof` -> `pg_type.typrelid`). The returned rows are the parent's
+type. It is **always fresh** (it rediscovers the in-flight child on every call, so it can neither
+double-count an attached child nor miss a new one) and leaves no object behind. Two costs: it is an
+**optimization fence** (a dynamic-SQL SRF, so a `WHERE` on top materializes the union before filtering
+and will not use the child's `CHECK` exclusion; fine for `COUNT`/full reads, slower than a hand-written
+union for heavily-filtered reads on a large table), and it does nothing for writes (an already-moved row
+is a silent `0 rows` no-op until it attaches, with no fix). When no drain is in flight it is just
+`select * from <parent>`. Raises if the anchor is not a managed table's rowtype.
 
 ### `pgpm.check_uuidv7`
 

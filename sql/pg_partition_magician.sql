@@ -1397,28 +1397,45 @@ $$;
 -- parent: a plain `select ... from parent` mid-drain UNDERCOUNTS the interval being drained (by however
 -- many rows have moved so far). This is inherent -- Postgres has no way to make an unattached relation
 -- visible through the parent, and will not attach a partition while the DEFAULT still holds rows in its
--- range (chicken-and-egg). snapshot() builds (or refreshes) a view <parent>_snapshot that UNIONs the
--- parent with every in-flight, not-yet-attached child, so a consistency-sensitive reader (a COUNT, a
--- logical backup, a reconciliation) can get the COMPLETE set during a drain. It is READ-ONLY and a
--- point-in-time aid (re-call it to refresh against the current in-flight child). It does NOTHING for
--- writes: an INSERT/UPDATE/DELETE through the parent that targets an already-moved row sees no row and
--- is a no-op (reports 0 rows) until the interval attaches -- there is no fix for that, by design.
--- Single-batch intervals and drain_all (one transaction) never open the gap.
-create or replace function pgpm.snapshot(p_parent regclass)
-returns regclass language plpgsql as $$
-declare cfg pgpm.config; v_nsp name; v_rel name; v_view name; v_arms text; v_child name;
+-- range (chicken-and-egg). snapshot() returns the COMPLETE set during a drain -- the parent UNION every
+-- in-flight, not-yet-attached child -- so a consistency-sensitive reader (a COUNT, a logical backup, a
+-- reconciliation) sees the moved rows too:
+--
+--   select count(*) from pgpm.snapshot(null::public.events);
+--
+-- It is a set-returning function whose row type is the parent's: the regclass cannot be inferred from a
+-- runtime value (return shape is fixed at plan time), so the caller passes the rowtype as a typed-NULL
+-- anchor, and snapshot() derives the table from it (pg_typeof -> pg_type.typrelid -> the table). Two
+-- honest costs, both inherent and documented: (1) it is an OPTIMIZATION FENCE -- the in-flight child set
+-- is dynamic so the body is dynamic SQL in an SRF, meaning a WHERE on top does NOT push down into the
+-- union arms or use the child's CHECK-constraint exclusion; it materializes the union, then filters.
+-- Fine for COUNT/full reads; for heavily-filtered reads on a large table a manual `select ... from
+-- parent union all select ... from <child>` plans better. (2) It does NOTHING for writes: an
+-- INSERT/UPDATE/DELETE through the parent that targets an already-moved row is a 0-row no-op until the
+-- interval attaches -- there is no fix, by design. Upside vs a stored view: it is ALWAYS FRESH (it
+-- rediscovers the in-flight child on every call, so it can neither double-count an attached child nor
+-- miss a newly-started one) and leaves no object behind. Single-batch intervals and drain_all (one
+-- transaction) never open the gap.
+create or replace function pgpm.snapshot(p_rowtype anyelement)
+returns setof anyelement language plpgsql as $$
+declare cfg pgpm.config; v_parent regclass; v_nsp name; v_rel name; v_arms text; v_child name;
 begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  -- derive the parent table from the rowtype anchor: a table's composite rowtype links 1:1 back to it.
+  select c.oid into v_parent
+    from pg_type t join pg_class c on c.oid = t.typrelid
+   where t.oid = pg_typeof(p_rowtype)::oid and c.relkind in ('r', 'p');
+  if v_parent is null then
+    raise exception 'pg_partition_magician: snapshot() needs a table rowtype anchor, e.g. pgpm.snapshot(null::public.events)';
+  end if;
+  select * into cfg from pgpm.config where parent_table = v_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', v_parent; end if;
   select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_view := (v_rel || '_snapshot')::name;
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = v_parent;
 
-  -- the parent already covers the DEFAULT and every attached partition.
-  v_arms := format('select * from %s', p_parent::text);
-
-  -- add every in-flight (unattached) drain child: a standalone table in this schema matching the
-  -- parent's child-partition naming that is NOT yet attached (same shape as the orphan guard).
+  -- the parent already covers the DEFAULT and every attached partition; add every in-flight
+  -- (unattached) drain child: a standalone table matching the parent's child-partition naming that is
+  -- NOT yet attached (same shape as the orphan guard).
+  v_arms := format('select * from %s', v_parent::text);
   for v_child in
     select c.relname from pg_class c
      where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
@@ -1431,8 +1448,7 @@ begin
     v_arms := v_arms || format(' union all select * from %I.%I', v_nsp, v_child);
   end loop;
 
-  execute format('create or replace view %I.%I as %s', v_nsp, v_view, v_arms);
-  return format('%I.%I', v_nsp, v_view)::regclass;
+  return query execute v_arms;
 end;
 $$;
 

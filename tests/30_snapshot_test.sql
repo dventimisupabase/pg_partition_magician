@@ -1,7 +1,8 @@
 -- The drain visibility gap, made concrete, and the snapshot() escape hatch. During a multi-batch
 -- drain the already-moved rows live in an unattached child, so `select from parent` UNDERCOUNTS the
--- interval being drained. pgpm.snapshot() builds a view that UNIONs the parent with the in-flight
--- child, giving a consistency-sensitive reader the complete set. Read-only; no fix exists for writes.
+-- interval being drained. pgpm.snapshot(null::<parent>) is a set-returning function that UNIONs the
+-- parent with the in-flight child, giving a consistency-sensitive reader the complete set inline.
+-- Read-only; no fix exists for writes.
 create extension if not exists pgtap;
 
 begin;
@@ -29,10 +30,9 @@ select cmp_ok(
   (select count(*)::int from public.snap), '<', 30,
   'mid-drain, a plain read of the parent UNDERCOUNTS (moved rows are in the unattached child)');
 
--- snapshot() unions the parent with the in-flight child, restoring the complete set.
-select pgpm.snapshot('public.snap');
+-- snapshot() unions the parent with the in-flight child, restoring the complete set, queried inline.
 select is(
-  (select count(*)::int from public.snap_snapshot),
+  (select count(*)::int from pgpm.snapshot(null::public.snap)),
   30, 'snapshot() restores the complete row set during the drain');
 
 -- and no rows were lost: parent + snapshot agree once the rest drains and attaches.

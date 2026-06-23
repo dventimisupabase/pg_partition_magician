@@ -362,16 +362,23 @@ synchronous "catch up now" path, not the online one). Reads of recent data are n
 drain only ever touches the old, closed tail.
 
 **Reads: the `snapshot()` escape hatch.** If a consistency-sensitive reader (a `COUNT(*)`, a logical
-backup, a reconciliation) needs the complete set *during* a drain, call:
+backup, a reconciliation) needs the complete set *during* a drain, query it inline:
 
 ```sql
-select pgpm.snapshot('public.events');        -- builds/refreshes the view public.events_snapshot
-select count(*) from public.events_snapshot;  -- the parent UNION every in-flight child
+select count(*) from pgpm.snapshot(null::public.events);  -- the parent UNION every in-flight child
 ```
 
-`snapshot()` builds a read-only view that `UNION`s the parent with every in-flight, not-yet-attached
-child, so it sees the moved rows too. It is read-only and point-in-time (re-call it to refresh against
-the current in-flight child).
+`snapshot()` is a read-only set-returning function that `UNION`s the parent with every in-flight,
+not-yet-attached child, so it sees the moved rows too. You pass the table as a typed-`NULL` anchor
+(`null::public.events`) rather than a name, because a function's row shape is fixed when the query is
+planned and cannot be inferred from a `regclass` value; `snapshot()` recovers the table from the
+anchor's type. It is **always fresh** (it rediscovers the in-flight child on every call, so it can
+neither double-count a child that has since attached nor miss a newly-started one) and leaves nothing
+behind. One honest cost worth knowing: it is an **optimization fence**. Because the in-flight child set
+is dynamic the body is dynamic SQL, so a `WHERE` on top does not push down into the union arms or use
+the in-flight child's `CHECK`-constraint exclusion; it materializes the union, then filters. That is
+fine for a `COUNT` or a full read, but for a heavily-filtered read on a large table a hand-written
+`select ... from parent union all select ... from <child> where ...` plans better.
 
 **Writes: there is no fix, and you should know that.** The write side of the gap is narrow but real,
 and it helps to be exact about what is and isn't affected. A fresh `INSERT` is never affected: a new

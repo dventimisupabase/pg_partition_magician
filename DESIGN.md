@@ -401,11 +401,18 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   the DEFAULT, fill the child, then atomic delete+attach) closes the read gap but risks *silent* lost
   updates if the closed tail is mutated mid-copy, strictly worse than today's *loud* anomalies; and a
   UNION view cannot replace the parent (writes, FK targets, and native routing all require a real
-  table). So the posture is to be loud about it and offer `pgpm.snapshot(parent)`, a read-only UNION
-  view (parent + every in-flight child) for consistency-sensitive reads during a drain. It does
-  nothing for writes (read-only) and is not a transparent fix (callers must use it). Single-batch
-  intervals and `drain_all` (one transaction) never open the gap, and only the old closed tail is ever
-  affected. Implemented: `pgpm.snapshot`, `tests/30`.
+  table). So the posture is to be loud about it and offer `pgpm.snapshot(null::parent)`, a read-only
+  set-returning function (parent UNION every in-flight child) for consistency-sensitive reads during a
+  drain, queried inline. It takes a typed-NULL rowtype anchor rather than a regclass because a
+  function's return shape is fixed at plan time and cannot be derived from a regclass value; it recovers
+  the table from the anchor's type. It is always fresh (rediscovers the in-flight child each call, so it
+  neither double-counts an attached child nor misses a new one) and leaves no object behind, unlike the
+  earlier stored-view form which also stranded a view in the user's schema on uninstall. Two inherent
+  costs, documented: it is an optimization fence (dynamic-SQL SRF, no predicate pushdown or child
+  `CHECK` exclusion, so it materializes the union before filtering), and it does nothing for writes
+  (read-only; an already-moved row is a `0 rows` no-op until attach). Single-batch intervals and
+  `drain_all` (one transaction) never open the gap, and only the old closed tail is ever affected.
+  Implemented: `pgpm.snapshot`, `tests/30`.
 - **Retain on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the

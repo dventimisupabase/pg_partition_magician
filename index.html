@@ -521,7 +521,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">6</span> Vanishing the backlog &middot; <code>drain</code></span>
             <h3>The old rows leave <code>DEFAULT</code> a chunk at a time.</h3>
-            <p>The closed tail still sitting in <code>DEFAULT</code> is moved into its real partitions in small microbatches: <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it where it belongs, commit, repeat. Background, paced, and pausable: <code>DEFAULT</code> shrinks toward empty and the workload is never blocked. Each newly-filled interval is attached by the misdirection above, so even that is a blink. We are upfront about the one cost: until an interval finishes and attaches, its already-moved rows sit in that not-yet-attached child, so a mid-drain read of the parent undercounts that interval. <code>pgpm.snapshot()</code> reads the complete set, and the guide says exactly when this can matter.</p>
+            <p>The closed tail still sitting in <code>DEFAULT</code> is moved into its real partitions in small microbatches: <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it where it belongs, commit, repeat. Background, paced, and pausable: <code>DEFAULT</code> shrinks toward empty and the workload is never blocked. Each newly-filled interval is attached by the misdirection above, so even that is a blink. We are upfront about the one cost: until an interval finishes and attaches, its already-moved rows sit in that not-yet-attached child, so a mid-drain read of the parent undercounts that interval. <code>pgpm.snapshot</code> reads the complete set, and the guide says exactly when this can matter.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-drain">
@@ -613,7 +613,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13 13l4 4"/></svg></div>
-          <div><h3>One gap, in the open</h3><p>While an interval drains, its already-moved rows live in a not-yet-attached child, so a mid-drain read of the parent undercounts that interval, and a write to a moved row no-ops. We don't hide it: <code>pgpm.snapshot()</code> returns the complete set, and the guide spells out exactly when it can affect you (append-only and time-local tables are immune). The rows are never lost, only briefly unreachable through the parent.</p></div>
+          <div><h3>One gap, in the open</h3><p>While an interval drains, its already-moved rows live in a not-yet-attached child, so a mid-drain read of the parent undercounts that interval, and a write to a moved row no-ops. We don't hide it: <code>pgpm.snapshot</code> returns the complete set, and the guide spells out exactly when it can affect you (append-only and time-local tables are immune). The rows are never lost, only briefly unreachable through the parent.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
