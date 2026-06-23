@@ -1,7 +1,5 @@
 # Partition a live Postgres table online, with nothing but SQL
 
-*Draft. Figures are in `bench/figures/` as PNG (shown here) and vector SVG (use the SVGs for the published post).*
-
 Partitioning a table you wish you had partitioned a year ago is one of Postgres's sharpest edges. The table is already large and already serving traffic, and the textbook fix (create a partitioned copy, backfill it, swap it in) wants a maintenance window, double the storage, and a careful application dance. So the table just keeps growing: autovacuum strains, indexes bloat, and "retention" becomes a `DELETE` that fights your workload.
 
 **pg_partition_magician** does the conversion online, in the background, with nothing but SQL.
@@ -32,7 +30,7 @@ You schedule one procedure, `pgpm.maintenance_all()`, on `pg_cron`. Each tick it
 - **drain**: move the `DEFAULT`'s closed tail (the rows that now belong in a real partition) into that partition, in small paced batches.
 - **retain**: drop partitions older than your policy.
 
-![A 40M-row table partitioned live: rows draining out of the DEFAULT while partitions are created, the workload running throughout.](../bench/figures/01-online-conversion.png)
+![A 40M-row table partitioned live: rows draining out of the DEFAULT while partitions are created, the workload running throughout.](../bench/figures/01-online-conversion.svg)
 
 The cutover moved no data; this is the data moving afterward, in the background, while the table stays online.
 
@@ -40,7 +38,7 @@ The cutover moved no data; this is the data moving afterward, in the background,
 
 Copying data on a busy database is exactly the thing that wrecks tail latency, so pgpm's entire posture is to stay invisible. The drain works in small paced batches under `SHARE UPDATE EXCLUSIVE` (which blocks neither reads nor writes), takes the brief stronger lock only for the instant it attaches a finished partition, and runs every step under a short `lock_timeout` inside its own subtransaction. If it ever loses a lock race to your workload, it defers and retries instead of blocking anyone.
 
-![Ambient-workload latency through the whole conversion: p50 and p95 hold at the baseline.](../bench/figures/02-latency-unnoticeable.png)
+![Ambient-workload latency through the whole conversion: p50 and p95 hold at the baseline.](../bench/figures/02-latency-unnoticeable.svg)
 
 That is the headline: the workload's p50 and p95 latency sit on the baseline for the entire conversion. The partitioning is happening underneath, unnoticed.
 
@@ -48,21 +46,21 @@ That is the headline: the workload's p50 and p95 latency sit on the baseline for
 
 A drain that is too eager floods the write-ahead log and triggers checkpoint storms, which hurts everyone. With adaptive feathering on (`pgpm.set_drain_adaptive`), the per-tick drain budget rides an AIMD controller, the same additive-increase / multiplicative-decrease law TCP uses to sit just under a link's capacity: it probes upward when the database is calm and halves the moment it senses WAL or checkpoint pressure.
 
-![The adaptive drain budget feathering between its ceiling and floor: throttled under pressure, opening back up as it clears.](../bench/figures/03-adaptive-feathering.png)
+![The adaptive drain budget feathering between its ceiling and floor: throttled under pressure, opening back up as it clears.](../bench/figures/03-adaptive-feathering.svg)
 
 It also watches the workload directly. A second, self-calibrating signal learns this database's *normal* level of IO and lock contention, then backs the drain off when a workload spike pushes live contention above that learned baseline, and resumes once the spike passes. The drain yields to your traffic, not the other way around.
 
-![A write surge mid-conversion: the drain budget feathers down as live contention exceeds the learned baseline, then recovers when the surge clears.](../bench/figures/04-ambient-surge.png)
+![A write surge mid-conversion: the drain budget feathers down as live contention exceeds the learned baseline, then recovers when the surge clears.](../bench/figures/04-ambient-surge.svg)
 
 ### It scales, and the pace is a dial
 
 The cutover is always instant. The only thing that grows with table size is the background drain, and that is the part you control.
 
-![Online conversion time from 1M to 40M rows; the full backlog drains to zero at every size.](../bench/figures/05-scale-ladder.png)
+![Online conversion time from 1M to 40M rows; the full backlog drains to zero at every size.](../bench/figures/05-scale-ladder.svg)
 
 Faster is not always better. At 40M rows, draining flat-out (a fixed rate) finishes sooner but drives the disk harder; adaptive feathering takes a little longer in exchange for staying under WAL and checkpoint pressure the whole way. You set the pace to your slack rate and let it feather down automatically under load.
 
-![Fixed vs adaptive at 40M: the adaptive budget feathers below the fixed rate under pressure; both drain the backlog to zero.](../bench/figures/06-fixed-vs-adaptive.png)
+![Fixed vs adaptive at 40M: the adaptive budget feathers below the fixed rate under pressure; both drain the backlog to zero.](../bench/figures/06-fixed-vs-adaptive.svg)
 
 ## Try it
 
