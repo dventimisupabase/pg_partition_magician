@@ -1106,7 +1106,7 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('premade=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
+  return format('attained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
                 v_made, v_dropped, v_drain, v_suspended, v_restored, v_note);
 end;
 $$;

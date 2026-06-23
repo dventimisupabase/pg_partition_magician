@@ -538,13 +538,13 @@
         <!-- 7 -->
         <div class="beat reveal">
           <div class="beat-copy">
-            <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain</code></span>
+            <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintenance_all</code></span>
             <h3>One <code>pg_cron</code> tick repeats every move, and shows its hands.</h3>
             <p>A single scheduled call ties it together: <b style="color:var(--green)">attain</b> keeps the future stocked, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions. It loops on <code>pg_cron</code> forever, and every action is written to an audit log in <code>pgpm.log</code>, the magician keeping his hands open. Pause it whenever; the <code>DEFAULT</code> keeps everything safe in the meantime.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-loop">
-              <div class="ring"><span class="tickdot"></span><span class="ring-lbl">pg_cron &middot; maintain()</span></div>
+              <div class="ring"><span class="tickdot"></span><span class="ring-lbl">pg_cron &middot; maintenance_all()</span></div>
               <div class="jobs"><b class="job">attain</b><b class="job">drain</b><b class="job">retain</b></div>
               <div class="ledger"><span class="ledger-lbl">pgpm.log</span><i></i><i></i><i></i></div>
             </div>
@@ -605,7 +605,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is your primary key and pgpm never rewrites it, an incoming FK still references a key that survives, so <code>transmute</code> keeps it, re-pointed at the new parent, no denormalization. A table whose primary key doesn't include the partition key is refused up front, never silently mangled.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is part of your primary key and pgpm never rewrites it, the key an incoming FK references survives the conversion. Opt into <code>p_incoming_fks =&gt; 'preserve'</code> and <code>transmute</code> drops each incoming FK for the move, then re-adds it against the new parent once the drain is idle, no denormalization. A primary key that doesn't include the partition key is refused up front, never silently mangled.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
@@ -613,7 +613,7 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>112 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
+          <div><h3>Proven across versions</h3><p>147 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
         </div>
       </div>
     </div>

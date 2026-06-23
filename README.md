@@ -22,13 +22,13 @@ of native `RANGE`-partitioned tables:
   Optionally adaptive (`pgpm.set_drain_adaptive`): the pace self-tunes against checkpoint pressure to
   stay unnoticeable.
 - **retain**: drop partitions older than a policy.
-- **maintenance**: the single procedure `pg_cron` calls (attain + retain + drain).
+- **maintenance**: the single procedure `pg_cron` calls (attain, drain, retain).
 
 **Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the
 referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records
 and drops each incoming FK for the conversion, then re-adds it against the new parent once the drain
 is idle (no composite-FK story, ever). A table whose primary key excludes the control column is
-refused: partition on a key that is already your PK. See the
+refused: partition on a key that is already part of your PK. See the
 [guide](docs/guide.md#incoming-foreign-keys).
 
 Think "a slice of `pg_partman`, installable as plain SQL." The schema is `pgpm`.
@@ -57,12 +57,12 @@ and uninstall. `pg_cron` must be enabled to run scheduled maintenance.
 ```sql
 -- 1. Convert a live table online and register it (no data moves here):
 select pgpm.transmute(
-  p_parent    => 'public.events',
-  p_control   => 'created_at',   -- the timestamp to range-partition on
-  p_interval  => interval '1 month', -- daily / weekly / monthly / yearly ...
-  p_attain   => 7,              -- keep 7 partitions ahead
-  p_retain => '90 days',      -- drop partitions older than this (null = keep)
-  p_paused    => false           -- let scheduled maintenance run
+  p_parent   => 'public.events',
+  p_control  => 'created_at',         -- the timestamp to range-partition on
+  p_interval => interval '1 month',   -- daily / weekly / monthly / yearly ...
+  p_attain   => 7,                    -- keep 7 partitions ahead
+  p_retain   => '90 days',            -- drop partitions older than this (null = keep)
+  p_paused   => false                 -- let scheduled maintenance run
 );
 
 -- 2. Schedule the one entry point (pg_cron):

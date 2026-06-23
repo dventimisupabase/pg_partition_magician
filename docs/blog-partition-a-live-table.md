@@ -22,7 +22,7 @@ pg_partition_magician is just tables, views, and PL/pgSQL. If you can run a SQL 
 
 ### The cutover is metadata-only
 
-pgpm partitions on a *monotonic* key: a timestamp, an integer/bigint id (including Snowflake-style ids), or a UUIDv7/ULID. It asks one thing of you: that key must already be part of the table's primary key. Given that, `transmute()` converts the table with no data movement. Your existing table becomes the `DEFAULT` partition of a new partitioned parent, and because the key already leads the primary key, the PK is reused in place, so nothing is rewritten. The cutover is a metadata operation that returns in milliseconds, even on a table with tens of millions of rows.
+pgpm partitions on a *monotonic* key: a timestamp, an integer/bigint id (including Snowflake-style ids), or a UUIDv7/ULID. It asks one thing of you: that key must already be part of the table's primary key. Given that, `transmute()` converts the table with no data movement. Your existing table becomes the `DEFAULT` partition of a new partitioned parent, and because that key is already in the primary key, the PK is reused in place, so nothing is rewritten. The cutover is a metadata operation that returns in milliseconds, even on a table with tens of millions of rows.
 
 ### Then pg_cron drives the lifecycle
 
@@ -69,12 +69,12 @@ Faster is not always better. At 40M rows, draining flat-out (a fixed rate) finis
 ```sql
 -- 1. Convert a live table online and register it (no data moves here):
 select pgpm.transmute(
-  p_parent    => 'public.events',
-  p_control   => 'created_at',        -- the monotonic key to range-partition on
-  p_interval  => interval '1 month',  -- daily / weekly / monthly / yearly ...
+  p_parent   => 'public.events',
+  p_control  => 'created_at',        -- the monotonic key to range-partition on
+  p_interval => interval '1 month',  -- daily / weekly / monthly / yearly ...
   p_attain   => 7,                   -- keep 7 partitions ahead of writes
-  p_retain => '90 days',           -- drop partitions older than this (null = keep)
-  p_paused    => false                -- let scheduled maintenance run
+  p_retain   => '90 days',           -- drop partitions older than this (null = keep)
+  p_paused   => false                -- let scheduled maintenance run
 );
 
 -- 2. Schedule the one entry point (pg_cron):
