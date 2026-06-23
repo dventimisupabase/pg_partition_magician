@@ -495,7 +495,8 @@ $$;
 create or replace function pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
-  p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text
+  p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text,
+  p_drain_adaptive boolean
 )
 returns regclass language plpgsql as $$
 declare
@@ -732,14 +733,15 @@ begin
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
-                           obtain, retain, keep_default, drain_batch, default_table, paused)
+                           obtain, retain, keep_default, drain_batch, default_table, paused, drain_adaptive)
   values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_obtain, p_retain,
-          p_keep_default, p_drain_batch, v_default, p_paused)
+          p_keep_default, p_drain_batch, v_default, p_paused, p_drain_adaptive)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
     obtain = excluded.obtain, retain = excluded.retain, keep_default = excluded.keep_default,
-    drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused;
+    drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused,
+    drain_adaptive = excluded.drain_adaptive;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
 
@@ -782,14 +784,15 @@ create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
-  p_paused boolean default true, p_incoming_fks text default 'error'
+  p_paused boolean default true, p_incoming_fks text default 'error',
+  p_drain_adaptive boolean default false
 ) returns regclass language sql as $$
   select pgpm._transmute(p_parent, p_control,
     case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
          then 'uuidv7' else 'time' end,
     p_interval::text, p_anchor::text, p_obtain,
-    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
+    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive);
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
@@ -797,10 +800,11 @@ create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
-  p_paused boolean default true, p_incoming_fks text default 'error'
+  p_paused boolean default true, p_incoming_fks text default 'error',
+  p_drain_adaptive boolean default false
 ) returns regclass language sql as $$
   select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
-                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
+                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive);
 $$;
 
 -- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and

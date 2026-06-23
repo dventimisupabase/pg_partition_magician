@@ -36,7 +36,8 @@ pgpm.transmute(
   p_drain_batch  int         default 5000,
   p_anchor       timestamptz default '2000-01-01 00:00:00+00',
   p_paused       boolean     default true,
-  p_incoming_fks text        default 'error'
+  p_incoming_fks text        default 'error',
+  p_drain_adaptive boolean   default false
 ) returns regclass
 ```
 
@@ -56,6 +57,7 @@ interval literal is ambiguous against the bigint overload, so cast it: `transmut
 | `p_anchor` | Grid origin for fixed-duration intervals. Calendar-aligned months ignore it. |
 | `p_paused` | When `true` (default), register but do not let scheduled `maintain` act until you [`resume`](#pgpmpause--pgpmresume). |
 | `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'preserve'` drops each for the conversion, records it, and re-adds it against the new parent once the drain is idle ([`restore_incoming_fks`](#pgpmrestore_incoming_fks)). See [incoming FKs](guide.md#incoming-foreign-keys). |
+| `p_drain_adaptive` | When `true`, register with adaptive feathering on (the AIMD self-tuning drain; see [`set_drain_adaptive`](#pgpmset_drain_adaptive)). Default `false` is the fixed-gentle rate. Equivalent to calling `set_drain_adaptive` after transmute, but chosen up front. |
 
 ### `pgpm.transmute` (integer grid: id)
 
@@ -64,7 +66,8 @@ pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
-  p_paused boolean default true, p_incoming_fks text default 'error'
+  p_paused boolean default true, p_incoming_fks text default 'error',
+  p_drain_adaptive boolean default false
 ) returns regclass
 ```
 
@@ -75,6 +78,8 @@ integer literal selects it with no cast: `transmute(t, c, 10000000)`. Difference
 - `p_retain` is a `bigint` count of intervals to keep, not an interval.
 - `p_anchor` is a `bigint` grid origin (default `0`).
 - The frontier is `max(control)`.
+
+`p_keep_default`, `p_paused`, `p_incoming_fks`, and `p_drain_adaptive` mean the same as in the interval overload.
 
 ### What transmute does
 
@@ -232,7 +237,9 @@ ceiling is `drain_batch` itself (a bigger batch means a bigger WAL spike, so the
 your tuned rate); adaptive only ever feathers *down* from it, as far as `drain_batch`/16 under sustained
 pressure. So set `drain_batch` to your optimistic "when there's slack" rate and let the controller back
 off automatically under load. Off (the default) keeps the fixed `drain_batch` rate. Toggling resets the
-controller state so it restarts cleanly from `drain_batch`.
+controller state so it restarts cleanly from `drain_batch`. To start a table adaptive from the moment it
+is converted, pass [`transmute(..., p_drain_adaptive => true)`](#pgpmtransmute-time-grid-time--uuidv7)
+instead of calling this afterward.
 
 ### `pgpm.set_drain_ambient`
 

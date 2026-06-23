@@ -175,6 +175,10 @@ system's spare capacity:
 select pgpm.set_drain_adaptive('public.events', true);
 ```
 
+Or choose it up front at conversion time, alongside the other knobs:
+`pgpm.transmute('public.events', 'created_at', interval '1 month', p_drain_adaptive => true)`. Either
+way the default is off (the predictable fixed `drain_batch` rate).
+
 Now each maintenance tick measures how fast the drain is generating WAL and compares it to the rate the
 database can absorb between checkpoints (`max_wal_size` / `checkpoint_timeout`). If the drain is
 outrunning that, a forced checkpoint and its I/O storm are on the way, so pgpm eases the budget down
