@@ -96,3 +96,7 @@ the [transmute walkthrough](docs/guide.md#transmute-a-table).
 
 The suite is pgTAP, runs on Docker only, and is exactly what CI runs on every push. See
 [ONBOARDING.md](ONBOARDING.md) for the development loop and the test matrix in detail.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
