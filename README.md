@@ -15,7 +15,9 @@ of native `RANGE`-partitioned tables:
 - **`transmute()`**: convert an existing (possibly huge, *live*) unpartitioned table into a partitioned
   one **online**, with no up-front data movement. One function, two type-safe overloads picked by the
   width parameter (an `interval` for the time grid, a `bigint` step for the integer grid); the kind
-  (time vs uuidv7) is read from the control column's type.
+  (time vs uuidv7) is read from the control column's type. Reversible with **`untransmute()`** up until
+  maintenance first runs: the cutover moves no data, so the table can be cleanly restored until a real
+  partition exists (after that it is a one-way door).
 - **attain**: keep N partitions ahead of the write frontier so live writes always have a real
   partition.
 - **drain**: move the `DEFAULT` partition's closed tail into proper partitions in paced microbatches.
@@ -72,10 +74,13 @@ select cron.schedule('pgpm', '1 minute', 'call pgpm.maintenance_all()');
 select * from pgpm.status();
 ```
 
-That is it. Maintenance attains ahead, drains the transmuted table's closed tail into partitions, and
-applies retention. `transmute` never rewrites the primary key, so the cutover is always metadata-only; it
-just requires the control column to already be part of the table's primary key (else it refuses). See
-the [transmute walkthrough](docs/guide.md#transmute-a-table).
+That is it. Maintenance obtains new empty partitions ahead, drains the
+transmuted table's closed tail into empty partitions, and applies
+retention to keep or drop old partitions. `transmute` never rewrites
+the primary key, so the cutover is always metadata-only; it just
+requires the control column to already be part of the table's primary
+key (else it refuses). See the [transmute
+walkthrough](docs/guide.md#transmute-a-table).
 
 ## Documentation
 
