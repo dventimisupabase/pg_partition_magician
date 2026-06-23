@@ -50,7 +50,7 @@ minute to minute. "Unnoticeable" means living within the leftover.
   `uuidv7` / ULID key, where the key *is* the PK), Postgres's rule is already satisfied and no
   widening is needed; see section 8. In that common case this cost center collapses to zero and only
   the drain remains.
-- **Steady (ongoing): the drain** (plus tiny, periodic attain and retain). Moving the closed
+- **Steady (ongoing): the drain** (plus tiny, periodic obtain and retain). Moving the closed
   tail out of `DEFAULT` in microbatches is **infinitely divisible**: a batch can be made
   arbitrarily small and spaced arbitrarily far apart.
 
@@ -113,7 +113,7 @@ The model gives the operator an honest, two-sided message:
 A quieter clause in the same contract: **pgpm does not leave.** It is tempting to picture it as a
 one-shot converter that transmutes a table, drains it, and exits stage left, but the drain is only the
 *backlog*. Keeping live writes landing in real partitions means creating partitions ahead of the
-frontier *forever* (attain), and PostgreSQL ships no mechanism to do that: declarative partitioning
+frontier *forever* (obtain), and PostgreSQL ships no mechanism to do that: declarative partitioning
 hands you the partition primitives but no policy engine to create, retain, and drop partitions on a
 schedule. Someone has to run that loop, whether `pg_partman`, an operator's own cron, or pgpm, so
 once you transmute, pgpm stays on as a standing companion, the way `pg_partman` would. Less Houdini than
@@ -376,7 +376,7 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   `NOT VALID` FK there; acceptable as a one-time step. The lifecycle is managed: a preserve-managed FK
   is **live if and only if the closed tail is empty**. `maintain` suspends (re-drops) a live managed
   FK before any drain that would move referenced rows and restores it once the tail is drained, so a
-  later attain-miss drain neither stalls (`NO ACTION`) nor silently mutates the referencing side
+  later obtain-miss drain neither stalls (`NO ACTION`) nor silently mutates the referencing side
   (`CASCADE` / `SET NULL`, verified on PG 17). `suspend_incoming_fks` shares the drain's subtransaction:
   if it cannot drop a live FK the drain is skipped that tick rather than run past it. `drain_all`
   suspends too. The `dropped_fk` record persists after restore (marked live via `restored_at`) so the

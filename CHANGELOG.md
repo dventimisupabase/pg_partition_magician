@@ -20,32 +20,32 @@
   `pgpm.dropped_fk`, and re-adds it verbatim against the new parent (`NOT VALID` + `VALIDATE`) once the
   drain is idle. `maintain` manages the lifecycle: a managed FK is live only while the closed tail is
   empty, so it suspends (re-drops) a live FK before a drain that would move referenced rows and restores
-  it after, and a later attain-miss drain neither stalls (`NO ACTION`) nor silently deletes/nulls the
+  it after, and a later obtain-miss drain neither stalls (`NO ACTION`) nor silently deletes/nulls the
   referencing rows (`CASCADE` / `SET NULL`). Referential actions, `DEFERRABLE`-ness, and self-referential
   FKs are preserved (the self-ref re-add is validating, not online). `pgpm.dropped_fk.restored_at` tracks
   the live/dropped state. (tests/19-24)
-- `transmute` no longer runs `attain` inside its transaction. Attaching a partition to a
+- `transmute` no longer runs `obtain` inside its transaction. Attaching a partition to a
   parent whose DEFAULT already holds data makes Postgres scan the default, and inside
   transmute's `ACCESS EXCLUSIVE` transaction that scan blocked all access for its duration
   (~minutes per premade partition at scale). `transmute` now does the metadata-only cutover
   only (a fresh parent with just the DEFAULT attached scans nothing), so it stays online
-  even on a 100GB+ table. Run `pgpm.attain()` / `pgpm.maintain()` afterward to build
+  even on a 100GB+ table. Run `pgpm.obtain()` / `pgpm.maintain()` afterward to build
   the future partitions online (their `VALIDATE` scans run under a non-blocking lock).
   Until then, writes route to the DEFAULT (correct, just not yet split into future cells).
-- `maintain` no longer lets an attain/retain failure abort the drain. Attaining a
+- `maintain` no longer lets an obtain/retain failure abort the drain. Obtaining a
   future partition needs `ACCESS EXCLUSIVE` on the parent plus a scan of the DEFAULT, which
   contends with concurrent inserts into the default's open cell; under sustained write load
-  the two sides could deadlock, and because attain ran first in the same transaction the
+  the two sides could deadlock, and because obtain ran first in the same transaction the
   deadlock aborted the whole maintenance run, so the drain never made progress. `maintain`
   now caps lock waits (`lock_timeout`, turning a would-be deadlock into a fast retryable miss)
-  and isolates attain, retain, and the drain in separate subtransactions: a step that
+  and isolates obtain, retain, and the drain in separate subtransactions: a step that
   loses the lock race is deferred (logged as `*_skip`, retried next tick) without aborting the
   drain. The closed-tail drain attaches via the scan-skip path, so it keeps converting the
-  table online even while attain repeatedly defers under load. Two further safeguards keep
-  attain from disrupting the workload under sustained writes: (a) attain/retain use a very
+  table online even while obtain repeatedly defers under load. Two further safeguards keep
+  obtain from disrupting the workload under sustained writes: (a) obtain/retain use a very
   short `lock_timeout` so a lost lock race fails in milliseconds -- barely blocking the workload,
-  and bailing before attain's `VALIDATE` scan of the default; (b) after a deferral, attain
-  backs off (a window recorded in `pgpm.config.attain_retry_after`) instead of retrying every
+  and bailing before obtain's `VALIDATE` scan of the default; (b) after a deferral, obtain
+  backs off (a window recorded in `pgpm.config.obtain_retry_after`) instead of retrying every
   tick. The drain keeps a longer `lock_timeout` so its infrequent, must-win attach isn't starved.
 - `drain_step`'s "any rows left in this range?" check now uses `EXISTS` instead of `count(*)`.
   The old `count(*)` re-scanned the entire remaining range after every microbatch -- O(rows^2 /
@@ -88,6 +88,6 @@ Initial release of pg_partition_magician.
 - Pure-SQL online RANGE-partition manager (schema `pgpm`); only runtime dependency is pg_cron.
 - Partition dimensions: `time`, `id` (bigint/numeric, incl. Snowflake-style), `uuidv7`/ULID-as-uuid. float/double rejected.
 - `transmute` / `transmute_by_id` / `transmute_by_uuidv7`: online conversion of an existing table (attach as DEFAULT, no rebuild of the default's PK index).
-- attain ahead of the write frontier; paced microbatch drain of the DEFAULT's closed tail (scan-skip attach); retain; maintenance via pg_cron.
+- obtain ahead of the write frontier; paced microbatch drain of the DEFAULT's closed tail (scan-skip attach); retain; maintenance via pg_cron.
 - Incoming-FK handling: refuse by default, opt-in drop+record, and `generate_fk_recovery()`.
 - Three install channels (psql / bundle / dbdev-TLE) built from one source; PG 15-18 channel test matrix; 53 pgTAP tests.

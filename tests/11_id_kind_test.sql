@@ -1,4 +1,4 @@
--- Verifies integer/id-range partitioning (events_id): structure, attain ahead
+-- Verifies integer/id-range partitioning (events_id): structure, obtain ahead
 -- of the id frontier, full drain, and row conservation. Robust to seed size.
 create extension if not exists pgtap;
 

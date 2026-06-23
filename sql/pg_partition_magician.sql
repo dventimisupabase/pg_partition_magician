@@ -4,7 +4,7 @@
 --   * Only runtime dependency: pg_cron (and only for scheduling). No compiled
 --     extension. Install with: psql -f this_file.sql.  Schema: pgpm.
 --   * Manages the full lifecycle of native RANGE-partitioned tables: transmute an
---     existing (possibly huge, live) table online, attain ahead of the write
+--     existing (possibly huge, live) table online, obtain ahead of the write
 --     frontier, drain the DEFAULT's closed tail, retain, all via maintenance.
 --
 -- Control-type contract -- a column works as the partition key if it is:
@@ -34,17 +34,17 @@ create table if not exists pgpm.config (
                    check (control_kind in ('time', 'id', 'uuidv7')),
   partition_step   text        not null,    -- '1 month' (time/uuidv7) | '10000000' (id)
   partition_anchor text        not null,    -- '2000-01-01...' (time/uuidv7) | '0' (id)
-  attain          int         not null default 4,
+  obtain          int         not null default 4,
   retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
   keep_default     boolean     not null default true,
   drain_batch      int         not null default 5000,
   default_table    name        not null,
   paused           boolean     not null default true,
   created_at       timestamptz not null default now(),
-  -- when maintenance may next attempt attain for this parent. Under sustained write contention
-  -- attain keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
+  -- when maintenance may next attempt obtain for this parent. Under sustained write contention
+  -- obtain keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
   -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
-  attain_retry_after timestamptz,
+  obtain_retry_after timestamptz,
   -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
   -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
   -- single batch huge. null = cap by drain_batch rows only (default). See DESIGN.md section 8.
@@ -81,7 +81,7 @@ create table if not exists pgpm.config (
   drain_ambient_baseline    numeric
 );
 -- upgrade path for installs that predate these columns
-alter table pgpm.config add column if not exists attain_retry_after timestamptz;
+alter table pgpm.config add column if not exists obtain_retry_after timestamptz;
 alter table pgpm.config add column if not exists drain_max_blocks int;
 alter table pgpm.config add column if not exists drain_adaptive boolean not null default false;
 alter table pgpm.config add column if not exists drain_budget int;
@@ -297,11 +297,11 @@ begin
   insert into pgpm.part (parent_table, child_name, lo, hi)
     values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi) on conflict do nothing;
   insert into pgpm.log (parent_table, action, lo, hi, method)
-    values (format('%I.%I', p_nsp, p_rel)::regclass, 'attain', p_lo, p_hi, v_method);
+    values (format('%I.%I', p_nsp, p_rel)::regclass, 'obtain', p_lo, p_hi, v_method);
 end;
 $$;
 
-create or replace function pgpm.attain(p_parent regclass)
+create or replace function pgpm.obtain(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_default regclass;
@@ -316,7 +316,7 @@ begin
   v_frontier := pgpm._frontier_native(p_parent);
   v_lo       := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
 
-  for k in 0 .. cfg.attain loop
+  for k in 0 .. cfg.obtain loop
     if k > 0 then v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo); end if;
     v_hi   := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
     v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
@@ -494,7 +494,7 @@ $$;
 
 create or replace function pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
-  p_step text, p_anchor text, p_attain int, p_retain text,
+  p_step text, p_anchor text, p_obtain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text
 )
 returns regclass language plpgsql as $$
@@ -732,13 +732,13 @@ begin
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
-                           attain, retain, keep_default, drain_batch, default_table, paused)
-  values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_attain, p_retain,
+                           obtain, retain, keep_default, drain_batch, default_table, paused)
+  values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_obtain, p_retain,
           p_keep_default, p_drain_batch, v_default, p_paused)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
-    attain = excluded.attain, retain = excluded.retain, keep_default = excluded.keep_default,
+    obtain = excluded.obtain, retain = excluded.retain, keep_default = excluded.keep_default,
     drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
@@ -751,14 +751,14 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  -- NOTE: attain is intentionally NOT run inside transmute. It attaches future partitions,
+  -- NOTE: obtain is intentionally NOT run inside transmute. It attaches future partitions,
   -- and attaching a partition to a parent whose DEFAULT already holds data makes Postgres
   -- scan the default -- which, inside this ACCESS EXCLUSIVE transaction, blocks ALL access
   -- for the whole scan (O(default), minutes on a large table). transmute() therefore does the
   -- metadata-only cutover ONLY (a fresh parent with just the DEFAULT attached scans nothing),
-  -- so it stays online even at scale. Run pgpm.attain(parent) (or pgpm.maintain, or the
+  -- so it stays online even at scale. Run pgpm.obtain(parent) (or pgpm.maintain, or the
   -- scheduled maintenance job) AFTER transmute to build the future partitions online -- its
-  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until attain
+  -- VALIDATE scans then run under a non-blocking SHARE UPDATE EXCLUSIVE lock. Until obtain
   -- runs, new writes route to the DEFAULT (correct, just not yet split into future cells).
   return v_parent;
 end;
@@ -780,7 +780,7 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- callers cast: transmute(t, c, interval '1 month').
 create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
-  p_attain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
@@ -788,29 +788,29 @@ create or replace function pgpm.transmute(
     case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
          then 'uuidv7' else 'time' end,
-    p_interval::text, p_anchor::text, p_attain,
+    p_interval::text, p_anchor::text, p_obtain,
     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
 create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
-  p_attain int default 4, p_retain bigint default null, p_keep_default boolean default true,
+  p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error'
 ) returns regclass language sql as $$
-  select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_attain,
+  select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
                      p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks);
 $$;
 
 -- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and
--- creates no real partitions (attain does that, later -- see the NOTE in _transmute), so until
--- maintenance/attain has run the DEFAULT partition still holds 100% of the rows and the original
+-- creates no real partitions (obtain does that, later -- see the NOTE in _transmute), so until
+-- maintenance/obtain has run the DEFAULT partition still holds 100% of the rows and the original
 -- table is sitting there untouched, merely renamed and attached. untransmute exploits that: detach the
 -- DEFAULT (it is a complete standalone table again the instant it detaches, because transmute never
 -- drops its PK), drop the now-childless parent, rename the DEFAULT back, and undo the few things
 -- transmute changed on it (identity moved to the parent, the drain's autovacuum knobs, preserved
--- incoming FKs). It is a one-way door the moment a real partition exists: once attain has run, live
+-- incoming FKs). It is a one-way door the moment a real partition exists: once obtain has run, live
 -- writes route into real partitions (and the drain may have moved rows out of the DEFAULT), so the
 -- DEFAULT is no longer the whole table -- untransmute then refuses. Returns the restored table.
 --
@@ -835,12 +835,12 @@ begin
   v_defreg := format('%I.%I', v_nsp, cfg.default_table)::regclass;
 
   -- THE GATE: reversible only while the DEFAULT is the sole partition. Any other attached child means
-  -- attain/maintenance has run, live writes have begun routing into real partitions (and the drain may
+  -- obtain/maintenance has run, live writes have begun routing into real partitions (and the drain may
   -- have moved rows out of the DEFAULT), so the DEFAULT no longer holds the whole table. One-way door.
   select count(*) into v_nreal
     from pg_inherits where inhparent = p_parent and inhrelid <> v_defreg;
   if v_nreal > 0 then
-    raise exception 'pg_partition_magician: cannot untransmute % -- % real partition(s) already exist, so the DEFAULT no longer holds the whole table. Reversal is only possible before maintenance/attain runs; this is a one-way door once draining begins.',
+    raise exception 'pg_partition_magician: cannot untransmute % -- % real partition(s) already exist, so the DEFAULT no longer holds the whole table. Reversal is only possible before maintenance/obtain runs; this is a one-way door once draining begins.',
       p_parent, v_nreal;
   end if;
 
@@ -1080,7 +1080,7 @@ begin
 end;
 $$;
 
--- renamed maintenance -> maintain / maintenance_all -> maintain_all (completes the attain/drain/retain
+-- renamed maintenance -> maintain / maintenance_all -> maintain_all (completes the obtain/drain/retain
 -- rhyme). Drop the old names so re-running the installer over a prior version does not strand them.
 drop function if exists pgpm.maintenance(regclass);
 drop procedure if exists pgpm.maintenance_all();
@@ -1104,35 +1104,35 @@ begin
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
   -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
   --
-  -- attain/retain get a VERY SHORT lock_timeout. Attaining a future partition's first step
+  -- obtain/retain get a VERY SHORT lock_timeout. Obtaining a future partition's first step
   -- (ADD CONSTRAINT on the default, for the scan-skip path) takes ACCESS EXCLUSIVE on the default
   -- -- which the live workload's inserts hold almost continuously. A long timeout there is doubly
   -- bad: it blocks the workload for the whole wait (the pending ACCESS EXCLUSIVE queues every new
   -- locker behind it), AND if it does win the lock it goes on to VALIDATE-scan the entire default
   -- before the CREATE -- a scan that is wasted whenever the CREATE then can't get its lock. Failing
-  -- fast makes a deferral nearly free: no long block, and it bails before that scan. attain is
+  -- fast makes a deferral nearly free: no long block, and it bails before that scan. obtain is
   -- optional (the future cells aren't written yet; the DEFAULT catches anything), so it simply
   -- retries when the workload next has a gap.
   perform set_config('lock_timeout', '200ms', true);
 
-  -- attain back-off: once a deferral happens, don't retry every tick -- under sustained write
-  -- contention attain can't win the lock for minutes, and each attempt risks a wasted default
+  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write
+  -- contention obtain can't win the lock for minutes, and each attempt risks a wasted default
   -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
-  -- them), so deferring attain is harmless. A successful attain clears the back-off.
-  if coalesce(cfg.attain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+  -- them), so deferring obtain is harmless. A successful obtain clears the back-off.
+  if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
     begin
-      v_made := pgpm.attain(p_parent);
-      if cfg.attain_retry_after is not null then
-        update pgpm.config set attain_retry_after = null where parent_table = p_parent;
+      v_made := pgpm.obtain(p_parent);
+      if cfg.obtain_retry_after is not null then
+        update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
       end if;
     exception when others then
-      v_note := v_note || ' attain_deferred';
-      update pgpm.config set attain_retry_after = clock_timestamp() + interval '30 seconds'
+      v_note := v_note || ' obtain_deferred';
+      update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'attain_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'obtain_skip', left(sqlerrm, 200));
     end;
   else
-    v_note := v_note || ' attain_backoff';
+    v_note := v_note || ' obtain_backoff';
   end if;
 
   begin
@@ -1247,7 +1247,7 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('attained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
+  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s%s',
                 v_made, v_dropped, v_drain, v_suspended, v_restored, v_note);
 end;
 $$;
@@ -1324,7 +1324,7 @@ $$;
 
 create or replace function pgpm.status()
 returns table (
-  parent regclass, control_kind text, partition_step text, attain int, retain text,
+  parent regclass, control_kind text, partition_step text, obtain int, retain text,
   paused boolean, n_partitions bigint, default_rows bigint, default_oldest text, newest_bound text
 )
 language plpgsql as $$
@@ -1339,7 +1339,7 @@ begin
     execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
-    attain := r.attain; retain := r.retain; paused := r.paused; n_partitions := v_np;
+    obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     default_rows := v_drows; default_oldest := v_old; newest_bound := v_new;
     return next;
   end loop;

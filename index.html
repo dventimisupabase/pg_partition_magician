@@ -540,12 +540,12 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain_all</code></span>
             <h3>One <code>pg_cron</code> tick repeats every move, and shows its hands.</h3>
-            <p>A single scheduled call ties it together: <b style="color:var(--green)">attain</b> keeps the future stocked, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions. It loops on <code>pg_cron</code> forever, and every action is written to an audit log in <code>pgpm.log</code>, the magician keeping his hands open. And the act waits for your cue: <code>transmute</code> registers the table <em>paused</em>, so you inspect first, then <code>resume()</code> to go live (and <code>pause()</code> to stop it anytime); the <code>DEFAULT</code> keeps everything safe in the meantime.</p>
+            <p>A single scheduled call ties it together: <b style="color:var(--green)">obtain</b> keeps the future stocked, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions. It loops on <code>pg_cron</code> forever, and every action is written to an audit log in <code>pgpm.log</code>, the magician keeping his hands open. And the act waits for your cue: <code>transmute</code> registers the table <em>paused</em>, so you inspect first, then <code>resume()</code> to go live (and <code>pause()</code> to stop it anytime); the <code>DEFAULT</code> keeps everything safe in the meantime.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-loop">
               <div class="ring"><span class="tickdot"></span><span class="ring-lbl">pg_cron &middot; maintain_all()</span></div>
-              <div class="jobs"><b class="job">attain</b><b class="job">drain</b><b class="job">retain</b></div>
+              <div class="jobs"><b class="job">obtain</b><b class="job">drain</b><b class="job">retain</b></div>
               <div class="ledger"><span class="ledger-lbl">pgpm.log</span><i></i><i></i><i></i></div>
             </div>
           </figure>

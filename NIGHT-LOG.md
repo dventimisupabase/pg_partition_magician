@@ -137,7 +137,7 @@ single statement out of 188,118. Evidence (pgfr, convert window): FORCED_CHECKPO
 > `max_wal_size` 4GB), checkpoint flush write 1090s / sync 574s cumulative, TEMP_FILE_SPILLS 5.64GB
 (drain CTE batch materialization), DEAD_TUPLE 41.5% on `events_default` (autovacuum trailing 26M
 deletes), SEQUENTIAL_SCAN_STORM 480M tuples (inherent online-attach VALIDATE; `lock_timeout` is now
-100ms so attain fast-fails with no wasted long lock-waits, 43 deferred). Workload waits in-window
+100ms so obtain fast-fails with no wasted long lock-waits, 43 deferred). Workload waits in-window
 were dominated by IO:DataFileRead 54%, LWLock:WALWrite 36%, IO:WalSync 18%. The 38s max is one
 statement caught behind a forced-checkpoint I/O storm on a burst-limited 2XL disk. `drain.progress.csv`
 shows the matching plateaus (~30 to 45s) where `default_rows` flatlines and `last_drain_age_s` climbs

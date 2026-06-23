@@ -40,20 +40,20 @@ and the month-spread is unchanged).
 ## The phases (a passive observer)
 
 pgpm is **self-driving**: you call `transmute()` once and pgpm's own pg_cron maintenance
-attains and drains the default autonomously, inside the database. So this harness does
+obtains and drains the default autonomously, inside the database. So this harness does
 **not** perform the partitioning: it sets pgpm up the way an operator would, drives an
 ambient workload, and *observes*. Three phases:
 
 1. **baseline**: ambient workload against the *unpartitioned* table.
 2. **convert**: fire `pgpm.transmute()` once (`p_paused => false`) and schedule
-   `pgpm.maintain` on pg_cron, then **pgpm** attains and drains the default on its
+   `pgpm.maintain` on pg_cron, then **pgpm** obtains and drains the default on its
    own while the harness drives the workload and watches `pgpm.log` until the drain settles.
    The harness never calls `drain_step`; because the conversion runs server-side, a
    dropped harness connection can't stop it.
 3. **post**: ambient workload against the now-partitioned table.
 
 The report compares client tps + p50/p95/p99 latency across the three phases and summarizes
-pgpm's own conversion (drain/attain from `pgpm.log`). The system-metric time-series (WAL,
+pgpm's own conversion (drain/obtain from `pgpm.log`). The system-metric time-series (WAL,
 checkpoints, `pg_stat_io`, wait/lock events) is **pg_flight_recorder's** job: it records them
 continuously and server-side, and the report slices its series to the conversion window. So
 degradation *while pgpm converts the table under load* is visible without the harness
@@ -97,13 +97,13 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions: set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after; avoids scattered per-row index maintenance across hundreds of millions of inserts |
 | `BENCH_INTERVAL` | `1 month` | partition width |
-| `BENCH_ATTAIN` | `3` | future partitions pgpm attains (configured on transmute; pgpm's maintenance does it) |
+| `BENCH_OBTAIN` | `3` | future partitions pgpm obtains (configured on transmute; pgpm's maintenance does it) |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
 | `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
 | `BENCH_PHASE_SECS` | `120` | baseline/post observation duration |
 | `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
 | `BENCH_DRAIN_BATCH` | `20000` | rows per `drain_step`, set on `transmute`; **pgpm** uses it when *it* drains |
-| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintain`, how often pgpm drives attain + drain |
+| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintain`, how often pgpm drives obtain + drain |
 | `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm drains |
 | `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |
@@ -123,7 +123,7 @@ profiles that bundle drive-intensity + how we observe:
 - **`stress`** (default), aggressive drain (2 s maintenance, large batch), **run to completion**
   (`BENCH_OBSERVE_MODE=settle`): drive the drain hard so it finishes within the run, then confirm
   it settled. This is the *stress test*, it deliberately exceeds production load to surface
-  bugs and limits, and it's how most of pgpm's drain/attain hardening was found.
+  bugs and limits, and it's how most of pgpm's drain/obtain hardening was found.
 - **`gentle`**, representative drain (20 s maintenance, small batch sized **under `work_mem`** so
   it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the drain is
   steadily running, then measure the workload over a fixed window and compare it to baseline,
@@ -172,7 +172,7 @@ to cut that on repeat runs, with an honest caveat on each:
 ## Output (`bench/results/`)
 
 - `report.md`: the before/during/after comparison, client tps + latency percentiles per
-  phase, a summary of pgpm's own conversion (drain/attain counts, rows moved, closed-tail
+  phase, a summary of pgpm's own conversion (drain/obtain counts, rows moved, closed-tail
   remaining, from `pgpm.log`), and a pointer to the pgfr system-metric series sliced to the
   conversion window.
 - `<phase>.pgbench.txt`: raw pgbench summary (tps, latency average).
@@ -199,7 +199,7 @@ conversion summary, but no system-metric time-series; set `BENCH_PGFR=1` for the
 
 ## Interpreting the results
 
-- **convert** is the window that matters: pgpm is attaining + draining the default while
+- **convert** is the window that matters: pgpm is obtaining + draining the default while
   the ambient workload runs. p50/p95 should stay close to baseline; the conversion is
   online. Expect occasional `max` blips: the brief `ACCESS EXCLUSIVE` on the transmute cutover,
   and pgpm's partition `ATTACH`es. If `max` is large or sustained, that's a real finding

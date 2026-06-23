@@ -14,7 +14,7 @@ set +a
 # A pilot exists to validate the PIPELINE quickly, not to test at scale. Keep the
 # closed tail tiny so the whole run is ~5 min and we can iterate fast and often:
 # 3M rows over 2 months -> ~1.5M-row closed tail -> ~1-2 min drain. Concurrency
-# (16 clients) is kept high so transmute/attain/drain still run under real contention.
+# (16 clients) is kept high so transmute/obtain/drain still run under real contention.
 # (For an at-scale confirmation run, bump BENCH_ROWS to 40M+ and the caps below.)
 export BENCH_ROWS=3000000         # ~1 GB; ~1.5M rows in the closed tail to drain
 export BENCH_MONTHS=2             # current (open) + prior (closed)
