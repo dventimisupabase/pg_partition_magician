@@ -381,6 +381,22 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   if it cannot drop a live FK the drain is skipped that tick rather than run past it. `drain_all`
   suspends too. The `dropped_fk` record persists after restore (marked live via `restored_at`) so the
   cycle can repeat.
+- **The drain visibility gap is general, not only an FK problem.** The "referenced row transiently
+  outside the parent" above is one face of a structural property: the unattached-intermediate move
+  means that during a multi-batch drain the already-moved rows of the draining interval are durable
+  but not reachable through the parent. A plain `SELECT` against the parent mid-drain *undercounts*
+  that interval, and a write through the parent that targets an already-moved row is a silent no-op
+  (`0 rows`) until the interval attaches. This is inherent: Postgres exposes no way to make an
+  unattached relation visible through a partitioned parent, and forbids attaching `[lo,hi)` while the
+  DEFAULT holds rows in that range. Both rejected fixes were worse: a copy-then-swap (leave rows in
+  the DEFAULT, fill the child, then atomic delete+attach) closes the read gap but risks *silent* lost
+  updates if the closed tail is mutated mid-copy, strictly worse than today's *loud* anomalies; and a
+  UNION view cannot replace the parent (writes, FK targets, and native routing all require a real
+  table). So the posture is to be loud about it and offer `pgpm.snapshot(parent)`, a read-only UNION
+  view (parent + every in-flight child) for consistency-sensitive reads during a drain. It does
+  nothing for writes (read-only) and is not a transparent fix (callers must use it). Single-batch
+  intervals and `drain_all` (one transaction) never open the gap, and only the old closed tail is ever
+  affected. Implemented: `pgpm.snapshot`, `tests/30`.
 - **Retain on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the

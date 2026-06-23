@@ -195,6 +195,12 @@ partition; when that interval empties, it attaches the partition and returns. Re
 | `p_batch` | Rows to move this step. Defaults to `config.drain_batch`. If `config.drain_max_blocks` is set, the batch is additionally capped to about that many heap+TOAST blocks (so wide rows cannot make one batch huge). |
 | `p_include_open` | When `true`, also drain the current open interval (attaches it via a plain, briefly blocking `ATTACH`). Use only to finish a table. |
 
+The child is created standalone and attached only when the interval empties, so across a multi-step
+drain the already-moved rows are not visible through the parent until that attach. A mid-drain read of
+the parent undercounts the draining interval; see [`snapshot`](#pgpmsnapshot) and the guide's
+[Read consistency during a drain](guide.md#read-consistency-during-a-drain). `drain_all` (one
+transaction) and single-batch intervals do not open this gap.
+
 ### `pgpm.drain_all`
 
 ```sql
@@ -300,6 +306,21 @@ The DEFAULT health check. `default_rows` is everything in the DEFAULT (the open 
 normally); `closed_rows` is the alert: rows in already-closed intervals that should have drained.
 `closed_rows > 0` in steady state means the drain is behind. `oldest` is the oldest control value
 present.
+
+### `pgpm.snapshot`
+
+```sql
+pgpm.snapshot(p_parent regclass) returns regclass
+```
+
+The read-consistency escape hatch for the [drain visibility gap](guide.md#read-consistency-during-a-drain).
+Builds (or refreshes) a read-only view `<parent>_snapshot` that `UNION`s the parent with every
+in-flight, not-yet-attached drain child, then returns the view. During a multi-step drain the parent
+alone undercounts the draining interval (its moved rows sit in an unattached child); querying the
+snapshot view sees them too. Point-in-time: re-call it to refresh against the current in-flight child.
+Read-only, it does not help writes (a write through the parent that targets an already-moved row is a
+silent `0 rows` no-op until the interval attaches, with no fix). When no drain is in flight the view is
+just `select * from <parent>`. Raises if the table is not managed.
 
 ### `pgpm.check_uuidv7`
 

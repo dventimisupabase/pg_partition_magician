@@ -22,7 +22,10 @@ of native `RANGE`-partitioned tables:
   partition.
 - **drain**: move the `DEFAULT` partition's closed tail into proper partitions in paced microbatches.
   Optionally adaptive (`pgpm.set_drain_adaptive`): the pace self-tunes against checkpoint pressure to
-  stay unnoticeable.
+  stay unnoticeable. One honest caveat: a multi-batch drain moves rows through an unattached child, so
+  a mid-drain read of the parent **undercounts the interval being drained** (and a write to an
+  already-moved row no-ops) until it attaches. This is inherent; `pgpm.snapshot()` gives a complete
+  read, and the [guide](docs/guide.md#read-consistency-during-a-drain) explains it in full.
 - **retain**: drop partitions older than a policy.
 - **maintain**: the single procedure `pg_cron` calls (obtain, drain, retain).
 

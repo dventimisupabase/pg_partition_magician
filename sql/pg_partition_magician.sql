@@ -1350,6 +1350,52 @@ begin
 end;
 $$;
 
+-- snapshot(): a read-consistency escape hatch for the drain visibility gap. THE GAP: the drain moves a
+-- closed interval out of the DEFAULT into a brand-new child that is created STANDALONE and only ATTACHed
+-- once the whole interval has moved (see drain_step). Between the first microbatch and that attach, the
+-- already-moved rows are durable but live in an UNATTACHED table, so they are NOT reachable through the
+-- parent: a plain `select ... from parent` mid-drain UNDERCOUNTS the interval being drained (by however
+-- many rows have moved so far). This is inherent -- Postgres has no way to make an unattached relation
+-- visible through the parent, and will not attach a partition while the DEFAULT still holds rows in its
+-- range (chicken-and-egg). snapshot() builds (or refreshes) a view <parent>_snapshot that UNIONs the
+-- parent with every in-flight, not-yet-attached child, so a consistency-sensitive reader (a COUNT, a
+-- logical backup, a reconciliation) can get the COMPLETE set during a drain. It is READ-ONLY and a
+-- point-in-time aid (re-call it to refresh against the current in-flight child). It does NOTHING for
+-- writes: an INSERT/UPDATE/DELETE through the parent that targets an already-moved row sees no row and
+-- is a no-op (reports 0 rows) until the interval attaches -- there is no fix for that, by design.
+-- Single-batch intervals and drain_all (one transaction) never open the gap.
+create or replace function pgpm.snapshot(p_parent regclass)
+returns regclass language plpgsql as $$
+declare cfg pgpm.config; v_nsp name; v_rel name; v_view name; v_arms text; v_child name;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_view := (v_rel || '_snapshot')::name;
+
+  -- the parent already covers the DEFAULT and every attached partition.
+  v_arms := format('select * from %s', p_parent::text);
+
+  -- add every in-flight (unattached) drain child: a standalone table in this schema matching the
+  -- parent's child-partition naming that is NOT yet attached (same shape as the orphan guard).
+  for v_child in
+    select c.relname from pg_class c
+     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
+       and c.relkind = 'r' and starts_with(c.relname, v_rel || '_p')
+       and case when cfg.control_kind = 'id'
+                then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
+                else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$' end
+       and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
+  loop
+    v_arms := v_arms || format(' union all select * from %I.%I', v_nsp, v_child);
+  end loop;
+
+  execute format('create or replace view %I.%I as %s', v_nsp, v_view, v_arms);
+  return format('%I.%I', v_nsp, v_view)::regclass;
+end;
+$$;
+
 -- restore_incoming_fks(): re-add the incoming FKs that transmute(..., p_incoming_fks => 'preserve')
 -- recorded, pointing them back at the new partitioned parent (`NOT VALID` then `VALIDATE`, so the
 -- re-add is online), but only once it is SAFE. Safe = the conversion is quiescent: the closed tail is

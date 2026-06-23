@@ -51,6 +51,11 @@ any row that does not match a real partition still has a home (no lost writes, e
 obtain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
 and otherwise stays empty. `check_default()` tells you if anything is stuck there.
 
+**Reads during a drain undercount.** While an interval is draining, its already-moved rows sit in an
+unattached child and are not visible through the parent, so a mid-drain `SELECT` undercounts that
+interval. This is inherent and unfixable; use [`snapshot()`](#read-consistency-during-a-drain) for a
+complete read. The full, honest treatment is in [Read consistency during a drain](#read-consistency-during-a-drain).
+
 **The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives
 three jobs per table:
 
@@ -321,6 +326,53 @@ the DEFAULT). So the active interval simply lives in the DEFAULT until it closes
 closed tail. Measured on PG 15 (4M-row default): plain attach 101 ms under `ACCESS EXCLUSIVE` vs
 scan-skip attach 0.43 ms. The full rationale is in [DESIGN.md](../DESIGN.md).
 
+## Read consistency during a drain
+
+This is the one correctness caveat worth understanding before you rely on pgpm. We would rather state
+it plainly than bury it.
+
+**The gap.** The drain moves a closed interval out of the `DEFAULT` into a brand-new child table that
+is created *standalone* and only `ATTACH`ed to the parent once the whole interval has moved (it moves
+in paced microbatches; see [`drain_step`](reference.md#pgpmdrain_step)). Between the first microbatch
+and that final attach, the rows already moved are durable but live in an **unattached** table, and a
+query against the parent only scans attached partitions. So a plain `SELECT ... FROM parent` issued
+*mid-drain* **undercounts the interval being drained**, by however many of its rows have moved so far.
+The rows are never lost; they are temporarily not reachable through the parent.
+
+**Why it is inherent.** Postgres has no way to make an unattached relation visible through a
+partitioned parent, and it will not attach a partition for `[lo, hi)` while the `DEFAULT` still holds
+rows in that range (a chicken-and-egg). Every alternative was tried (see [DESIGN.md](../DESIGN.md)
+section 8): there is no online, microbatched drain that keeps the interval continuously visible
+through the parent. pgpm chose paced and non-blocking and accepted this gap, rather than block the
+workload or risk silent loss from a copy-then-swap.
+
+**When there is no gap.** Only the interval *currently* draining is affected, and only while it
+drains. An interval small enough to drain in one batch attaches in the same transaction (no gap), and
+`drain_all()` runs the whole drain in one transaction (no gap, but it holds locks, so it is the
+synchronous "catch up now" path, not the online one). Reads of recent data are never affected: the
+drain only ever touches the old, closed tail.
+
+**Reads: the `snapshot()` escape hatch.** If a consistency-sensitive reader (a `COUNT(*)`, a logical
+backup, a reconciliation) needs the complete set *during* a drain, call:
+
+```sql
+select pgpm.snapshot('public.events');        -- builds/refreshes the view public.events_snapshot
+select count(*) from public.events_snapshot;  -- the parent UNION every in-flight child
+```
+
+`snapshot()` builds a read-only view that `UNION`s the parent with every in-flight, not-yet-attached
+child, so it sees the moved rows too. It is read-only and point-in-time (re-call it to refresh against
+the current in-flight child).
+
+**Writes: there is no fix, and you should know that.** An `INSERT` / `UPDATE` / `DELETE` issued through
+the parent that targets a row already moved into the unattached child finds **no row** and is a silent
+no-op (it reports `0 rows affected`) until the interval attaches. `snapshot()` cannot help: it is
+read-only, and you cannot write through it. There is no way around this on the online drain path; it is
+the write-side face of the same gap. For the workloads pgpm targets it is a non-issue, because the
+drained rows are the old, closed tail, which is typically immutable. If your workload does mutate old
+rows, drive that interval to completion with `drain_all()` (one transaction, no gap) before issuing
+such writes, or `pause` the table while you do.
+
 ## WAL and checkpoint sizing
 
 The drain rewrites rows (a cross-partition `DELETE` + `INSERT`), so a conversion is a burst of WAL
@@ -400,5 +452,10 @@ What to do:
   [transmute a table](#transmute-a-table).
 - **Incoming foreign keys**: refused by default, or preserved (dropped for the conversion and re-added
   against the new parent) with `p_incoming_fks => 'preserve'`; see above.
+- **Reads undercount mid-drain; writes to moved rows no-op.** A `SELECT` against the parent while an
+  interval is draining misses its already-moved rows (use [`snapshot()`](#read-consistency-during-a-drain)
+  for a complete read); a write targeting such a row is a silent `0 rows` no-op until it attaches, with
+  no fix. Both are inherent to the online drain. See
+  [Read consistency during a drain](#read-consistency-during-a-drain).
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by
   default).
