@@ -387,10 +387,13 @@ clear that bar:
   in the fully-writable `DEFAULT` with no gap; by the time the interval closes and drains, they are
   frozen. The lever is the **partition interval**: size it coarser than your mutation-settling window
   (monthly partitions for orders that settle within days) and the churn lands entirely in the open
-  interval. A daily partition on that same table would let more mutation happen after close.
+  interval. A daily partition on that same table would let more mutation happen after close. The drain
+  reinforces this: it only ever moves *closed* intervals, oldest-first, and never the open one that
+  writes are still landing in, so the rows it has in flight are always the most-settled, never the
+  range under active write.
 - **`DROP`-based retention**, which is what pgpm does (`retain` drops whole partitions), so the one
   routine write to old rows never happens as DML. `retain` drops the *oldest attached* partitions while
-  the drain works the *newest-closed* interval through an unattached child, so the two never collide.
+  the drain operates on the unattached in-flight child, so the two never collide.
 
 Even when a mutation does land in the danger window the footprint is small: at most one interval is
 exposed at a time, only during its drain, and only for writes to already-moved rows. The genuine
