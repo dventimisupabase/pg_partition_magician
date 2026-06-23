@@ -11,7 +11,7 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
 - **40 M rows**, spread over the last 2 months (~Apr 20 → Jun 20) → ~12 GB heap+indexes
   unpartitioned. Generated server-side by 8 parallel sessions.
 - Conversion: `build_pk_concurrently` (online PK) → `transmute(p_paused => false)` →
-  `pgpm.maintain` scheduled on pg_cron every 2 s. pgpm self-drives attain + drain;
+  `pgpm.maintain` scheduled on pg_cron every 2 s. pgpm self-drives obtain + drain;
   the harness only observes. Drain batch 150 000.
 
 ## Result: converted online, workload never stopped
@@ -21,10 +21,10 @@ continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500
 - **Drain: 27.4 M closed-tail rows moved** in 184 microbatches, attaching 2 closed
   partitions; default drained to the open-month residue (`closed_rows = 0`). 6 partitions
   total (default + 3 premade-ahead + 2 drained). **40 M rows conserved.**
-- **`maintain()` hardening validated under load:** attain **succeeded 3×** (during
-  lulls) and **deferred 14×** (`attain_skip`, when it lost the lock race to the live
+- **`maintain()` hardening validated under load:** obtain **succeeded 3×** (during
+  lulls) and **deferred 14×** (`obtain_skip`, when it lost the lock race to the live
   insert workload), and the drain ran to completion regardless. Before the fix, the first
-  attain deadlock aborted the whole maintenance run and the drain never started.
+  obtain deadlock aborted the whole maintenance run and the drain never started.
 
 ## Throughput / latency by phase
 
@@ -75,7 +75,7 @@ bounded `statement_timeout` + reuse one persistent connection rather than one ps
 ## Bugs this rung's path surfaced (all fixed before this pass)
 
 1. Observer falsely declared "settled" before the drain started (`coalesce(age, 999999)`).
-2. `maintain()` let an attain deadlock abort the drain (the hardening above).
+2. `maintain()` let an obtain deadlock abort the drain (the hardening above).
 3. Convert-phase pgbench was orphaned (harness killed the subshell wrapper, not pgbench).
 4. No TCP keepalives → the bulk-generation connections went half-open over the NAT'd path
    and the harness hung. Keepalives now added to every connection.

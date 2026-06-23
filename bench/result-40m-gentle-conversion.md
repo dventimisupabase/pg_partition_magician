@@ -20,7 +20,7 @@ PostgreSQL 17.6, staging "green"). Same engine and same 40M-row workload as the
   by 8 parallel sessions, then **`VACUUM (FREEZE, ANALYZE)`** so the post-bulk-load freeze WAL
   settles *before* measurement (`BENCH_PREFREEZE=1`; see "I/O attribution").
 - Conversion: `build_pk_concurrently` (online PK) → `transmute()` → `pgpm.maintain` on pg_cron
-  **every 20 s**, **drain batch 20 000**. pgpm self-drives attain + drain; the harness observes.
+  **every 20 s**, **drain batch 20 000**. pgpm self-drives obtain + drain; the harness observes.
 - Observe mode: **window**, 60 s warm-up to steady-state draining, then a 300 s measurement window.
   Convert metrics are restricted to that window (the one-time transmute cutover is excluded).
 - **Connection path: Supavisor session-mode pooler (port 5432), `BENCH_USE_POOLER=1`**, over the
@@ -41,7 +41,7 @@ latency **tracks baseline at every percentile** while pgpm drains the closed tai
 **The verdict is the latency comparison, and it is unambiguous: the drain did not slow the
 workload.** Convert p50/p95 are statistically identical to baseline and p99 is *better*. During
 the window pgpm self-drove correctly under live load: **23 drain microbatches** (460k closed-tail
-rows moved), attain **succeeded 3× and deferred 6×** under lock contention (the back-off ceding to
+rows moved), obtain **succeeded 3× and deferred 6×** under lock contention (the back-off ceding to
 the live insert workload, exactly as intended). Closed tail intentionally left draining
 (26.6 M rows remain, a windowed run is not run to completion).
 
@@ -81,7 +81,7 @@ steady-state drain itself stays under the instance's I/O baseline, which is the 
 Over the direct `.red` endpoint (Postgres over a Tailscale/NAT CGNAT route) the **workload
 connection dropped ~80 s into convert on all 3 runs**, truncating the window (n=8662 or n/a). The
 server was unaffected every time, pgpm kept draining straight through the client blackout
-(`drain_ops` climbing, attain creating partitions). Switching the client to the **Supavisor
+(`drain_ops` climbing, obtain creating partitions). Switching the client to the **Supavisor
 session-mode pooler** (public path) resolved it: the window is captured in full and latency is
 *lower* (~76 ms vs ~90 ms on Tailscale). Session mode (not transaction mode 6543) is required, the
 harness needs a stable server backend per connection for `set statement_timeout=0`, the COMMIT-ing

@@ -49,9 +49,9 @@ select public.generate_messages(coalesce(current_setting('poc.seed_count', true)
 analyze public.messages;
 
 select pgpm.transmute('public.messages', 'created_at', interval '1 month',
-                  p_attain => 4, p_retain => null, p_drain_batch => 5000, p_paused => true);
--- transmute() does the cutover only; attain the future partitions separately (online)
-select pgpm.attain('public.messages');
+                  p_obtain => 4, p_retain => null, p_drain_batch => 5000, p_paused => true);
+-- transmute() does the cutover only; obtain the future partitions separately (online)
+select pgpm.obtain('public.messages');
 
 -- ---- integer/id dimension: events_id ---------------------------------------
 create table public.events_id (
@@ -61,8 +61,8 @@ create table public.events_id (
 insert into public.events_id (payload)
   select 'evt ' || g from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g;
 analyze public.events_id;
-select pgpm.transmute('public.events_id', 'id', 10000, p_attain => 2, p_drain_batch => 5000);
-select pgpm.attain('public.events_id');
+select pgpm.transmute('public.events_id', 'id', 10000, p_obtain => 2, p_drain_batch => 5000);
+select pgpm.obtain('public.events_id');
 
 -- ---- uuidv7 dimension: events_uuid -----------------------------------------
 create table public.events_uuid (
@@ -85,5 +85,5 @@ from (
   from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g
 ) s;
 analyze public.events_uuid;
-select pgpm.transmute('public.events_uuid', 'id', interval '1 month', p_attain => 2, p_drain_batch => 5000);
-select pgpm.attain('public.events_uuid');
+select pgpm.transmute('public.events_uuid', 'id', interval '1 month', p_obtain => 2, p_drain_batch => 5000);
+select pgpm.obtain('public.events_uuid');

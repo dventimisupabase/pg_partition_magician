@@ -2,11 +2,11 @@
 # At-scale load test for pg_partition_magician.
 #
 # pgpm is self-driving: you call transmute() once and pgpm's own pg_cron maintenance
-# attains + drains the default autonomously, inside the database. So this harness only
+# obtains + drains the default autonomously, inside the database. So this harness only
 # (1) generates the bulk data SERVER-SIDE, (2) drives an ambient OLTP workload that has
 # nothing to do with pgpm, (3) triggers the conversion once (transmute + schedule
 # pgpm.maintain) and marks the phase boundaries, and (4) writes a report. It never
-# drives drain_step/attain itself; the conversion runs server-side.
+# drives drain_step/obtain itself; the conversion runs server-side.
 #
 # The SYSTEM metrics (WAL, checkpoints, pg_stat_io, wait/lock events, table sizes) are
 # pg_flight_recorder's job -- it records them continuously and server-side, and the report
@@ -35,7 +35,7 @@ BENCH_PREFREEZE="${BENCH_PREFREEZE:-0}"     # 1 = VACUUM(FREEZE,ANALYZE) after g
                                             #     freeze/hint-bit WAL settles BEFORE measuring (gentle arm: keeps the
                                             #     load aftermath out of the window so windowed I/O reflects the drain)
 BENCH_INTERVAL="${BENCH_INTERVAL:-1 month}" # partition width
-BENCH_ATTAIN="${BENCH_ATTAIN:-3}"
+BENCH_OBTAIN="${BENCH_OBTAIN:-3}"
 
 BENCH_CLIENTS="${BENCH_CLIENTS:-16}"        # pgbench concurrent clients
 BENCH_JOBS="${BENCH_JOBS:-4}"               # pgbench worker threads
@@ -343,9 +343,9 @@ assert_workload_healthy baseline   # bail now if the workload is timing out, bef
 # ---- 4. conversion: trigger pgpm ONCE, then OBSERVE it self-drive -----------
 # The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator
 # does -- fire transmute() once (unpaused) and schedule pgpm.maintain on pg_cron -- and then
-# pgpm's OWN cron jobs attain + drain the default autonomously, inside the database. The
+# pgpm's OWN cron jobs obtain + drain the default autonomously, inside the database. The
 # harness only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the
-# drain settles. Nothing here calls drain_step or attain; a dropped observer connection
+# drain settles. Nothing here calls drain_step or obtain; a dropped observer connection
 # can't stop the conversion, because the conversion isn't running on this connection.
 say "conversion: trigger pgpm.transmute, then observe pgpm self-drive (pg_cron) under load"
 pgss_reset
@@ -370,7 +370,7 @@ convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversio
 # place), so the cutover is always metadata-only. See DESIGN.md section 8.
 echo "  firing pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
 transmute_t0=$(q "select extract(epoch from clock_timestamp())")
-q "select pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_ATTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+q "select pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 transmute_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 
@@ -396,7 +396,7 @@ else
   echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
 fi
 
-# 4c. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives attain + drain
+# 4c. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives obtain + drain
 #     (standard pgpm operation; the operator schedules it once; pg_cron skips overlapping runs)
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
 q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_all()')" >/dev/null
@@ -564,7 +564,7 @@ say "report"
   fi
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
   echo "- drain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_attach'") partition attaches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") rows moved"
-  echo "- attain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='attain'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='attain_skip'") deferred under lock contention"
+  echo "- obtain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='obtain'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='obtain_skip'") deferred under lock contention"
   if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
     echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe'") backoffs ($(q "select coalesce(string_agg(method||':'||c,', '),'none') from (select method, count(*) c from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe' group by method order by 2 desc) s") )"
   fi

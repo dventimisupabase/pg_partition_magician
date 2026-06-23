@@ -48,13 +48,13 @@ still receiving writes) and "closed" once the frontier moves past its upper boun
 
 **The DEFAULT is a safety net.** Transmutation attaches your original table as the `DEFAULT` partition, so
 any row that does not match a real partition still has a home (no lost writes, ever). In steady state
-attain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
+obtain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
 and otherwise stays empty. `check_default()` tells you if anything is stuck there.
 
 **The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives
 three jobs per table:
 
-- **attain**: create up to N partitions ahead of the frontier, so live writes always land in a real
+- **obtain**: create up to N partitions ahead of the frontier, so live writes always land in a real
   partition.
 - **drain**: move the DEFAULT's closed tail into proper partitions, a small microbatch at a time,
   then attach each interval's partition when it empties. The only range ever drained is one that has
@@ -151,7 +151,7 @@ select * from pgpm.status();              -- looks right?
 select pgpm.resume('public.events');      -- go live
 ```
 
-From there, each tick attains ahead, drains a microbatch of the closed tail, and applies retention.
+From there, each tick obtains ahead, drains a microbatch of the closed tail, and applies retention.
 You can also transmute with `p_paused => false` to go live immediately and skip the `resume` step.
 
 To convert a table synchronously (tests, one-shot migrations) instead of waiting for the paced cron,
@@ -277,7 +277,7 @@ in-flight child partition), so it is safe to call early or repeatedly. An incomi
 a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
 
 After it is restored, `maintain` keeps a managed FK on a leash: a preserve-managed FK is live only
-while the closed tail is empty. If a later drain appears (for example attain falls behind and rows
+while the closed tail is empty. If a later drain appears (for example obtain falls behind and rows
 land in the DEFAULT for an interval that then closes), `maintain` suspends the FK before draining
 (`pgpm.suspend_incoming_fks` keeps them safe across that drain) and restores it afterward, so the
 catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK) silently deletes or nulls the
@@ -302,7 +302,7 @@ Two facts about Postgres drive the design:
    `ACCESS EXCLUSIVE`, which would block the workload.
 
 pgpm sidesteps #2 for every range that receives no concurrent writes (closed past intervals on the
-drain, future intervals on attain) with a scan-skip attach:
+drain, future intervals on obtain) with a scan-skip attach:
 
 ```sql
 ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
@@ -386,7 +386,7 @@ What to do:
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the DEFAULT safety
   net absorb stragglers. Arbitrary backdated keys break it.
-- **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state attain stays ahead so the
+- **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state obtain stays ahead so the
   DEFAULT stays empty; `check_default()` flags any stray row.
 - **Retain uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
 - **Unique secondary indexes** are not auto-propagated (a partitioned unique index must include the

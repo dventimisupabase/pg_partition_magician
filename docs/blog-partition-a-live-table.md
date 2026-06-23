@@ -26,7 +26,7 @@ pgpm partitions on a *monotonic* key: a timestamp, an integer/bigint id (includi
 
 You schedule one procedure, `pgpm.maintain_all()`, on `pg_cron`. Each tick it does three things:
 
-- **attain**: keep N real partitions ahead of the write frontier, so live inserts always land in a real partition and never pile up in the `DEFAULT`.
+- **obtain**: keep N real partitions ahead of the write frontier, so live inserts always land in a real partition and never pile up in the `DEFAULT`.
 - **drain**: move the `DEFAULT`'s closed tail (the rows that now belong in a real partition) into that partition, in small paced batches.
 - **retain**: drop partitions older than your policy.
 
@@ -71,14 +71,14 @@ select pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',        -- the monotonic key to range-partition on
   p_interval => interval '1 month',  -- daily / weekly / monthly / yearly ...
-  p_attain   => 7,                   -- keep 7 partitions ahead of writes
+  p_obtain   => 7,                   -- keep 7 partitions ahead of writes
   p_retain   => '90 days'            -- drop partitions older than this (null = keep)
 );
 
 -- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
 select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
 
--- 3. Inspect, then go live. Maintenance only starts attaining and draining once you resume:
+-- 3. Inspect, then go live. Maintenance only starts obtaining and draining once you resume:
 select * from pgpm.status();
 select pgpm.resume('public.events');
 ```

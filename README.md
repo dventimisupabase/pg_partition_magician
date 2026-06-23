@@ -18,13 +18,13 @@ of native `RANGE`-partitioned tables:
   (time vs uuidv7) is read from the control column's type. Reversible with **`untransmute()`** up until
   maintenance first runs: the cutover moves no data, so the table can be cleanly restored until a real
   partition exists (after that it is a one-way door).
-- **attain**: keep N partitions ahead of the write frontier so live writes always have a real
+- **obtain**: keep N partitions ahead of the write frontier so live writes always have a real
   partition.
 - **drain**: move the `DEFAULT` partition's closed tail into proper partitions in paced microbatches.
   Optionally adaptive (`pgpm.set_drain_adaptive`): the pace self-tunes against checkpoint pressure to
   stay unnoticeable.
 - **retain**: drop partitions older than a policy.
-- **maintain**: the single procedure `pg_cron` calls (attain, drain, retain).
+- **maintain**: the single procedure `pg_cron` calls (obtain, drain, retain).
 
 **Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the
 referenced unique key always survives partitioning: with `p_incoming_fks => 'preserve'` it records
@@ -63,14 +63,14 @@ select pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',         -- the timestamp to range-partition on
   p_interval => interval '1 month',   -- daily / weekly / monthly / yearly ...
-  p_attain   => 7,                    -- keep 7 partitions ahead
+  p_obtain   => 7,                    -- keep 7 partitions ahead
   p_retain   => '90 days'             -- drop partitions older than this (null = keep)
 );
 
 -- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
 select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
 
--- 3. Inspect, then go live. Maintenance only starts attaining and draining once you resume:
+-- 3. Inspect, then go live. Maintenance only starts obtaining and draining once you resume:
 select * from pgpm.status();
 select pgpm.resume('public.events');
 ```

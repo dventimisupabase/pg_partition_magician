@@ -1,5 +1,5 @@
 -- Verifies uuidv7 (time-grid, uuid-encoded boundaries) partitioning on
--- events_uuid: codec roundtrip, structure, attain, full drain, conservation.
+-- events_uuid: codec roundtrip, structure, obtain, full drain, conservation.
 -- Robust to seed size.
 create extension if not exists pgtap;
 
