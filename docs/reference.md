@@ -129,11 +129,32 @@ call pgpm.maintain_all()
 ```
 
 A procedure that runs `maintain` for every managed table. This is the single entry point you
-schedule with `pg_cron`:
+schedule with `pg_cron`, via [`pgpm.schedule()`](#pgpmschedule--pgpmunschedule) or by hand:
 
 ```sql
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
+select pgpm.schedule();   -- or: cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')
 ```
+
+### `pgpm.schedule` / `pgpm.unschedule`
+
+```sql
+pgpm.schedule(p_every text default '* * * * *') returns bigint
+pgpm.unschedule() returns int
+```
+
+A thin convenience wrapper around `pg_cron` for the one job pgpm needs. `schedule()` registers a single
+job named `pgpm` that runs `call pgpm.maintain_all()` (which covers every managed table), so you
+schedule once, not per table; it returns the `pg_cron` job id. `p_every` is a `pg_cron` schedule:
+standard 5-field cron (`'* * * * *'` every minute, the default; `'*/5 * * * *'` every 5 minutes) or
+pg_cron's seconds interval (`'30 seconds'`). Note pg_cron does **not** accept `'1 minute'`-style
+strings; minute cadence uses cron syntax. The job targets `current_database()`, and re-running
+`schedule()` updates the interval in place rather than duplicating. `unschedule()` removes it and
+returns how many jobs it removed (`0` if none, so it is idempotent).
+
+pgpm never schedules on its own: `transmute` stays `pg_cron`-free, and you can drive the lifecycle by
+hand (`drain_all` / `maintain`) with no `pg_cron` at all. Call these **from the database where
+`pg_cron` is installed** (its `cron` schema must be present); `schedule()` raises a clear error if
+`pg_cron` is absent, and `unschedule()` is then a no-op. `uninstall.sql` removes the job for you.
 
 ### `pgpm.maintain`
 

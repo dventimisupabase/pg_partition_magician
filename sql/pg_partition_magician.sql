@@ -1266,6 +1266,46 @@ begin
 end;
 $$;
 
+-- schedule()/unschedule(): a thin convenience wrapper around pg_cron for the one job pgpm needs, so the
+-- operator does not hand-write the cron incantation. pgpm never schedules on its own (transmute stays
+-- pg_cron-free, and the drain can be driven by hand with drain_all/maintain); this is the deliberate,
+-- discoverable way to turn the scheduled lifecycle on. One canonical job named 'pgpm' calls
+-- maintain_all() for ALL managed tables, so it is scheduled once, not per table, and re-scheduling
+-- updates the interval rather than duplicating. It targets current_database() via schedule_in_database,
+-- so the job runs against the database pgpm lives in whether or not that is the cron database. The cron
+-- calls are dynamic (EXECUTE) on purpose: the cron schema is only resolved at call time, so this file
+-- still installs cleanly where pg_cron is not enabled yet. Run it FROM the database where pg_cron is
+-- installed (its `cron` schema must be present); uninstall.sql already unschedules every 'pgpm%' job.
+-- p_every is a pg_cron schedule: standard 5-field cron ('* * * * *' = every minute, the default;
+-- '*/5 * * * *' = every 5 min) or pg_cron's seconds interval ('30 seconds'). Note pg_cron does NOT
+-- accept '1 minute'-style interval strings; minute cadence goes through cron syntax.
+create or replace function pgpm.schedule(p_every text default '* * * * *')
+returns bigint language plpgsql as $$
+declare v_jobid bigint;
+begin
+  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+    raise exception 'pg_partition_magician: pg_cron is not installed in this database; enable it (create extension pg_cron) to schedule maintenance, or drive the drain by hand with drain_all/maintain';
+  end if;
+  execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
+                 'pgpm', p_every, 'call pgpm.maintain_all()', current_database())
+    into v_jobid;
+  return v_jobid;
+end;
+$$;
+
+create or replace function pgpm.unschedule()
+returns int language plpgsql as $$
+declare v_n int := 0;
+begin
+  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+    return 0;   -- nothing scheduled if pg_cron is not here
+  end if;
+  execute 'select count(*)::int from (select cron.unschedule(jobid) from cron.job '
+       || 'where jobname = ''pgpm'' and database = current_database()) s' into v_n;
+  return v_n;
+end;
+$$;
+
 create or replace function pgpm.check_default(p_parent regclass)
 returns table (default_rows bigint, closed_rows bigint, oldest text)
 language plpgsql as $$

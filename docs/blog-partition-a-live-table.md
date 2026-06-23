@@ -75,8 +75,8 @@ select pgpm.transmute(
   p_retain   => '90 days'            -- drop partitions older than this (null = keep)
 );
 
--- 2. Schedule the one entry point (pg_cron). It stays idle while the table is paused:
-select cron.schedule('pgpm', '1 minute', 'call pgpm.maintain_all()');
+-- 2. Schedule maintenance on pg_cron (one job covers every table; idle while paused):
+select pgpm.schedule();   -- every minute; pass a pg_cron schedule (e.g. '*/5 * * * *') for another cadence
 
 -- 3. Inspect, then go live. Maintenance only starts obtaining and draining once you resume:
 select * from pgpm.status();
