@@ -88,7 +88,7 @@
       pointer-events: none; z-index: 0;
     }
     .hero-inner { position: relative; z-index: 1; display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 56px; align-items: center; }
-    .hero h1 { font-size: clamp(2.4rem, 5.2vw, 3.9rem); margin: 18px 0 22px; }
+    .hero h1 { font-size: clamp(2rem, 5.2vw, 3.9rem); margin: 18px 0 22px; white-space: nowrap; }
     .hero h1 em { font-style: italic; color: var(--brass); }
     .hero p.lede { color: var(--fg-dim); font-size: 1.12rem; max-width: 52ch; }
     .hero-actions { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 32px; }
@@ -302,7 +302,7 @@
 
     /* dimensions (three suits, not a sequence) */
     .suits { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-    .suit-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: border-color 160ms var(--ease), transform 160ms var(--ease); }
+    .suit-card { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: border-color 160ms var(--ease), transform 160ms var(--ease); min-width: 0; }
     .suit-card:hover { border-color: var(--border-strong); transform: translateY(-3px); }
     .suit-card .glyph { font-family: var(--font-display); font-size: 1.8rem; color: var(--brass); }
     .suit-card h3 { font-family: var(--font-mono); font-size: 0.95rem; color: var(--fg); margin: 14px 0 8px; }
@@ -355,6 +355,9 @@
       .hero-inner { grid-template-columns: 1fr; gap: 18px; }
       .stage { height: 248px; order: -1; }
       .stage .fan { height: 230px; }
+      /* the headline is three no-wrap lines; on the full-width 1-col layout, scale the font with the
+         viewport (capped) so the longest line ("No magic necessary") fits without wrapping or overflow */
+      .hero h1 { font-size: min(10.5vw, 3.6rem); }
     }
     @media (prefers-reduced-motion: reduce) {
       * { scroll-behavior: auto !important; }
@@ -394,7 +397,7 @@
     <div class="wrap hero-inner">
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
-        <h1 class="display">Now a table. Now partitions.<br>It only looks like <em>magic</em>.</h1>
+        <h1 class="display">Now a table<br>Now partitions<br>No <em>magic</em> necessary</h1>
         <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>
