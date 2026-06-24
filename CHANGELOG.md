@@ -68,6 +68,11 @@
   `status().fks_unvalidated`. New `pgpm.incoming_fk_orphans(parent)` lists the blocking rows and
   `pgpm.validate_incoming_fks(parent)` finishes validation once they are cleared; `status().fks_suspended`
   surfaces the RI-off window. `pgpm.dropped_fk` gains a `validated_at` column. (tests/38)
+- **Docs: clarified that retention is a standing floor, not just an aging process (issue #97, closed as
+  working-as-intended).** A row inserted with a control value already past the horizon (a backdated or
+  late-arriving event) is reclaimed by the next maintenance cycle, exactly as any retention system would
+  drop it -- the `INSERT` succeeds and a later transaction removes it per the policy you set. To keep
+  late-arriving data, retain on an ingestion timestamp or widen the window. Pinned by tests/40.
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in
