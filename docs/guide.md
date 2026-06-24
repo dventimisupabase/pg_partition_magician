@@ -226,7 +226,7 @@ are OR'd, so the drain feathers down when either fires.
 ## Monitor
 
 ```sql
-select * from pgpm.status();        -- one row per managed table: partitions, rows still in DEFAULT
+select * from pgpm.status();        -- one row per managed table: partitions, backlog, drain progress
 select * from pgpm.partitions;      -- the partition registry with bounds
 ```
 
@@ -238,6 +238,13 @@ select * from pgpm.check_default('public.events');
 
 `closed_rows > 0` means rows that should have drained are still in the DEFAULT (the drain is behind,
 or paused). `default_rows` counting only the open interval is normal.
+
+`status()` surfaces the same `closed_rows`, plus two columns that tell a **wedged** drain from a
+merely **slow** one: `last_drained` (when the drain last made progress) and `drain_skips` (deferrals
+logged since then). A slow-but-healthy drain shows `closed_rows` falling and `drain_skips` near zero; a
+wedged drain (for example the upsert/duplicate-key wedge, see [Read consistency during a
+drain](#read-consistency-during-a-drain)) shows `closed_rows` stuck above zero, a stale `last_drained`,
+and a climbing `drain_skips`.
 
 For `uuidv7` tables, confirm the column really is time-ordered (not random UUIDv4):
 

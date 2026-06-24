@@ -20,6 +20,11 @@
   materializing a partition that `retain` would immediately drop. Retention now bounds storage even on a
   never-completing drain, and the materialize-then-drop churn is gone. `retain()` itself is unchanged (a
   cheap `DROP` of materialized partitions). (tests/34)
+- **`status()` distinguishes a wedged drain from a slow one (issue #92).** It gains `closed_rows` (the
+  drainable backlog, the same value `check_default` reports), `last_drained` (when the drain last made
+  progress), and `drain_skips` (deferrals logged since that progress). A non-zero `closed_rows` with a
+  stale `last_drained` and a climbing `drain_skips` is a wedged drain (e.g. the upsert/duplicate-key
+  wedge); a healthy slow drain shows `closed_rows` falling and `drain_skips` near zero. (tests/35)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

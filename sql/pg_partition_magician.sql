@@ -1401,25 +1401,44 @@ begin
 end;
 $$;
 
+-- status(): the operator's at-a-glance view. Beyond the static config it surfaces two things that let
+-- a WEDGED drain be told apart from a merely slow one (issue #92): closed_rows, the drainable backlog
+-- (rows in the DEFAULT below the open interval, via check_default), and a stall signal --
+-- last_drained (when the drain last made progress) plus drain_skips (deferrals logged SINCE that
+-- progress). A non-zero closed_rows with a stale/null last_drained and a climbing drain_skips is a
+-- wedged drain (e.g. the upsert/duplicate-key wedge); a slow-but-healthy drain shows closed_rows
+-- falling and drain_skips ~0. default_rows stays the total (open + closed) for contrast.
 create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
-  paused boolean, n_partitions bigint, default_rows bigint, default_oldest text, newest_bound text
+  paused boolean, n_partitions bigint, default_rows bigint, closed_rows bigint,
+  default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint
 )
 language plpgsql as $$
-declare r pgpm.config; v_nsp name; v_def text; v_drows bigint; v_old text; v_np bigint; v_new text;
+declare
+  r pgpm.config; v_nsp name; v_np bigint; v_new text;
+  v_drows bigint; v_closed bigint; v_old text;
+  v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
-    v_def := format('%I.%I', v_nsp, r.default_table);
-    execute format('select count(*)::bigint, (select t.%I::text from %s t order by t.%I limit 1) from %s',
-                   r.control_column, v_def, r.control_column, v_def) into v_drows, v_old;
+    -- backlog via the canonical check_default: default_rows (total), closed_rows (drainable now), oldest
+    select cd.default_rows, cd.closed_rows, cd.oldest into v_drows, v_closed, v_old
+      from pgpm.check_default(r.parent_table) cd;
     select count(*) into v_np from pgpm.part where parent_table = r.parent_table;
     execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
+    -- drain progress vs stall, from the append-only log. drain_skips counts deferrals logged AFTER the
+    -- last progress, ordered by the log's monotonic id (robust even when many rows share one tick's
+    -- now()). retain_reclaim counts as progress (issue #91), like drain_move/drain_attach.
+    select max(at), max(id) into v_last_drained, v_last_progress_id from pgpm.log
+      where parent_table = r.parent_table and action in ('drain_move', 'drain_attach', 'retain_reclaim');
+    select count(*) into v_skips from pgpm.log
+      where parent_table = r.parent_table and action = 'drain_skip' and id > coalesce(v_last_progress_id, 0);
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
-    default_rows := v_drows; default_oldest := v_old; newest_bound := v_new;
+    default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
+    last_drained := v_last_drained; drain_skips := v_skips;
     return next;
   end loop;
 end;

@@ -324,9 +324,12 @@ One row per managed table.
 | `retain` | `text` | Retention policy, or null. |
 | `paused` | `boolean` | Whether scheduled maintenance is paused. |
 | `n_partitions` | `bigint` | Registered partitions (excludes the DEFAULT). |
-| `default_rows` | `bigint` | Rows still in the DEFAULT. |
+| `default_rows` | `bigint` | Rows still in the DEFAULT (open interval + undrained closed tail). |
+| `closed_rows` | `bigint` | The **drainable backlog**: rows in already-closed intervals still in the DEFAULT (same as [`check_default`](#pgpmcheck_default)). `0` in steady state. |
 | `default_oldest` | `text` | Oldest control value still in the DEFAULT. |
 | `newest_bound` | `text` | Upper bound of the newest registered partition. |
+| `last_drained` | `timestamptz` | When the drain last made progress (a `drain_move` / `drain_attach` / `retain_reclaim`), or null if never. |
+| `drain_skips` | `bigint` | Drain deferrals logged *since* `last_drained` (by log id). With `closed_rows > 0` and a stale `last_drained`, a climbing value means a **wedged** drain (e.g. the upsert/duplicate-key wedge), not a merely slow one. |
 
 ### `pgpm.check_default`
 
