@@ -59,6 +59,15 @@
   the attach, instead of being discoverable only by scanning `pg_class`. `status()` gains
   `inflight_partitions` (and `n_partitions` now counts only attached partitions); `pgpm.partitions`
   exposes `attached`; `retain` only drops attached partitions, never an in-flight one. (tests/37)
+- **A preserve-managed incoming FK can no longer be permanently bricked by an orphan, and its state is
+  visible (issue #95).** `restore_incoming_fks` now splits the re-add: `ADD CONSTRAINT ... NOT VALID`
+  (enforces every new write, always succeeds) is committed separately from `VALIDATE`. An orphan written
+  while the FK is suspended (RI is off for the drain's duration -- inherent) used to make `VALIDATE` fail
+  and roll the whole re-add back, so the FK was never restored, silently. Now the FK comes back enforcing
+  new writes immediately and a blocked `VALIDATE` leaves it `NOT VALID`, surfaced by the new
+  `status().fks_unvalidated`. New `pgpm.incoming_fk_orphans(parent)` lists the blocking rows and
+  `pgpm.validate_incoming_fks(parent)` finishes validation once they are cleared; `status().fks_suspended`
+  surfaces the RI-off window. `pgpm.dropped_fk` gains a `validated_at` column. (tests/38)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

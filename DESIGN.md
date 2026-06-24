@@ -385,8 +385,19 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   drain never completes (the FK stays dropped and recorded, surfaced by `status`). **Implemented**:
   `p_incoming_fks => 'preserve'` records and drops eligible incoming FKs at transmute (and refuses the
   widening case), and `pgpm.restore_incoming_fks(parent)` re-adds them against the new parent once the
-  drain is quiescent; `maintain` calls it automatically. Tests in `tests/19`-`tests/23`,
-  cross-version PG 15 to 18. Covered on the id/uuidv7 happy path: single and multiple incoming FKs,
+  drain is quiescent; `maintain` calls it automatically. Tests in `tests/19`-`tests/24` and `tests/38`,
+  cross-version PG 15 to 18. **The re-add is split (issue #95)** so a pre-existing orphan -- written
+  during the (possibly unbounded) window the FK is dropped, which is the inherent RI-off cost of
+  `preserve` -- cannot permanently brick restoration: `ADD CONSTRAINT ... NOT VALID` (enforces every new
+  write, always succeeds) is committed separately from `VALIDATE` (scans existing rows). A `VALIDATE`
+  that fails on an orphan leaves the FK `NOT VALID` (still enforcing new writes), surfaced by
+  `status().fks_unvalidated`, rather than rolling the re-add back into a forever-deferred silent drop;
+  `pgpm.incoming_fk_orphans()` lists the blockers and `pgpm.validate_incoming_fks()` finishes once they
+  are cleared. The RI-off window itself is inherent (the FK must be dropped for the drain, even a `NOT
+  VALID` one would reject the move) and is surfaced by `status().fks_suspended` rather than hidden. The
+  upstream anomaly -- an upsert against an already-moved row taking the wrong branch -- is the write-side
+  visibility gap (issue #107); the drain-side robustness here is only about not bricking on its
+  aftermath. Covered on the id/uuidv7 happy path: single and multiple incoming FKs,
   their referential actions (`CASCADE` / `SET NULL` / `RESTRICT`) and `DEFERRABLE`-ness (both ride
   along in the recorded definition), and self-referential FKs (verified: a single-column FK to a
   partitioned-by-id table is legal and enforced). The self-referential re-add is validating, not

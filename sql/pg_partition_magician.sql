@@ -147,16 +147,33 @@ create table if not exists pgpm.dropped_fk (
   referencing_table   regclass    not null,
   constraint_name     name        not null,
   definition          text        not null,
-  -- lifecycle marker for a preserve-managed incoming FK: null = currently DROPPED (awaiting restore),
-  -- set = currently LIVE on the parent. maintenance keeps the invariant "a managed FK is live iff the
-  -- closed tail is empty": it suspends (drops, restored_at -> null) before a drain that would move
-  -- referenced rows, and restores (re-adds, restored_at -> now()) once the drain is idle. The row is
-  -- kept after restore (rather than deleted) so the suspend/restore cycle can repeat.
+  -- lifecycle markers for a preserve-managed incoming FK (issue #95):
+  --   restored_at null                     => DROPPED (RI off: during the drain, or initially after transmute).
+  --   restored_at set, validated_at null   => RE-ADDED as NOT VALID: enforces RI for all NEW writes, but
+  --                                            pre-existing rows are not yet verified (orphans, if any,
+  --                                            are tolerated-but-flagged -- surfaced by status().fks_unvalidated
+  --                                            and pgpm.incoming_fk_orphans(), cleared via validate_incoming_fks()).
+  --   restored_at set, validated_at set    => fully VALIDATED.
+  -- maintenance keeps "a managed FK is live (in any re-added form) iff the closed tail is empty": it
+  -- suspends (re-drops, both timestamps -> null) before a drain that would move referenced rows, and
+  -- restore_incoming_fks re-adds NOT VALID once the drain is idle. Splitting the re-add from the VALIDATE
+  -- is what stops a pre-existing orphan from permanently bricking restoration: the FK comes back
+  -- enforcing new writes immediately, and validation is a separate, loud step.
   restored_at         timestamptz,
+  validated_at        timestamptz,
   dropped_at          timestamptz not null default now()
 );
--- upgrade path for installs that predate this column
+-- upgrade path for installs that predate these columns
 alter table pgpm.dropped_fk add column if not exists restored_at timestamptz;
+alter table pgpm.dropped_fk add column if not exists validated_at timestamptz;
+-- backfill validated_at for FKs already re-added by an older pgpm (which validated in one step): mark
+-- them validated iff the actual constraint is currently convalidated. Keyed off pg_constraint, not a
+-- blanket update, so a genuinely re-added-NOT-VALID FK (convalidated = false) is never wrongly marked.
+update pgpm.dropped_fk d set validated_at = d.restored_at
+ where d.restored_at is not null and d.validated_at is null
+   and exists (select 1 from pg_constraint c
+                where c.conrelid = d.referencing_table and c.conname = d.constraint_name
+                  and c.contype = 'f' and c.convalidated);
 
 -- =============================== adapter layer ===============================
 
@@ -1521,17 +1538,24 @@ $$;
 -- inflight_partitions is the count of drain children created but not yet attached (issue #94): a
 -- standing non-zero value alongside a stale last_drained means an attach is stalled (its rows are
 -- durable but not visible through the parent until it attaches; use snapshot() for a complete read).
+-- fks_suspended / fks_unvalidated surface preserve-managed incoming FK state (issue #95):
+-- fks_suspended = incoming FKs currently DROPPED (RI off on the referencing table -- expected during a
+-- drain, a standing value if the drain never finishes); fks_unvalidated = FKs re-added NOT VALID
+-- (enforcing new writes) but blocked from full validation by pre-existing orphans (see
+-- incoming_fk_orphans() / validate_incoming_fks()).
 create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
   paused boolean, n_partitions bigint, inflight_partitions bigint, default_rows bigint, closed_rows bigint,
-  default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint
+  default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
+  fks_suspended bigint, fks_unvalidated bigint
 )
 language plpgsql as $$
 declare
   r pgpm.config; v_nsp name; v_np bigint; v_inflight bigint; v_new text;
   v_drows bigint; v_closed bigint; v_old text;
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
+  v_fks_susp bigint; v_fks_unval bigint;
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
@@ -1550,11 +1574,17 @@ begin
       where parent_table = r.parent_table and action in ('drain_move', 'drain_attach', 'retain_reclaim');
     select count(*) into v_skips from pgpm.log
       where parent_table = r.parent_table and action = 'drain_skip' and id > coalesce(v_last_progress_id, 0);
+    -- preserve-managed incoming FK state: dropped (RI off) vs re-added-but-not-validated (orphan-blocked)
+    select count(*) filter (where restored_at is null),
+           count(*) filter (where restored_at is not null and validated_at is null)
+      into v_fks_susp, v_fks_unval
+      from pgpm.dropped_fk where parent_table = r.parent_table;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     inflight_partitions := v_inflight;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
+    fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval;
     return next;
   end loop;
 end;
@@ -1623,19 +1653,22 @@ end;
 $$;
 
 -- restore_incoming_fks(): re-add the incoming FKs that transmute(..., p_incoming_fks => 'preserve')
--- recorded, pointing them back at the new partitioned parent (`NOT VALID` then `VALIDATE`, so the
--- re-add is online), but only once it is SAFE. Safe = the conversion is quiescent: the closed tail is
--- fully drained (no closed rows linger in the DEFAULT) and no in-flight, not-yet-attached child
--- partition exists. The drain moves rows out of the DEFAULT through such a child, during which a
--- referenced row is briefly outside the parent and a live NO ACTION FK would reject the move (see
--- DESIGN.md section 8), so the FK must stay dropped until the drain is idle. Returns the number
--- restored, 0 (a no-op) while the drain is still in flight, so `maintain` can call it every tick
--- and it acts only when the table is ready.
+-- recorded, pointing them back at the new partitioned parent, but only once it is SAFE. Safe = the
+-- conversion is quiescent: the closed tail is fully drained (no closed rows linger in the DEFAULT) and
+-- no in-flight, not-yet-attached child partition exists. The drain moves rows out of the DEFAULT through
+-- such a child, during which a referenced row is briefly outside the parent and a live NO ACTION FK
+-- would reject the move (see DESIGN.md section 8), so the FK must stay dropped until the drain is idle.
+-- The re-add is split (issue #95): `ADD CONSTRAINT ... NOT VALID` (enforces every new write, always
+-- succeeds) committed separately from `VALIDATE` (scans existing rows, may fail on an orphan written
+-- during the suspend window). A failed VALIDATE leaves the FK NOT VALID -- enforcing new writes,
+-- surfaced via status().fks_unvalidated -- rather than rolling the re-add back into a permanent silent
+-- brick. Returns the number re-added; 0 (a no-op) while the drain is still in flight, so `maintain`
+-- can call it every tick and it acts only when the table is ready.
 create or replace function pgpm.restore_incoming_fks(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_closed bigint; v_inflight name;
-  r pgpm.dropped_fk%rowtype; v_n int := 0;
+  r pgpm.dropped_fk%rowtype; v_n int := 0; v_is_part boolean; v_readded boolean;
 begin
   if not exists (select 1 from pgpm.dropped_fk
                   where parent_table = p_parent and restored_at is null) then
@@ -1665,31 +1698,104 @@ begin
    limit 1;
   if v_inflight is not null then return 0; end if;
 
-  -- safe: re-add each preserved FK against the parent. The recorded definition already names the
-  -- parent (it was captured before the rename, and that name is now the parent).
+  -- Re-add each dropped FK, then attempt to VALIDATE it once -- in SEPARATE subtransactions, so a
+  -- VALIDATE that fails on a pre-existing orphan does NOT roll back the re-add (issue #95). A re-added
+  -- NOT VALID FK already enforces RI for every NEW write; only pre-existing rows go unverified. So the
+  -- FK comes back the instant the drain is idle and can never be permanently bricked by an orphan
+  -- written during the suspend window; the orphans (if any) are surfaced by status().fks_unvalidated /
+  -- pgpm.incoming_fk_orphans() and cleared with pgpm.validate_incoming_fks() once the operator removes
+  -- them. The recorded definition already names the parent (captured before the rename).
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is null order by id loop
-    if (select relkind from pg_class where oid = r.referencing_table) = 'p' then
-      -- The referencing side is itself partitioned (a self-referential FK is now on the parent).
-      -- Postgres does not support NOT VALID foreign keys on a partitioned referencing table, so add
-      -- it validating in one step. This single re-add is not online (it scans and takes a stronger
-      -- lock), acceptable as a one-time conversion step; self-referential / partitioned-referencer
-      -- FKs are typically on smaller hierarchy tables. The referential action and DEFERRABLE
-      -- attributes ride along in the recorded definition either way.
-      execute format('alter table %s add constraint %I %s',
-                     r.referencing_table::text, r.constraint_name, r.definition);
-    else
-      execute format('alter table %s add constraint %I %s not valid',
-                     r.referencing_table::text, r.constraint_name, r.definition);
-      execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+    v_is_part := (select relkind from pg_class where oid = r.referencing_table) = 'p';
+    v_readded := false;
+    begin
+      if v_is_part then
+        -- self-referential / partitioned referencer: Postgres forbids NOT VALID FKs here, so add it
+        -- validating in one step (all-or-nothing). A pre-existing orphan leaves it DROPPED and logged,
+        -- without bricking the other FKs; self-ref / partitioned-referencer FKs are typically small.
+        execute format('alter table %s add constraint %I %s',
+                       r.referencing_table::text, r.constraint_name, r.definition);
+        update pgpm.dropped_fk set restored_at = now(), validated_at = now() where id = r.id;
+      else
+        execute format('alter table %s add constraint %I %s not valid',
+                       r.referencing_table::text, r.constraint_name, r.definition);
+        update pgpm.dropped_fk set restored_at = now(), validated_at = null where id = r.id;
+      end if;
+      v_readded := true;
+      v_n := v_n + 1;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
+    exception when others then
+      insert into pgpm.log (parent_table, action, method)
+        values (p_parent, 'restore_incoming_fk_failed', left(r.constraint_name || ': ' || sqlerrm, 200));
+    end;
+    -- validate the just-re-added NOT VALID FK once; a pre-existing orphan keeps it NOT VALID (still
+    -- enforcing new writes) and is surfaced, NOT rolled back into the dropped state.
+    if v_readded and not v_is_part then
+      begin
+        execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+        update pgpm.dropped_fk set validated_at = now() where id = r.id;
+      exception when others then
+        insert into pgpm.log (parent_table, action, method)
+          values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+      end;
     end if;
-    -- keep the record, marked LIVE: maintenance may need to suspend (re-drop) it again before a
-    -- later drain, so pgpm must remember which incoming FKs it manages even after restoring them.
-    update pgpm.dropped_fk set restored_at = now() where id = r.id;
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
-    v_n := v_n + 1;
   end loop;
   return v_n;
+end;
+$$;
+
+-- validate_incoming_fks(): finish validating any preserve-managed FK that was re-added NOT VALID but
+-- not yet validated (its pre-existing orphans blocked it). Run after clearing the orphans
+-- (pgpm.incoming_fk_orphans() lists the counts). Each VALIDATE is isolated, so one still-blocked FK
+-- does not stop the others; returns the number newly validated. maintenance does NOT auto-retry the
+-- VALIDATE every tick (it would re-scan the referencing table each time), so this is the deliberate
+-- operator step to fully validate once the data is clean.
+create or replace function pgpm.validate_incoming_fks(p_parent regclass)
+returns int language plpgsql as $$
+declare r pgpm.dropped_fk%rowtype; v_n int := 0;
+begin
+  for r in select * from pgpm.dropped_fk
+            where parent_table = p_parent and restored_at is not null and validated_at is null order by id loop
+    begin
+      execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+      update pgpm.dropped_fk set validated_at = now() where id = r.id;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'validate_incoming_fk', r.constraint_name);
+      v_n := v_n + 1;
+    exception when others then
+      insert into pgpm.log (parent_table, action, method)
+        values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+    end;
+  end loop;
+  return v_n;
+end;
+$$;
+
+-- incoming_fk_orphans(): for each preserve-managed FK that is re-added but not yet validated, count the
+-- orphan rows blocking validation -- referencing rows whose (non-null) FK columns match no parent key.
+-- The operator uses this to find and clear what blocks validate_incoming_fks(). Reads the column
+-- mapping from the live (NOT VALID) constraint in pg_constraint; handles composite FKs.
+create or replace function pgpm.incoming_fk_orphans(p_parent regclass)
+returns table (referencing_table regclass, constraint_name name, orphan_rows bigint)
+language plpgsql as $$
+declare r pgpm.dropped_fk%rowtype; c pg_constraint%rowtype; v_join text; v_notnull text; v_cnt bigint;
+begin
+  for r in select * from pgpm.dropped_fk
+            where parent_table = p_parent and restored_at is not null and validated_at is null order by id loop
+    select * into c from pg_constraint
+      where conrelid = r.referencing_table and conname = r.constraint_name and contype = 'f';
+    if not found then continue; end if;
+    select string_agg(format('r.%I = p.%I', fa.attname, pa.attname), ' and '),
+           string_agg(format('r.%I is not null', fa.attname), ' and ')
+      into v_join, v_notnull
+      from unnest(c.conkey, c.confkey) with ordinality as u(fk_att, pk_att, ord)
+      join pg_attribute fa on fa.attrelid = c.conrelid and fa.attnum = u.fk_att
+      join pg_attribute pa on pa.attrelid = c.confrelid and pa.attnum = u.pk_att;
+    execute format('select count(*)::bigint from %s r where %s and not exists (select 1 from %s p where %s)',
+                   c.conrelid::regclass::text, v_notnull, c.confrelid::regclass::text, v_join) into v_cnt;
+    referencing_table := r.referencing_table; constraint_name := r.constraint_name; orphan_rows := v_cnt;
+    return next;
+  end loop;
 end;
 $$;
 
@@ -1713,7 +1819,7 @@ begin
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is not null order by id loop
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
-    update pgpm.dropped_fk set restored_at = null where id = r.id;
+    update pgpm.dropped_fk set restored_at = null, validated_at = null where id = r.id;
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'suspend_incoming_fk', r.constraint_name);
     v_n := v_n + 1;
   end loop;

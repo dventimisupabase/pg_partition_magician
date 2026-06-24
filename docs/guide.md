@@ -322,6 +322,27 @@ select pgpm.restore_incoming_fks('public.events');   -- maintenance does this fo
 in-flight child partition), so it is safe to call early or repeatedly. An incoming FK that references
 a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
 
+Two honest points about the window the FK is dropped:
+
+- **RI is off on the referencing table for the whole drain.** The FK must be dropped while the drain
+  moves referenced rows (a live `NO ACTION` FK would block the move, a `CASCADE`/`SET NULL` would
+  silently mutate the referencing side), and the drain may run a long time (or never finish under tight
+  supply). So writes to the referencing table go unchecked during that window, and `status().fks_suspended`
+  surfaces it. `'preserve'` is opt-in; if the referencing table takes heavy writes, bound the window
+  with `drain_all` in a maintenance window, or `pause`.
+- **An orphan written during that window will not brick the restore.** The re-add is split: `ADD
+  CONSTRAINT ... NOT VALID` (which already enforces every *new* write) is committed separately from
+  `VALIDATE` (which scans existing rows). If a pre-existing orphan blocks `VALIDATE`, the FK is left
+  `NOT VALID` -- back to enforcing new writes, surfaced by `status().fks_unvalidated` -- rather than
+  rolled back into a silent forever-deferred drop. List the blockers with
+  `pgpm.incoming_fk_orphans(parent)`, remove them, then finish with `pgpm.validate_incoming_fks(parent)`:
+
+```sql
+select * from pgpm.incoming_fk_orphans('public.events');   -- which FK, how many orphan rows
+-- ... delete or fix the offending referencing rows ...
+select pgpm.validate_incoming_fks('public.events');        -- validates the now-clean FKs
+```
+
 After it is restored, `maintain` keeps a managed FK on a leash: a preserve-managed FK is live only
 while the closed tail is empty. If a later drain appears (for example obtain falls behind and rows
 land in the DEFAULT for an interval that then closes), `maintain` suspends the FK before draining

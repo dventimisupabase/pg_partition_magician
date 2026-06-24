@@ -338,6 +338,8 @@ One row per managed table.
 | `newest_bound` | `text` | Upper bound of the newest registered partition. |
 | `last_drained` | `timestamptz` | When the drain last made progress (a `drain_move` / `drain_attach` / `retain_reclaim`), or null if never. |
 | `drain_skips` | `bigint` | Drain deferrals logged *since* `last_drained` (by log id). With `closed_rows > 0` and a stale `last_drained`, a climbing value means a **wedged** drain (e.g. the upsert/duplicate-key wedge), not a merely slow one. |
+| `fks_suspended` | `bigint` | Preserve-managed incoming FKs currently **dropped** -- RI is off on the referencing table (expected during a drain; a standing value means the drain never finished). |
+| `fks_unvalidated` | `bigint` | Preserve-managed incoming FKs re-added `NOT VALID` (enforcing new writes) but not yet fully validated -- blocked by pre-existing orphans. See [`incoming_fk_orphans`](#pgpmincoming_fk_orphans) / [`validate_incoming_fks`](#pgpmvalidate_incoming_fks). |
 
 ### `pgpm.check_default`
 
@@ -411,14 +413,41 @@ pgpm.restore_incoming_fks(p_parent regclass) returns int
 
 Re-adds the incoming FKs that `transmute(..., p_incoming_fks => 'preserve')` recorded (the
 [`pgpm.dropped_fk`](#pgpmdropped_fk) rows that are currently dropped), pointing them back at the new
-partitioned parent with `NOT VALID` + `VALIDATE` (so the re-add is online; a self-referential FK, whose
-referencing side is the partitioned parent, is added validating in one step since Postgres rejects
-`NOT VALID` there). Returns the number restored. It self-gates on quiescence: a no-op (returns 0) while
-the closed tail still has rows or an in-flight child partition exists. The record is kept after
-restore, marked live (`restored_at` set), not deleted, so the FK can be suspended again before a later
-drain. Safe to call early or repeatedly; `maintain` calls it automatically once the drain is idle,
-so you only call it by hand on the synchronous `drain_all` path. See the
-[guide](guide.md#incoming-foreign-keys).
+partitioned parent. The re-add and the validation are **split** (issue #95): `ADD CONSTRAINT ... NOT
+VALID` (enforces every new write, always succeeds) is committed separately from `VALIDATE` (scans
+existing rows). If a pre-existing orphan -- written during the suspend window -- blocks `VALIDATE`, the
+FK is left `NOT VALID` (still enforcing new writes, surfaced by `status().fks_unvalidated`) rather than
+rolled back into a permanent silent brick; finish it with [`validate_incoming_fks`](#pgpmvalidate_incoming_fks)
+after clearing the orphans ([`incoming_fk_orphans`](#pgpmincoming_fk_orphans)). A self-referential FK,
+whose referencing side is the partitioned parent, is added validating in one step (Postgres rejects
+`NOT VALID` there). Returns the number re-added. Self-gates on quiescence: a no-op (returns 0) while the
+closed tail still has rows or an in-flight child partition exists. The record is kept (so the FK can be
+suspended again before a later drain). `maintain` calls it automatically once the drain is idle; you
+call it by hand only on the synchronous `drain_all` path. See the [guide](guide.md#incoming-foreign-keys).
+
+### `pgpm.validate_incoming_fks`
+
+```sql
+pgpm.validate_incoming_fks(p_parent regclass) returns int
+```
+
+Finishes validating any preserve-managed FK that was re-added `NOT VALID` but is not yet validated
+(`restored_at` set, `validated_at` null) -- typically because a pre-existing orphan blocked it. Run
+after clearing the orphans ([`incoming_fk_orphans`](#pgpmincoming_fk_orphans) lists them). Each
+`VALIDATE` is isolated, so one still-blocked FK does not stop the others; returns the number newly
+validated. `maintain` does **not** auto-retry the `VALIDATE` every tick (it would re-scan the
+referencing table each time), so this is the deliberate operator step once the data is clean.
+
+### `pgpm.incoming_fk_orphans`
+
+```sql
+pgpm.incoming_fk_orphans(p_parent regclass)
+  returns table (referencing_table regclass, constraint_name name, orphan_rows bigint)
+```
+
+For each preserve-managed FK that is re-added but not yet validated, counts the orphan rows blocking
+validation -- referencing rows whose (non-null) FK columns match no parent key. Use it to find and
+clear what blocks [`validate_incoming_fks`](#pgpmvalidate_incoming_fks). Handles composite FKs.
 
 ### `pgpm.suspend_incoming_fks`
 
@@ -494,7 +523,10 @@ Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g
 
 Incoming FKs dropped by `transmute(..., p_incoming_fks => 'preserve')`, kept as managed records so they
 can be re-added against the new parent. Columns: `id`, `parent_table`, `referencing_table`,
-`constraint_name`, `definition`, `restored_at`, `dropped_at`. `restored_at` tracks lifecycle state
-(null = currently dropped/suspended, set = currently live): [`restore_incoming_fks`](#pgpmrestore_incoming_fks)
-re-adds the FK and sets it, [`suspend_incoming_fks`](#pgpmsuspend_incoming_fks) re-drops it before a
-later drain and clears it. The row persists for the life of the managed FK.
+`constraint_name`, `definition`, `restored_at`, `validated_at`, `dropped_at`. The two timestamps track
+lifecycle state: `restored_at` null = currently **dropped/suspended** (RI off); `restored_at` set,
+`validated_at` null = re-added **`NOT VALID`** (enforcing new writes, pre-existing rows unverified);
+both set = fully **validated**. [`restore_incoming_fks`](#pgpmrestore_incoming_fks) re-adds (`NOT VALID`)
+and validates, [`validate_incoming_fks`](#pgpmvalidate_incoming_fks) finishes a blocked validation, and
+[`suspend_incoming_fks`](#pgpmsuspend_incoming_fks) re-drops (clearing both) before a later drain. The
+row persists for the life of the managed FK.
