@@ -354,6 +354,10 @@ select * from pgpm.incoming_fk_orphans('public.events');   -- which FK, how many
 select pgpm.validate_incoming_fks('public.events');        -- validates the now-clean FKs
 ```
 
+For the full step-by-step recovery (what to run, in order, when an alert says an incoming FK is
+unvalidated), follow the runbook entry [Referential-integrity violations after a `preserve`
+drain](runbook.md#referential-integrity-violations-after-a-preserve-drain).
+
 After it is restored, `maintain` keeps a managed FK on a leash: a preserve-managed FK is live only
 while the closed tail is empty. If a later drain appears (for example obtain falls behind and rows
 land in the DEFAULT for an interval that then closes), `maintain` suspends the FK before draining
@@ -525,6 +529,9 @@ What to do:
   is the better fix when you can, and the two compose (raise the budget, keep adaptive as a safety net).
 
 ## Operations and troubleshooting
+
+For step-by-step procedures to run when an alert fires, see the [runbook](runbook.md). The notes below
+are the quick reference.
 
 - **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`.
   A paused table is registered but untouched by `maintain` (you can still drive `drain_*`

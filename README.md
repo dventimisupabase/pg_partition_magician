@@ -95,6 +95,8 @@ walkthrough](docs/guide.md#transmute-a-table).
   retain, incoming foreign keys, operations and troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object (signatures, parameters,
   returns, examples).
+- **[Runbook](docs/runbook.md)**: symptom-driven, step-by-step operational procedures for when an alert
+  fires (e.g. referential-integrity violations after a `preserve` drain).
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview of
   how the online conversion works.
 - **[DESIGN.md](DESIGN.md)**: the operating model and design rationale.

@@ -47,6 +47,7 @@ docker compose --profile pg15 down -v
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
+| `docs/runbook.md` | Operational runbook: symptom -> step-by-step procedures (e.g. RI violations after a preserve drain) |
 | `DESIGN.md` | The operating model and design rationale |
 | `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
 
