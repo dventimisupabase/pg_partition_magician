@@ -350,7 +350,9 @@
     .reveal.in { opacity: 1; transform: none; }
 
     @media (max-width: 920px) {
-      .hero-inner { grid-template-columns: 1fr; gap: 24px; }
+      /* tighten the top void so the fan AND the headline are both above the fold on open */
+      .hero { padding: 24px 0 56px; }
+      .hero-inner { grid-template-columns: 1fr; gap: 22px; }
       .stage { height: 320px; order: -1; }
     }
     @media (prefers-reduced-motion: reduce) {
