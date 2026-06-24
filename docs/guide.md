@@ -288,6 +288,17 @@ instead of materializing a partition only to `DROP` it next tick. So aged rows a
 they never made it out of the `DEFAULT`, and there is no materialize-then-drop churn. This runs as part
 of the drain (logged as `retain_reclaim`), so it only happens while maintenance is running.
 
+**Retention is a standing floor, not just an aging process.** The policy is "no data with a control
+value below the horizon persists" -- aging is just the usual way rows cross that line. A row inserted
+with a control value *already* past the horizon (a backdated record, or a late-arriving event) is
+therefore subject to retention immediately: the next maintenance cycle reclaims it, exactly as any
+retention system would (a `DELETE` cron or `pg_partman` drop the same row the same way). This is not a
+loss to recover from -- it is the policy you asked for ("keep only N"), applied to data that was born
+expired. The `INSERT` still succeeds; a later, separate maintenance transaction removes the row per
+policy. If you need late-arriving data kept for a window *from arrival*, retain on an ingestion
+timestamp (so the control column is when pgpm saw the row, not when the event happened) rather than on
+event time, or widen the policy.
+
 ## Incoming foreign keys
 
 If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
