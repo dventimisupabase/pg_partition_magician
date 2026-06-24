@@ -47,6 +47,12 @@
   baseline + relative surge) like before; the `drain_ambient_*` knobs are unchanged, with new controller
   state `drain_ambient_io_baseline` / `drain_io_read_time` / `drain_io_blks_read`. `_ambient_io_waiters()`
   is replaced by `_ambient_lock_waiters()`. (tests/26, tests/41)
+- **A non-PK UNIQUE secondary index is no longer silently dropped (issue #90).** transmute now carries
+  it onto the parent as a partitioned unique index when its key includes the partition key (global
+  uniqueness genuinely preserved, exactly as the PK is reused), and refuses with guidance when it
+  excludes the partition key, or is partial/expression (global uniqueness cannot be enforced on a
+  partitioned table) -- the same refuse-or-preserve contract as the PK and incoming-FK cases, instead of
+  a `raise notice` that quietly lost the guarantee. (tests/33)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

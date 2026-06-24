@@ -556,7 +556,7 @@ returns regclass language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
-  v_idx_names text[]; v_idx_defs text[]; v_skipped int; v_old name; v_new name; v_pdef text; j int;
+  v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
   v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int;
@@ -678,17 +678,33 @@ begin
   end if;
   v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
 
-  -- secondary (non-PK, non-unique) indexes to recreate on the parent
+  -- Secondary indexes to carry onto the parent (step 9b recreates them as partitioned, attaching the
+  -- default's). NON-unique secondaries always carry. A non-PK UNIQUE secondary can only become a
+  -- partitioned unique index if its KEY columns include the partition key (Postgres's rule), so we carry
+  -- those too -- global uniqueness genuinely preserved, exactly as the PK is reused when it covers the
+  -- partition key -- and REFUSE the rest below, never silently dropping a uniqueness guarantee (issue
+  -- #90). indkey casts via its text form (int2vector is 0-based; string_to_array gives a 1-based array),
+  -- sliced to indnkeyatts so INCLUDE columns don't count; partial / expression unique indexes can't be
+  -- carried either, so they fall to the refusal.
+  select a.attnum into v_ctl_attnum
+    from pg_attribute a where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
   select array_agg(c.relname::text), array_agg(pg_get_indexdef(i.indexrelid)) into v_idx_names, v_idx_defs
     from pg_index i join pg_class c on c.oid = i.indexrelid
-   where i.indrelid = p_parent and i.indislive and not i.indisprimary and not i.indisunique;
-  -- a unique secondary index (not the PK) can't be carried to a partitioned table unless it includes
-  -- the partition key, and pgpm doesn't carry unique secondaries at all -- warn so the operator can
-  -- recreate any it needs on the parent by hand.
-  select count(*) into v_skipped from pg_index i
-   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary;
-  if v_skipped > 0 then
-    raise notice 'pg_partition_magician: skipped % unique secondary index(es) on %; recreate on the parent manually (must include the partition key)', v_skipped, p_parent;
+   where i.indrelid = p_parent and i.indislive and not i.indisprimary
+     and (not i.indisunique
+          or (i.indpred is null and i.indexprs is null
+              and v_ctl_attnum = any((string_to_array(i.indkey::text, ' ')::int2[])[1:i.indnkeyatts])));
+  -- Refuse any non-PK UNIQUE secondary that CANNOT be carried (its key omits the partition key, or it is
+  -- partial / on an expression): global uniqueness cannot be enforced on the partitioned table, so this
+  -- is the same refuse-with-guidance contract as the PK and incoming-FK cases, not a silent drop.
+  select string_agg(c.relname, ', ' order by c.relname) into v_uniq_bad
+    from pg_index i join pg_class c on c.oid = i.indexrelid
+   where i.indrelid = p_parent and i.indislive and i.indisunique and not i.indisprimary
+     and not (i.indpred is null and i.indexprs is null
+              and v_ctl_attnum = any((string_to_array(i.indkey::text, ' ')::int2[])[1:i.indnkeyatts]));
+  if v_uniq_bad is not null then
+    raise exception 'pg_partition_magician: cannot transmute % -- the UNIQUE secondary index(es) (%) do not include the partition key % in their key columns (or are partial/expression indexes), so global uniqueness cannot be enforced on a partitioned table. Add % to the key of each, or drop them, then re-run transmute. A unique index that already includes % is carried automatically.',
+      p_parent, v_uniq_bad, quote_ident(p_control), quote_ident(p_control), quote_ident(p_control);
   end if;
 
   -- 0. incoming FKs (capture before the rename; record after the new parent exists). pgpm never
@@ -791,8 +807,8 @@ begin
     for j in 1 .. array_length(v_idx_names, 1) loop
       v_old  := v_idx_names[j]::name;
       v_new  := (v_old || '_pgpm')::name;
-      v_pdef := regexp_replace(v_idx_defs[j], '^CREATE INDEX \S+ ON ',
-                               'CREATE INDEX ' || quote_ident(v_new) || ' ON ONLY ');
+      v_pdef := regexp_replace(v_idx_defs[j], '^CREATE (UNIQUE )?INDEX \S+ ON ',
+                               'CREATE \1INDEX ' || quote_ident(v_new) || ' ON ONLY ');
       execute v_pdef;
       execute format('alter index %I.%I attach partition %I.%I', v_nsp, v_new, v_nsp, v_old);
     end loop;

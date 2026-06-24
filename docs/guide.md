@@ -327,9 +327,11 @@ across this cycle.
 ## Secondary indexes
 
 `transmute` copies the old table's non-unique secondary indexes onto the parent as partitioned indexes
-(attaching the default's existing index, no rebuild), so they propagate to every partition. Unique
-secondary indexes are skipped, because a partitioned unique index must include the partition key;
-recreate those on the parent by hand.
+(attaching the default's existing index, no rebuild), so they propagate to every partition. A unique
+secondary index is carried the same way **when its key includes the partition key** (so global
+uniqueness is genuinely preserved). One whose key excludes the partition key cannot be a partitioned
+unique index, so `transmute` **refuses** rather than silently dropping the guarantee: add the partition
+key to that index, or drop it, then re-transmute.
 
 ## How the conversion stays online
 
@@ -513,8 +515,8 @@ What to do:
 - **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state obtain stays ahead so the
   DEFAULT stays empty; `check_default()` flags any stray row.
 - **Retain uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
-- **Unique secondary indexes** are not auto-propagated (a partitioned unique index must include the
-  partition key); recreate them on the parent by hand.
+- **Unique secondary indexes** are carried when their key includes the partition key; one that excludes
+  it is refused (a partitioned unique index must include the partition key), never silently dropped.
 - **The primary key is never rewritten.** The control column must already be part of the table's
   primary key; a table with no primary key, or a PK that excludes the control column, is refused. See
   [transmute a table](#transmute-a-table).

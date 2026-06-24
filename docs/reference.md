@@ -90,8 +90,10 @@ integer literal selects it with no cast: `transmute(t, c, 10000000)`. Difference
 
 Renames the live table to `<name>_default`, creates a partitioned parent under the original name, and
 attaches the old table as the `DEFAULT` partition. No rows move. Identity moves to the parent.
-Non-unique secondary indexes are carried onto the parent; unique secondary indexes are skipped
-(recreate by hand). The transmuted table is registered in [`pgpm.config`](#pgpmconfig) and starts paused;
+Non-unique secondary indexes are carried onto the parent; a unique secondary index is carried too when
+its key includes the partition key, and otherwise **refused** (global uniqueness cannot be enforced on a
+partitioned table without the partition key in the index). The transmuted table is registered in
+[`pgpm.config`](#pgpmconfig) and starts paused;
 nothing drains until you [`resume`](#pgpmpause--pgpmresume) it (or drive `drain_*` by hand).
 
 ### No PK rewrite
