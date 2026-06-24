@@ -398,7 +398,7 @@
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
         <h1 class="display">Now a table<br>Now partitions<br>No <em>magic</em> necessary</h1>
-        <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned table, online. It attaches your table as the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition, keeps new partitions ahead of your writes, and drains the backlog in the background.</p>
+        <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned one, online. Your live table becomes the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition; pgpm keeps partitions ahead of your writes and drains the backlog behind the scenes.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>
           <a class="btn btn-ghost" href="https://github.com/dventimisupabase/pg_partition_magician" target="_blank" rel="noopener">
@@ -611,23 +611,23 @@
       <div class="truths">
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M3 14l4-5 3 3 4-6 3 4"/><path d="M3 17h14"/></svg></div>
-          <div><h3>One rule: monotonicity</h3><p>The key must only move forward. Float keys are rejected outright: <code style="font-family:var(--font-mono);color:var(--fg-dim)">NaN</code> and infinity would poison the frontier math.</p></div>
+          <div><h3>One rule: monotonicity</h3><p>The key must only move forward. Floats are rejected: <code style="font-family:var(--font-mono);color:var(--fg-dim)">NaN</code> and infinity would poison the frontier math.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>Because the partition key is part of your primary key and pgpm never rewrites it, the key an incoming FK references survives the conversion. Opt into <code>p_incoming_fks =&gt; 'preserve'</code> and <code>transmute</code> drops each incoming FK for the move, then re-adds it against the new parent once the drain is idle, no denormalization. A primary key that doesn't include the partition key is refused up front, never silently mangled.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>pgpm never rewrites the primary key, so the unique key an incoming FK references survives the conversion. With <code>p_incoming_fks =&gt; 'preserve'</code>, each FK is dropped for the move and re-added against the new parent once the drain is idle, no denormalization.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
-          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row that arrives without a home is caught there, never lost, and surfaced by a check function.</p></div>
+          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row with no real partition lands there, never lost, and a check function flags it.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13 13l4 4"/></svg></div>
-          <div><h3>One gap, in the open</h3><p>While an interval drains, its already-moved rows live in a not-yet-attached child, so a mid-drain read of the parent undercounts that interval, and a write to a moved row no-ops. We don't hide it: <code>pgpm.snapshot</code> returns the complete set, and the guide spells out exactly when it can affect you (append-only and time-local tables are immune). The rows are never lost, only briefly unreachable through the parent.</p></div>
+          <div><h3>One gap, in the open</h3><p>While an interval drains, its moved rows live in a not-yet-attached child, so a mid-drain read of the parent undercounts it, and a write to a moved row no-ops. <code>pgpm.snapshot</code> reads the complete set; append-only and time-local tables are immune, and nothing is lost.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>182 tests on PostgreSQL 15, 16, 17, and 18: each installed three different ways, every partition kind exercised.</p></div>
+          <div><h3>Proven across versions</h3><p>192 tests on PostgreSQL 15-18, all three install channels, every partition kind.</p></div>
         </div>
       </div>
     </div>
