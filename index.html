@@ -164,6 +164,11 @@
     .beat-wide { grid-template-columns: 1fr; gap: 30px; justify-items: center; }
     .beat-wide .beat-copy { max-width: 760px; text-align: center; }
     .beat-wide .fig { width: 100%; }
+    /* grid items default to min-width:auto and refuse to shrink below their content's intrinsic
+       width; on a phone the widest diagram would push the whole column past the viewport (horizontal
+       scroll). Let both columns shrink to the track: the figure clips via .dg's overflow:hidden, and
+       long copy/code wraps. */
+    .beat-copy { min-width: 0; overflow-wrap: break-word; }
 
     .beat-copy .move { font-family: var(--font-mono); font-size: 12.5px; letter-spacing: 0.03em; color: var(--brass); display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; }
     .beat-wide .beat-copy .move { justify-content: center; }
@@ -175,7 +180,7 @@
     .beat-copy code { font-family: var(--font-mono); font-size: 0.84em; color: var(--green); }
 
     /* figure frame + the scroll-progress var (0 = before, 1 = resolved) */
-    .fig { margin: 0; }
+    .fig { margin: 0; min-width: 0; }
     .dg { --p: 0; position: relative; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 14px; padding: 30px 28px; min-height: 260px; display: flex; flex-direction: column; justify-content: center; gap: 16px; overflow: hidden; }
 
     /* shared primitives */
