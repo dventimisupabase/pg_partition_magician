@@ -53,6 +53,12 @@
   excludes the partition key, or is partial/expression (global uniqueness cannot be enforced on a
   partitioned table) -- the same refuse-or-preserve contract as the PK and incoming-FK cases, instead of
   a `raise notice` that quietly lost the guarantee. (tests/33)
+- **An in-flight (unattached) drain child is now tracked in pgpm's catalog (issue #94).** The drain
+  creates each child standalone and attaches it only when the interval has fully moved; that child is
+  now recorded in `pgpm.part` with a new `attached` column set `false` at creation and flipped `true` at
+  the attach, instead of being discoverable only by scanning `pg_class`. `status()` gains
+  `inflight_partitions` (and `n_partitions` now counts only attached partitions); `pgpm.partitions`
+  exposes `attached`; `retain` only drops attached partitions, never an in-flight one. (tests/37)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

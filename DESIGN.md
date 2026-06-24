@@ -470,7 +470,13 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   only at the end, so an interrupted drain leaves an un-attached child that `DROP TABLE <parent>
   CASCADE` does not remove. Re-transmuting the recreated table would let the next drain reuse that orphan
   by name and collide on its stale keys. `transmute` now refuses up front when such an orphan exists
-  (`tests/18`).
+  (`tests/18`). That un-attached child is also recorded in `pgpm.part` with `attached = false` the
+  moment it is created and flipped to `true` at the attach (issue #94, `tests/37`), so an in-flight or
+  stalled child is tracked in pgpm's own catalog and surfaced by `status().inflight_partitions`, not
+  discoverable only by scanning `pg_class`; `retain` only drops attached partitions, never an in-flight
+  one. (The orphan guard and `snapshot` still scan `pg_class` directly: they verify physical reality,
+  which is the right source of truth for "is there an un-attached table," independent of pgpm's
+  bookkeeping.)
 - The **bench** (`bench/`) is the instrument that measures the supply side and pgpm's demand against
   it; the **size ladder** (`bench/SIZE_LADDER.md`) is the beginnings of the calibration curve; the
   **storage-IO note** (`bench/STORAGE-IO-ON-GREEN.md`) is the AWS worked example of the substrate

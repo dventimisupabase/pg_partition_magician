@@ -330,7 +330,8 @@ One row per managed table.
 | `obtain` | `int` | Partitions kept ahead. |
 | `retain` | `text` | Retention policy, or null. |
 | `paused` | `boolean` | Whether scheduled maintenance is paused. |
-| `n_partitions` | `bigint` | Registered partitions (excludes the DEFAULT). |
+| `n_partitions` | `bigint` | Attached partitions (excludes the DEFAULT and any in-flight child). |
+| `inflight_partitions` | `bigint` | Drain children created but not yet attached. A standing non-zero value with a stale `last_drained` means an attach is stalled: those rows are durable but not visible through the parent until they attach (use [`snapshot`](#pgpmsnapshot) for a complete read). |
 | `default_rows` | `bigint` | Rows still in the DEFAULT (open interval + undrained closed tail). |
 | `closed_rows` | `bigint` | The **drainable backlog**: rows in already-closed intervals still in the DEFAULT (same as [`check_default`](#pgpmcheck_default)). `0` in steady state. |
 | `default_oldest` | `text` | Oldest control value still in the DEFAULT. |
@@ -481,7 +482,8 @@ text. Columns: `parent_table`, `child_name`, `lo`, `hi`, `created_at`.
 ### `pgpm.partitions`
 
 A read-friendly view over `pgpm.part`: `parent_table`, `child_name`, `lo`, `hi`, `created_at`,
-ordered by parent then `lo`.
+`attached` (false while a drain child is created but not yet attached to the parent), ordered by
+parent then `lo`.
 
 ### `pgpm.log`
 

@@ -248,6 +248,12 @@ wedged drain (for example the upsert/duplicate-key wedge, see [Read consistency 
 drain](#read-consistency-during-a-drain)) shows `closed_rows` stuck above zero, a stale `last_drained`,
 and a climbing `drain_skips`.
 
+`status()` also reports `inflight_partitions`: drain children created but not yet attached. It is
+normally 0 (or briefly 1 mid-drain); a standing non-zero value with a stale `last_drained` means an
+attach is stalled, and those rows are durable but not visible through the parent until they attach (use
+[`snapshot()`](#read-consistency-during-a-drain) for a complete read). `select * from pgpm.partitions`
+shows each partition's `attached` flag.
+
 For `uuidv7` tables, confirm the column really is time-ordered (not random UUIDv4):
 
 ```sql

@@ -119,8 +119,16 @@ create table if not exists pgpm.part (
   lo           text        not null,
   hi           text        not null,
   created_at   timestamptz not null default now(),
+  -- false while the drain is still moving rows into this child (created standalone, not yet ATTACHed to
+  -- the parent); flipped true at the attach. Lets an in-flight (or stalled, or interrupted) drain child
+  -- be tracked in pgpm's catalog and surfaced by status(), instead of being discoverable only by
+  -- scanning pg_class for the name pattern. obtain creates partitions already attached, so the default
+  -- is true; only the drain inserts a row with attached=false. (issue #94)
+  attached     boolean     not null default true,
   primary key (parent_table, child_name)
 );
+-- upgrade path for installs that predate this column
+alter table pgpm.part add column if not exists attached boolean not null default true;
 
 create table if not exists pgpm.log (
   id           bigint generated always as identity primary key,
@@ -440,6 +448,10 @@ begin
                    v_nsp, v_name, v_nsp, v_rel);
     execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                    v_nsp, v_name, (v_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
+    -- record the child the moment it exists, marked in-flight (not yet attached) so it is tracked in
+    -- pgpm's catalog across a multi-batch drain, not only at the final attach below (issue #94).
+    insert into pgpm.part (parent_table, child_name, lo, hi, attached)
+      values (p_parent, v_name, v_lo, v_hi, false) on conflict (parent_table, child_name) do nothing;
   end if;
 
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
@@ -484,7 +496,10 @@ begin
     execute format('alter table %s drop constraint %I', v_def, v_excl);
     v_method := 'check_skip';
   end if;
-  insert into pgpm.part (parent_table, child_name, lo, hi) values (p_parent, v_name, v_lo, v_hi) on conflict do nothing;
+  -- the interval is fully drained and the child is now attached: record it (or flip the in-flight row
+  -- from the create step above to attached). Idempotent via the upsert.
+  insert into pgpm.part (parent_table, child_name, lo, hi, attached) values (p_parent, v_name, v_lo, v_hi, true)
+    on conflict (parent_table, child_name) do update set attached = true;
   insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'drain_attach', v_lo, v_hi, v_method);
   return 'attached:' || v_name || ':' || v_method;
 end;
@@ -532,7 +547,7 @@ begin
   v_ncast := pgpm._native_type(cfg.control_kind);
 
   for r in execute format(
-    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and hi::%s <= %L::%s order by lo::%s',
+    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
     p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast)
   loop
     execute format('drop table %I.%I', v_nsp, r.child_name);
@@ -1503,15 +1518,18 @@ $$;
 -- progress). A non-zero closed_rows with a stale/null last_drained and a climbing drain_skips is a
 -- wedged drain (e.g. the upsert/duplicate-key wedge); a slow-but-healthy drain shows closed_rows
 -- falling and drain_skips ~0. default_rows stays the total (open + closed) for contrast.
+-- inflight_partitions is the count of drain children created but not yet attached (issue #94): a
+-- standing non-zero value alongside a stale last_drained means an attach is stalled (its rows are
+-- durable but not visible through the parent until it attaches; use snapshot() for a complete read).
 create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
-  paused boolean, n_partitions bigint, default_rows bigint, closed_rows bigint,
+  paused boolean, n_partitions bigint, inflight_partitions bigint, default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint
 )
 language plpgsql as $$
 declare
-  r pgpm.config; v_nsp name; v_np bigint; v_new text;
+  r pgpm.config; v_nsp name; v_np bigint; v_inflight bigint; v_new text;
   v_drows bigint; v_closed bigint; v_old text;
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
 begin
@@ -1520,8 +1538,10 @@ begin
     -- backlog via the canonical check_default: default_rows (total), closed_rows (drainable now), oldest
     select cd.default_rows, cd.closed_rows, cd.oldest into v_drows, v_closed, v_old
       from pgpm.check_default(r.parent_table) cd;
-    select count(*) into v_np from pgpm.part where parent_table = r.parent_table;
-    execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass',
+    -- n_partitions counts attached (real) partitions; inflight_partitions the not-yet-attached drain children
+    select count(*) filter (where attached), count(*) filter (where not attached)
+      into v_np, v_inflight from pgpm.part where parent_table = r.parent_table;
+    execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
     -- drain progress vs stall, from the append-only log. drain_skips counts deferrals logged AFTER the
     -- last progress, ordered by the log's monotonic id (robust even when many rows share one tick's
@@ -1532,6 +1552,7 @@ begin
       where parent_table = r.parent_table and action = 'drain_skip' and id > coalesce(v_last_progress_id, 0);
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
+    inflight_partitions := v_inflight;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
     return next;
@@ -1701,4 +1722,4 @@ end;
 $$;
 
 create or replace view pgpm.partitions as
-  select parent_table, child_name, lo, hi, created_at from pgpm.part order by parent_table, lo;
+  select parent_table, child_name, lo, hi, created_at, attached from pgpm.part order by parent_table, lo;
