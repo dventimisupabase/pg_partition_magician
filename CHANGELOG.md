@@ -38,6 +38,15 @@
   incompressible rows could be the multi-GB spike the feature exists to prevent. It now estimates the
   average by sampling `pg_column_size` (cheap and TOAST-aware), so the budget holds even before ANALYZE.
   (tests/36)
+- **The adaptive ambient signal no longer depends on `pg_monitor` (issue #98); pg_cron is again the only
+  runtime dependency.** The consumer-priority signal previously read `pg_stat_activity.wait_event`, which
+  Postgres masks for other roles unless the reader holds `pg_monitor`. It is rebuilt from two
+  role-independent terms, OR'd, on catalogs any unprivileged role reads in full: a **lock-wait** count
+  from `pg_locks` (non-pgpm backends blocked on an ungranted lock) and a **read-I/O latency** from
+  `pg_stat_database` (ms/block, inert when `track_io_timing` is off). Both are self-calibrating (EWMA
+  baseline + relative surge) like before; the `drain_ambient_*` knobs are unchanged, with new controller
+  state `drain_ambient_io_baseline` / `drain_io_read_time` / `drain_io_blks_read`. `_ambient_io_waiters()`
+  is replaced by `_ambient_lock_waiters()`. (tests/26, tests/41)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

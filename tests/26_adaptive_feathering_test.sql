@@ -3,14 +3,14 @@
 -- AIMD. The LEADING signal is the WAL generation rate vs the sustainable rate (max_wal_size /
 -- checkpoint_timeout): outrun a fraction (drain_wal_high_water) of it and a forced checkpoint is coming,
 -- so back off before its I/O storm. A forced checkpoint that slips through is a reactive backstop.
--- A SECOND, complementary signal backs off when ambient workload is contended -- more than
--- drain_ambient_max_waiters non-pgpm client backends stuck on IO/lock waits -- so the drain yields to
--- workload that is being starved (which the WAL signal misses: a crowded-out writer makes little WAL).
--- Off by default (mode 1, fixed rate; ambient signal off until drain_ambient_max_waiters > 0).
+-- A SECOND, complementary signal backs off when the drain is crowding the workload (which the WAL
+-- signal misses: a crowded-out backend makes little WAL). It uses two role-independent terms (no
+-- pg_monitor): a lock-wait count from pg_locks and a read-I/O latency from pg_stat_database. Off by
+-- default (mode 1, fixed rate; ambient signal off until drain_ambient_factor > 0).
 create extension if not exists pgtap;
 
 begin;
-select plan(40);
+select plan(48);
 
 -- ---- the pure controller: AIMD arithmetic, independent of any server state -------------------------
 select is(pgpm._aimd_next(10000, false, 1000, 64000, 1000), 11000,
@@ -38,8 +38,8 @@ select is(pgpm._feather_congested(20000000, 0, 0.7, false), false,
           'unknown sustainable rate => not congested (no divide-by-zero)');
 
 -- ---- the ambient-contention signal: back off when workload backends are starved on IO/locks --------
-select cmp_ok(pgpm._ambient_io_waiters(), '>=', 0::int,
-              'ambient IO/lock-waiter sensor returns a non-negative count');
+select cmp_ok(pgpm._ambient_lock_waiters(), '>=', 0::int,
+              'ambient lock-wait sensor (pg_locks, role-independent) returns a non-negative count');
 select is(pgpm._ambient_congested(5, 3), true,
           'more waiters than the threshold => congested (yield to the contended workload)');
 select is(pgpm._ambient_congested(2, 3), false,
@@ -72,6 +72,27 @@ select is(pgpm._ambient_surge(9, NULL, 2.0, 2), true,
           'a clear surge on a fresh/idle box (no baseline) still fires via the floor');
 select is(pgpm._ambient_surge(4, 0, 2.0, 5), false,
           'the floor stops an idle box (baseline ~0) firing on a few transient waiters');
+
+-- ---- the I/O-latency ambient term (role-independent, from pg_stat_database; no pg_monitor) ---------
+-- avg ms/block over the interval between two cumulative samples; NULL until there is a prior sample or
+-- when no blocks were read; 0 (inert) when track_io_timing is off and no read-time accrues.
+select is(pgpm._ambient_io_latency(NULL, NULL, 100, 1000), NULL::numeric,
+          'no prior sample yet => no I/O latency to report');
+select is(pgpm._ambient_io_latency(100, 1000, 300, 1100), 2.0::numeric,
+          '200ms of read time over 100 block reads => 2.0 ms/block');
+select is(pgpm._ambient_io_latency(100, 1000, 100, 1100), 0::numeric,
+          'track_io_timing off (no read-time delta) => 0 ms/block (never surges)');
+select is(pgpm._ambient_io_latency(100, 1000, 300, 1000), NULL::numeric,
+          'no block reads this interval => no latency (nothing to measure)');
+-- the relative surge on the latency (pure), floored so a fast box does not fire on a tiny latency
+select is(pgpm._ambient_io_surge(10.0, 2.0, 2.0, 1.0), true,
+          'read latency well above factor*baseline => surge (yield to the starved workload)');
+select is(pgpm._ambient_io_surge(3.0, 2.0, 2.0, 1.0), false,
+          'latency within the baseline band => calm');
+select is(pgpm._ambient_io_surge(10.0, 2.0, 0, 1.0), false,
+          'factor 0 disables the I/O-latency term too (back-compatible default)');
+select is(pgpm._ambient_io_surge(0.5, 0.01, 2.0, 1.0), false,
+          'a tiny latency below the 1.0 ms/block floor stays calm even on an idle baseline');
 
 -- ---- the backstop sensor: version-aware forced-checkpoint counter ----------------------------------
 select cmp_ok(pgpm._forced_checkpoints(), '>=', 0::bigint,

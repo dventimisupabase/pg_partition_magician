@@ -288,23 +288,27 @@ pgpm.set_drain_ambient(p_parent regclass, p_factor numeric default 2.0,
                        p_alpha numeric default 0.2, p_floor int default 2) returns void
 ```
 
-A second, complementary backoff signal makes the drain yield when it is starving the *workload* (which
-the WAL-rate signal cannot see -- a crowded-out writer makes little WAL). It counts non-pgpm client
-backends stuck on IO/lock waits and is **self-calibrating**: a fixed waiter threshold is the wrong shape
-because "normal" is box-dependent, so instead it learns the recent normal as an EWMA baseline and backs
-off on a *relative surge* above it. Enable it with:
+A second, complementary backoff signal makes the drain yield when it is crowding the *workload* (which
+the WAL-rate signal cannot see -- a crowded-out backend makes little WAL). It needs **no `pg_monitor` and
+no superuser**: it reads only catalogs any role sees in full. Two role-independent terms, OR'd: a
+**lock-wait** count from `pg_locks` (non-pgpm backends blocked on an ungranted lock -- the drain's brief
+`ATTACH` and row/page locks show up here) and a **read-I/O latency** from `pg_stat_database` (ms per block
+read; inert when `track_io_timing` is off). Each is **self-calibrating** -- a fixed threshold is the wrong
+shape because "normal" is box-dependent, so each learns its recent normal as an EWMA baseline and backs
+off on a *relative surge* above it. Enable with:
 
 ```sql
 select pgpm.set_drain_ambient('public.events', 2.0);  -- factor 2.0; optional alpha, floor args
 ```
 
-The controller then feathers down when live waiters exceed `drain_ambient_factor` times the learned
-`drain_ambient_baseline` (an EWMA, smoothing `drain_ambient_alpha`), floored at `drain_ambient_floor` so
-an idle box does not react to a couple of transient waiters. The smoothing is damped 10x during a surge,
-so a transient spike stays visible while a sustained regime shift is relearned. `drain_ambient_factor` =
-0 (the default) turns the signal off. The old fixed `config.drain_ambient_max_waiters` is still honored as
-an optional absolute cap, OR'd on top (0 = off). All three backoff signals (WAL rate, ambient surge,
-absolute cap) are OR'd: the drain feathers down if any fires.
+The controller feathers down when either term exceeds `drain_ambient_factor` times its learned baseline
+(`drain_ambient_baseline` for lock-waits, `drain_ambient_io_baseline` for latency; EWMA smoothing
+`drain_ambient_alpha`). The lock term is floored at `drain_ambient_floor` so an idle box does not react to
+a couple of transient waiters; the I/O term at a fixed 1.0 ms/block. The smoothing is damped 10x during a
+surge, so a transient spike stays visible while a sustained regime shift is relearned. `drain_ambient_factor`
+= 0 (the default) turns both terms off. The old fixed `config.drain_ambient_max_waiters` is still honored as
+an optional absolute cap on the lock-wait count, OR'd on top (0 = off). All backoff signals (WAL rate,
+lock-wait surge, I/O-latency surge, absolute cap) are OR'd: the drain feathers down if any fires.
 
 ## Inspection
 
@@ -455,11 +459,14 @@ for the `paused` flag, [`set_drain_adaptive`](#pgpmset_drain_adaptive) /
 | `drain_adaptive` | `boolean` | Adaptive feathering (mode 2) on/off. Set via `set_drain_adaptive`; default off. |
 | `drain_budget` | `int` | Controller state: current adaptive rows/tick budget; null until the first adaptive tick. |
 | `drain_wal_high_water` | `numeric` | Back off when the WAL rate exceeds this fraction of the sustainable rate (`max_wal_size`/`checkpoint_timeout`); default 1.0. Lower (e.g. 0.7) is gentler on the workload but drains slower. |
-| `drain_ambient_max_waiters` | `int` | Ambient signal, optional absolute cap: also back off when more than this many non-pgpm client backends are stuck on IO/lock waits. 0 = disabled (default). |
-| `drain_ambient_factor` | `numeric` | Self-calibrating ambient signal: back off when live waiters exceed this factor times the learned baseline. Set via `set_drain_ambient`; 0 = disabled (default). |
-| `drain_ambient_alpha` | `numeric` | EWMA smoothing for the ambient baseline (damped 10x during a surge); default 0.2. |
-| `drain_ambient_floor` | `int` | Minimum effective baseline for the ambient surge trigger, so an idle box does not react to a couple of transient waiters; default 2. |
-| `drain_ambient_baseline` | `numeric` | Controller state: learned EWMA of the per-tick ambient waiter count; null until the signal is on and the first adaptive tick seeds it. |
+| `drain_ambient_max_waiters` | `int` | Ambient signal, optional absolute cap: also back off when more than this many non-pgpm backends are blocked on a lock (`pg_locks`). 0 = disabled (default). |
+| `drain_ambient_factor` | `numeric` | Self-calibrating ambient signal: back off when a term (lock-wait count, or read-I/O latency) exceeds this factor times its learned baseline. Set via `set_drain_ambient`; 0 = disabled (default, disables both terms). |
+| `drain_ambient_alpha` | `numeric` | EWMA smoothing for the ambient baselines (damped 10x during a surge); default 0.2. |
+| `drain_ambient_floor` | `int` | Minimum effective baseline for the lock-wait surge trigger, so an idle box does not react to a couple of transient waiters; default 2. (The I/O-latency term uses a fixed 1.0 ms/block floor.) |
+| `drain_ambient_baseline` | `numeric` | Controller state: learned EWMA of the per-tick lock-wait count (`pg_locks`); null until the signal is on and the first adaptive tick seeds it. |
+| `drain_ambient_io_baseline` | `numeric` | Controller state: learned EWMA of the read-I/O latency (ms/block, from `pg_stat_database`); null until seeded. |
+| `drain_io_read_time` | `numeric` | Controller state: previous tick's cumulative `pg_stat_database.blk_read_time` (to compute the latency delta). |
+| `drain_io_blks_read` | `bigint` | Controller state: previous tick's cumulative `pg_stat_database.blks_read`. |
 | `drain_wal_lsn` | `pg_lsn` | Controller state: previous tick's WAL position (to compute the WAL rate). |
 | `drain_wal_at` | `timestamptz` | Controller state: previous tick's timestamp (to compute the WAL rate). |
 | `drain_ckpt_seen` | `bigint` | Controller state: last forced-checkpoint counter (reactive backstop); null = uninitialized. |

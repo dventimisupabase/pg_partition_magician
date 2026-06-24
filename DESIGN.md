@@ -240,32 +240,41 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   *A second, complementary signal: ambient contention (IMPLEMENTED).* The WAL-rate signal is a
   *producer* self-limit -- it stops the drain over-driving WAL into its own checkpoint storms. It does
   **not** make the drain yield to ambient *workload*: a bench surge proved it. When the drain crowds the
-  workload off the disk, those backends pile up on IO/lock waits while generating little WAL of their
-  own (they are *starved*, not writing), so the WAL signal stays quiet and the drain keeps hogging the
-  disk. The fix is a *consumer-priority* signal that sees the contention directly: `pgpm._ambient_io_waiters()`
-  counts non-pgpm client backends currently stuck on IO/Lock/LWLock/BufferPin waits, and the controller
-  backs off when they spike. The two signals are **OR'd, not exchanged** -- they cover disjoint failure
-  modes (over-driving WAL vs starving the workload), so the drain feathers down if *either* fires and
-  recovers when *both* are clear.
+  workload off the disk, those backends are *starved* while generating little WAL of their own, so the
+  WAL signal stays quiet and the drain keeps hogging the disk. The fix is a *consumer-priority* signal
+  that sees the contention directly, OR'd with the WAL signal (**not** exchanged -- they cover disjoint
+  failure modes, so the drain feathers down if *either* fires and recovers when *both* are clear).
 
-  *Self-calibrating the ambient signal (IMPLEMENTED).* A *fixed* waiter threshold is the wrong shape: the
-  "normal" waiter count is box- and workload-dependent (near zero on an idle box, double digits on a busy
-  one where every client occasionally IO-waits), so one constant fires everywhere or nowhere -- two bench
-  demos confirmed a fixed threshold could not separate a surge from the baseline. So the signal learns its
-  own normal: `drain_ambient_baseline` is an EWMA (smoothing `drain_ambient_alpha`, default 0.2) of the
-  per-tick waiter count, and `_ambient_surge` fires when the current count exceeds `drain_ambient_factor`
-  times that learned baseline (default factor 0 = off; a typical on-value is 2.0), floored at
-  `drain_ambient_floor` (default 2) so an idle box does not back off on a couple of transient waiters. The
-  baseline's smoothing is damped 10x during a surge, so a transient spike barely moves it (the surge stays
-  visible for its whole duration) while a *sustained* regime shift is still relearned over many ticks --
-  and the AIMD floor guarantees forward progress throughout. The old fixed `drain_ambient_max_waiters`
-  remains as an optional absolute cap, OR'd on top (0 = off). Both are set with `set_drain_ambient(parent,
-  factor, alpha, floor)`. This is the *self-calibrates to the hardware* idea applied to the consumer
-  signal, mirroring the WAL signal's settings-derived proxy. Further supply signals (replication lag, an
-  ambient-latency delta) plug in as additional OR'd terms; the waiter count is a coarse, point-in-time
-  sample, smoothed by AIMD and now the EWMA baseline across ticks. Tests in `tests/26`; cross-version PG
-  15 to 18. (Cross-role visibility of `wait_event` needs `pg_monitor`; same-role backends are always
-  visible.)
+  *The consumer signal must not add a dependency (IMPLEMENTED).* The obvious way to "see the workload"
+  is `pg_stat_activity.wait_event`, but that column is **masked for other roles** unless the reader holds
+  `pg_monitor` -- and pgpm's whole premise is install-anywhere, pure SQL, *pg_cron as the only runtime
+  dependency*. An earlier cut took the `pg_monitor` dependency; this is the correction (issue #98). The
+  consumer signal is rebuilt from **two role-independent terms, OR'd**, on catalogs any unprivileged role
+  reads in full: (1) **lock-wait pressure** -- `pgpm._ambient_lock_waiters()` counts non-pgpm backends
+  blocked on an ungranted lock in `pg_locks` (fully visible to everyone; the drain's brief `ATTACH`
+  ACCESS EXCLUSIVE and its row/page locks surface here); and (2) **read-I/O latency** --
+  `pgpm._ambient_io_latency()` derives average ms per block read from `pg_stat_database`
+  (`blk_read_time`/`blks_read` deltas), the read-starvation the lock term misses, inert when
+  `track_io_timing` is off. The lesson generalized: when a refinement would cost a dependency, find the
+  signal that a base install can already see -- robustness beats fidelity. (`pg_locks` lock-blocking is
+  also the sharper *user-noticeable* symptom; the WAL term still covers write/checkpoint over-drive.)
+
+  *Self-calibrating the ambient signal (IMPLEMENTED).* A *fixed* threshold is the wrong shape for either
+  term: "normal" is box- and workload-dependent (near zero idle, higher on a busy box), so one constant
+  fires everywhere or nowhere -- bench demos confirmed it could not separate a surge from the baseline. So
+  each term learns its own normal: `drain_ambient_baseline` is an EWMA (smoothing `drain_ambient_alpha`,
+  default 0.2) of the per-tick lock-wait count and `drain_ambient_io_baseline` the same for the read
+  latency; a term surges when the current sample exceeds `drain_ambient_factor` times its learned baseline
+  (default factor 0 = off, disabling **both** terms; a typical on-value is 2.0). The lock term is floored
+  at `drain_ambient_floor` (default 2) so an idle box does not fire on a couple of transient waiters; the
+  I/O term at a small fixed `1.0` ms/block (below which a block read is not "slow"). Each baseline's
+  smoothing is damped 10x during its own surge, so a transient spike barely moves it (the surge stays
+  visible) while a *sustained* regime shift is still relearned over many ticks -- and the AIMD floor
+  guarantees forward progress throughout. The old fixed `drain_ambient_max_waiters` remains as an optional
+  absolute cap on the lock-wait count, OR'd on top (0 = off). All are set with `set_drain_ambient(parent,
+  factor, alpha, floor)`. Further supply signals (replication lag, etc.) plug in as additional OR'd terms.
+  Tests in `tests/26` and `tests/41`; cross-version PG 15 to 18. No `pg_monitor`, no superuser, pg_cron
+  only.
 
   *The controller.* AIMD, the additive-increase / multiplicative-decrease law TCP uses to ride just
   under a link's capacity: a calm tick recovers the budget up by a small step, a tick whose WAL rate is

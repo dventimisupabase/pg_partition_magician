@@ -64,21 +64,34 @@ create table if not exists pgpm.config (
   drain_wal_lsn        pg_lsn,
   drain_wal_at         timestamptz,
   drain_wal_high_water numeric not null default 1.0,
-  -- ambient-contention signal (consumer priority): back off when non-pgpm client backends are stuck on
-  -- IO/lock waits (the drain is starving the workload). Two complementary triggers, OR'd:
-  --   * SELF-CALIBRATING (primary): a fixed waiter threshold is the wrong shape -- "normal" waiter count
-  --     is box/workload-dependent (~0 idle, double digits busy). So we learn the recent normal as an EWMA
-  --     (drain_ambient_baseline, smoothing drain_ambient_alpha) and back off on a RELATIVE surge: current
-  --     waiters > drain_ambient_factor * baseline, floored at drain_ambient_floor so an idle box does not
-  --     fire on a couple of transient waiters. drain_ambient_factor = 0 disables it (the default).
-  --   * ABSOLUTE cap (optional backstop): back off when more than drain_ambient_max_waiters are contended,
-  --     regardless of baseline. 0 = disabled. Useful as a hard ceiling on top of the relative trigger.
-  -- 0/0 = ambient signal fully off (pure WAL behaviour). See DESIGN.md section 8.
+  -- ambient-contention signal (consumer priority): back off when the drain is crowding the live
+  -- workload. Built only on catalogs a plain (non-superuser, non-pg_monitor) role can fully read, so
+  -- pgpm's only runtime dependency stays pg_cron. Two role-independent terms feed the same
+  -- self-calibrating controller, OR'd with an optional absolute cap:
+  --   * LOCK-WAIT pressure (drain_ambient_baseline): how many non-pgpm backends are blocked on an
+  --     ungranted lock (pg_locks, fully visible to any role -- unlike pg_stat_activity.wait_event, which
+  --     pg_monitor masks for other roles). The drain's brief ATTACH (ACCESS EXCLUSIVE on the parent) and
+  --     row/page locks show up here. SELF-CALIBRATING: a fixed threshold is the wrong shape ("normal" is
+  --     box/workload-dependent), so learn the recent normal as an EWMA (smoothing drain_ambient_alpha)
+  --     and back off on a RELATIVE surge: current > drain_ambient_factor * baseline, floored at
+  --     drain_ambient_floor so an idle box does not fire on a couple of transient waiters.
+  --     drain_ambient_factor = 0 disables BOTH self-calibrating terms (the default).
+  --   * I/O LATENCY (drain_ambient_io_baseline): average ms per block read from disk, from
+  --     pg_stat_database (blk_read_time / blks_read deltas; drain_io_read_time / drain_io_blks_read hold
+  --     the previous cumulative sample). Captures the read-I/O starvation the lock signal misses.
+  --     Self-calibrating the same way (EWMA baseline, surge at drain_ambient_factor * baseline). Inert
+  --     when track_io_timing is off (no read time accrues, so the latency is 0 and never surges).
+  --   * ABSOLUTE cap (optional backstop): back off when more than drain_ambient_max_waiters backends are
+  --     lock-blocked, regardless of baseline. 0 = disabled.
+  -- factor 0 + cap 0 = ambient signal fully off (pure WAL behaviour). See DESIGN.md section 8.
   drain_ambient_max_waiters int     not null default 0,
   drain_ambient_factor      numeric not null default 0,
   drain_ambient_alpha       numeric not null default 0.2,
   drain_ambient_floor       int     not null default 2,
-  drain_ambient_baseline    numeric
+  drain_ambient_baseline    numeric,        -- EWMA of the lock-wait count
+  drain_ambient_io_baseline numeric,        -- EWMA of the I/O read latency (ms/block)
+  drain_io_read_time        numeric,        -- previous cumulative pg_stat_database.blk_read_time
+  drain_io_blks_read        bigint          -- previous cumulative pg_stat_database.blks_read
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists obtain_retry_after timestamptz;
@@ -94,6 +107,9 @@ alter table pgpm.config add column if not exists drain_ambient_factor numeric no
 alter table pgpm.config add column if not exists drain_ambient_alpha numeric not null default 0.2;
 alter table pgpm.config add column if not exists drain_ambient_floor int not null default 2;
 alter table pgpm.config add column if not exists drain_ambient_baseline numeric;
+alter table pgpm.config add column if not exists drain_ambient_io_baseline numeric;
+alter table pgpm.config add column if not exists drain_io_read_time numeric;
+alter table pgpm.config add column if not exists drain_io_blks_read bigint;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -1007,22 +1023,46 @@ create or replace function pgpm._feather_congested(
           and p_observed_bps / p_sustainable_bps > p_high_water);
 $$;
 
--- The AMBIENT signal: how many OTHER (non-pgpm) client backends are right now stuck on an IO, lock, or
--- buffer wait. This is the consumer-priority sensor the WAL rate misses entirely: when the drain crowds
--- the workload off the disk, those backends pile up on IO/Lock waits while generating little WAL of
--- their own (they are starved, not writing), so the WAL signal stays quiet. Counting the waiters sees
--- them directly. A point-in-time sample per maintenance tick -- noisy alone, smoothed by AIMD over
--- ticks. (Cross-role visibility of wait_event needs pg_monitor; backends of the maintenance role itself
--- are always visible. Excludes pgpm's own maintenance statements.)
-create or replace function pgpm._ambient_io_waiters()
+-- The AMBIENT signal, term 1: how many OTHER (non-pgpm) backends are right now blocked on an ungranted
+-- lock. This is a consumer-priority sensor the WAL rate misses entirely -- when the drain's brief ATTACH
+-- (ACCESS EXCLUSIVE on the parent) or its row/page locks block the workload, those backends queue here
+-- while generating little WAL of their own. Read from pg_locks, which is FULLY VISIBLE to any role (no
+-- pg_monitor needed, unlike pg_stat_activity.wait_event, which is masked for other roles); this is what
+-- lets pgpm keep pg_cron as its only runtime dependency. count(distinct pid) so one blocked backend
+-- counts once however many lock rows it waits on; excludes pgpm's own maintenance backend. A
+-- point-in-time sample per tick -- noisy alone, smoothed by the EWMA baseline and AIMD over ticks.
+create or replace function pgpm._ambient_lock_waiters()
 returns int language sql stable as $$
-  select count(*)::int from pg_stat_activity
-   where datname = current_database()
-     and pid <> pg_backend_pid()
-     and state = 'active'
-     and backend_type = 'client backend'
-     and wait_event_type in ('IO', 'Lock', 'LWLock', 'BufferPin')
-     and coalesce(query, '') not like '%pgpm.%';
+  select count(distinct pid)::int from pg_locks
+   where not granted and pid is not null and pid <> pg_backend_pid();
+$$;
+
+-- The AMBIENT signal, term 2 (pure): average ms per block read from disk over the interval between two
+-- cumulative pg_stat_database samples (blk_read_time / blks_read). This is the read-I/O-starvation
+-- sensor the lock signal misses: when the drain saturates the disk, the workload's reads slow down and
+-- this latency climbs. Returns NULL when there is no prior sample or no blocks were read this interval
+-- (nothing to measure). When track_io_timing is OFF, blk_read_time never advances, so the delta is 0
+-- and this returns 0 -- inert, never surges. Like blk timing generally, this needs no elevated role.
+create or replace function pgpm._ambient_io_latency(
+  p_prev_time numeric, p_prev_blks bigint, p_cur_time numeric, p_cur_blks bigint)
+returns numeric language sql immutable as $$
+  select case
+           when p_prev_time is null or p_prev_blks is null then null
+           when coalesce(p_cur_blks, 0) - p_prev_blks <= 0 then null      -- no disk reads this interval
+           when coalesce(p_cur_time, 0) - p_prev_time < 0 then null       -- counter reset
+           else (p_cur_time - p_prev_time) / (p_cur_blks - p_prev_blks)   -- ms per block read
+         end;
+$$;
+
+-- The ambient I/O-latency surge decision (pure, unit-tested): congested when the read latency exceeds
+-- p_factor times the learned baseline, floored at p_floor (ms/block) so an idle/fast box (baseline ~0)
+-- does not fire on a tiny absolute latency. Mirrors _ambient_surge but on a numeric latency rather than
+-- an integer count. p_factor = 0 (the shared ambient factor) disables it; a NULL latency is calm.
+create or replace function pgpm._ambient_io_surge(
+  p_latency numeric, p_baseline numeric, p_factor numeric, p_floor numeric)
+returns boolean language sql immutable as $$
+  select coalesce(p_factor, 0) > 0 and p_latency is not null
+     and p_latency > greatest(coalesce(p_baseline, 0), coalesce(p_floor, 0)) * p_factor;
 $$;
 
 -- The ambient ABSOLUTE-cap decision (pure, unit-tested): congested if more than p_max waiters are
@@ -1033,16 +1073,18 @@ returns boolean language sql immutable as $$
   select coalesce(p_max, 0) > 0 and coalesce(p_waiters, 0) > p_max;
 $$;
 
--- The SELF-CALIBRATING baseline (pure, unit-tested): one EWMA step toward the latest waiter sample.
--- This is the learned "normal" ambient waiter count, which the relative surge trigger compares against.
--- A null baseline (first observation) initialises to that observation; otherwise the standard
--- exponential moving average alpha*observed + (1-alpha)*baseline. The caller damps alpha during a surge
--- so a transient spike barely moves the baseline (clean detection), while a sustained regime shift is
--- still relearned over many ticks (the AIMD floor guarantees forward progress meanwhile).
-create or replace function pgpm._ambient_baseline_next(p_baseline numeric, p_observed int, p_alpha numeric)
+-- The SELF-CALIBRATING baseline (pure, unit-tested): one EWMA step toward the latest sample. This is
+-- the learned "normal" the relative surge triggers compare against; it serves BOTH ambient terms (the
+-- lock-wait count and the I/O latency), so p_observed is numeric (a count auto-casts). A null baseline
+-- (first observation) initialises to that observation; otherwise the standard exponential moving average
+-- alpha*observed + (1-alpha)*baseline. The caller damps alpha during a surge so a transient spike barely
+-- moves the baseline (clean detection), while a sustained regime shift is still relearned over many
+-- ticks (the AIMD floor guarantees forward progress meanwhile).
+drop function if exists pgpm._ambient_baseline_next(numeric, integer, numeric);
+create or replace function pgpm._ambient_baseline_next(p_baseline numeric, p_observed numeric, p_alpha numeric)
 returns numeric language sql immutable as $$
   select case
-           when p_baseline is null then p_observed::numeric
+           when p_baseline is null then p_observed
            else coalesce(p_alpha, 0) * p_observed + (1 - coalesce(p_alpha, 0)) * p_baseline
          end;
 $$;
@@ -1111,7 +1153,8 @@ returns void language plpgsql as $$
 begin
   update pgpm.config
      set drain_ambient_factor = p_factor, drain_ambient_alpha = p_alpha,
-         drain_ambient_floor = p_floor, drain_ambient_baseline = null
+         drain_ambient_floor = p_floor, drain_ambient_baseline = null,
+         drain_ambient_io_baseline = null
    where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 end;
@@ -1151,7 +1194,8 @@ declare
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
   v_waiters int; v_wal_cong boolean; v_amb_cong boolean; v_reason text;
-  v_amb_surge boolean; v_amb_abs boolean; v_amb_baseline numeric;
+  v_lock_surge boolean; v_lock_abs boolean; v_amb_baseline numeric;
+  v_io_time numeric; v_io_blks bigint; v_io_lat numeric; v_io_surge boolean; v_io_baseline numeric;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -1226,31 +1270,46 @@ begin
       end if;
     end if;
     v_ckpt      := pgpm._forced_checkpoints();
-    -- Two complementary backoff signals, OR'd (see DESIGN sec 8): the WAL-rate signal (producer
-    -- self-limit against checkpoint storms) and the ambient signal (consumer priority -- yield when
-    -- non-pgpm backends are starved on IO/locks, which the WAL rate cannot see). Either fires => halve.
+    -- Backoff signals, OR'd (see DESIGN sec 8): the WAL-rate signal (producer self-limit against
+    -- checkpoint storms) and the ambient signal (consumer priority -- yield when the drain is crowding
+    -- the workload, which the WAL rate cannot see). Any fires => halve. The ambient signal has two
+    -- role-independent terms (no pg_monitor): a lock-wait surge (pg_locks) and an I/O-latency surge
+    -- (pg_stat_database), each self-calibrating against its own learned EWMA baseline, OR'd with the
+    -- optional absolute lock-wait cap. A surge damps that baseline's smoothing 10x so a transient spike
+    -- barely moves it (keeps the surge visible) while a sustained shift is still relearned. Baselines
+    -- only advance when the signal is enabled (drain_ambient_factor > 0).
     v_wal_cong := pgpm._feather_congested(
                     v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
                     cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
-    -- The ambient signal: a SELF-CALIBRATING relative surge (current waiters vs the learned baseline)
-    -- OR'd with the optional absolute cap. The baseline is an EWMA learned from the calm ticks; we damp
-    -- its smoothing by 10x during a surge so a transient spike barely moves it (keeps the surge visible),
-    -- while a sustained regime shift is still relearned over many ticks. Baseline only advances when the
-    -- signal is enabled (drain_ambient_factor > 0); otherwise it stays null (pure WAL / absolute-cap mode).
-    v_waiters  := pgpm._ambient_io_waiters();
-    v_amb_surge := pgpm._ambient_surge(v_waiters, cfg.drain_ambient_baseline,
-                                       cfg.drain_ambient_factor, cfg.drain_ambient_floor);
-    v_amb_abs   := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
-    v_amb_cong := v_amb_surge or v_amb_abs;
+    -- term 1: lock-wait pressure (role-independent count from pg_locks)
+    v_waiters  := pgpm._ambient_lock_waiters();
+    v_lock_surge := pgpm._ambient_surge(v_waiters, cfg.drain_ambient_baseline,
+                                        cfg.drain_ambient_factor, cfg.drain_ambient_floor);
+    v_lock_abs   := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
+    -- term 2: read-I/O latency (ms/block) over the interval since the last tick (inert if track_io_timing off)
+    select s.blk_read_time::numeric, s.blks_read
+      into v_io_time, v_io_blks
+      from pg_stat_database s where s.datname = current_database();
+    v_io_lat   := pgpm._ambient_io_latency(cfg.drain_io_read_time, cfg.drain_io_blks_read, v_io_time, v_io_blks);
+    v_io_surge := pgpm._ambient_io_surge(v_io_lat, cfg.drain_ambient_io_baseline, cfg.drain_ambient_factor, 1.0);
+    v_amb_cong := v_lock_surge or v_lock_abs or v_io_surge;
     v_amb_baseline := cfg.drain_ambient_baseline;
+    v_io_baseline  := cfg.drain_ambient_io_baseline;
     if cfg.drain_ambient_factor > 0 then
       v_amb_baseline := pgpm._ambient_baseline_next(
         cfg.drain_ambient_baseline, v_waiters,
-        case when v_amb_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
+        case when v_lock_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
+      if v_io_lat is not null then
+        v_io_baseline := pgpm._ambient_baseline_next(
+          cfg.drain_ambient_io_baseline, v_io_lat,
+          case when v_io_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
+      end if;
     end if;
     v_congested := v_wal_cong or v_amb_cong;
-    v_reason   := case when v_wal_cong and v_amb_cong then 'wal+ambient'
-                       when v_wal_cong then 'wal' when v_amb_cong then 'ambient' else 'probe' end;
+    v_reason   := coalesce(nullif(concat_ws('+',
+                    case when v_wal_cong then 'wal' end,
+                    case when v_lock_surge or v_lock_abs then 'lock' end,
+                    case when v_io_surge then 'io' end), ''), 'probe');
     v_budget    := pgpm._aimd_next(
                      coalesce(cfg.drain_budget, cfg.drain_batch),       -- start optimistic at the ceiling
                      v_congested,
@@ -1286,7 +1345,9 @@ begin
   if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%' or v_drain like 'reclaimed:%') then
     update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
                            drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts,
-                           drain_ambient_baseline = v_amb_baseline
+                           drain_ambient_baseline = v_amb_baseline,
+                           drain_ambient_io_baseline = v_io_baseline,
+                           drain_io_read_time = v_io_time, drain_io_blks_read = v_io_blks
       where parent_table = p_parent;
     v_note := v_note || format(' adaptive[%s %s]', v_budget, v_reason);
     insert into pgpm.log (parent_table, action, rows, method)
