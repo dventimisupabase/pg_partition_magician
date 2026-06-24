@@ -62,6 +62,7 @@ cast it: `transmute(t, c, interval '1 month')`.
 | `p_paused` | When `true` (default), register but do not let scheduled `maintain` act until you [`resume`](#pgpmpause--pgpmresume). |
 | `p_incoming_fks` | `'error'` (default) refuses if other tables have FKs pointing at `p_parent`; `'preserve'` drops each for the conversion, records it, and re-adds it against the new parent once the drain is idle ([`restore_incoming_fks`](#pgpmrestore_incoming_fks)). See [incoming FKs](guide.md#incoming-foreign-keys). |
 | `p_drain_adaptive` | When `true`, register with adaptive feathering on (the AIMD self-tuning drain; see [`set_drain_adaptive`](#pgpmset_drain_adaptive)). Default `false` is the fixed-gentle rate. Equivalent to calling `set_drain_adaptive` after transmute, but chosen up front. |
+| `p_force_uuidv7` | Only relevant for a `uuid` control column (treated as `uuidv7`). By default transmute refuses a column that samples as overwhelmingly random (UUIDv4); set `true` to override when you are certain it is time-ordered. Default `false`. |
 
 ### `pgpm.transmute` (integer grid: id)
 

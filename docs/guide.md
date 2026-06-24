@@ -38,8 +38,10 @@ dependency is `pg_cron`, and only to run the background job.
   with uuid-encoded bounds. Transmute with `pgpm.transmute(..., interval '...')`; a `uuid` control
   column is *treated as* this kind. Note PostgreSQL has no UUIDv7 type and v7-ness is not detectable
   from the catalog (the column is just `uuid`), so pgpm *assumes* a `uuid` control column is
-  time-ordered and samples it ([`check_uuidv7`](reference.md#pgpmcheck_uuidv7)) to warn if it looks
-  random; it cannot verify this from the type.
+  time-ordered and samples it ([`check_uuidv7`](reference.md#pgpmcheck_uuidv7)) to gate the conversion:
+  a column that samples as overwhelmingly random (UUIDv4) is refused, since range-partitioning a
+  non-time-ordered key is meaningless. Pass `p_force_uuidv7 => true` to override if you are certain it
+  is time-ordered.
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
 ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a

@@ -526,7 +526,7 @@ create or replace function pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text,
-  p_drain_adaptive boolean
+  p_drain_adaptive boolean, p_force_uuidv7 boolean default false
 )
 returns regclass language plpgsql as $$
 declare
@@ -595,13 +595,22 @@ begin
     end if;
   end;
 
-  -- uuidv7 sanity check: the type can't tell us the values are time-ordered, so
-  -- sample them -- random (UUIDv4) columns decode to implausible timestamps.
+  -- uuidv7 sanity check (issue #96): a uuid control column is TREATED as uuidv7 on assumption, so we
+  -- sample it. Genuine UUIDv7/ULID decodes to plausible recent timestamps (~1.0); random UUIDv4 scores
+  -- ~0. Below a hard floor (0.5) the column is overwhelmingly random, so range-partitioning it would
+  -- scatter rows across meaningless partitions on a garbage frontier -- so REFUSE, mirroring the
+  -- float-key and PK refusals, unless the operator overrides with p_force_uuidv7. Between the floor and
+  -- 0.95 we warn but proceed (mostly time-ordered with some noise, within the bounded-lag contract).
   if p_control_kind = 'uuidv7' then
     select sampled, fraction into v_uchk_n, v_uchk_frac from pgpm.check_uuidv7(p_parent, p_control, 1000);
-    if coalesce(v_uchk_n, 0) > 0 and v_uchk_frac < 0.95 then
-      raise notice 'pg_partition_magician: only % of % sampled % values decode to plausible recent timestamps; the column may be random (UUIDv4) rather than time-ordered (UUIDv7/ULID) -- partitioning will misbehave. Proceeding; verify with pgpm.check_uuidv7().',
-        (round(v_uchk_frac * 100, 1) || '%'), v_uchk_n, quote_ident(p_control);
+    if coalesce(v_uchk_n, 0) > 0 then
+      if v_uchk_frac < 0.5 and not p_force_uuidv7 then
+        raise exception 'pg_partition_magician: only % of % sampled % values decode to plausible recent timestamps -- the column looks random (UUIDv4), not time-ordered (UUIDv7/ULID), so range-partitioning it would scatter rows across meaningless partitions on a garbage frontier. If you are certain it is time-ordered, re-run with p_force_uuidv7 => true; otherwise partition on a genuinely time-ordered key. Inspect with pgpm.check_uuidv7().',
+          (round(v_uchk_frac * 100, 1) || '%'), v_uchk_n, quote_ident(p_control);
+      elsif v_uchk_frac < 0.95 then
+        raise notice 'pg_partition_magician: only % of % sampled % values decode to plausible recent timestamps; the column may be random (UUIDv4) rather than time-ordered (UUIDv7/ULID) -- partitioning may misbehave. Proceeding; verify with pgpm.check_uuidv7().',
+          (round(v_uchk_frac * 100, 1) || '%'), v_uchk_n, quote_ident(p_control);
+      end if;
     end if;
   end if;
 
@@ -812,7 +821,8 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 
 -- Time grid: interval width. The control column's type selects the kind -- a uuid column is TREATED as
 -- uuidv7 (ULIDs stored as uuid included; PostgreSQL has no UUIDv7 type to detect, so this is an
--- assumption check_uuidv7 samples to warn on, not a verification), anything else is time
+-- assumption check_uuidv7 samples to gate, not a verification: a column that samples as overwhelmingly
+-- random (UUIDv4) is refused unless p_force_uuidv7 => true), anything else is time
 -- (timestamptz/timestamp/date; _transmute rejects a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
 -- callers cast: transmute(t, c, interval '1 month').
 create or replace function pgpm.transmute(
@@ -820,14 +830,14 @@ create or replace function pgpm.transmute(
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false
+  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false
 ) returns regclass language sql as $$
   select pgpm._transmute(p_parent, p_control,
     case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
          then 'uuidv7' else 'time' end,
     p_interval::text, p_anchor::text, p_obtain,
-    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive);
+    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7);
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.

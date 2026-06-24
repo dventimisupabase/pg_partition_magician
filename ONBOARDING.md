@@ -118,7 +118,8 @@ rollback;
 - **float/double are rejected** as control columns (imprecise boundaries; NaN/Inf
   poison the frontier).
 - **UUIDv7/ULID can't be verified by type**: the uuidv7 kind is assigned to a `uuid`
-  control column (PostgreSQL has no UUIDv7 type to detect); `transmute` samples and *warns* if the values look random (v4);
+  control column (PostgreSQL has no UUIDv7 type to detect); `transmute` samples and *refuses* if the
+  values look overwhelmingly random (v4), unless `p_force_uuidv7 => true`;
   `pgpm.check_uuidv7(table, col)` runs the check on demand.
 - **Incoming FKs**: `transmute` refuses by default; `p_incoming_fks => 'preserve'` records +
   drops them for the conversion, and `restore_incoming_fks` re-adds them against the new

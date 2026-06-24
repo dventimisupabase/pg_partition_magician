@@ -25,6 +25,12 @@
   progress), and `drain_skips` (deferrals logged since that progress). A non-zero `closed_rows` with a
   stale `last_drained` and a climbing `drain_skips` is a wedged drain (e.g. the upsert/duplicate-key
   wedge); a healthy slow drain shows `closed_rows` falling and `drain_skips` near zero. (tests/35)
+- **transmute refuses a random-uuid control column (issue #96).** A `uuid` control column is treated as
+  `uuidv7` on assumption; when it samples as overwhelmingly random (UUIDv4 -- a plausibility fraction
+  below 0.5), transmute now refuses rather than only warning, since range-partitioning a
+  non-time-ordered key scatters rows across meaningless partitions on a garbage frontier (mirroring the
+  float-key and PK refusals). A new `p_force_uuidv7 => true` overrides it for an operator certain the
+  column is time-ordered. (tests/13, tests/39)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in
