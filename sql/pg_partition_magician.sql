@@ -776,9 +776,10 @@ drop function if exists pgpm.transmute_by_uuidv7(regclass, name, interval, int, 
 drop procedure if exists pgpm.build_pk_concurrently(regclass, name, interval, interval);
 drop function if exists pgpm.generate_fk_recovery(regclass);
 
--- Time grid: interval width. The control column's type selects the kind -- a uuid column is uuidv7
--- (ULIDs stored as uuid included), anything else is time (timestamptz/timestamp/date; _transmute rejects
--- a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
+-- Time grid: interval width. The control column's type selects the kind -- a uuid column is TREATED as
+-- uuidv7 (ULIDs stored as uuid included; PostgreSQL has no UUIDv7 type to detect, so this is an
+-- assumption check_uuidv7 samples to warn on, not a verification), anything else is time
+-- (timestamptz/timestamp/date; _transmute rejects a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
 -- callers cast: transmute(t, c, interval '1 month').
 create or replace function pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,

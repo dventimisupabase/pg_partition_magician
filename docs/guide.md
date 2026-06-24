@@ -35,8 +35,11 @@ dependency is `pg_cron`, and only to run the background job.
 - `id`: an `int` / `bigint` / `numeric` column, on an integer step. Covers Snowflake-style ids.
   Transmute with `pgpm.transmute(..., <bigint step>)`.
 - `uuidv7`: a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values, on a time grid
-  with uuid-encoded bounds. Transmute with `pgpm.transmute(..., interval '...')` (uuidv7 is inferred from the
-  uuid column).
+  with uuid-encoded bounds. Transmute with `pgpm.transmute(..., interval '...')`; a `uuid` control
+  column is *treated as* this kind. Note PostgreSQL has no UUIDv7 type and v7-ness is not detectable
+  from the catalog (the column is just `uuid`), so pgpm *assumes* a `uuid` control column is
+  time-ordered and samples it ([`check_uuidv7`](reference.md#pgpmcheck_uuidv7)) to warn if it looks
+  random; it cannot verify this from the type.
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
 ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a
@@ -109,9 +112,11 @@ partitioned parent under the original name, and attaches the old table as the `D
 ### Pick the kind
 
 There is one `pgpm.transmute`, with two type-safe overloads chosen by the width parameter: an `interval`
-selects the time grid, a `bigint` step selects the integer grid. The kind (time vs uuidv7) is
-auto-detected from the control column's type. A bare interval string literal is ambiguous between the
-overloads, so interval calls must cast (`interval '...'`); an integer width needs no cast.
+selects the time grid, a `bigint` step selects the integer grid. Within the time grid, a `uuid` control
+column is treated as `uuidv7` and a timestamp column as plain `time` (a `uuid` column is assumed
+time-ordered, not detected as v7; see [Control kinds](#concepts)). A bare interval string literal is
+ambiguous between the overloads, so interval calls must cast (`interval '...'`); an integer width needs
+no cast.
 
 ```sql
 -- time (timestamp/timestamptz/date control column)
@@ -120,8 +125,8 @@ select pgpm.transmute('public.events', 'created_at', interval '1 month');
 -- id (bigint/numeric), 10M ids per partition
 select pgpm.transmute('public.events', 'id', 10000000);
 
--- uuidv7 / ULID-as-uuid (uuid control column; inferred from the column type)
-select pgpm.transmute('public.events', 'id', interval '1 day');
+-- uuidv7 / ULID-as-uuid (a uuid control column is treated as this kind)
+select pgpm.transmute('public.events', 'event_uuid', interval '1 day');
 ```
 
 Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does

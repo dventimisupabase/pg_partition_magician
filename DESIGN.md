@@ -162,9 +162,12 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
 
   *One front door.* The three wrappers (`transmute` / `transmute_by_id` / `transmute_by_uuidv7`) collapse into a
   single `transmute` with two type-safe overloads on the width parameter: `bigint` selects the integer
-  grid (`id`), `interval` selects the time grid, with `time` versus `uuidv7` auto-detected from the
-  control column's type (a `uuid` column is uuidv7, otherwise time; the `check_uuidv7` plausibility
-  sampling stays a warning). The kind argument disappears, the column type carries the meaning. The
+  grid (`id`), `interval` selects the time grid, within which a `uuid` control column is *treated as*
+  `uuidv7`, anything else `time`. This is an assumption, not a detection: PostgreSQL has no UUIDv7 type
+  and v7-ness is not knowable from the catalog (the column is just `uuid`), so a `uuid` control column
+  opts into time-ordered semantics and the `check_uuidv7` plausibility sampling warns if its values
+  look random rather than time-ordered. The kind argument disappears; the width picks the grid and the
+  column type picks `uuid`-vs-timestamp. The
   price of type safety is that a bare interval literal is ambiguous between the two overloads, so
   callers write `transmute(t, c, interval '1 month')` (an integer width needs no cast); that is the right
   trade against string parameters that secretly carry meaning. The `_transmute` engine (text params plus a

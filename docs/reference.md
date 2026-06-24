@@ -19,9 +19,9 @@ see [DESIGN.md](../DESIGN.md).
 ## Transmutation
 
 `transmute` converts an existing, unpartitioned table into a native `RANGE`-partitioned one, online and
-metadata-only. It is one function with two type-safe overloads chosen by the width parameter; the
-partition kind is read from the control column. pgpm never rewrites the primary key (see
-[No PK rewrite](#no-pk-rewrite)).
+metadata-only. It is one function with two type-safe overloads chosen by the width parameter; within
+the time grid, a `uuid` control column is treated as `uuidv7` and a timestamp column as `time`. pgpm
+never rewrites the primary key (see [No PK rewrite](#no-pk-rewrite)).
 
 ### `pgpm.transmute` (time grid: time / uuidv7)
 
@@ -41,9 +41,13 @@ pgpm.transmute(
 ) returns regclass
 ```
 
-The interval overload. The kind is inferred from the control column's type: a `uuid` column is
-`uuidv7` (ULID-as-uuid included), a `timestamptz` / `timestamp` / `date` column is `time`. A bare
-interval literal is ambiguous against the bigint overload, so cast it: `transmute(t, c, interval '1 month')`.
+The interval overload. Within the time grid the control column's type picks the kind: a `uuid` column
+is treated as `uuidv7` (ULID-as-uuid included), a `timestamptz` / `timestamp` / `date` column is
+`time`. Note this is an assumption, not a detection: PostgreSQL has no UUIDv7 type and v7-ness is not
+knowable from the catalog (the column is just `uuid`), so a `uuid` control column is *assumed*
+time-ordered and [`check_uuidv7`](#pgpmcheck_uuidv7) samples the data to warn if it looks random (v4)
+rather than verifying the type. A bare interval literal is ambiguous against the bigint overload, so
+cast it: `transmute(t, c, interval '1 month')`.
 
 | Parameter | Meaning |
 |---|---|

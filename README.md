@@ -14,8 +14,9 @@ of native `RANGE`-partitioned tables:
 
 - **`transmute()`**: convert an existing (possibly huge, *live*) unpartitioned table into a partitioned
   one **online**, with no up-front data movement. One function, two type-safe overloads picked by the
-  width parameter (an `interval` for the time grid, a `bigint` step for the integer grid); the kind
-  (time vs uuidv7) is read from the control column's type. Reversible with **`untransmute()`** up until
+  width parameter (an `interval` for the time grid, a `bigint` step for the integer grid); within the
+  time grid a `uuid` control column is **treated as** time-ordered `uuidv7` (PostgreSQL has no UUIDv7
+  type to detect, so pgpm assumes time-ordering and samples to warn). Reversible with **`untransmute()`** up until
   maintenance first runs: the cutover moves no data, so the table can be cleanly restored until a real
   partition exists (after that it is a one-way door).
 - **obtain**: keep N partitions ahead of the write frontier so live writes always have a real

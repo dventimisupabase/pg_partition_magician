@@ -24,7 +24,7 @@ select cmp_ok(
 -- warn-by-default: transmute still proceeds on the suspect column (operator's call)
 select lives_ok(
   $$ select pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
-  'transmute (uuidv7 inferred from the uuid column) warns but proceeds on a random-uuid column'
+  'transmute (uuid column treated as uuidv7) warns but proceeds on a random-uuid column'
 );
 
 select * from finish();
