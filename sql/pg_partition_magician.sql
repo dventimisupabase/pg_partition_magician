@@ -343,6 +343,7 @@ declare
   v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
   v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
   v_excl name; v_method text; v_reltuples real; v_avg numeric; v_blk_limit int;
+  v_retain_boundary text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -380,6 +381,35 @@ begin
   v_name   := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
   v_lo_lit := pgpm._encode(cfg.control_kind, v_lo);
   v_hi_lit := pgpm._encode(cfg.control_kind, v_hi);
+
+  -- Retention-aware reclaim (issue #91): if this oldest closed interval is entirely below the
+  -- retention horizon, retain() would DROP it the instant it became a partition -- so skip the
+  -- materialize+attach and DELETE the batch straight out of the DEFAULT, paced exactly like a normal
+  -- microbatch (and cheaper: no INSERT, no child, no attach). This reclaims the aged tail even when it
+  -- never made it out of the DEFAULT, so retention bounds storage on a lagging drain too, and spares
+  -- the wasted I/O of materializing a partition only to drop it next tick. The horizon matches
+  -- retain()'s exactly: an interval is below it iff hi <= boundary (id: floor(frontier - retain);
+  -- time/uuidv7: floor(now() - retain)).
+  if cfg.retain is not null then
+    if cfg.control_kind = 'id'
+      then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                  (v_frontier::numeric - cfg.retain::numeric)::text);
+      else v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                  (now() - cfg.retain::interval)::text);
+    end if;
+    if not pgpm._native_gt(cfg.control_kind, v_hi, v_retain_boundary) then
+      execute format($f$
+        delete from %1$s where ctid in (select ctid from %1$s
+                         where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
+      $f$, v_def, cfg.control_column, v_lo_lit, v_hi_lit, v_batch);
+      get diagnostics v_moved = row_count;
+      insert into pgpm.log (parent_table, action, lo, hi, rows)
+        values (p_parent, 'retain_reclaim', v_lo, v_hi, v_moved);
+      execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
+                     v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
+      return case when v_more then 'reclaimed:' || v_moved else 'reclaimed:' || v_moved || ':done' end;
+    end if;
+  end if;
 
   if to_regclass(format('%I.%I', v_nsp, v_name)) is null then
     execute format('create table %I.%I (like %I.%I including defaults including indexes including constraints excluding identity)',
@@ -1231,11 +1261,11 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
   end;
 
-  -- Commit the adaptive step ONLY when the drain did work (moved rows or attached). A fully-drained,
-  -- idle table must not churn config or log a budget row every tick (a standing steward ticks forever).
-  -- Leaving the ckpt baseline stale across an idle gap just makes the next active tick treat any
-  -- idle-period checkpoints as congestion and back off once -- the safe direction.
-  if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%') then
+  -- Commit the adaptive step ONLY when the drain did work (moved/reclaimed rows or attached). A
+  -- fully-drained, idle table must not churn config or log a budget row every tick (a standing steward
+  -- ticks forever). Leaving the ckpt baseline stale across an idle gap just makes the next active tick
+  -- treat any idle-period checkpoints as congestion and back off once -- the safe direction.
+  if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%' or v_drain like 'reclaimed:%') then
     update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
                            drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts,
                            drain_ambient_baseline = v_amb_baseline

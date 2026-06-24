@@ -14,6 +14,12 @@
   time-ordered primary key (Snowflake bigint / UUIDv7 / ULID) as the data model. Forbidding PK rewrites removed `build_pk_concurrently`, the composite-FK recovery
   path (`generate_fk_recovery`, the `'drop'` incoming-FK mode, the `dropped_fk` composite columns), and
   the build-path complexity; every incoming FK is now the `preserve` path. (tests/25)
+- **Retention reclaims the un-drained `DEFAULT` tail (issue #91).** When the drain lags, an interval
+  that ages past `retain` while still in the `DEFAULT` is now reclaimed in place: the drain `DELETE`s it
+  straight out of the `DEFAULT` (paced like a microbatch, logged as `retain_reclaim`) instead of
+  materializing a partition that `retain` would immediately drop. Retention now bounds storage even on a
+  never-completing drain, and the materialize-then-drop churn is gone. `retain()` itself is unchanged (a
+  cheap `DROP` of materialized partitions). (tests/34)
 - `transmute(..., p_incoming_fks => 'preserve')` + `pgpm.restore_incoming_fks` / `pgpm.suspend_incoming_fks`:
   keep incoming foreign keys across the conversion. Since `transmute` never rewrites the PK, the referenced
   unique key always survives, so `'preserve'` drops each incoming FK for the conversion, records it in

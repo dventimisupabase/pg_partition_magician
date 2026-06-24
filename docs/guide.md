@@ -266,6 +266,13 @@ update pgpm.config set retain = '90 days' where parent_table = 'public.events'::
 Retain uses plain `DROP` (a brief lock). `DETACH ... CONCURRENTLY` cannot run inside a function,
 so for very large cold partitions you may prefer to detach them concurrently by hand.
 
+Retention also bounds storage when the drain is behind. If a closed interval ages past the policy
+while it is still in the `DEFAULT` (the drain has not reached it yet), the drain reclaims it in place:
+it `DELETE`s the aged rows straight out of the `DEFAULT`, paced exactly like a normal drain microbatch,
+instead of materializing a partition only to `DROP` it next tick. So aged rows are reclaimed even when
+they never made it out of the `DEFAULT`, and there is no materialize-then-drop churn. This runs as part
+of the drain (logged as `retain_reclaim`), so it only happens while maintenance is running.
+
 ## Incoming foreign keys
 
 If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),

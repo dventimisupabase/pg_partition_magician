@@ -417,6 +417,17 @@ primitives that move along it already exist: `drain_batch` (set at `transmute`) 
   (read-only; an already-moved row is a `0 rows` no-op until attach). Single-batch intervals and
   `drain_all` (one transaction) never open the gap, and only the old closed tail is ever affected.
   Implemented: `pgpm.snapshot`, `tests/30`.
+- **Retention reclaims the un-drained tail (IMPLEMENTED).** `retain` only `DROP`s materialized
+  partitions, so on a lagging drain (the section 4 slow-or-never regime) data that aged past the policy
+  while still sitting in the `DEFAULT` was invisible to retention and never reclaimed: storage was not
+  actually bounded, and the oldest-first drain would even waste budget materializing a below-horizon
+  interval only for `retain` to drop it the next tick. The fix folds retention into the drain. When the
+  oldest closed interval is entirely below the retention horizon (the same boundary `retain` uses), the
+  drain `DELETE`s that batch straight out of the `DEFAULT` (paced and feathered like any microbatch, and
+  cheaper -- no INSERT, no child, no attach) instead of materializing it. So retention bounds storage
+  even when the drain never catches up, and the materialize-then-drop churn is gone. The reclaim is part
+  of the drain, so it obeys the same unnoticeable invariant and adaptive budget; `retain` itself stays a
+  cheap metadata `DROP`. Logged as `retain_reclaim`; tests in `tests/34`.
 - **Retain on a semantic axis, via a key-to-time bridge.** Partitioning happens on a *physical*
   axis (the key); operators reason about retention on a *semantic* axis (time, "older than 90 days").
   A mapping from time to key bridges them, so a table can partition on its `id` (no widening, per the

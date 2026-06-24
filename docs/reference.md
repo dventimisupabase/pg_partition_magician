@@ -214,6 +214,9 @@ partition; when that interval empties, it attaches the partition and returns. Re
 - `'moved:N'` after moving `N` rows but the interval is not yet empty.
 - `'attached:<child>:<method>'` when the interval emptied and its partition was attached;
   `method` is `plain`, `check_skip`, or similar.
+- `'reclaimed:N'` / `'reclaimed:N:done'` when the oldest interval is entirely below the retention
+  horizon: the batch is `DELETE`d straight out of the `DEFAULT` (no partition is materialized) rather
+  than moved, since [`retain`](#pgpmretain) would drop it anyway. `:done` marks the interval emptied.
 
 | Parameter | Meaning |
 |---|---|
@@ -251,6 +254,11 @@ pgpm.retain(p_parent regclass) returns int
 Drops partitions older than `config.retain` (an interval for `time`/`uuidv7`, a count of
 intervals for `id`). Returns the number dropped. Uses plain `DROP` (a brief lock); `null` retain
 keeps everything. For very large cold partitions you may prefer to `DETACH ... CONCURRENTLY` by hand.
+
+`retain` itself only drops *materialized* partitions. An interval that ages past the policy while it
+is still in the `DEFAULT` (a lagging drain) is reclaimed in place by [`drain_step`](#pgpmdrain_step)
+instead, which `DELETE`s it straight out of the `DEFAULT` (paced, logged as `retain_reclaim`). So
+retention bounds storage even when the drain never catches up.
 
 ### `pgpm.set_drain_adaptive`
 
@@ -465,7 +473,7 @@ ordered by parent then `lo`.
 ### `pgpm.log`
 
 Append-only audit trail of actions. Columns: `id`, `parent_table`, `action` (e.g. `drain_move`,
-`drain_attach`, `obtain_skip`), `lo`, `hi`, `method`, `rows`, `at`.
+`drain_attach`, `retain_drop`, `retain_reclaim`, `obtain_skip`), `lo`, `hi`, `method`, `rows`, `at`.
 
 ### `pgpm.dropped_fk`
 
