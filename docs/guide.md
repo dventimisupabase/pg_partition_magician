@@ -1,8 +1,8 @@
 # pg_partition_magician: user guide
 
-A task-oriented guide to converting a live PostgreSQL table to native `RANGE` partitioning and
-running it. For the full function/catalog reference see [reference.md](reference.md); for the design
-rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
+A task-oriented guide to converting a live PostgreSQL table to native `RANGE` partitioning and running
+it. For the full function and catalog reference see [reference.md](reference.md); for the design
+rationale see [REDESIGN.md](../REDESIGN.md); for a visual overview see the
 [explainer](https://dventimisupabase.github.io/pg_partition_magician/).
 
 ## Contents
@@ -11,11 +11,13 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 - [Install](#install)
 - [Transmute a table](#transmute-a-table)
 - [Run it](#run-it)
+- [Refine the history](#refine-the-history)
 - [Monitor](#monitor)
 - [Retain](#retain)
 - [Incoming foreign keys](#incoming-foreign-keys)
 - [Secondary indexes](#secondary-indexes)
 - [How the conversion stays online](#how-the-conversion-stays-online)
+- [Read consistency during a move](#read-consistency-during-a-move)
 - [WAL and checkpoint sizing](#wal-and-checkpoint-sizing)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Caveats and v1 scope](#caveats-and-v1-scope)
@@ -23,53 +25,59 @@ rationale see [DESIGN.md](../DESIGN.md); for a visual overview see the
 ## Concepts
 
 **What it manages.** pg_partition_magician transmutes an existing, unpartitioned table into a native
-`RANGE`-partitioned table and then keeps it healthy: it creates future partitions ahead of your
-writes, moves old rows out of a holding area into their proper partitions in small steps, and drops
-partitions past your retention policy. Everything is pure SQL in the `pgpm` schema; the only runtime
-dependency is `pg_cron`, and only to run the background job.
+`RANGE`-partitioned table and then keeps it healthy: it creates future partitions ahead of your writes,
+optionally splits the historical bulk into proper partitions on a schedule, and drops partitions past
+your retention policy. Everything is pure SQL in the `pgpm` schema; the only runtime dependency is
+`pg_cron`, and only to run the background job.
 
 **Control kinds.** A table is partitioned on one monotonic key, of one of three kinds:
 
-- `time`: a `timestamptz` / `timestamp` / `date` column, on an interval grid (calendar-aligned for
-  whole months/years, fixed-duration otherwise). Transmute with `pgpm.transmute(..., interval '...')`.
-- `id`: an `int` / `bigint` / `numeric` column, on an integer step. Covers Snowflake-style ids.
-  Transmute with `pgpm.transmute(..., <bigint step>)`.
-- `uuidv7`: a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values, on a time grid
-  with uuid-encoded bounds. Transmute with `pgpm.transmute(..., interval '...')`; a `uuid` control
-  column is *treated as* this kind. Note PostgreSQL has no UUIDv7 type and v7-ness is not detectable
-  from the catalog (the column is just `uuid`), so pgpm *assumes* a `uuid` control column is
-  time-ordered and samples it ([`check_uuidv7`](reference.md#pgpmcheck_uuidv7)) to gate the conversion:
-  a column that samples as overwhelmingly random (UUIDv4) is refused, since range-partitioning a
-  non-time-ordered key is meaningless. Pass `p_force_uuidv7 => true` to override if you are certain it
-  is time-ordered.
+- `time`: a `timestamptz` / `timestamp` / `date` column, on an interval grid (calendar-aligned for whole
+  months/years, fixed-duration otherwise). Transmute with `pgpm.transmute(..., interval '...')`.
+- `id`: an `int` / `bigint` / `numeric` column, on an integer step. Covers Snowflake-style ids. Transmute
+  with `pgpm.transmute(..., <bigint step>)`.
+- `uuidv7`: a `uuid` column holding time-ordered UUIDv7 (or ULID-as-uuid) values, on a time grid with
+  uuid-encoded bounds. A `uuid` control column is *treated as* this kind. PostgreSQL has no UUIDv7 type
+  and v7-ness is not detectable from the catalog, so pgpm *assumes* a `uuid` control column is
+  time-ordered and samples it ([`check_uuidv7`](reference.md#check_uuidv7)) to gate the conversion: a
+  column that samples as overwhelmingly random (UUIDv4) is refused. Pass `p_force_uuidv7 => true` to
+  override if you are certain it is time-ordered.
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
 ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a
 companion column instead.
 
 **The frontier.** The frontier is the newest point the data has reached: `now()` for `time`, and
-`max(control)` for `id` and `uuidv7`. An interval is "open" while the frontier is inside it (it is
-still receiving writes) and "closed" once the frontier moves past its upper bound.
+`max(control)` for `id` and `uuidv7`. An interval is "open" while the frontier is inside it (still
+receiving writes) and "closed" once the frontier moves past its upper bound.
 
-**The DEFAULT is a safety net.** Transmutation attaches your original table as the `DEFAULT` partition, so
-any row that does not match a real partition still has a home (no lost writes, ever). In steady state
-obtain keeps the current and future intervals covered, so the DEFAULT holds only the open interval
-and otherwise stays empty. `check_default()` tells you if anything is stuck there.
+**The monolith.** Conversion moves **no rows**. It renames your original table aside and attaches it,
+intact, as one bounded **coarse child** -- the *monolith* -- covering `[grid_floor(min), B)`, where `B` is
+the grid boundary just above the frontier. So immediately after transmute the whole history lives in one
+correct, fully-queryable partition, and the table is partitioned in form. The monolith doubles as the
+current partition until the frontier crosses `B`, then it freezes.
 
-**Reads during a drain undercount.** While an interval is draining, its already-moved rows sit in an
-unattached child and are not visible through the parent, so a mid-drain `SELECT` undercounts that
-interval. This is inherent and unfixable; use [`snapshot()`](#read-consistency-during-a-drain) for a
-complete read. The full, honest treatment is in [Read consistency during a drain](#read-consistency-during-a-drain).
+**The DEFAULT is an empty safety net.** Alongside the monolith, transmute creates a fresh, empty
+`DEFAULT` partition. It is the leading-edge net: if a write ever arrives that no real partition covers
+(obtain fell behind, a backdated row, a gap), it lands here instead of erroring. In steady state obtain
+keeps the frontier covered, so the `DEFAULT` stays empty. Keeping it empty is what keeps obtain cheap;
+`check_default()` tells you if anything is stuck there.
 
-**The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives
-three jobs per table:
+**The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives these
+per table:
 
 - **obtain**: create up to N partitions ahead of the frontier, so live writes always land in a real
-  partition.
-- **drain**: move the DEFAULT's closed tail into proper partitions, a small microbatch at a time,
-  then attach each interval's partition when it empties. The only range ever drained is one that has
-  closed (no contention with live writes).
+  partition. With the `DEFAULT` empty this is a cheap, scan-free attach.
+- **drain (the magician's assistant)**: keep the `DEFAULT` empty by evacuating the occasional stray into
+  its proper partition. This is no longer the bulk mover -- it is a janitor for the leading-edge net.
 - **retain**: drop partitions older than your policy.
+- **refine** (optional): split the coarse monolith into finer partitions, on demand or paced across ticks.
+
+**Refine is the bulk mover.** The historical bulk sits in the monolith until you *refine* it into
+properly-sized partitions, by copying (never deleting) so there are no dead tuples and no vacuum. You can
+refine by hand, enable a paced auto-refine, or never refine at all -- a coarse monolith is a correct,
+permanent terminal state; you only lose partition pruning and fine-grained retention over its span until
+it is split. See [Refine the history](#refine-the-history).
 
 ## Install
 
@@ -108,17 +116,17 @@ psql "$DATABASE_URL" -f sql/uninstall.sql
 
 ## Transmute a table
 
-Transmutation is online and moves no data up front: it renames your table to `<name>_default`, creates a
-partitioned parent under the original name, and attaches the old table as the `DEFAULT` partition.
+Conversion is online and moves no data. It renames your table to a coarse-child name, creates a
+partitioned parent under the original name, attaches the old table as the bounded **monolith** child, and
+creates a fresh empty `DEFAULT`.
 
 ### Pick the kind
 
 There is one `pgpm.transmute`, with two type-safe overloads chosen by the width parameter: an `interval`
 selects the time grid, a `bigint` step selects the integer grid. Within the time grid, a `uuid` control
-column is treated as `uuidv7` and a timestamp column as plain `time` (a `uuid` column is assumed
-time-ordered, not detected as v7; see [Control kinds](#concepts)). A bare interval string literal is
-ambiguous between the overloads, so interval calls must cast (`interval '...'`); an integer width needs
-no cast.
+column is treated as `uuidv7` and a timestamp column as plain `time`. A bare interval string literal is
+ambiguous between the overloads, so interval calls must cast (`interval '...'`); an integer width needs no
+cast.
 
 ```sql
 -- time (timestamp/timestamptz/date control column)
@@ -132,32 +140,35 @@ select pgpm.transmute('public.events', 'event_uuid', interval '1 day');
 ```
 
 Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does
-nothing until you `resume` it (see [Run it](#run-it)). All parameters are documented in the
-[reference](reference.md#transmutation).
+nothing until you `resume` it (see [Run it](#run-it)). All parameters are in the
+[reference](reference.md#conversion).
 
-### The cutover is always metadata-only
+### The cutover is online, with no row movement
 
-`transmute` never rewrites the primary key. It reuses the existing PK in place, so the cutover holds its
-`ACCESS EXCLUSIVE` lock only briefly (no `O(rows)` index build, ever).
+The conversion never rewrites the primary key and never moves a row. It does do one **online, read-only
+scan** of the original (to certify the monolith's bound so the attach is metadata-only), under a gentle
+`SHARE UPDATE EXCLUSIVE` lock that does not block reads or writes; then a brief metadata-only
+`ACCESS EXCLUSIVE` step renames, creates the parent, attaches the monolith, and creates the `DEFAULT`. So
+the only `O(rows)` work is a single non-blocking read -- no index rebuild, no row rewrite, no downtime.
+(Contrast the old model, which paid no scan up front but then rewrote every historical row through a
+perpetual drain.)
 
-The one requirement is that the control column already be part of the primary key. Postgres only
-requires a partitioned PK to *include* the partition key, not lead it, so a single-column PK on the
-control column qualifies, and so does a composite PK that contains it (e.g. `(tenant_id, id)`
-partitioned by `id`). A table with no primary key at all is refused: the control column must be part
-of a primary key for pgpm to partition on it.
+The one requirement is that the control column already be part of the primary key. Postgres only requires
+a partitioned PK to *include* the partition key, not lead it, so a single-column PK on the control column
+qualifies, and so does a composite PK that contains it (e.g. `(tenant_id, id)` partitioned by `id`). A
+table with no primary key, or a PK that *excludes* the control column (the classic `events(id PRIMARY
+KEY, created_at)` wanting time partitioning), is refused with a clear error: make the control column part
+of the PK first (give it a single-column time-ordered key, or widen the PK with `CREATE UNIQUE INDEX
+CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`), then re-transmute.
 
-If the table has a PK that *excludes* the control column (the classic `events(id PRIMARY KEY,
-created_at)` wanting time partitioning), `transmute` refuses with a clear error: make the control column
-part of the PK first, then re-transmute. Either give the table a single-column time-ordered key, or widen
-the PK yourself (`CREATE UNIQUE INDEX CONCURRENTLY`, then `ALTER TABLE ... ADD PRIMARY KEY USING
-INDEX`). pgpm only partitions tables whose key is already the partition key: the modern
-time-ordered-PK data model (bigint/Snowflake, UUIDv7, ULID).
+`transmute` is reversible until you commit to it: while the monolith is intact and holds the whole table,
+[`untransmute`](reference.md#untransmute) cleanly restores the original. It becomes a one-way door once a
+row lands outside the monolith (the frontier crosses `B`) or you refine it.
 
 ## Run it
 
-Schedule maintenance with `pgpm.schedule()`, a thin wrapper around `pg_cron` for the one job pgpm
-needs. It stays idle while the table is paused, so inspect with [`status()`](#monitor) first, then
-`resume` to go live:
+Schedule maintenance with `pgpm.schedule()`, a thin wrapper around `pg_cron` for the one job pgpm needs.
+It stays idle while the table is paused, so inspect with [`status()`](#monitor) first, then `resume`:
 
 ```sql
 select pgpm.schedule();                   -- one pg_cron job (every minute) drives maintain_all() for all tables
@@ -166,103 +177,122 @@ select pgpm.resume('public.events');      -- go live
 ```
 
 `pgpm.schedule(p_every)` takes a `pg_cron` schedule (`'* * * * *'` every minute is the default;
-`'*/5 * * * *'` every 5 minutes; `'30 seconds'` for pg_cron's sub-minute syntax). Note pg_cron does
-not accept `'1 minute'`-style interval strings; minute cadence goes through cron syntax. It registers
-one job named `pgpm` that calls `maintain_all()` for every managed table, targeting the current
-database, and re-running it updates the interval in place. `pgpm.unschedule()` removes it. Run these
-from the database where `pg_cron` is installed (its `cron` schema must be present). If you prefer, the
-raw equivalent is `cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')`.
+`'*/5 * * * *'` every 5 minutes; `'30 seconds'` for pg_cron's sub-minute syntax). pg_cron does not accept
+`'1 minute'`-style interval strings; minute cadence goes through cron syntax. It registers one job named
+`pgpm` that calls `maintain_all()` for every managed table in the current database, and re-running it
+updates the cadence in place. `pgpm.unschedule()` removes it. Run these from the database where `pg_cron`
+is installed. The raw equivalent is `cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')`.
 
-From there, each tick obtains ahead, drains a microbatch of the closed tail, and applies retention.
-You can also transmute with `p_paused => false` to go live immediately and skip the `resume` step.
+From there, each tick obtains ahead, evacuates any stray from the `DEFAULT`, applies retention, and (if
+auto-refine is on) advances one refine microbatch. You can also transmute with `p_paused => false` to go
+live immediately and skip `resume`.
 
-To convert a table synchronously (tests, one-shot migrations) instead of waiting for the paced cron,
-drive the drain to completion yourself. `p_include_open => true` also drains and attaches the current
-open interval (a brief blocking attach against a small default):
+To convert and split a table synchronously (tests, one-shot migrations) instead of waiting for the paced
+cron, drive it by hand: `obtain` the forward partitions, then `refine` the monolith once it has frozen
+(see [Refine the history](#refine-the-history)).
 
-```sql
-select pgpm.drain_all('public.events', p_include_open => true);
-```
+### Adaptive feathering (let the work tune itself)
 
-Tune the pace with `config.drain_batch` (rows per microbatch) and the cron cadence. For tables with
-highly variable row width, set `config.drain_max_blocks` to cap each batch by storage size rather
-than row count.
-
-### Adaptive feathering (let the drain tune itself)
-
-Instead of fixing the rate by hand, turn on adaptive mode and let pgpm ride the drain just under the
-system's spare capacity:
+Instead of fixing the rate by hand, turn on adaptive mode and let pgpm ride the per-tick budget just under
+the system's spare capacity:
 
 ```sql
 select pgpm.set_drain_adaptive('public.events', true);
 ```
 
-Or choose it up front at conversion time, alongside the other knobs:
-`pgpm.transmute('public.events', 'created_at', interval '1 month', p_drain_adaptive => true)`. Either
-way the default is off (the predictable fixed `drain_batch` rate).
+Or choose it up front: `pgpm.transmute(..., p_drain_adaptive => true)`. Each maintenance tick then
+measures how fast it is generating WAL and compares it to the rate the database can absorb between
+checkpoints (`max_wal_size` / `checkpoint_timeout`); if it is outrunning that, a forced checkpoint and its
+I/O storm are on the way, so pgpm eases the budget down *before* the storm and recovers gently once there
+is slack again -- the additive-increase / halve-on-congestion idea TCP uses. Your `drain_batch` is the
+ceiling; it only feathers *down* from there, as far as one-sixteenth of `drain_batch` under sustained
+pressure. The same budget paces both the assistant drain and refine's microbatches.
 
-Now each maintenance tick measures how fast the drain is generating WAL and compares it to the rate the
-database can absorb between checkpoints (`max_wal_size` / `checkpoint_timeout`). If the drain is
-outrunning that, a forced checkpoint and its I/O storm are on the way, so pgpm eases the budget down
-*before* the storm hits, then recovers gently once there is slack again, the same
-additive-increase / halve-on-congestion idea TCP uses to ride just under a link's capacity. Your
-`drain_batch` is the ceiling (a bigger batch would mean a bigger write spike, so the controller never
-goes above your tuned rate); it only ever feathers *down* from there, as far as one-sixteenth of
-`drain_batch` under sustained pressure. So set `drain_batch` to the rate you want when there is plenty
-of slack and let pgpm back off automatically under load, instead of hand-tuning a safe fixed rate. The
-backoff point is tunable (`config.drain_wal_high_water`, default 1.0 of the sustainable rate; lower
-drains gentler but slower); it still
-respects `drain_max_blocks`. Off by default; turn it back off with
-`pgpm.set_drain_adaptive('public.events', false)`.
+A second, complementary signal yields to *ambient query load* (which the WAL signal misses, since a
+starved workload makes little WAL). Turn it on with `pgpm.set_drain_ambient('public.events', 2.0)`: it
+counts your own backends stuck on IO/lock waits, learns the recent normal (an EWMA baseline), and backs
+off only on a *relative surge* above it. Off by default; the WAL and ambient signals are OR'd.
 
-That WAL signal keeps the drain from storming the checkpointer, but on its own it does not make the
-drain yield to *ambient query load* (a workload being starved generates little WAL, so the WAL signal
-stays quiet). For that, turn on the ambient signal with `pgpm.set_drain_ambient('public.events', 2.0)`.
-It counts your own client backends stuck on IO/lock waits and is self-calibrating: a fixed waiter count
-would be the wrong shape, since "normal" depends on the box and workload, so instead it learns the
-recent normal (an EWMA baseline) and backs off only on a *relative surge* above it -- when live waiters
-exceed the factor (here 2x) times that baseline. It gets the drain out of the way of a workload surge
-and resumes once the surge clears. The signal is off by default (factor 0); the WAL and ambient signals
-are OR'd, so the drain feathers down when either fires.
+## Refine the history
+
+After transmute, the history is one coarse monolith. **Refining** splits it into proper, fine-grained
+partitions. It is optional: a coarse monolith is correct and queryable forever; refining is what restores
+partition pruning and fine-grained retention over the historical span.
+
+How refine works, and why it is cheap: it **copies** the monolith's rows into new fine children and swaps
+them in atomically, then drops the now-empty source. Because it copies rather than deletes, the kept
+partitions have no dead tuples and need no vacuum; the cost is transient extra disk (roughly 2x the
+range being refined, while the copies coexist with the source) and the one-time copy I/O. A sub-range
+entirely below the retention horizon is reclaimed rather than materialized, so refining never builds a
+partition that retention would immediately drop.
+
+A child can only be refined once it is **frozen** -- its whole range below the current frontier, so no
+live write still lands in it. The monolith freezes once the frontier crosses `B`.
+
+**Refine by hand** (synchronous, atomic, one transaction):
+
+```sql
+select pgpm.refine_history('public.events');   -- split the oldest coarse child to the configured step
+```
+
+`refine_history` refines the oldest coarse child (the monolith) to the configured partition step. For a
+hierarchical split (monolith to per-year to per-month, to bound the transient disk on a tight volume),
+call `pgpm.refine(parent, child, target_step)` with chosen steps.
+
+**Auto-refine** (paced across maintenance ticks):
+
+```sql
+select pgpm.set_refine('public.events', '1 month');   -- feather the monolith toward monthly, one microbatch per tick
+```
+
+With auto-refine on, each `maintain` tick advances one budget-sized microbatch of the oldest frozen coarse
+child toward the target step, under the same adaptive budget as the drain. It is off by default
+(`set_refine(parent, null)` turns it back off) and always safe to enable: it only paces refinement; it
+never starts on a child that is not frozen or whose range still has strays in the `DEFAULT`.
+
+One trade comes with the paced path. The synchronous `refine()` runs in a single transaction, so it is
+atomic and a concurrent reader never sees a partial state. Auto-refine commits microbatches across ticks,
+so while a coarse child is mid-split its already-moved rows live briefly in not-yet-attached children and
+a plain read of the parent **undercounts** that range; use [`snapshot()`](#read-consistency-during-a-move)
+for a complete read. This is the same gap the assistant drain has, and the same escape hatch covers it.
+
+**Disk.** Refining needs transient headroom (about 2x the span being refined) for the copies before the
+source is dropped. On an elastic or auto-scaling volume this is absorbed; on a fixed volume, refine
+hierarchically (coarse first, then each coarse child) so each step's footprint stays bounded, or skip
+refinement and keep the coarse monolith.
 
 ## Monitor
 
 ```sql
-select * from pgpm.status();        -- one row per managed table: partitions, backlog, drain progress
-select * from pgpm.partitions;      -- the partition registry with bounds
+select * from pgpm.status();        -- one row per managed table: partitions, backlog, progress
 ```
 
-The key health signal is the DEFAULT's closed tail. In steady state it should be zero:
+`status()` surfaces, beyond the static config:
 
-```sql
-select * from pgpm.check_default('public.events');
-```
-
-`closed_rows > 0` means rows that should have drained are still in the DEFAULT (the drain is behind,
-or paused). `default_rows` counting only the open interval is normal.
-
-`status()` surfaces the same `closed_rows`, plus two columns that tell a **wedged** drain from a
-merely **slow** one: `last_drained` (when the drain last made progress) and `drain_skips` (deferrals
-logged since then). A slow-but-healthy drain shows `closed_rows` falling and `drain_skips` near zero; a
-wedged drain (for example the upsert/duplicate-key wedge, see [Read consistency during a
-drain](#read-consistency-during-a-drain)) shows `closed_rows` stuck above zero, a stale `last_drained`,
-and a climbing `drain_skips`.
-
-`status()` also reports `inflight_partitions`: drain children created but not yet attached. It is
-normally 0 (or briefly 1 mid-drain); a standing non-zero value with a stale `last_drained` means an
-attach is stalled, and those rows are durable but not visible through the parent until they attach (use
-[`snapshot()`](#read-consistency-during-a-drain) for a complete read). `select * from pgpm.partitions`
-shows each partition's `attached` flag.
+- **`coarse_partitions` and `history_unrefined`** -- how many attached partitions are still coarse
+  (wider than one step), and whether any remain. `history_unrefined = true` is the refinement backlog:
+  pruning and fine retention are suspended over that coarse span until it is refined.
+- **`closed_rows` / `default_rows`** -- the assistant drain's backlog: rows in the `DEFAULT` that should
+  have a real partition. In steady state this is **zero** (the monolith holds the history; the `DEFAULT`
+  is the empty net). A non-zero `closed_rows` means a stray landed there and has not yet been evacuated.
+- **`last_drained` / `drain_skips`** -- progress versus stall: a non-zero `closed_rows` with a stale
+  `last_drained` and a climbing `drain_skips` is a wedged drain; falling `closed_rows` with
+  `drain_skips ~ 0` is merely slow.
+- **`inflight_partitions`** -- children created but not yet attached (a drain or a cross-tick refine in
+  progress). Their rows are durable but not visible through the parent until they attach; use
+  [`snapshot()`](#read-consistency-during-a-move) for a complete read.
+- **`fks_suspended` / `fks_unvalidated`** -- preserve-managed incoming FKs currently dropped (RI off)
+  versus re-added `NOT VALID` but blocked from validation by pre-existing orphans.
 
 For `uuidv7` tables, confirm the column really is time-ordered (not random UUIDv4):
 
 ```sql
-select * from pgpm.check_uuidv7('public.events', 'id');
+select * from pgpm.check_uuidv7('public.events', 'event_uuid');
 ```
 
 A low `fraction` means the values do not decode to plausible timestamps and the table should not be
-partitioned on that column. For an `id`-partitioned table where you want calendar retention, check
-that a timestamp column rises with the id:
+partitioned on that column. For an `id`-partitioned table where you want calendar retention, check that a
+timestamp column rises with the id:
 
 ```sql
 select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
@@ -270,83 +300,74 @@ select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
 
 ## Retain
 
-Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops
-partitions past it. Retain is an interval for `time`/`uuidv7` and a count of intervals for `id`.
-`null` keeps everything.
+Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops partitions
+past it. Retain is an interval for `time`/`uuidv7` and a count of intervals for `id`. `null` keeps
+everything.
 
 ```sql
 update pgpm.config set retain = '90 days' where parent_table = 'public.events'::regclass;
 ```
 
-Retain uses plain `DROP` (a brief lock). `DETACH ... CONCURRENTLY` cannot run inside a function,
-so for very large cold partitions you may prefer to detach them concurrently by hand.
+Retain drops a partition only when its **whole range** is older than the horizon, using plain `DROP` (a
+brief lock). Two consequences in the monolith model:
 
-Retention also bounds storage when the drain is behind. If a closed interval ages past the policy
-while it is still in the `DEFAULT` (the drain has not reached it yet), the drain reclaims it in place:
-it `DELETE`s the aged rows straight out of the `DEFAULT`, paced exactly like a normal drain microbatch,
-instead of materializing a partition only to `DROP` it next tick. So aged rows are reclaimed even when
-they never made it out of the `DEFAULT`, and there is no materialize-then-drop churn. This runs as part
-of the drain (logged as `retain_reclaim`), so it only happens while maintenance is running.
+- **Retention is suspended over un-refined coarse history.** A coarse monolith spanning the horizon is
+  not dropped (it still holds within-horizon data), so its aged span is not reclaimed until you refine
+  it. Refine is retention-aware: it reclaims the below-horizon sub-ranges directly instead of
+  materializing partitions only to drop them. So on a table you want aggressively retained, enable
+  auto-refine (or refine by hand) to let retention reach the history.
+- **The assistant drain reclaims aged strays in place.** If a stray ages past the horizon while still in
+  the `DEFAULT`, the drain `DELETE`s it straight out (logged `retain_reclaim`) rather than materializing a
+  doomed partition.
 
-**Retention is a standing floor, not just an aging process.** The policy is "no data with a control
-value below the horizon persists" -- aging is just the usual way rows cross that line. A row inserted
-with a control value *already* past the horizon (a backdated record, or a late-arriving event) is
-therefore subject to retention immediately: the next maintenance cycle reclaims it, exactly as any
-retention system would (a `DELETE` cron or `pg_partman` drop the same row the same way). This is not a
-loss to recover from -- it is the policy you asked for ("keep only N"), applied to data that was born
-expired. The `INSERT` still succeeds; a later, separate maintenance transaction removes the row per
-policy. If you need late-arriving data kept for a window *from arrival*, retain on an ingestion
-timestamp (so the control column is when pgpm saw the row, not when the event happened) rather than on
-event time, or widen the policy.
+**Retention is a standing floor, not just an aging process.** The policy is "no data with a control value
+below the horizon persists" -- aging is just the usual way rows cross that line. A row inserted with a
+control value *already* past the horizon (a backdated or late-arriving record) is subject to retention
+immediately: the next maintenance cycle reclaims it, exactly as any retention system would. The `INSERT`
+succeeds; a later, separate maintenance transaction removes the row per policy. If you need late-arriving
+data kept for a window *from arrival*, retain on an ingestion timestamp rather than event time, or widen
+the policy.
 
 ## Incoming foreign keys
 
 If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
 those FKs are handled, not ignored. Because `transmute` never rewrites the primary key, the referenced
-unique key always survives partitioning, so an incoming FK to the primary key is always preservable:
-no composite key, no denormalization, ever.
+unique key always survives partitioning, so an incoming FK to the primary key is always preservable: no
+composite key, no denormalization, ever.
 
-There is one mechanical wrinkle. The drain moves the closed tail through a standalone,
-not-yet-attached child table, so a referenced row is briefly outside the parent while it is moved,
-which a `NO ACTION` FK rejects. The FK therefore cannot ride through the conversion in place: it is
-dropped for the duration and re-added against the new parent once the drain is done.
+There is one mechanical wrinkle. Maintenance that moves referenced rows -- the assistant drain, and a
+cross-tick refine -- moves them through a standalone, not-yet-attached child, so a referenced row is
+briefly outside the parent, which a `NO ACTION` FK would reject and a `CASCADE`/`SET NULL` FK would
+silently honour. So the FK cannot ride through in place: it is dropped for the conversion and re-added
+against the new parent.
 
 `transmute` offers two modes for incoming FKs:
 
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
-- **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the
-  referencing table is otherwise untouched), then re-add it against the new parent once the drain is
-  idle.
+- **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the referencing
+  table is otherwise untouched), then re-add it against the new parent once maintenance is idle.
 
-With `'preserve'`, once the closed tail has fully drained, `pgpm.restore_incoming_fks(parent)` re-adds
-each FK against the new parent (`NOT VALID` + `VALIDATE`). `maintain` calls `restore_incoming_fks`
-automatically, so on the scheduled path you do nothing; on the synchronous path, call it yourself
-after `drain_all`:
+With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK once the closed tail has drained;
+`maintain` calls it automatically, so on the scheduled path you do nothing. It is a no-op until the drain
+is quiescent (no closed rows in the `DEFAULT`, no in-flight child), so it is safe to call early or
+repeatedly. Because the monolith holds every referenced row attached from the moment of cutover, with no
+closed tail to wait for, the FK is typically restorable immediately after transmute.
 
 ```sql
 select pgpm.transmute('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
-select pgpm.drain_all('public.events', p_include_open => true);
 select pgpm.restore_incoming_fks('public.events');   -- maintenance does this for you on the cron path
 ```
 
-`restore_incoming_fks` is a no-op until the drain is quiescent (no closed rows in the DEFAULT, no
-in-flight child partition), so it is safe to call early or repeatedly. An incoming FK that references
-a non-PK key that cannot survive partitioning is refused by `'preserve'` with guidance.
-
 Two honest points about the window the FK is dropped:
 
-- **RI is off on the referencing table for the whole drain.** The FK must be dropped while the drain
-  moves referenced rows (a live `NO ACTION` FK would block the move, a `CASCADE`/`SET NULL` would
-  silently mutate the referencing side), and the drain may run a long time (or never finish under tight
-  supply). So writes to the referencing table go unchecked during that window, and `status().fks_suspended`
-  surfaces it. `'preserve'` is opt-in; if the referencing table takes heavy writes, bound the window
-  with `drain_all` in a maintenance window, or `pause`.
+- **RI is off on the referencing table while the FK is down.** Writes to the referencing table go
+  unchecked during that window, and `status().fks_suspended` surfaces it. `'preserve'` is opt-in; if the
+  referencing table takes heavy writes, keep the window short (restore promptly) or `pause`.
 - **An orphan written during that window will not brick the restore.** The re-add is split: `ADD
   CONSTRAINT ... NOT VALID` (which already enforces every *new* write) is committed separately from
-  `VALIDATE` (which scans existing rows). If a pre-existing orphan blocks `VALIDATE`, the FK is left
-  `NOT VALID` -- back to enforcing new writes, surfaced by `status().fks_unvalidated` -- rather than
-  rolled back into a silent forever-deferred drop. List the blockers with
-  `pgpm.incoming_fk_orphans(parent)`, remove them, then finish with `pgpm.validate_incoming_fks(parent)`:
+  `VALIDATE`. If a pre-existing orphan blocks `VALIDATE`, the FK is left `NOT VALID` (still enforcing new
+  writes, surfaced by `status().fks_unvalidated`) rather than rolled back. List blockers with
+  `pgpm.incoming_fk_orphans(parent)`, remove them, then `pgpm.validate_incoming_fks(parent)`:
 
 ```sql
 select * from pgpm.incoming_fk_orphans('public.events');   -- which FK, how many orphan rows
@@ -354,223 +375,163 @@ select * from pgpm.incoming_fk_orphans('public.events');   -- which FK, how many
 select pgpm.validate_incoming_fks('public.events');        -- validates the now-clean FKs
 ```
 
-For the full step-by-step recovery (what to run, in order, when an alert says an incoming FK is
-unvalidated), follow the runbook entry [Referential-integrity violations after a `preserve`
-drain](runbook.md#referential-integrity-violations-after-a-preserve-drain).
+For the full step-by-step recovery, see the runbook entry
+[Referential-integrity violations after a `preserve` drain](runbook.md#referential-integrity-violations-after-a-preserve-drain).
 
-After it is restored, `maintain` keeps a managed FK on a leash: a preserve-managed FK is live only
-while the closed tail is empty. If a later drain appears (for example obtain falls behind and rows
-land in the DEFAULT for an interval that then closes), `maintain` suspends the FK before draining
-(`pgpm.suspend_incoming_fks` keeps them safe across that drain) and restores it afterward, so the
-catch-up drain neither stalls nor (for a `CASCADE` / `SET NULL` FK) silently deletes or nulls the
-referencing rows. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved
-across this cycle.
+After it is restored, `maintain` keeps a managed FK on a leash: it is live only while the closed tail is
+empty. If a later drain appears (obtain falls behind and rows land in the `DEFAULT` for an interval that
+then closes), `maintain` suspends the FK before draining (`pgpm.suspend_incoming_fks`) and restores it
+afterward. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved across the
+cycle.
+
+> Note on auto-refine and preserve FKs: a cross-tick refine moves historical referenced rows the same way
+> the drain does, so the same leash should apply. If you run auto-refine on a table with a live
+> preserve-managed FK over the refined span, prefer refining by hand with the synchronous `refine()` (one
+> atomic transaction, no RI window), or keep the FK suspended (`pause`/`drain_all`-window) until the
+> refine completes.
 
 ## Secondary indexes
 
 `transmute` copies the old table's non-unique secondary indexes onto the parent as partitioned indexes
-(attaching the default's existing index, no rebuild), so they propagate to every partition. A unique
-secondary index is carried the same way **when its key includes the partition key** (so global
-uniqueness is genuinely preserved). One whose key excludes the partition key cannot be a partitioned
-unique index, so `transmute` **refuses** rather than silently dropping the guarantee: add the partition
-key to that index, or drop it, then re-transmute.
+(reusing the monolith's existing index, no rebuild), so they propagate to every partition, including the
+fine children that refine creates. A unique secondary index is carried the same way **when its key
+includes the partition key** (so global uniqueness is genuinely preserved). One whose key excludes the
+partition key cannot be a partitioned unique index, so `transmute` **refuses** rather than silently
+dropping the guarantee: add the partition key to that index, or drop it, then re-transmute.
 
 ## How the conversion stays online
 
 Two facts about Postgres drive the design:
 
 1. You cannot convert a table to partitioned in place, so transmute renames the live table, creates a
-   partitioned parent under the original name, and attaches the old table as the `DEFAULT`. No rows
+   partitioned parent under the original name, and attaches the old table as a bounded child. No rows
    move; the app sees no change.
-2. Adding a partition while the DEFAULT holds data forces a full scan of the DEFAULT under
-   `ACCESS EXCLUSIVE`, which would block the workload.
+2. Attaching a partition whose rows are not certified in range forces a scan under `ACCESS EXCLUSIVE`,
+   which would block the workload.
 
-pgpm sidesteps #2 for every range that receives no concurrent writes (closed past intervals on the
-drain, future intervals on obtain) with a scan-skip attach:
+pgpm sidesteps #2 with a scan-skip attach: certify the bound with a validated `CHECK` under the gentle,
+non-blocking `SHARE UPDATE EXCLUSIVE` lock *before* the attach, so the attach itself is metadata-only.
 
 ```sql
-ADD CONSTRAINT excl CHECK (control < lo OR control >= hi) NOT VALID  -- catalog only, instant
-VALIDATE CONSTRAINT excl                                            -- the scan, under SHARE UPDATE EXCLUSIVE (non-blocking)
-ATTACH / CREATE PARTITION ...                                       -- default scan skipped, metadata-only
-DROP CONSTRAINT excl
+ADD CONSTRAINT b CHECK (control >= lo AND control < hi) NOT VALID  -- catalog only, instant
+VALIDATE CONSTRAINT b                                              -- the scan, under SHARE UPDATE EXCLUSIVE (non-blocking)
+ATTACH PARTITION ...                                               -- scan skipped, metadata-only
 ```
 
-The one rule that keeps this safe: never exclude the interval currently receiving writes (a
-`NOT VALID` CHECK is enforced on new rows, so excluding the live range would reject writes routing to
-the DEFAULT). So the active interval simply lives in the DEFAULT until it closes, then drains as a
-closed tail. Measured on PG 15 (4M-row default): plain attach 101 ms under `ACCESS EXCLUSIVE` vs
-scan-skip attach 0.43 ms. The full rationale is in [DESIGN.md](../DESIGN.md).
+The monolith attaches this way at transmute (one online scan of the original). `obtain`'s forward
+partitions need no scan at all, because the `DEFAULT` they would be checked against is empty (this is why
+keeping the `DEFAULT` empty matters). Refine's fine children are born with their bound `CHECK`, so they
+too attach metadata-only. The one rule that keeps it safe: never certify a range that is still receiving
+writes -- the monolith covers up to `B` (a boundary above the frontier) precisely so the current interval
+lives inside it, and refine only touches frozen children.
 
-## Read consistency during a drain
+## Read consistency during a move
 
-This is the one correctness caveat worth understanding before you rely on pgpm. We would rather state
-it plainly than bury it.
+This is the one correctness caveat worth understanding. We would rather state it plainly than bury it,
+and in this model it is much narrower than it used to be.
 
-**The gap.** The drain moves a closed interval out of the `DEFAULT` into a brand-new child table that
-is created *standalone* and only `ATTACH`ed to the parent once the whole interval has moved (it moves
-in paced microbatches; see [`drain_step`](reference.md#pgpmdrain_step)). Between the first microbatch
-and that final attach, the rows already moved are durable but live in an **unattached** table, and a
-query against the parent only scans attached partitions. So a plain `SELECT ... FROM parent` issued
-*mid-drain* **undercounts the interval being drained**, by however many of its rows have moved so far.
-The rows are never lost; they are temporarily not reachable through the parent.
+**The gap.** When maintenance moves rows between partitions across separate transactions -- the assistant
+drain evacuating a stray, or an **auto-refine** splitting a coarse child tick by tick -- the rows already
+moved live briefly in a standalone, not-yet-attached child. A query against the parent only scans attached
+partitions, so a plain `SELECT ... FROM parent` issued mid-move **undercounts** the range being moved. The
+rows are never lost; they are temporarily not reachable through the parent.
 
-**Why it is inherent.** Postgres has no way to make an unattached relation visible through a
-partitioned parent, and it will not attach a partition for `[lo, hi)` while the `DEFAULT` still holds
-rows in that range (a chicken-and-egg). Every alternative was tried (see [DESIGN.md](../DESIGN.md)
-section 8): there is no online, microbatched drain that keeps the interval continuously visible
-through the parent. pgpm chose paced and non-blocking and accepted this gap, rather than block the
-workload or risk silent loss from a copy-then-swap.
-
-**When there is no gap.** Only the interval *currently* draining is affected, and only while it
-drains. An interval small enough to drain in one batch attaches in the same transaction (no gap), and
-`drain_all()` runs the whole drain in one transaction (no gap, but it holds locks, so it is the
-synchronous "catch up now" path, not the online one). Reads of recent data are never affected: the
-drain only ever touches the old, closed tail.
+**When there is no gap.** The synchronous paths never open it: `refine()` and `refine_history()` run the
+whole split in one transaction (atomic), and `drain_all()` runs the whole drain in one transaction. The
+gap is specific to the *paced, cross-tick* paths (the scheduled drain and auto-refine), and only for the
+single range in flight, only while it moves. Reads of recent data are never affected: maintenance only
+ever moves old, closed ranges.
 
 **Reads: the `snapshot()` escape hatch.** If a consistency-sensitive reader (a `COUNT(*)`, a logical
-backup, a reconciliation) needs the complete set *during* a drain, query it inline:
+backup, a reconciliation) needs the complete set during a move, query it inline:
 
 ```sql
 select count(*) from pgpm.snapshot(null::public.events);  -- the parent UNION every in-flight child
 ```
 
 `snapshot()` is a read-only set-returning function that `UNION`s the parent with every in-flight,
-not-yet-attached child, so it sees the moved rows too. You pass the table as a typed-`NULL` anchor
-(`null::public.events`) rather than a name, because a function's row shape is fixed when the query is
-planned and cannot be inferred from a `regclass` value; `snapshot()` recovers the table from the
-anchor's type. It is **always fresh** (it rediscovers the in-flight child on every call, so it can
-neither double-count a child that has since attached nor miss a newly-started one) and leaves nothing
-behind. One honest cost worth knowing: it is an **optimization fence**. Because the in-flight child set
-is dynamic the body is dynamic SQL, so a `WHERE` on top does not push down into the union arms or use
-the in-flight child's `CHECK`-constraint exclusion; it materializes the union, then filters. That is
-fine for a `COUNT` or a full read, but for a heavily-filtered read on a large table a hand-written
-`select ... from parent union all select ... from <child> where ...` plans better.
+not-yet-attached child. You pass the table as a typed-`NULL` anchor (`null::public.events`) because a
+function's row shape is fixed at plan time and cannot be inferred from a `regclass` value. It is always
+fresh and leaves nothing behind. One honest cost: it is an **optimization fence** (the in-flight child set
+is dynamic, so a `WHERE` on top does not push down); fine for a `COUNT` or full read, but for a
+heavily-filtered read on a large table a hand-written `parent UNION ALL <child>` plans better.
 
-**Writes: there is no fix, and you should know that.** The write side of the gap is narrow but real,
-and it helps to be exact about what is and isn't affected. A fresh `INSERT` is never affected: a new
-row (even a back-dated one whose key lands in the draining range) routes to the `DEFAULT`, and the next
-drain batch sweeps it up. What bites is an `UPDATE` or `DELETE` through the parent that targets a row
-*already moved* into the unattached child: it finds **no row** and is a silent no-op (reports `0 rows
-affected`) until the interval attaches. `snapshot()` cannot help here; it is read-only, and you cannot
-write through it. One sharper edge: an `INSERT ... ON CONFLICT (pk)` (upsert) that targets an
-already-moved row won't find it in the parent, takes the INSERT path, and writes a *duplicate* key into
-the `DEFAULT`; the next drain batch then tries to move that key into the child, which already holds it,
-and the drain **stalls on a duplicate-key error**. So on a table that upserts into historical ranges
-the gap is not merely a no-op, it can wedge the drain.
-
-**Does this affect you?** The deciding question is not "is the data old," and not even strictly "is the
-closed tail immutable," but **"does a row settle before its interval closes?"** Three common shapes
-clear that bar:
-
-- **Append-only facts** (logs, events, metrics, audit, clickstream), the canonical reason to reach for
-  time-range partitioning. Old rows are never mutated, so the gap is unreachable.
-- **Mutable but time-local entity tables** (`orders`, tickets, subscriptions) whose rows churn near
-  creation and then freeze. That churn happens while the interval is still *open*, where the rows live
-  in the fully-writable `DEFAULT` with no gap; by the time the interval closes and drains, they are
-  frozen. The lever is the **partition interval**: size it coarser than your mutation-settling window
-  (monthly partitions for orders that settle within days) and the churn lands entirely in the open
-  interval. A daily partition on that same table would let more mutation happen after close. The drain
-  reinforces this: it only ever moves *closed* intervals, oldest-first, and never the open one that
-  writes are still landing in, so the rows it has in flight are always the most-settled, never the
-  range under active write.
-- **`DROP`-based retention**, which is what pgpm does (`retain` drops whole partitions), so the one
-  routine write to old rows never happens as DML. `retain` drops the *oldest attached* partitions while
-  the drain operates on the unattached in-flight child, so the two never collide.
-
-Even when a mutation does land in the danger window the footprint is small: at most one interval is
-exposed at a time, only during its drain, and only for writes to already-moved rows. The genuine
-exposure is tables that mutate **arbitrarily old** rows, a ledger with backdated adjustments, a
-document store editing years-old rows, anything that upserts into historical ranges. No partition
-interval is coarse enough to localize that. For those, drive the interval to completion with
-`drain_all()` (one transaction, no gap) before the writes, `pause` the table while you do, or partition
-on a different axis.
+**Writes: there is no fix for the paced path.** A write through the parent that targets a row *already
+moved* into an unattached child finds no row and is a silent no-op until the interval attaches; an
+`INSERT ... ON CONFLICT` (upsert) on such a key can write a duplicate that later wedges the move on a
+duplicate-key error. A fresh `INSERT` is never affected (it routes to the `DEFAULT` and the next batch
+sweeps it). If you mutate **arbitrarily old** rows (a ledger with backdated adjustments, a document store
+editing years-old rows), prefer the synchronous `refine()`/`drain_all()` (one transaction, no gap) and
+`pause` the table while you do, or partition on a different axis.
 
 ## WAL and checkpoint sizing
 
-The drain rewrites rows (a cross-partition `DELETE` + `INSERT`), so a conversion is a burst of WAL
-concentrated over the drain window. If `max_wal_size` is small relative to that WAL rate (plus your
-ambient write load), Postgres fires *requested* (forced) checkpoints whenever WAL hits the limit,
-rather than the gentle *timed* checkpoints paced by `checkpoint_timeout`. A forced checkpoint flushes
-a burst of dirty buffers; on a throughput-limited disk that flush can stall the workload for seconds.
-At scale this, not the drain's row movement, is usually the worst latency you will see.
+Moving rows rewrites them (a cross-partition `DELETE` + `INSERT`), so a **refine** is a burst of WAL
+concentrated over the refine window (the steady-state assistant drain is tiny by comparison). If
+`max_wal_size` is small relative to that WAL rate plus your ambient write load, Postgres fires *requested*
+(forced) checkpoints whenever WAL hits the limit, rather than gentle *timed* checkpoints. A forced
+checkpoint flushes a burst of dirty buffers; on a throughput-limited disk that flush can stall the
+workload for seconds. At scale this, not the row movement itself, is usually the worst latency you see.
 
-How to tell, during or after a conversion:
+How to tell:
 
 ```sql
 -- PG 17+; on 15/16 use pg_stat_bgwriter.checkpoints_req / checkpoints_timed
 select num_requested, num_timed from pg_stat_checkpointer;
 ```
 
-A meaningful and growing `num_requested` means `max_wal_size` is too small for your write rate.
+A meaningful and growing `num_requested` means `max_wal_size` is too small for your write rate. What to do:
 
-What to do:
-
-- **Raise `max_wal_size`** so checkpoints are time-driven, not size-driven. Rough target:
-  `max_wal_size >= peak_WAL_rate x checkpoint_timeout`, with headroom. This makes checkpoints regular
-  and spread (by `checkpoint_completion_target`, default 0.9) instead of bursty, and cuts WAL
-  write-amplification (fewer checkpoints means fewer full-page images). The cost is longer crash
-  recovery and more `pg_wal` disk.
-- **`checkpoint_timeout` is a secondary, situational knob.** Raising it cuts checkpoint frequency
-  further but trades more recovery time, and only helps when paired with a large enough `max_wal_size`.
-- **Scaling compute is the natural moment to revisit `max_wal_size`.** A bigger instance usually means
-  a higher write rate (fills `max_wal_size` faster) and, on managed platforms, a higher disk-throughput
-  ceiling that absorbs checkpoint flushes better. On Supabase, `max_wal_size` and `checkpoint_timeout`
-  are not scaled by compute tier (both stay at the 4GB / 5min defaults); set them yourself via the CLI,
-  which reloads without a restart:
+- **Raise `max_wal_size`** so checkpoints are time-driven. Rough target:
+  `max_wal_size >= peak_WAL_rate x checkpoint_timeout`, with headroom. The cost is longer crash recovery
+  and more `pg_wal` disk. On Supabase, `max_wal_size`/`checkpoint_timeout` are not scaled by tier; set
+  them via the CLI (reloads without restart):
 
   ```bash
   supabase --experimental --project-ref <ref> postgres-config update --config max_wal_size=16GB
   ```
 
-- **Or let pgpm throttle the producer instead.** `pgpm.set_drain_adaptive(parent, true)` paces the
-  drain's own WAL down when it outruns what the checkpointer can sustain (see
-  [Adaptive feathering](#adaptive-feathering-let-the-drain-tune-itself)). It is the complementary lever
-  when you cannot raise `max_wal_size` enough or the disk simply cannot keep up; raising `max_wal_size`
-  is the better fix when you can, and the two compose (raise the budget, keep adaptive as a safety net).
+- **Or let pgpm throttle the producer.** Adaptive feathering paces the work's own WAL down when it
+  outruns what the checkpointer can sustain, and auto-refine spreads the refine across ticks so the WAL
+  burst becomes a trickle. The two compose: raise `max_wal_size` when you can, keep adaptive as a safety
+  net.
 
 ## Operations and troubleshooting
 
-For step-by-step procedures to run when an alert fires, see the [runbook](runbook.md). The notes below
-are the quick reference.
+For step-by-step procedures when an alert fires, see the [runbook](runbook.md). Quick reference:
 
-- **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`.
-  A paused table is registered but untouched by `maintain` (you can still drive `drain_*`
-  manually).
-- **The closed tail is growing.** `check_default()` shows `closed_rows > 0`: the table is unpaused
-  but the drain is not keeping up. Raise `drain_batch`, run the cron more often, or run
-  `drain_all()` once to catch up.
-- **Re-transmuting a table fails with an "orphan" error.** A drain creates each child partition as a
-  standalone table and attaches it only when that interval finishes draining. If a drain is
-  interrupted and you then `DROP TABLE <parent> CASCADE` and recreate the table, the un-attached
-  child survives the cascade (it has no dependency on the parent) and a re-transmute would collide on its
-  stale keys. `transmute` detects this and refuses up front; drop the named orphan table and retry.
-- **Finishing the current period.** Normal maintenance never drains the open interval. To convert a
-  table completely (including the in-progress interval), run
-  `drain_all(parent, p_include_open => true)`; the open interval attaches via a brief blocking
-  attach, cheapest done last against a small default.
+- **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`. A
+  paused table is registered but untouched by `maintain` (you can still drive `drain_*`/`refine` by hand).
+- **A stray is stuck in the `DEFAULT`.** `check_default()` shows `closed_rows > 0`: the table is unpaused
+  but the assistant drain has not evacuated it. Raise `drain_batch`, run the cron more often, or
+  `drain_all()` once.
+- **History is not being split.** `status().history_unrefined` is true and you want fine partitions:
+  enable auto-refine (`set_refine`) or run `refine_history` by hand once the monolith has frozen.
+- **Re-transmuting a table fails with an "orphan" error.** A drain or interrupted refine creates child
+  partitions as standalone tables before attaching them; an un-attached child survives a `DROP TABLE
+  <parent> CASCADE`. `transmute` detects a leftover and refuses up front; drop the named orphan and retry.
 
 ## Caveats and v1 scope
 
-- **Dimensions:** `time` (interval step; whole-month or fixed-duration; mixing is rejected), `id`
-  (bigint/numeric step), `uuidv7`/ULID-as-uuid (time grid, uuid bounds). `float`/`double` rejected.
-  Other sortable encodings are not built in; partition on a companion column.
+- **Dimensions:** `time` (interval step; whole-month or fixed-duration; mixing rejected), `id`
+  (bigint/numeric step), `uuidv7`/ULID-as-uuid (time grid, uuid bounds). `float`/`double` rejected; other
+  encodings partition on a companion column.
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
-  clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the DEFAULT safety
-  net absorb stragglers. Arbitrary backdated keys break it.
-- **Empty DEFAULT kept as a safety net** (`keep_default`). In steady state obtain stays ahead so the
-  DEFAULT stays empty; `check_default()` flags any stray row.
-- **Retain uses plain `DROP`** (a brief lock); detach huge cold partitions concurrently by hand.
-- **Unique secondary indexes** are carried when their key includes the partition key; one that excludes
-  it is refused (a partitioned unique index must include the partition key), never silently dropped.
-- **The primary key is never rewritten.** The control column must already be part of the table's
-  primary key; a table with no primary key, or a PK that excludes the control column, is refused. See
-  [transmute a table](#transmute-a-table).
-- **Incoming foreign keys**: refused by default, or preserved (dropped for the conversion and re-added
-  against the new parent) with `p_incoming_fks => 'preserve'`; see above.
-- **Reads undercount mid-drain; writes to moved rows no-op.** A `SELECT` against the parent while an
-  interval is draining misses its already-moved rows (use [`snapshot()`](#read-consistency-during-a-drain)
-  for a complete read); a write targeting such a row is a silent `0 rows` no-op until it attaches, with
-  no fix. Both are inherent to the online drain. See
-  [Read consistency during a drain](#read-consistency-during-a-drain).
-- Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by
-  default).
+  clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the `DEFAULT` net absorb
+  stragglers. Arbitrary backdated keys break it.
+- **The cutover is online but not instant:** one non-blocking, read-only scan of the original, then a
+  brief metadata cutover. No row movement, no PK rewrite, no index rebuild.
+- **The history starts coarse.** It is one monolith partition until refined; until then, pruning and
+  fine-grained retention are suspended over its span. A coarse monolith is a valid permanent state.
+- **Refine needs transient disk** (about 2x the span being refined) and copies the rows; the synchronous
+  path is atomic and gap-free, the paced auto-refine path opens the narrow read-consistency gap below.
+- **The empty `DEFAULT` is the safety net** (`keep_default`); `check_default()` flags any stray.
+- **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on refine.
+- **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.
+- **The primary key is never rewritten;** the control column must already be part of it.
+- **Incoming foreign keys** are refused by default, or preserved (dropped for the conversion, re-added
+  against the new parent) with `p_incoming_fks => 'preserve'`.
+- **Mid-move reads undercount on the paced paths; writes to moved rows no-op.** Inherent to an online
+  move; see [Read consistency during a move](#read-consistency-during-a-move). The synchronous paths avoid
+  it entirely.
+- Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by default).
