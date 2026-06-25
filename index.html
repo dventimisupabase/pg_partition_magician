@@ -130,7 +130,7 @@
     .card .lbl { font-family: var(--font-mono); font-size: 11px; color: #6B6357; letter-spacing: 0.04em; }
     .card .rows { height: 4px; border-radius: 2px; background: #D8D0BE; }
     .card .rows + .rows { margin-top: 5px; width: 70%; }
-    /* role coding survives on the ivory faces via the label: bronze = the original DEFAULT, green = the new partitions */
+    /* role coding survives on the ivory faces via the label: bronze = the original table (now the monolith), green = the new fine partitions */
     .card.is-default { border-color: #D8CBA8; background: linear-gradient(160deg, #F7F1E1, #EFE8D5); }
     .card.is-default .lbl { color: #8A6A2E; }
     .card.is-part .lbl { color: #1E7A4D; }
@@ -405,7 +405,7 @@
       <div>
         <span class="eyebrow">Pure SQL · pg_cron only</span>
         <h1 class="display">Now a table<br>Now partitions<br>No <em>magic</em> necessary</h1>
-        <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned one, online. Your live table becomes the <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">DEFAULT</code> partition; pgpm keeps partitions ahead of your writes and drains the backlog behind the scenes.</p>
+        <p class="lede">pg_partition_magician transmutes an existing Postgres table into a native RANGE-partitioned one, online. Your live table is kept intact as one bounded <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">MONOLITH</code> partition, no rows move; pgpm keeps fresh partitions ahead of your writes, and refines the history into fine partitions on demand.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="install.html">Install</a>
           <a class="btn btn-ghost" href="https://github.com/dventimisupabase/pg_partition_magician" target="_blank" rel="noopener">
@@ -418,7 +418,7 @@
 
       <div class="stage">
         <div class="fan" id="fan" aria-hidden="true">
-          <div class="card is-default"><div><div class="suit">♠</div><div class="lbl">DEFAULT</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
+          <div class="card is-default"><div><div class="suit">♠</div><div class="lbl">MONOLITH</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit red">♦</div><div class="lbl">2026_03</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit">♣</div><div class="lbl">2026_04</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
           <div class="card is-part"><div><div class="suit red">♥</div><div class="lbl">2026_05</div></div><div><div class="rows"></div><div class="rows"></div></div></div>
@@ -459,14 +459,14 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>transmute</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>transmute()</code> renames your live table aside (<code>events</code> &rarr; <code>events_default</code>) and builds a partitioned parent under the <em>same name</em>, with the old table attached as its <code>DEFAULT</code>. Same name, same rows, a catalog-only swap the app never sees. The one requirement: the partition key must already be in the primary key (move 3); if not, <code>transmute</code> refuses and tells you how, rather than mangling it. And it reverses cleanly, until the first real partition exists, <code>untransmute</code> puts the table back exactly as it was.</p>
+            <p><code>transmute()</code> renames your live table aside and builds a partitioned parent under the <em>same name</em>, attaching the old table intact as one bounded <em>monolith</em> child that holds the whole history, with a fresh empty <code>DEFAULT</code> as the safety net. No rows move: same name, same data, a catalog-only swap the app never sees. The one requirement: the partition key must already be in the primary key (move 3); if not, <code>transmute</code> refuses and tells you how, rather than mangling it. And it reverses cleanly, while the monolith still holds the whole table, <code>untransmute</code> puts it back exactly as it was.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
               <div class="app"><code>SELECT &hellip; FROM events</code><span class="arr">&darr;</span></div>
               <div class="swapstage">
                 <div class="box parent stage-2"><span class="tag">events &middot; PARTITIONED</span></div>
-                <div class="box def stage-1"><span class="tag tag-rename">events <span class="becomes">&rarr; events_default</span></span><span class="pin">DEFAULT</span><i class="rows"></i><i class="rows"></i></div>
+                <div class="box def stage-1"><span class="tag tag-rename">events <span class="becomes">&rarr; the monolith</span></span><span class="pin">MONOLITH</span><i class="rows"></i><i class="rows"></i></div>
               </div>
             </div>
           </figure>
@@ -493,22 +493,22 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">4</span> The one rule of the act</span>
             <h3>Never touch the interval that's live.</h3>
-            <p>Everything keys off the <b style="color:var(--brass)">frontier</b>: the line between settled past and live present. Intervals behind it are <b style="color:var(--green)">closed</b>, safe to rebuild into real partitions; the one <em>straddling</em> it is <b style="color:var(--brass)">open</b>, still taking writes, and pgpm's lone rule is to leave it be. New rows land in a partition <b style="color:var(--green)">obtained</b> ahead, or in <code>DEFAULT</code>. Once the frontier passes and the interval closes, only <em>then</em> is it reorganized.</p>
+            <p>Everything keys off the <b style="color:var(--brass)">frontier</b>: the line between settled past and live present. Behind it sits the <b style="color:var(--green)">closed</b> history, in one coarse <b style="color:var(--brass)">monolith</b>, safe to refine into fine partitions whenever you like; the one <em>straddling</em> it is <b style="color:var(--brass)">open</b>, still taking writes, and pgpm's lone rule is to leave it be. Ahead of it, partitions are <b style="color:var(--green)">obtained</b> in advance, so new rows always land in a real partition (only a stray falls to the empty <code>DEFAULT</code> net). Nothing is reorganized until it has closed.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-frontier">
               <div class="writes"><span class="arr">writes &darr;</span></div>
               <div class="timeline">
-                <div class="ival part">Jan</div>
+                <div class="ival tail">Jan<span class="mini">in monolith</span></div>
                 <div class="ival part">Feb</div>
-                <div class="ival tail">Mar<span class="mini">in DEFAULT</span></div>
+                <div class="ival part">Mar</div>
                 <div class="ival open">Apr<span class="mini">open &middot; live</span></div>
                 <div class="ival future">May</div>
                 <div class="ival future">Jun</div>
                 <div class="frontier"><span>frontier &middot; now</span></div>
               </div>
               <div class="axis"></div>
-              <div class="legend"><span class="k part">real partition</span><span class="k tail">closed tail &middot; DEFAULT</span><span class="k open">open</span><span class="k future">obtained ahead</span></div>
+              <div class="legend"><span class="k part">fine partition</span><span class="k tail">in the monolith</span><span class="k open">open</span><span class="k future">obtained ahead</span></div>
             </div>
           </figure>
         </div>
@@ -518,7 +518,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">5</span> The misdirection</span>
             <h3>Attaching a partition looks like it needs a full scan. It doesn't.</h3>
-            <p>A normal <code>ATTACH</code> scans all of <code>DEFAULT</code> under <code>ACCESS EXCLUSIVE</code> to prove no row belongs in the new partition. pgpm proves it first: <code>CHECK&nbsp;&hellip;&nbsp;NOT&nbsp;VALID</code> is instant, then <code>VALIDATE</code> scans under a gentle <code>SHARE UPDATE EXCLUSIVE</code> lock that lets reads <em>and</em> writes continue, so the <code>ATTACH</code> skips its scan. A 4M-row attach: <strong style="color:var(--fg)">101&nbsp;ms &rarr; 0.4&nbsp;ms</strong>.</p>
+            <p>A normal <code>ATTACH</code> scans the whole table being attached under <code>ACCESS EXCLUSIVE</code> to prove every row honors the bound. pgpm proves it first: <code>CHECK&nbsp;&hellip;&nbsp;NOT&nbsp;VALID</code> is instant, then <code>VALIDATE</code> scans under a gentle <code>SHARE UPDATE EXCLUSIVE</code> lock that lets reads <em>and</em> writes continue, so the <code>ATTACH</code> skips its scan. The same move attaches the monolith at cutover and every refined partition after. A 4M-row attach: <strong style="color:var(--fg)">101&nbsp;ms &rarr; 0.4&nbsp;ms</strong>.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-lock">
@@ -536,13 +536,13 @@
         <!-- 6 -->
         <div class="beat reveal">
           <div class="beat-copy">
-            <span class="move"><span class="move-n">6</span> Vanishing the backlog &middot; <code>drain</code></span>
-            <h3>The old rows leave <code>DEFAULT</code> a chunk at a time.</h3>
-            <p>The closed tail leaves <code>DEFAULT</code> in small microbatches, <code>DELETE&nbsp;&hellip;&nbsp;RETURNING</code> a chunk, <code>INSERT</code> it home, repeat, paced and pausable so the workload never blocks. One honest cost: until an interval finishes attaching, its already-moved rows sit in an unattached child, so a mid-drain read of the parent undercounts it. <code>pgpm.snapshot</code> reads the complete set.</p>
+            <span class="move"><span class="move-n">6</span> Reshaping the history &middot; <code>refine</code></span>
+            <h3>The coarse history splits into fine partitions, by copying.</h3>
+            <p>The history starts as one coarse monolith. <code>refine</code> splits it by <em>copying</em>: it reads a range into a fresh, born-validated partition, swaps it in, and drops the source, online and a chunk at a time. Because it copies instead of deleting, there are no dead tuples and no vacuum. It is optional, a coarse monolith is a correct, permanent state, and refine is what restores partition pruning and fine-grained retention. (The leading-edge <code>DEFAULT</code> stays empty; the assistant <code>drain</code> clears the rare stray that lands there.) One honest cost: a paced cross-tick refine moves rows through an unattached child, so a mid-move read of the parent undercounts the range in flight. <code>pgpm.snapshot</code> reads the complete set, and the synchronous <code>refine()</code> never opens the gap.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-drain">
-              <div class="box def drainbox"><span class="tag">DEFAULT</span><i class="lvl"></i><span class="chunk c1"></span><span class="chunk c2"></span><span class="chunk c3"></span></div>
+              <div class="box def drainbox"><span class="tag">MONOLITH</span><i class="lvl"></i><span class="chunk c1"></span><span class="chunk c2"></span><span class="chunk c3"></span></div>
               <div class="parts">
                 <div class="box part p1"><span class="tag">2026_01</span></div>
                 <div class="box part p2"><span class="tag">2026_02</span></div>
@@ -557,7 +557,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain_all</code></span>
             <h3>One <code>pg_cron</code> tick repeats every move, and shows its hands.</h3>
-            <p>One scheduled call ties it together: <b style="color:var(--green)">obtain</b> stocks the future, <b style="color:var(--green)">drain</b> empties the closed tail, <b style="color:var(--green)">retain</b> drops cold partitions, looping on <code>pg_cron</code> with every step written to <code>pgpm.log</code>, the magician keeping his hands open. It starts <em>paused</em>: <code>resume()</code> to go live, <code>pause()</code> to stop.</p>
+            <p>One scheduled call ties it together: <b style="color:var(--green)">obtain</b> stocks the future, the assistant <b style="color:var(--green)">drain</b> keeps the <code>DEFAULT</code> empty, <b style="color:var(--green)">retain</b> drops cold partitions, and, once you enable it, <b style="color:var(--green)">refine</b> splits the history a chunk per tick, looping on <code>pg_cron</code> with every step written to <code>pgpm.log</code>, the magician keeping his hands open. It starts <em>paused</em>: <code>resume()</code> to go live, <code>pause()</code> to stop.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-loop">
@@ -622,19 +622,19 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>pgpm never rewrites the primary key, so the unique key an incoming FK references survives the conversion. With <code>p_incoming_fks =&gt; 'preserve'</code>, each FK is dropped for the move and re-added against the new parent once the drain is idle, no denormalization.</p></div>
+          <div><h3>Foreign keys, preserved</h3><p>pgpm never rewrites the primary key, so the unique key an incoming FK references survives the conversion. With <code>p_incoming_fks =&gt; 'preserve'</code>, each FK is dropped for any row movement and re-added against the new parent once the move is idle, no denormalization.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
-          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition stays. A row with no real partition lands there, never lost, and a check function flags it.</p></div>
+          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition is always present, and empty in steady state. A row with no real partition lands there, never lost, and a check function flags it.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13 13l4 4"/></svg></div>
-          <div><h3>One gap, in the open</h3><p>While an interval drains, its moved rows live in a not-yet-attached child, so a mid-drain read of the parent undercounts it, and a write to a moved row no-ops. <code>pgpm.snapshot</code> reads the complete set; append-only and time-local tables are immune, and nothing is lost.</p></div>
+          <div><h3>One gap, in the open</h3><p>While a paced move runs (the assistant drain, or a cross-tick refine), its rows live in a not-yet-attached child, so a mid-move read of the parent undercounts it, and a write to a moved row no-ops. <code>pgpm.snapshot</code> reads the complete set, the synchronous <code>refine()</code> and <code>drain_all()</code> never open the gap, and nothing is lost.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>192 tests on PostgreSQL 15-18, all three install channels, every partition kind.</p></div>
+          <div><h3>Proven across versions</h3><p>289 tests on PostgreSQL 15-18, all three install channels, every partition kind.</p></div>
         </div>
       </div>
     </div>
