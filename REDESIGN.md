@@ -270,21 +270,34 @@ default are **dropped**: the monolith is frozen and never drains, so nothing chu
 does not run inside transmute (no reason to, and the monolith covers up to `B`), but afterward it takes
 the cheap plain path because the `DEFAULT` is empty.
 
-### 12. The frozen-monolith rule and refinement policy
+### 12. The frozen-monolith rule and refinement policy (IMPLEMENTED)
+
+Built across PRs #116 (`refine`), #118 (budget-sized microbatches) and #119 (the auto-refine maintain
+policy). What shipped:
 
 Refinability is **derived, no flag**: a coarse row is refinable iff `coarse.hi <= _grid_floor(frontier)`
-(kind-aware), which `maintain` evaluates from the frontier it already computes each tick. The monolith
-freezes once the frontier crosses `B`.
+(kind-aware), which `refine_step` evaluates from the frontier `maintain` already computes each tick. The
+monolith freezes once the frontier crosses `B`.
 
 - **Default off.** Refinement is the heavy roughly-2x operation, so it is operator-gated, consistent
-  with completion-being-optional. Manual is `pgpm.refine(...)` on the operator's schedule.
-- **Optional auto.** A config opt-in (`refine_enabled`, a target granularity, and a **disk-headroom
-  guard**) lets `maintain`, as a low-priority step after obtain/drain/retain, run one bounded
-  refinement step per tick on a frozen coarse child, **prioritized by the retention floor** (refine the
-  child the floor is crossing, so `retain` can then drop sub-ranges). The headroom guard refuses to
-  start a refinement that would not fit in free space, protecting fixed-disk operators.
-- `maintain` never blocks on this: not-frozen, `DEFAULT`-not-clear, or insufficient-headroom all defer
-  cleanly.
+  with completion-being-optional. Manual is `pgpm.refine(...)` / `pgpm.refine_history(...)` on the
+  operator's schedule (synchronous, one transaction, atomic and gap-free).
+- **Optional auto (shipped).** `config.refine_to` (set via `pgpm.set_refine(parent, target_step)`, null =
+  off) lets `maintain`, as a low-priority step after obtain/drain/retain/restore, run **one budget-sized
+  microbatch per tick** on the oldest frozen coarse child via `refine_step`, under the same adaptive
+  budget as the drain. The microbatch is the resumable unit (the state is the shrinking coarse child plus
+  the accumulating not-yet-attached fine children, like the drain's shrinking `DEFAULT`); pacing it across
+  ticks is the true unnoticeable feathering, at the cost of a transient `snapshot()`-covered gap while a
+  coarse child splits (section 9's trade, taken deliberately on the cross-tick path only).
+- `maintain` never blocks or errors on this: `refine_step` reports preconditions as soft statuses
+  (`active` = not frozen, `default_dirty` = a stray sits in the range, `nosubdiv`), and the step runs in
+  its own subtransaction, so a lock race or a soft status just retries next tick.
+
+Two refinements sketched here but **not yet built**, both safe to add later: a **disk-headroom guard**
+(refuse to start a refinement whose transient ~2x would not fit in free space, protecting fixed-disk
+operators) and **retention-floor prioritization** (refine the child the floor is crossing first). Today
+`maintain` simply takes the oldest (smallest-`lo`) frozen coarse child, which in practice is the one
+nearest the floor anyway.
 
 ### 13. `untransmute` under the new layout
 
@@ -325,16 +338,22 @@ The quiet payoff: because refinement copies-then-swaps and the drain is demoted 
 assistant, the `snapshot()` read gap nearly disappears, surviving only for that residual case, not the bulk
 (echoing section 9).
 
-## Build order
+## Build order (SHIPPED)
 
 The pieces are independently shippable, and the table is correct and online without refinement
-(strategy 1 is a valid terminal state), so they sequence naturally:
+(strategy 1 is a valid terminal state), so they sequenced naturally. All are now on `main`:
 
 1. **Naming and the overlap check** (sections 6, 7), plus transmute recording the monolith `pgpm.part`
-   row. Prerequisites for even the never-refine path.
+   row. Prerequisites for even the never-refine path. (PR #116)
 2. **The new transmute layout and ordering** (sections 1, 2, 11): the validated-`CHECK` monolith
-   attach, the fresh empty `DEFAULT`, the two simplifications.
-3. **The `untransmute` gate change** (section 13, Tier 1).
-4. **`status()` coarse-awareness** (section 14).
-5. **The `refine` primitive and hierarchical control** (sections 10, 12), last, because the table is
-   already correct, online, and partitioned in form without it.
+   attach, the fresh empty `DEFAULT`, the two simplifications. (PR #116)
+3. **The `untransmute` gate change** (section 13, Tier 1). (PR #116)
+4. **`status()` coarse-awareness** (section 14). (PR #116)
+5. **The `refine` primitive and hierarchical control** (sections 10, 12). (PR #116)
+6. **Retention-aware refine**: below-horizon sub-ranges reclaimed, never materialized. (PR #117)
+7. **Feathered copy**: refine moves in budget-sized microbatches (drain budget + block budget). (PR #118)
+8. **The auto-refine maintain policy** (section 12): `refine_step` + `config.refine_to` / `set_refine`,
+   one microbatch per `maintain` tick, true cross-tick pacing. (PR #119)
+
+Not yet built, noted in section 12: the disk-headroom guard and retention-floor prioritization for
+auto-refine. Tier 2 `untransmute` foldback (section 13) also remains a future option.
