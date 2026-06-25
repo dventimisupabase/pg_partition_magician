@@ -266,10 +266,21 @@ begin
 end;
 $$;
 
-create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text)
+-- _part_name maps a partition's NATIVE [lo, hi) to its child table name. A one-step range (hi is the
+-- next grid value after lo, the common fine partition) keeps the historical name _p<lo>; a wider range
+-- (a coarse / monolith child, REDESIGN.md section 6) is named _p<lo>_to_<hi> so it can never collide
+-- with the fine child at its low edge. Both bounds are formatted at the step's granularity. hi is
+-- optional: omitted (or equal to the one-step value) yields the fine name, so existing callers are
+-- unchanged. The name is a human-facing LABEL only -- pgpm.part holds the authoritative bounds, so the
+-- 63-byte identifier limit is cosmetic, never a correctness concern (a hash fallback is future work).
+drop function if exists pgpm._part_name(name, text, text, text);
+create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text,
+                                           p_hi_native text default null)
 returns name language plpgsql immutable as $$
-declare v_months int; v_secs double precision; fmt text;
+declare v_months int; v_secs double precision; fmt text; v_coarse boolean; v_lo text; v_hi text;
 begin
+  v_coarse := p_hi_native is not null
+          and pgpm._native_gt(p_kind, p_hi_native, pgpm._grid_next(p_kind, p_step, p_lo_native));
   if p_kind in ('time', 'uuidv7') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     v_secs   := extract(epoch from p_step::interval);
@@ -279,9 +290,19 @@ begin
     elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';
     else                                              fmt := 'YYYY_MM_DD_HH24MI';
     end if;
-    return (p_relname || '_p' || to_char(p_lo_native::timestamptz, fmt))::name;
+    v_lo := to_char(p_lo_native::timestamptz, fmt);
+    if v_coarse then
+      v_hi := to_char(p_hi_native::timestamptz, fmt);
+      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
+    end if;
+    return (p_relname || '_p' || v_lo)::name;
   else
-    return (p_relname || '_p' || lpad(floor(p_lo_native::numeric)::text, 19, '0'))::name;
+    v_lo := lpad(floor(p_lo_native::numeric)::text, 19, '0');
+    if v_coarse then
+      v_hi := lpad(floor(p_hi_native::numeric)::text, 19, '0');
+      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
+    end if;
+    return (p_relname || '_p' || v_lo)::name;
   end if;
 end;
 $$;
@@ -360,8 +381,17 @@ begin
   for k in 0 .. cfg.obtain loop
     if k > 0 then v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo); end if;
     v_hi   := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
-    v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
+    v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo, v_hi);
     continue when to_regclass(format('%I.%I', v_nsp, v_name)) is not null;
+    -- skip a candidate that overlaps an EXISTING attached partition (e.g. the coarse monolith that
+    -- covers the active interval, REDESIGN.md section 7). Half-open [v_lo,v_hi) overlaps [p.lo,p.hi)
+    -- iff p.hi > v_lo and v_hi > p.lo. Creating it would error on an overlapping partition; pgpm.part
+    -- is the source of truth, and the non-overlap invariant holds over attached rows only.
+    continue when exists (
+      select 1 from pgpm.part p
+       where p.parent_table = p_parent and p.attached
+         and pgpm._native_gt(cfg.control_kind, p.hi, v_lo)
+         and pgpm._native_gt(cfg.control_kind, v_hi, p.lo));
     v_lo_lit := pgpm._encode(cfg.control_kind, v_lo);
     v_hi_lit := pgpm._encode(cfg.control_kind, v_hi);
     -- skip a range the DEFAULT still holds data for (only the active interval)
