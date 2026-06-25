@@ -1,15 +1,15 @@
 # pg_partition_magician operational runbook
 
-Symptom-driven, step-by-step procedures for operators. When something alerts you, find the matching
-entry and follow the steps top to bottom. This is the "do this, then this" book, deliberately distinct
-from the other docs:
+Symptom-driven, step-by-step procedures for operators. When something alerts you, find the matching entry
+and follow the steps top to bottom. This is the "do this, then this" book, deliberately distinct from the
+other docs:
 
 - the [README](../README.md) is the front door;
 - the [user guide](guide.md) explains the *concepts* and how to use pgpm;
 - the [reference](reference.md) documents *every* function and catalog object;
 - the [explainer](https://dventimisupabase.github.io/pg_partition_magician/) is the visual overview;
-- **this runbook** is what you reach for at 2am, when you do not want to reconstruct a procedure from
-  bits scattered across the others.
+- **this runbook** is what you reach for at 2am, when you do not want to reconstruct a procedure from bits
+  scattered across the others.
 
 Every entry has the same shape: **Symptom** (how you noticed) -> **What it means** (one paragraph) ->
 **Steps** (numbered, copy-paste) -> **Verify** -> **Prevent**.
@@ -17,6 +17,9 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 ## Entries
 
 - [Referential-integrity violations after a `preserve` drain](#referential-integrity-violations-after-a-preserve-drain)
+- [The history is not splitting into fine partitions](#the-history-is-not-splitting-into-fine-partitions)
+- [A stray is stuck in the DEFAULT (the drain is behind)](#a-stray-is-stuck-in-the-default-the-drain-is-behind)
+- [Disk is filling during a refine](#disk-is-filling-during-a-refine)
 
 ## Referential-integrity violations after a `preserve` drain
 
@@ -24,15 +27,15 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 `NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `validate_incoming_fk_blocked`
 rows; or a periodic RI audit (or an application error) flags dangling references into the parent.
 
-**What it means.** You converted with `p_incoming_fks => 'preserve'`. While pgpm drained the closed
-tail, the incoming FK was dropped, so referential integrity was off on the referencing table for that
-window. (This is by design and is itself visible as `status().fks_suspended`; see the guide's
-[incoming foreign keys](guide.md#incoming-foreign-keys).) When the drain reached quiescence, pgpm
-re-added the FK so it once again enforces every *new* write (as `NOT VALID`), but it could not fully
-*validate* the constraint because rows that violate it were written during the window. Those orphans
-are real RI violations to reconcile. New writes are already guarded again; you are cleaning up the
-historical rows. The attribution is exact: the FK was valid when pgpm dropped it, so any orphan present
-now arose during the drain window.
+**What it means.** You converted with `p_incoming_fks => 'preserve'`. While pgpm moved referenced rows --
+the assistant drain evacuating a stray, or an auto-refine splitting the monolith -- the incoming FK was
+dropped, so referential integrity was off on the referencing table for that window. (This is by design and
+visible as `status().fks_suspended`; see the guide's
+[incoming foreign keys](guide.md#incoming-foreign-keys).) When the move reached quiescence, pgpm re-added
+the FK so it once again enforces every *new* write (as `NOT VALID`), but it could not fully *validate* the
+constraint because rows that violate it were written during the window. Those orphans are real RI
+violations to reconcile; new writes are already guarded again. The attribution is exact: the FK was valid
+when pgpm dropped it, so any orphan present now arose during the window.
 
 **Steps.**
 
@@ -42,9 +45,9 @@ now arose during the drain window.
    select parent, fks_suspended, fks_unvalidated from pgpm.status();
    ```
 
-   `fks_unvalidated > 0` for a parent means an incoming FK was re-added but is blocked from validation.
-   (If instead `fks_suspended > 0`, a drain is still in flight and the FK is currently fully dropped:
-   let the drain finish, or bound it, before reconciling -- see **Prevent**.)
+   `fks_unvalidated > 0` for a parent means an incoming FK was re-added but is blocked from validation. (If
+   instead `fks_suspended > 0`, a move is still in flight and the FK is currently fully dropped: let it
+   finish, or bound it, before reconciling -- see **Prevent**.)
 
 2. List the blocked foreign keys and how many orphan rows each has:
 
@@ -53,8 +56,8 @@ now arose during the drain window.
    -- referencing_table | constraint_name | orphan_rows
    ```
 
-3. Inspect the offending rows so you can decide what to do. For a single-column FK
-   (`reactions.event_id` referencing `events.id`, say):
+3. Inspect the offending rows so you can decide what to do. For a single-column FK (`reactions.event_id`
+   referencing `events.id`, say):
 
    ```sql
    select r.*
@@ -93,10 +96,169 @@ now arose during the drain window.
 
    The foreign key is fully valid again.
 
-**Prevent.** Referential integrity is necessarily off while a `preserve` drain runs: the FK must be
-dropped so the drain can relocate referenced rows through an unattached child, and that cannot be
-avoided. To shrink the window, drive the conversion to completion in a maintenance window with
-`select pgpm.drain_all('public.events', p_include_open => true);`, or `select pgpm.pause('public.events');`
-during heavy bursts of writes to the referencing table. If that table takes continuous heavy writes
-throughout a long conversion, prefer the default `p_incoming_fks => 'error'` and convert during a
-quieter period. Background: the guide's [incoming foreign keys](guide.md#incoming-foreign-keys).
+**Prevent.** Referential integrity is necessarily off while pgpm relocates referenced rows: the FK must be
+dropped so a row can move through an unattached child, and that cannot be avoided. In the monolith model
+the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
+(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later assistant drain or
+an auto-refine actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never
+accumulate; and refine by hand with the synchronous `select pgpm.refine_history('public.events');` (one
+atomic transaction, no RI window) instead of auto-refine, or `pause` heavy referencing-table write bursts
+while a refine runs. If that table takes continuous heavy writes throughout a long refine, prefer the
+default `p_incoming_fks => 'error'` and reconcile separately.
+
+## The history is not splitting into fine partitions
+
+**Symptom.** `pgpm.status()` shows `history_unrefined = true` and `coarse_partitions > 0` that does not
+fall; queries over old data do not prune to a single partition; retention is not reclaiming old data.
+
+**What it means.** After `transmute`, the history lives in one coarse **monolith** partition. That is a
+correct, permanent state, but pruning and fine-grained retention are suspended over its span until it is
+**refined** into proper partitions. If you want fine history, refine has either not been enabled, or it
+cannot make progress yet.
+
+**Steps.**
+
+1. See the backlog and whether auto-refine is on:
+
+   ```sql
+   select parent, coarse_partitions, history_unrefined from pgpm.status();
+   select parent_table, refine_to from pgpm.config where refine_to is not null;   -- auto-refine targets
+   ```
+
+2. If `refine_to` is null, the history is intentionally coarse. To split it, either enable paced
+   auto-refine or do it by hand once the monolith has **frozen** (the frontier has moved past its upper
+   bound `B`):
+
+   ```sql
+   select pgpm.set_refine('public.events', '1 month');   -- paced: one microbatch per maintain tick
+   -- or, synchronously now (atomic, one transaction):
+   select pgpm.refine_history('public.events');
+   ```
+
+3. If auto-refine is on but `coarse_partitions` is not falling, check why a tick is not progressing in
+   `pgpm.log`:
+
+   ```sql
+   select at, action, method from pgpm.log
+    where parent_table = 'public.events'::regclass and action in ('refine_skip', 'refine')
+    order by id desc limit 10;
+   ```
+
+   - A `maintain` summary of `refine=active` means the monolith has **not frozen yet** (the current
+     interval still lands in it); it will refine once the frontier crosses `B`.
+   - `refine=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the assistant
+     drain clear it (see the next entry), then refine resumes.
+   - `refine=fk_live_deferred` means a preserve-managed FK is live and could not be suspended this tick;
+     it retries next tick.
+   - A `refine_skip` log row is a lock-race deferral; it retries.
+
+4. If disk is the constraint, see [Disk is filling during a refine](#disk-is-filling-during-a-refine).
+
+**Verify.**
+
+```sql
+select coarse_partitions, history_unrefined from pgpm.status() where parent = 'public.events'::regclass;
+-- coarse_partitions falling toward 0; history_unrefined false once fully split
+```
+
+**Prevent.** Decide up front whether the table needs fine history. If it does, enable `set_refine` after
+`transmute` (or refine by hand in a maintenance window). If a coarse monolith is acceptable, leave it.
+
+## A stray is stuck in the DEFAULT (the drain is behind)
+
+**Symptom.** `pgpm.status()` shows `closed_rows > 0` (or `pgpm.check_default()` does); optionally a stale
+`last_drained` and a climbing `drain_skips`.
+
+**What it means.** In the monolith model the `DEFAULT` is the empty leading-edge net; in steady state it
+holds nothing. A non-zero `closed_rows` means a stray landed there (obtain fell behind the frontier, a
+backdated row, or a gap) and the **assistant drain** has not yet evacuated it into a proper partition. A
+falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_rows` with a stale
+`last_drained` and a climbing `drain_skips` is a **wedged** drain.
+
+**Steps.**
+
+1. Quantify the backlog and the progress signal:
+
+   ```sql
+   select closed_rows, default_rows, default_oldest from pgpm.check_default('public.events');
+   select last_drained, drain_skips from pgpm.status() where parent = 'public.events'::regclass;
+   ```
+
+2. If it is merely behind, raise the pace or catch up by hand:
+
+   ```sql
+   update pgpm.config set drain_batch = 20000 where parent_table = 'public.events'::regclass;  -- bigger microbatch
+   select pgpm.drain_all('public.events');                                                     -- catch up now (synchronous)
+   ```
+
+3. If it is **wedged** (a stale `last_drained`, climbing `drain_skips`), look for the cause in the log:
+
+   ```sql
+   select at, action, method from pgpm.log
+    where parent_table = 'public.events'::regclass and action = 'drain_skip' order by id desc limit 10;
+   ```
+
+   A recurring duplicate-key error is the upsert-into-a-moved-row wedge (see the guide's
+   [read consistency](guide.md#read-consistency-during-a-move)): an `INSERT ... ON CONFLICT` targeted a
+   row already moved into an unattached child and wrote a duplicate into the `DEFAULT`, which the next
+   batch then collides on. Remove the duplicate from the `DEFAULT` (keep the already-moved copy), then let
+   the drain continue.
+
+**Verify.**
+
+```sql
+select closed_rows from pgpm.check_default('public.events');   -- expect 0
+```
+
+**Prevent.** Keep `obtain` comfortably ahead of the frontier (raise `config.obtain`, or run the cron more
+often) so the frontier never outruns the real partitions and writes never fall to the `DEFAULT`. For
+tables that upsert into historical ranges, prefer the synchronous `drain_all()` in a window over the paced
+drain.
+
+## Disk is filling during a refine
+
+**Symptom.** Free space drops while a refine is running; `pgpm.status()` shows `inflight_partitions > 0`
+for the table.
+
+**What it means.** `refine` **copies** the monolith's rows into new fine partitions and only drops the
+source after they are swapped in, so it transiently needs roughly **2x the disk** of the range being
+refined while the copies coexist with the source. On an elastic or auto-scaling volume this is absorbed;
+on a fixed volume it can be a problem if you refine a large coarse child in one shot.
+
+**Steps.**
+
+1. See what is in flight:
+
+   ```sql
+   select parent, coarse_partitions, inflight_partitions from pgpm.status();
+   ```
+
+2. If you are disk-bound, stop starting new work and let the current refine finish (it drops its source at
+   the swap, reclaiming the transient space):
+
+   ```sql
+   select pgpm.set_refine('public.events', null);   -- pause auto-refine (the in-flight one still completes)
+   ```
+
+3. Refine **hierarchically** so each step's footprint stays bounded: split the monolith into coarse units
+   first (for example per year), then refine one coarse unit at a time. Each later step only needs ~2x of
+   one unit, not of the whole history:
+
+   ```sql
+   -- one coarse unit, by hand (target a coarser step first, then the fine step per unit)
+   select pgpm.refine('public.events', '<monolith child name from pgpm.part>', '1 year');
+   ```
+
+4. Or acquire more disk: on a managed/elastic volume, grow it (or let auto-scaling absorb the spike), then
+   resume `set_refine`.
+
+**Verify.**
+
+```sql
+-- free space recovers after the swap drops the source; the coarse child is gone from pgpm.part
+select coarse_partitions, inflight_partitions from pgpm.status() where parent = 'public.events'::regclass;
+```
+
+**Prevent.** Before refining a large history on a fixed volume, prearrange about 2x the headroom of the
+span you will refine, or refine hierarchically so the transient footprint stays bounded to one unit at a
+time. On an elastic volume, no special preparation is needed.
