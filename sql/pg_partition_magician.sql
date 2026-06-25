@@ -609,10 +609,11 @@ $$;
 -- ============================== refine ==============================
 
 -- refine(): split a FROZEN coarse child (the monolith, or a coarser child from a prior pass) into finer
--- children. It COPIES the rows into standalone children and swaps them in for the coarse child in one
--- transaction, then DROPs the now-vestigial source. No DELETE, so no dead tuples, no vacuum, no bloat
--- (REDESIGN.md section 10): the costs are transient ~2x disk for the child being refined and the one-time
--- copy I/O. Preconditions, refused rather than improvised: the child is FROZEN (its whole range at/below
+-- children. It MOVES the rows into standalone children in budget-sized microbatches and swaps them in
+-- for the coarse child in one transaction, then DROPs the now-empty source. The kept children only ever
+-- receive inserts, so the product has no bloat; the source's delete churn is discarded with the DROP
+-- (REDESIGN.md section 10). The costs are transient ~2x disk for the child being refined and the
+-- one-time copy I/O. Preconditions, refused rather than improvised: the child is FROZEN (its whole range at/below
 -- the current grid floor, so the copy is a consistent snapshot -- the monolith freezes once the frontier
 -- crosses B), the target step SUBDIVIDES it, and the DEFAULT holds no rows inside its range (a stray there
 -- is the assistant drain's job first). Returns the number of fine children created. Retention-aware: when
@@ -622,8 +623,10 @@ $$;
 -- partition_step (the finest grid); the hierarchical monolith -> coarse -> fine path is just repeated
 -- calls with chosen steps. The swap takes a brief ACCESS EXCLUSIVE on the parent (small N
 -- children, all metadata-only attaches); a caller that must stay unnoticeable bounds it with a short
--- lock_timeout and retries. (The copy is currently a single INSERT per sub-range; feathering it through
--- the adaptive controller, like the drain, is a follow-up -- it is a pacing concern, not correctness.)
+-- lock_timeout and retries. The move is budget-sized (drain_batch, capped by drain_max_blocks), so a wide
+-- sub-range never becomes one giant statement. The whole call is one transaction here, so atomic and
+-- gap-free; cross-tick adaptive PACING (true unnoticeable feathering) rides on the maintain-driven
+-- auto-refine policy, REDESIGN.md section 12.
 create or replace function pgpm.refine(p_parent regclass, p_child name, p_target_step text default null)
 returns int language plpgsql as $$
 declare
@@ -632,6 +635,8 @@ declare
   v_sub_lo text; v_sub_hi text; v_sub_name name; v_made int := 0;
   v_fine name[] := '{}'; v_fine_lo text[] := '{}'; v_fine_hi text[] := '{}'; i int;
   v_retain_boundary text; v_reclaimed int := 0;
+  v_batch int; v_lo_lit text; v_hi_lit text; v_moved bigint; v_more boolean;
+  v_reltuples real; v_avg numeric;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -685,8 +690,30 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
 
+  -- microbatch budget (rows per move), reusing the drain's row + block budget so a wide-row sub-range
+  -- can't become one giant statement (issue #93). drain_batch is the row cap; drain_max_blocks (if set)
+  -- caps heap+TOAST blocks, translated to a row limit via the coarse child's avg bytes/row (or a
+  -- pg_column_size sample when it has no stats), whichever is smaller.
+  v_batch := coalesce(cfg.drain_batch, 5000);
+  if cfg.drain_max_blocks is not null then
+    select c.reltuples into v_reltuples from pg_class c where c.oid = v_child;
+    if coalesce(v_reltuples, 0) > 0 then
+      v_avg := pg_table_size(v_child)::numeric / v_reltuples;
+    else
+      execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_child::text)
+        into v_avg;
+    end if;
+    if coalesce(v_avg, 0) > 0 then
+      v_batch := least(v_batch, greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int);
+    end if;
+  end if;
+
   -- 1. build the fine sub-ranges as STANDALONE children, each born with its validated bound CHECK, and
-  -- COPY the matching rows in (no DELETE on the source).
+  -- MOVE the matching rows in, in budget-sized microbatches (feathered). The source's deleted rows are
+  -- churn on a table that is dropped at the swap; the kept children only ever receive inserts, so the
+  -- product has no bloat. (The whole call is one transaction here, hence atomic and gap-free; a
+  -- maintain-driven auto-refine -- REDESIGN.md section 12 -- would call these microbatches across ticks
+  -- for true unnoticeable pacing, at the cost of a transient snapshot()-covered gap.)
   v_sub_lo := v_lo;
   loop
     exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_sub_lo);
@@ -708,12 +735,27 @@ begin
                    v_nsp, v_sub_name, (v_sub_name || '_ck'),
                    cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_lo),
                    cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_hi));
-    execute format('insert into %I.%I (%s) select %s from %s where %I >= %L and %I < %L',
-                   v_nsp, v_sub_name, v_cols, v_cols, v_child::text,
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_sub_hi));
     insert into pgpm.part (parent_table, child_name, lo, hi, attached)
       values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
+    -- move the sub-range in budget-sized microbatches (delete-returning-insert, ORDER BY the control
+    -- column so each batch is an index scan of exactly v_batch rows, like drain_step).
+    v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo);
+    v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi);
+    loop
+      execute format($f$
+        with b as (
+          delete from %1$s where ctid in (select ctid from %1$s
+                           where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
+          returning %6$s
+        )
+        insert into %7$I.%8$I (%6$s) select %6$s from b
+      $f$, v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols, v_nsp, v_sub_name);
+      get diagnostics v_moved = row_count;
+      insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_move', v_sub_lo, v_sub_hi, v_moved);
+      execute format('select exists (select 1 from %s where %I >= %L and %I < %L)',
+                     v_child::text, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
+      exit when not v_more;
+    end loop;
     v_fine    := array_append(v_fine, v_sub_name);
     v_fine_lo := array_append(v_fine_lo, v_sub_lo);
     v_fine_hi := array_append(v_fine_hi, v_sub_hi);
