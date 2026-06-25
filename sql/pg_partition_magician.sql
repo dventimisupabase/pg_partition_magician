@@ -615,9 +615,12 @@ $$;
 -- copy I/O. Preconditions, refused rather than improvised: the child is FROZEN (its whole range at/below
 -- the current grid floor, so the copy is a consistent snapshot -- the monolith freezes once the frontier
 -- crosses B), the target step SUBDIVIDES it, and the DEFAULT holds no rows inside its range (a stray there
--- is the assistant drain's job first). Returns the number of fine children created. p_target_step defaults
--- to the configured partition_step (the finest grid); the hierarchical monolith -> coarse -> fine path is
--- just repeated calls with chosen steps. The swap takes a brief ACCESS EXCLUSIVE on the parent (small N
+-- is the assistant drain's job first). Returns the number of fine children created. Retention-aware: when
+-- a retention policy is set, sub-ranges entirely below the horizon are NOT materialized (they would be
+-- dropped by retain() the moment they appeared) -- they are skipped and reclaimed when the coarse source
+-- is dropped, mirroring the drain's retain_reclaim (issue #91). p_target_step defaults to the configured
+-- partition_step (the finest grid); the hierarchical monolith -> coarse -> fine path is just repeated
+-- calls with chosen steps. The swap takes a brief ACCESS EXCLUSIVE on the parent (small N
 -- children, all metadata-only attaches); a caller that must stay unnoticeable bounds it with a short
 -- lock_timeout and retries. (The copy is currently a single INSERT per sub-range; feathering it through
 -- the adaptive controller, like the drain, is a follow-up -- it is a pacing concern, not correctness.)
@@ -628,6 +631,7 @@ declare
   v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
   v_sub_lo text; v_sub_hi text; v_sub_name name; v_made int := 0;
   v_fine name[] := '{}'; v_fine_lo text[] := '{}'; v_fine_hi text[] := '{}'; i int;
+  v_retain_boundary text; v_reclaimed int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -649,6 +653,18 @@ begin
   if pgpm._native_gt(cfg.control_kind, v_hi, v_floor) then
     raise exception 'pg_partition_magician: cannot refine % -- it is still active (upper bound % is above the current grid floor %); wait until the frontier passes its upper bound',
       p_child, v_hi, v_floor;
+  end if;
+
+  -- retention horizon (matches retain() and the drain's retain_reclaim, issue #91): a sub-range entirely
+  -- below it would be dropped by retain() the moment it materialized, so refine SKIPS it instead of
+  -- copying it into a doomed partition -- its rows are reclaimed when the coarse source is dropped.
+  if cfg.retain is not null then
+    if cfg.control_kind = 'id'
+      then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                  (v_frontier::numeric - cfg.retain::numeric)::text);
+      else v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                  (now() - cfg.retain::interval)::text);
+    end if;
   end if;
 
   -- PRECONDITION 2: the target step must actually subdivide the child.
@@ -676,6 +692,15 @@ begin
     exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_sub_lo);
     v_sub_hi := pgpm._grid_next(cfg.control_kind, v_step, v_sub_lo);
     if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;   -- clamp last
+    -- retention-aware: skip a sub-range entirely below the horizon (hi <= boundary). Don't materialize it
+    -- -- its rows are reclaimed when the coarse source is dropped at the swap (no copy, no doomed cell).
+    if v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary) then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'refine_reclaim', v_sub_lo, v_sub_hi, 'copy_skip');
+      v_reclaimed := v_reclaimed + 1;
+      v_sub_lo := v_sub_hi;
+      continue;
+    end if;
     v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
     execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
                    v_nsp, v_sub_name, v_nsp, v_rel);
@@ -712,9 +737,12 @@ begin
   delete from pgpm.part where parent_table = p_parent and child_name = p_child;
 
   -- 3. drop the now-vestigial coarse child -- COPY, not move, so just DROP (no DELETE, no dead tuples).
+  -- This also reclaims any below-horizon sub-ranges skipped above: their rows were never copied, so the
+  -- DROP is their retention reclaim (no materialize-then-drop churn).
   execute format('drop table %s', v_child::text);
   insert into pgpm.log (parent_table, action, lo, hi, rows, method)
-    values (p_parent, 'refine', v_lo, v_hi, v_made, 'copy_swap_drop');
+    values (p_parent, 'refine', v_lo, v_hi, v_made,
+            case when v_reclaimed > 0 then 'copy_swap_drop;reclaimed=' || v_reclaimed else 'copy_swap_drop' end);
   return v_made;
 end;
 $$;
