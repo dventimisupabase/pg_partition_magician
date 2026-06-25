@@ -18,6 +18,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 
 - [Referential-integrity violations after a `preserve` drain](#referential-integrity-violations-after-a-preserve-drain)
 - [The history is not splitting into fine partitions](#the-history-is-not-splitting-into-fine-partitions)
+- [Monitoring a non-empty DEFAULT](#monitoring-a-non-empty-default)
 - [A stray is stuck in the DEFAULT (the drain is behind)](#a-stray-is-stuck-in-the-default-the-drain-is-behind)
 - [Disk is filling during a refine](#disk-is-filling-during-a-refine)
 
@@ -168,6 +169,69 @@ select coarse_partitions, history_unrefined from pgpm.status() where parent = 'p
 **Prevent.** Decide up front whether the table needs fine history. If it does, enable `set_refine` after
 `transmute` (or refine by hand in a maintenance window). If a coarse monolith is acceptable, leave it.
 
+## Monitoring a non-empty DEFAULT
+
+**Symptom.** Monitoring fires on a non-empty `DEFAULT`: `pgpm.check_default('public.events')` reports
+`default_rows > 0`, or `pgpm.status()` shows it. Even a brief, self-clearing occupancy counts.
+
+**What it means.** In the monolith model the `DEFAULT` is the empty leading-edge net, so an **empty**
+`DEFAULT` is the healthy steady state: it means your partitioning matched reality (keys landed where you
+predicted, `obtain` stayed ahead of the frontier). Any occupancy means reality diverged from the model --
+worth knowing even when it self-heals, because a race lost briefly tends to be lost less briefly later.
+Landing in the `DEFAULT` *routinely* is an anti-pattern: a net you use every day is a hammock, and a
+load-bearing `DEFAULT` quietly signs you up for the assistant drain and its
+[read-consistency window](guide.md#read-consistency-during-a-move). Keep it a **tripwire** -- alarmed and
+empty.
+
+**Steps.**
+
+1. Alarm on the level, the age, and the trend -- not just presence:
+
+   ```sql
+   select default_rows, closed_rows, oldest from pgpm.check_default('public.events');
+   select default_oldest, last_drained, drain_skips from pgpm.status() where parent = 'public.events'::regclass;
+   ```
+
+   Alert when `default_rows > 0`. The oldest `DEFAULT` key (`oldest` / `default_oldest`) is the sharpest
+   single number -- it is at once "how long has coverage been missed" and "how stale is the unsorted
+   data." A rising oldest-age alongside a flat `default_rows` is a **wedged** drain (see
+   [A stray is stuck in the DEFAULT](#a-stray-is-stuck-in-the-default-the-drain-is-behind)).
+
+2. Triage the cause by comparing the `DEFAULT`'s key range to the frontier (`now()` for `time`,
+   `max(control)` for `id`/`uuidv7`). The `oldest` value usually settles it; for the full spread, read the
+   `DEFAULT` partition directly (its name is `config.default_table`, conventionally `<table>_default`):
+
+   ```sql
+   select min(created_at), max(created_at), count(*) from public.events_default;
+   ```
+
+   - **Leading-edge lag** -- the keys sit at/near the frontier: `obtain` fell behind the writers. The
+     urgent case, since it recurs and grows into a write-availability risk. Keep more partitions ahead
+     (`update pgpm.config set obtain = <n> where parent_table = 'public.events'::regclass;`) and/or run the
+     cron more often; catch up now with `select pgpm.drain_all('public.events');`.
+   - **Backdated / late-arriving** -- the keys sit well below the frontier: a producer is emitting old
+     timestamps/ids (clock skew, a replay or backfill), or your `retain` window is narrower than the real
+     late-arrival tail. Fix the producer, or widen retention. The drain homes these into a partition (or
+     reclaims them if they are already below the retention horizon).
+   - **A coverage gap** -- a key in a range you never provisioned (not ahead of the frontier, not in the
+     monolith). The drain homes it into a new partition for that interval like any stray; a *recurring* gap
+     points at a scheme assumption that does not hold (a key kind or range you did not expect), worth
+     chasing at the source.
+
+3. In every case the rows are safe in the `DEFAULT` and the assistant drain will home them; the alarm
+   exists to fix the *cause* so the `DEFAULT` returns to empty, not to rescue the rows.
+
+**Verify.**
+
+```sql
+select default_rows from pgpm.check_default('public.events');   -- expect 0 once the cause is fixed and the drain has caught up
+```
+
+**Prevent.** Treat the `DEFAULT` as a tripwire, not a landing zone. Keep `obtain` comfortably ahead of the
+frontier so steady-state writes always have a real partition and never reach the net, and alarm on *any*
+occupancy so a momentary miss gets attention before it becomes a standing one. The empty `DEFAULT` is
+insurance you are glad to hold and alarmed to ever use.
+
 ## A stray is stuck in the DEFAULT (the drain is behind)
 
 **Symptom.** `pgpm.status()` shows `closed_rows > 0` (or `pgpm.check_default()` does); optionally a stale
@@ -184,7 +248,7 @@ falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_row
 1. Quantify the backlog and the progress signal:
 
    ```sql
-   select closed_rows, default_rows, default_oldest from pgpm.check_default('public.events');
+   select closed_rows, default_rows, oldest from pgpm.check_default('public.events');
    select last_drained, drain_skips from pgpm.status() where parent = 'public.events'::regclass;
    ```
 
