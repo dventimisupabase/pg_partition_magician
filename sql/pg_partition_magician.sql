@@ -1650,18 +1650,35 @@ begin
     v_batch := v_budget;
   end if;
 
+  -- Auto-refine target, found UP FRONT: the oldest FROZEN coarse child (if auto-refine is on). Computed
+  -- before the drain so the suspend below can drop a live preserve-managed FK before refine moves
+  -- referenced rows -- the same leash the drain uses. A coarse child (hi > one step past lo) is frozen
+  -- once its whole range is at/below the current grid floor (no live write still lands in it).
+  if cfg.refine_to is not null then
+    execute format(
+      'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
+      || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo))'
+      || ' and not pgpm._native_gt(%L, p.hi, %L) order by p.lo::%s asc limit 1',
+      p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step,
+      cfg.control_kind,
+      pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, pgpm._frontier_native(p_parent)),
+      pgpm._native_type(cfg.control_kind))
+      into v_refine_child;
+  end if;
+
   -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
   -- so progress isn't starved. Its scans run under SHARE UPDATE EXCLUSIVE (non-blocking to the
   -- workload); only the brief final ATTACH needs a stronger lock.
   perform set_config('lock_timeout', '3s', true);
   begin
-    -- Suspend (re-drop) any preserve-managed FK that is currently live BEFORE draining: the drain
-    -- moves referenced rows out of the parent through an un-attached child, which a live NO ACTION FK
-    -- blocks and a live CASCADE/SET NULL FK silently honours (deleting/nulling the referencing rows).
-    -- suspend_incoming_fks is a no-op when the closed tail is empty. It shares this subtransaction with
-    -- the drain on purpose: if it cannot drop a live FK, the drain_step below never runs (the whole
-    -- block rolls back), so the drain never moves rows past a live FK -- it just defers and retries.
-    v_suspended := pgpm.suspend_incoming_fks(p_parent);
+    -- Suspend (re-drop) any preserve-managed FK that is currently live BEFORE moving referenced rows --
+    -- the drain (closed tail) OR auto-refine (a frozen coarse child) will move them, and a live NO ACTION
+    -- FK blocks the move while a CASCADE/SET NULL silently honours it. The suspend is normally gated on a
+    -- non-empty closed tail; force it when a refine is pending this tick (v_refine_child set), since a
+    -- refine-only tick has an empty closed tail. It shares this subtransaction with the drain on purpose:
+    -- if it cannot drop a live FK, the drain below never runs (the block rolls back), and the auto-refine
+    -- step further down is gated on no live FK remaining, so neither moves a row past a live FK.
+    v_suspended := pgpm.suspend_incoming_fks(p_parent, v_refine_child is not null);
     v_drain := pgpm.drain_step(p_parent, v_batch);
   exception when others then
     v_drain := 'deferred';
@@ -1685,40 +1702,41 @@ begin
       values (p_parent, 'drain_budget', v_budget, v_reason);
   end if;
 
-  -- Once the closed tail is drained, re-add any incoming FKs that transmute(..., 'preserve') dropped, now
-  -- against the new parent. restore_incoming_fks self-gates on quiescence (no closed rows, no in-flight
-  -- child), so it is a no-op until the drain is idle and harmless to attempt every tick. Isolated like
-  -- the steps above: a hiccup here never aborts the drain's progress.
+  -- Auto-refine (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
+  -- v_refine_child) one budget-sized microbatch toward refine_to per tick, under the same adaptive budget
+  -- as the drain. Isolated in its own subtransaction; a lock race or a soft status just retries next tick.
+  -- The cross-tick move feathers the refine, opening a transient snapshot()-covered gap while a coarse
+  -- child splits. GATED on no preserve-managed FK still live: the suspend above drops it before refine
+  -- moves a referenced row, and if that suspend did not take (lock race -> the drain block rolled back),
+  -- the refine defers rather than move a referenced row past a live FK.
+  if v_refine_child is not null then
+    if exists (select 1 from pgpm.dropped_fk where parent_table = p_parent and restored_at is not null) then
+      v_refine := 'fk_live_deferred';
+      v_note := v_note || ' refine_deferred_fk';
+    else
+      begin
+        v_refine := pgpm.refine_step(p_parent, v_refine_child, cfg.refine_to, v_batch);
+      exception when others then
+        v_refine := 'deferred';
+        v_note := v_note || ' refine_deferred';
+        insert into pgpm.log (parent_table, action, method) values (p_parent, 'refine_skip', left(sqlerrm, 200));
+      end;
+    end if;
+  elsif cfg.refine_to is not null then
+    v_refine := 'none';   -- auto-refine on, but no frozen coarse child to work
+  end if;
+
+  -- Re-add any incoming FKs that transmute(..., 'preserve') dropped, now against the new parent, AFTER
+  -- both the drain and the refine have moved this tick. restore_incoming_fks self-gates on quiescence (no
+  -- closed rows AND no in-flight child), so while a multi-tick refine is mid-flight it stays a no-op and
+  -- the FK remains suspended (RI off, surfaced by status().fks_suspended), re-adding only once the refine
+  -- has swapped in its fine children. Isolated: a hiccup here never aborts progress.
   begin
     v_restored := pgpm.restore_incoming_fks(p_parent);
   exception when others then
     v_note := v_note || ' restore_fk_deferred';
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
-
-  -- Auto-refine (REDESIGN.md sec 12): when refine_to is set, feather the OLDEST frozen coarse child toward
-  -- that step, ONE budget-sized microbatch per tick, under the same adaptive budget (v_batch) as the drain.
-  -- Off by default (refine_to null). Isolated in its own subtransaction; a lock race or a soft status
-  -- ('active'/'default_dirty'/'nosubdiv') just retries next tick. The cross-tick move IS the unnoticeable
-  -- feathering -- it opens a transient snapshot()-covered gap while a coarse child is splitting.
-  if cfg.refine_to is not null then
-    begin
-      execute format(
-        'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
-        || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo)) order by p.lo::%s asc limit 1',
-        p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step, pgpm._native_type(cfg.control_kind))
-        into v_refine_child;
-      if v_refine_child is null then
-        v_refine := 'none';
-      else
-        v_refine := pgpm.refine_step(p_parent, v_refine_child, cfg.refine_to, v_batch);
-      end if;
-    exception when others then
-      v_refine := 'deferred';
-      v_note := v_note || ' refine_deferred';
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'refine_skip', left(sqlerrm, 200));
-    end;
-  end if;
 
   return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s refine=%s%s',
                 v_made, v_dropped, v_drain, v_suspended, v_restored, v_refine, v_note);
@@ -2122,7 +2140,7 @@ $$;
 -- on PG 17). maintenance calls this before each drain step; restore_incoming_fks re-adds once the
 -- tail is drained, maintaining the invariant "a managed FK is live iff the closed tail is empty".
 -- A no-op (returns 0) when the closed tail is empty, so it is safe to call every tick.
-create or replace function pgpm.suspend_incoming_fks(p_parent regclass)
+create or replace function pgpm.suspend_incoming_fks(p_parent regclass, p_force boolean default false)
 returns int language plpgsql as $$
 declare v_closed bigint; r pgpm.dropped_fk%rowtype; v_n int := 0;
 begin
@@ -2130,8 +2148,13 @@ begin
                   where parent_table = p_parent and restored_at is not null) then
     return 0;
   end if;
-  select closed_rows into v_closed from pgpm.check_default(p_parent);
-  if coalesce(v_closed, 0) = 0 then return 0; end if;   -- no drain work => leave live FKs in place
+  -- Normally gated on drain work (closed tail rows): no work => leave live FKs in place. p_force overrides
+  -- the gate, for the caller (maintain's auto-refine) that is about to move referenced rows out of a
+  -- frozen coarse child even though the closed tail is empty.
+  if not p_force then
+    select closed_rows into v_closed from pgpm.check_default(p_parent);
+    if coalesce(v_closed, 0) = 0 then return 0; end if;
+  end if;
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is not null order by id loop
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
