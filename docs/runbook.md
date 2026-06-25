@@ -27,15 +27,18 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 `NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `validate_incoming_fk_blocked`
 rows; or a periodic RI audit (or an application error) flags dangling references into the parent.
 
-**What it means.** You converted with `p_incoming_fks => 'preserve'`. While pgpm moved referenced rows --
-the assistant drain evacuating a stray, or an auto-refine splitting the monolith -- the incoming FK was
+**What it means.** You converted with `p_incoming_fks => 'preserve'`. While the **assistant drain** moved
+referenced rows (evacuating a stray from the `DEFAULT` through an unattached child), the incoming FK was
 dropped, so referential integrity was off on the referencing table for that window. (This is by design and
 visible as `status().fks_suspended`; see the guide's
-[incoming foreign keys](guide.md#incoming-foreign-keys).) When the move reached quiescence, pgpm re-added
+[incoming foreign keys](guide.md#incoming-foreign-keys).) When the drain reached quiescence, pgpm re-added
 the FK so it once again enforces every *new* write (as `NOT VALID`), but it could not fully *validate* the
 constraint because rows that violate it were written during the window. Those orphans are real RI
 violations to reconcile; new writes are already guarded again. The attribution is exact: the FK was valid
-when pgpm dropped it, so any orphan present now arose during the window.
+when pgpm dropped it, so any orphan present now arose during the window. (Note: **refine** does *not* open
+this window -- it copies, and its swap drops and re-adds the FK within one atomic transaction -- but the
+same reconciliation applies if a refine or retention drops aged, still-referenced history: the re-validate
+then finds a true orphan.)
 
 **Steps.**
 
@@ -96,15 +99,16 @@ when pgpm dropped it, so any orphan present now arose during the window.
 
    The foreign key is fully valid again.
 
-**Prevent.** Referential integrity is necessarily off while pgpm relocates referenced rows: the FK must be
-dropped so a row can move through an unattached child, and that cannot be avoided. In the monolith model
-the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
-(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later assistant drain or
-an auto-refine actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never
-accumulate; and refine by hand with the synchronous `select pgpm.refine_history('public.events');` (one
-atomic transaction, no RI window) instead of auto-refine, or `pause` heavy referencing-table write bursts
-while a refine runs. If that table takes continuous heavy writes throughout a long refine, prefer the
-default `p_incoming_fks => 'error'` and reconcile separately.
+**Prevent.** Referential integrity is necessarily off while the **drain** relocates referenced rows: the FK
+must be dropped so a row can move through an unattached child, and that cannot be avoided. In the monolith
+model the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
+(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later assistant drain
+actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never accumulate, so the drain
+rarely runs; or `pause` heavy referencing-table write bursts while the drain catches up. A `refine` (manual
+or auto) opens no RI window of its own -- the copy never moves a referenced row out of the parent, and the
+swap's FK drop/re-add is one atomic transaction. The one refine-related caveat is data, not timing: if a
+refine or a retention policy drops aged history that is still referenced, the FK re-validates against a real
+orphan -- do not retain below rows you still reference.
 
 ## The history is not splitting into fine partitions
 
@@ -148,9 +152,9 @@ cannot make progress yet.
      interval still lands in it); it will refine once the frontier crosses `B`.
    - `refine=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the assistant
      drain clear it (see the next entry), then refine resumes.
-   - `refine=fk_live_deferred` means a preserve-managed FK is live and could not be suspended this tick;
-     it retries next tick.
-   - A `refine_skip` log row is a lock-race deferral; it retries.
+   - `refine=copied:N` is healthy forward progress (one budget-sized copy microbatch); `refine=swapped:K`
+     is a completed refine (K fine children attached). A `refine_skip` log row is a lock-race deferral, and
+     a `refine_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
 
 4. If disk is the constraint, see [Disk is filling during a refine](#disk-is-filling-during-a-refine).
 

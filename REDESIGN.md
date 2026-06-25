@@ -267,13 +267,19 @@ One primitive, `pgpm.refine(p_parent, p_coarse_child, p_target_step)`, invoked h
   -- per coarse child; wrap in a retry loop
   set local lock_timeout = '<short>';
   begin;
+    -- incoming FKs block DETACH (the referenced keys leave the parent between detach and the re-attach of
+    -- the copies, and Postgres will not look past the detach), so drop them here and re-add below -- all in
+    -- THIS transaction, so no other session ever sees RI off. This is the swap's one FK touch; the copy
+    -- needs none. (suspend_incoming_fks / restore_incoming_fks.)
     alter table <parent> detach partition <coarse_child>;
     alter table <parent> attach partition <fine_i> for values from (lo_i) to (hi_i);  -- one per sub-range
-    -- flip the fine pgpm.part rows to attached = true; delete the coarse pgpm.part row
+    -- flip the fine pgpm.part rows to attached = true; delete the coarse pgpm.part row; re-add the FKs
   commit;
   ```
 
-  On lock-timeout the txn aborts and retries; the copies are already done, so retry is cheap.
+  On lock-timeout the txn aborts and retries; the copies are already done, so retry is cheap. The transient
+  FK drop/re-add is invisible to other sessions (it lives entirely inside this transaction), so it is *not*
+  the multi-tick `snapshot()`/RI window the drain carries -- it is atomic.
 - **Drop the vestigial source** after commit (`DROP TABLE <coarse_child>`). No `DELETE`, no dead
   tuples, no vacuum, disk reclaimed.
 - **Hierarchical control.** A thin `refine_history` helper (or the operator) calls `refine` first

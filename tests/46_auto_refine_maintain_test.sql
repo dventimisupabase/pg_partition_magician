@@ -20,8 +20,8 @@ select is(
 -- one maintain tick makes PARTIAL progress (one microbatch), not the whole refine in a single tick
 select pgpm.maintain('public.ar');
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_move'),
-  '>', 0::bigint, 'one maintain tick feathered a refine microbatch (cross-tick pacing)');
+  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_copy'),
+  '>', 0::bigint, 'one maintain tick feathered a refine copy microbatch (cross-tick pacing)');
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
   1::bigint, 'after a single tick the coarse child is still mid-refine (not finished in one tick)');
@@ -38,8 +38,8 @@ select is(
   200, 'all 200 history rows conserved across the feathered cross-tick refine');
 
 select cmp_ok(
-  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_move'),
-  '>=', 5::bigint, 'the refine was paced across many microbatches, not one statement');
+  (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'refine_copy'),
+  '>=', 5::bigint, 'the refine was paced across many copy microbatches, not one statement');
 
 select * from finish();
 rollback;

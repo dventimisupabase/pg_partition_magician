@@ -32,10 +32,11 @@ ids), or **UUIDv7 / ULID** (time-ordered uuids). It then manages the full lifecy
 - **retain**: drop partitions older than a policy (suspended over coarse history until it is refined).
 - **maintain**: the single procedure `pg_cron` calls (obtain, drain, retain, and optional auto-refine).
 
-One honest caveat: the *paced* paths (the scheduled assistant drain, and cross-tick auto-refine) move rows
-through an unattached child, so a mid-move read of the parent **undercounts** the range in flight (and a
-write to an already-moved row no-ops) until it attaches. The synchronous `refine()` and `drain_all()` run
-in one transaction and never open this gap; `pgpm.snapshot` gives a complete read when a paced path does.
+One honest caveat: the scheduled assistant **drain** moves rows through an unattached child, so a mid-move
+read of the parent **undercounts** the range in flight (and a write to an already-moved row no-ops) until
+it attaches. **`refine` never opens this gap** (it copies, leaving every row in the monolith until one
+atomic swap), and the synchronous `drain_all()` is gap-free too; `pgpm.snapshot` gives a complete read
+while the paced drain is mid-move.
 The [guide](docs/guide.md#read-consistency-during-a-move) explains it in full.
 
 **Incoming foreign keys** are handled, not ignored. `transmute` never rewrites the primary key, so the

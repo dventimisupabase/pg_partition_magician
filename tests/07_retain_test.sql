@@ -1,9 +1,9 @@
 -- Retention in the monolith model, and retention-aware refine. While history is one coarse monolith
 -- spanning the horizon, retain() cannot drop it (retention is suspended over coarse history). refine() is
--- retention-aware: it materializes only the within-horizon sub-ranges and RECLAIMS the ones entirely
--- below the horizon (it skips the copy; their rows are dropped with the coarse source), so no doomed
--- partition is ever created and a later retain() has nothing to do. Mirrors the drain's retain_reclaim
--- (issue #91).
+-- retention-aware: it copies only the within-horizon sub-ranges and SKIPS the ones entirely below the
+-- horizon (it never copies them; their rows are discarded with the coarse source at the swap, never copied
+-- and never deleted out of it), so no doomed partition is ever created and a later retain() has nothing to
+-- do (issue #91).
 create extension if not exists pgtap;
 
 begin;
@@ -21,15 +21,15 @@ select is(
 
 select is(
   (select pgpm.refine_history('public.rt7'))::int,
-  3, 'retention-aware refine materializes only the 3 within-horizon sub-ranges [30000, 60000)');
+  3, 'retention-aware refine copies only the 3 within-horizon sub-ranges [30000, 60000)');
 
 select is(
-  (select count(distinct lo)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'refine_reclaim'),
-  3, 'the 3 below-horizon sub-ranges are reclaimed (logged refine_reclaim, microbatched), never materialized');
+  (select count(distinct lo)::int from pgpm.log where parent_table = 'public.rt7'::regclass and action = 'refine_aged'),
+  3, 'the 3 below-horizon sub-ranges are skipped (logged refine_aged), never copied or materialized');
 
 select is(
   (select count(*)::int from public.rt7 where id < 30000),
-  0, 'the aged rows below the horizon are reclaimed (dropped with the coarse source), never copied');
+  0, 'the aged rows below the horizon are discarded with the coarse source at the swap, never copied');
 
 select is(
   pgpm.retain('public.rt7'),

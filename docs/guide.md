@@ -250,11 +250,12 @@ child toward the target step, under the same adaptive budget as the drain. It is
 (`set_refine(parent, null)` turns it back off) and always safe to enable: it only paces refinement; it
 never starts on a child that is not frozen or whose range still has strays in the `DEFAULT`.
 
-One trade comes with the paced path. The synchronous `refine()` runs in a single transaction, so it is
-atomic and a concurrent reader never sees a partial state. Auto-refine commits microbatches across ticks,
-so while a coarse child is mid-split its already-moved rows live briefly in not-yet-attached children and
-a plain read of the parent **undercounts** that range; use [`snapshot()`](#read-consistency-during-a-move)
-for a complete read. This is the same gap the assistant drain has, and the same escape hatch covers it.
+Refine **copies**; it never deletes from the source. The coarse child stays whole and attached until one
+atomic swap detaches it, attaches the fine children, and drops it. So unlike the drain, a refine -- the
+paced, cross-tick auto-refine included -- never undercounts: every row stays visible in the monolith the
+whole time, and the swap is atomic, so a concurrent reader never sees a partial state. The kept fine
+children only ever receive inserts, so there are no dead tuples and no vacuum. (The one moment refine
+touches a foreign key is that swap; see [incoming foreign keys](#incoming-foreign-keys).)
 
 **Disk.** Refining needs transient headroom (about 2x the span being refined) for the copies before the
 source is dropped. On an elastic or auto-scaling volume this is absorbed; on a fixed volume, refine
@@ -278,9 +279,11 @@ select * from pgpm.status();        -- one row per managed table: partitions, ba
 - **`last_drained` / `drain_skips`** -- progress versus stall: a non-zero `closed_rows` with a stale
   `last_drained` and a climbing `drain_skips` is a wedged drain; falling `closed_rows` with
   `drain_skips ~ 0` is merely slow.
-- **`inflight_partitions`** -- children created but not yet attached (a drain or a cross-tick refine in
-  progress). Their rows are durable but not visible through the parent until they attach; use
-  [`snapshot()`](#read-consistency-during-a-move) for a complete read.
+- **`inflight_partitions`** -- children created but not yet attached: a drain mid-move, or a refine's
+  in-progress copies. A *drain* child holds rows not yet visible through the parent (use
+  [`snapshot()`](#read-consistency-during-a-move) for a complete read); a *refine* copy-child holds
+  duplicates of rows still in the monolith, so the parent count is already complete -- it is a
+  transient-disk signal, not a read gap.
 - **`fks_suspended` / `fks_unvalidated`** -- preserve-managed incoming FKs currently dropped (RI off)
   versus re-added `NOT VALID` but blocked from validation by pre-existing orphans.
 
@@ -313,8 +316,9 @@ brief lock). Two consequences in the monolith model:
 
 - **Retention is suspended over un-refined coarse history.** A coarse monolith spanning the horizon is
   not dropped (it still holds within-horizon data), so its aged span is not reclaimed until you refine
-  it. Refine is retention-aware: it reclaims the below-horizon sub-ranges directly instead of
-  materializing partitions only to drop them. So on a table you want aggressively retained, enable
+  it. Refine is retention-aware: it skips the below-horizon sub-ranges (it never copies them; they are
+  discarded with the source at the swap) instead of materializing partitions only to drop them. So on a
+  table you want aggressively retained, enable
   auto-refine (or refine by hand) to let retention reach the history.
 - **The assistant drain reclaims aged strays in place.** If a stray ages past the horizon while still in
   the `DEFAULT`, the drain `DELETE`s it straight out (logged `retain_reclaim`) rather than materializing a
@@ -335,11 +339,12 @@ those FKs are handled, not ignored. Because `transmute` never rewrites the prima
 unique key always survives partitioning, so an incoming FK to the primary key is always preservable: no
 composite key, no denormalization, ever.
 
-There is one mechanical wrinkle. Maintenance that moves referenced rows -- the assistant drain, and a
-cross-tick refine -- moves them through a standalone, not-yet-attached child, so a referenced row is
-briefly outside the parent, which a `NO ACTION` FK would reject and a `CASCADE`/`SET NULL` FK would
-silently honour. So the FK cannot ride through in place: it is dropped for the conversion and re-added
-against the new parent.
+There is one mechanical wrinkle. The assistant drain moves referenced rows through a standalone,
+not-yet-attached child, so a referenced row is briefly outside the parent, which a `NO ACTION` FK would
+reject and a `CASCADE`/`SET NULL` FK would silently honour. So the FK cannot ride through in place during a
+drain: it is dropped for the conversion and re-added against the new parent. (Refine is different -- it
+copies, never moving a referenced row out of the parent -- so the multi-tick copy needs no such leash; only
+its atomic swap touches the FK, see below.)
 
 `transmute` offers two modes for incoming FKs:
 
@@ -349,7 +354,8 @@ against the new parent.
 
 With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK once the closed tail has drained;
 `maintain` calls it automatically, so on the scheduled path you do nothing. It is a no-op until the drain
-is quiescent (no closed rows in the `DEFAULT`, no in-flight child), so it is safe to call early or
+is quiescent (no closed rows in the `DEFAULT`, no in-flight *drain* child -- a refine's copy-children do not
+count, since they never take a referenced row out of the parent), so it is safe to call early or
 repeatedly. Because the monolith holds every referenced row attached from the moment of cutover, with no
 closed tail to wait for, the FK is typically restorable immediately after transmute.
 
@@ -384,11 +390,11 @@ then closes), `maintain` suspends the FK before draining (`pgpm.suspend_incoming
 afterward. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved across the
 cycle.
 
-Auto-refine applies the same leash. A cross-tick refine moves historical referenced rows just as the
-drain does, so before it starts `maintain` suspends a live preserve-managed FK (RI off, surfaced by
-`status().fks_suspended`) and re-adds it once the refine has swapped in its fine children -- a referenced
-row is never left dangling mid-move. The synchronous `refine()` runs in one transaction and never opens an
-RI window at all.
+Auto-refine needs **no such leash during the copy**: a refine copies, so every referenced row stays in the
+monolith and is never outside the parent. The single exception is the swap's `DETACH` -- Postgres refuses
+to detach a partition whose rows are still referenced -- so the swap transiently drops the incoming FK(s)
+and re-adds them *within that one atomic transaction*. No other session ever observes RI off; there is no
+multi-tick suspension window the way the drain has, and the synchronous `refine()` is atomic end to end.
 
 ## Secondary indexes
 
@@ -430,17 +436,19 @@ lives inside it, and refine only touches frozen children.
 This is the one correctness caveat worth understanding. We would rather state it plainly than bury it,
 and in this model it is much narrower than it used to be.
 
-**The gap.** When maintenance moves rows between partitions across separate transactions -- the assistant
-drain evacuating a stray, or an **auto-refine** splitting a coarse child tick by tick -- the rows already
-moved live briefly in a standalone, not-yet-attached child. A query against the parent only scans attached
-partitions, so a plain `SELECT ... FROM parent` issued mid-move **undercounts** the range being moved. The
-rows are never lost; they are temporarily not reachable through the parent.
+**The gap belongs to the assistant drain alone.** When the paced drain evacuates a stray it `DELETE`s the
+row out of the `DEFAULT` and re-`INSERT`s it into a standalone, not-yet-attached child across separate
+transactions. A query against the parent only scans attached partitions, so a plain `SELECT ... FROM parent`
+issued mid-move **undercounts** the range being moved. The rows are never lost; they are temporarily not
+reachable through the parent.
 
-**When there is no gap.** The synchronous paths never open it: `refine()` and `refine_history()` run the
-whole split in one transaction (atomic), and `drain_all()` runs the whole drain in one transaction. The
-gap is specific to the *paced, cross-tick* paths (the scheduled drain and auto-refine), and only for the
-single range in flight, only while it moves. Reads of recent data are never affected: maintenance only
-ever moves old, closed ranges.
+**Refine never opens this gap.** Refine *copies*; it never deletes from the source. The coarse child stays
+whole and attached until one atomic swap, so every row is visible through the parent the entire time --
+paced auto-refine included. (Its in-flight copies are duplicates of rows still in the monolith, which is why
+`snapshot()` must *not* union them, and does not.) The synchronous paths are also gap-free: `refine()` /
+`refine_history()` and `drain_all()` each run in one transaction. So the gap is specific to the *paced
+drain*, only for the single range in flight, only while it moves. Reads of recent data are never affected:
+the drain only ever moves old, closed ranges.
 
 **Reads: the `snapshot()` escape hatch.** If a consistency-sensitive reader (a `COUNT(*)`, a logical
 backup, a reconciliation) needs the complete set during a move, query it inline:
@@ -449,20 +457,22 @@ backup, a reconciliation) needs the complete set during a move, query it inline:
 select count(*) from pgpm.snapshot(null::public.events);  -- the parent UNION every in-flight child
 ```
 
-`snapshot()` is a read-only set-returning function that `UNION`s the parent with every in-flight,
-not-yet-attached child. You pass the table as a typed-`NULL` anchor (`null::public.events`) because a
+`snapshot()` is a read-only set-returning function that `UNION`s the parent with every in-flight *drain*
+child (it deliberately skips a refine's copy-children, whose rows are already in the attached monolith, so
+it never double-counts). You pass the table as a typed-`NULL` anchor (`null::public.events`) because a
 function's row shape is fixed at plan time and cannot be inferred from a `regclass` value. It is always
 fresh and leaves nothing behind. One honest cost: it is an **optimization fence** (the in-flight child set
 is dynamic, so a `WHERE` on top does not push down); fine for a `COUNT` or full read, but for a
 heavily-filtered read on a large table a hand-written `parent UNION ALL <child>` plans better.
 
-**Writes: there is no fix for the paced path.** A write through the parent that targets a row *already
-moved* into an unattached child finds no row and is a silent no-op until the interval attaches; an
-`INSERT ... ON CONFLICT` (upsert) on such a key can write a duplicate that later wedges the move on a
+**Writes: there is no fix for the paced drain.** A write through the parent that targets a row the drain has
+*already moved* into an unattached child finds no row and is a silent no-op until the interval attaches; an
+`INSERT ... ON CONFLICT` (upsert) on such a key can write a duplicate that later wedges the drain on a
 duplicate-key error. A fresh `INSERT` is never affected (it routes to the `DEFAULT` and the next batch
-sweeps it). If you mutate **arbitrarily old** rows (a ledger with backdated adjustments, a document store
-editing years-old rows), prefer the synchronous `refine()`/`drain_all()` (one transaction, no gap) and
-`pause` the table while you do, or partition on a different axis.
+sweeps it). Refine does not have this problem -- it never removes a row from the parent -- so mutating old
+rows during a refine is safe. If you mutate rows a drain may be moving (a ledger with backdated
+adjustments, a document store editing years-old rows), prefer the synchronous `drain_all()` (one
+transaction, no gap) and `pause` the table while you do, or partition on a different axis.
 
 ## WAL and checkpoint sizing
 
@@ -523,8 +533,10 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   brief metadata cutover. No row movement, no PK rewrite, no index rebuild.
 - **The history starts coarse.** It is one monolith partition until refined; until then, pruning and
   fine-grained retention are suspended over its span. A coarse monolith is a valid permanent state.
-- **Refine needs transient disk** (about 2x the span being refined) and copies the rows; the synchronous
-  path is atomic and gap-free, the paced auto-refine path opens the narrow read-consistency gap below.
+- **Refine needs transient disk** (about 2x the span being refined) and copies the rows; both the
+  synchronous and the paced auto-refine path are gap-free (the source stays whole and attached until the
+  atomic swap, which transiently drops and re-adds any incoming FK within one transaction). The
+  read-consistency gap below is the *drain's*, not refine's.
 - **The empty `DEFAULT` is the safety net** (`keep_default`); `check_default()` flags any stray.
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on refine.
 - **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.

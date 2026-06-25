@@ -183,14 +183,15 @@ pgpm.refine_step(p_parent regclass, p_child name, p_target_step text default nul
   returns text
 ```
 
-One resumable microbatch of `refine`: it moves a within-horizon sub-range's next budget-sized batch into
-its fine child, or reclaims a below-horizon sub-range from the source, and performs the swap once the
-source is empty. The state is the shrinking coarse child plus the accumulating not-yet-attached fine
-children. Returns `moved:N`, `reclaimed:N`, `swapped:K` (refine complete, K children attached), or a soft
-no-progress status: `active` (not frozen yet), `default_dirty` (a stray sits in the range), `nosubdiv`
-(the step does not subdivide), or `idle`. This is the unit `maintain` paces across ticks; driven across
-separate transactions it feathers the move under the live workload at the cost of a transient
-`snapshot()`-covered gap.
+One resumable microbatch of `refine`: it **copies** (never deletes) a within-horizon sub-range's next
+budget-sized batch into its fine child, skips a below-horizon sub-range (discarded with the source at the
+swap), and performs the atomic swap once the cursor (`config.refine_cursor`) reaches the coarse `hi`. The
+source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
+`copied:N`, `swapped:K` (refine complete, K children attached), or a soft no-progress status: `active`
+(not frozen yet), `default_dirty` (a stray sits in the range), or `nosubdiv` (the step does not subdivide).
+This is the unit `maintain` paces across ticks; because it copies, the cross-tick path opens **no**
+read gap (unlike the drain). Its one FK touch is the swap's `DETACH`, which transiently drops and re-adds
+any incoming FK within that single transaction.
 
 ### `refine_history`
 
@@ -213,7 +214,7 @@ and -- when auto-refine is on (`config.refine_to`) -- one `refine_step` on the o
 A no-op while paused. Every step is isolated in its own subtransaction under a short `lock_timeout`, so it
 never blocks or deadlocks the live workload; a step that loses a lock race is deferred and retried next
 tick. Returns a one-line summary, for example
-`obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 refine=moved:5000`.
+`obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 refine=copied:5000`.
 
 ### `maintain_all`
 
@@ -326,17 +327,19 @@ One row per managed table. Beyond the static config it surfaces:
 pgpm.snapshot(p_rowtype anyelement) returns setof anyelement
 ```
 
-A complete, consistent read during a drain or a cross-tick refine. While rows are mid-move they live in an
+A complete, consistent read during a paced **drain**. While the drain has rows mid-move they live in an
 unattached child, so a plain `select` from the parent **undercounts**; `snapshot` unions the parent with
-every in-flight child. Pass the parent's row type as a typed `null` so it can infer the table:
+every in-flight drain child. (It deliberately skips a refine's copy-children -- their rows are still in the
+attached monolith -- so it never double-counts; refine, which copies, opens no gap to cover.) Pass the
+parent's row type as a typed `null` so it can infer the table:
 
 ```sql
 select count(*) from pgpm.snapshot(null::public.events);
 ```
 
 It is an optimization fence (it materializes the union, so a `WHERE` does not push down) and does nothing
-for writes (a write to an already-moved row no-ops until the interval attaches). Single-batch intervals and
-the synchronous `refine()`/`drain_all` never open the gap.
+for writes (a write to an already-moved drain row no-ops until the interval attaches). Single-batch
+intervals and the synchronous `drain_all`/`refine()` never open the gap.
 
 ### `check_default`
 
@@ -485,7 +488,7 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
 | `retain_drop` / `retain_reclaim` | a partition dropped by retention / aged rows deleted from the `DEFAULT` |
-| `refine_move` / `refine_reclaim` / `refine_attach` / `refine` | a refine microbatch moved / reclaimed a sub-range / attached a fine child / completed (`method` records the reclaimed count) |
+| `refine_copy` / `refine_aged` / `refine_attach` / `refine` | a refine microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `obtain_skip` / `retain_skip` / `drain_skip` / `refine_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
