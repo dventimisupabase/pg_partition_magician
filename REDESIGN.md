@@ -29,7 +29,7 @@ At transmute, rename the original to a coarse-child name, create the empty parti
 the original name, and attach the original as **one bounded child** covering
 `[grid_floor(min), B)` (the "monolith"), using a validated `CHECK` so the attach skips its scan.
 Create a fresh **empty `DEFAULT`** as a pure safety net. Going forward, `obtain` makes
-normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to a janitor
+normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to the assistant
 that keeps the `DEFAULT` empty. The monolith can later be **refined** (coarse to fine, hierarchically)
 on demand. The `DEFAULT` keystone is kept; it just no longer stores the history.
 
@@ -78,9 +78,9 @@ this only bites if the frontier reaches `B` before the scan finishes.
 - **NULL control values cannot occur.** The control column must be a member of the PK, and PK columns
   are `NOT NULL`, so the net never sees a NULL and the design never depends on it for NULL handling.
   This also satisfies range partitioning's own non-null-key requirement for free.
-- **The drain is demoted to a janitor.** It no longer moves the bulk; it evacuates the occasional
+- **The drain is demoted to the magician's assistant.** It no longer moves the bulk; it evacuates the occasional
   stray to keep the net empty so `obtain` stays on its plain path. `obtain` already declines to cover
-  a range the `DEFAULT` still holds rows for, which defines the janitor's remit.
+  a range the `DEFAULT` still holds rows for, which defines the assistant's remit.
 
 ### 4. The trilemma and the chosen strategy
 
@@ -185,8 +185,8 @@ exists (
 Because refinement copies and never deletes, and the swap is atomic, **the read-consistency caveat
 nearly disappears**. The `snapshot()` gap existed because the drain moved rows through an unattached
 child; refinement leaves rows visible in the monolith until the swap commits, so it never opens the
-gap, and the demoted janitor drain only ever touches a thin stray population. `snapshot()` remains
-for that residual janitor case, but the honest caveat that shaped the current design is largely
+gap, and the demoted assistant drain only ever touches a thin stray population. `snapshot()` remains
+for that residual assistant case, but the honest caveat that shaped the current design is largely
 retired here.
 
 ### 10. The refinement procedure
@@ -315,14 +315,14 @@ Extend the existing return shape:
 - **Surface the refinement backlog**, the new notion of outstanding work now that `default_rows` is
   normally about zero: an `unrefined_span text` (the extent covered by coarse children) plus a
   `history_unrefined boolean`, so the operator sees that pruning and fine retention are suspended over
-  that span. Keep `default_rows` / `closed_rows`, which now report only janitor strays.
+  that span. Keep `default_rows` / `closed_rows`, which now report only the strays the assistant evacuates.
 - **Reuse `inflight_partitions`** (the `attached = false` count, issue #94) to show
-  refinement-in-progress. To tell a refinement child from a drain-janitor child, add a small
+  refinement-in-progress. To tell a refinement child from an assistant-drain child, add a small
   `purpose text` tag to `pgpm.part` (`'drain'` or `'refine'`) and report it; deriving it from "range
   sits inside an attached coarse child" also works, but the tag is clearer.
 
-The quiet payoff: because refinement copies-then-swaps and the drain is demoted to a stray-janitor, the
-`snapshot()` read gap nearly disappears, surviving only for the residual janitor case, not the bulk
+The quiet payoff: because refinement copies-then-swaps and the drain is demoted to the stray-evacuating
+assistant, the `snapshot()` read gap nearly disappears, surviving only for that residual case, not the bulk
 (echoing section 9).
 
 ## Build order
