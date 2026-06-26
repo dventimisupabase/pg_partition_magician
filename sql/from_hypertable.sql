@@ -18,6 +18,10 @@
 -- continuous aggregates and space partitioning (>1 dimension); transmute also
 -- refuses a nullable control column, a key that excludes it, or a bare unique
 -- index. A trigger-based delta for update/delete workloads is a follow-up.
+-- Known gaps (shared with core transmute/drain/refine, tracked separately): a GENERATED column cannot be
+-- migrated (the copy's column list includes it and the INSERT is rejected), and a CHECK constraint is
+-- carried to the monolith but not propagated to the partitioned parent (so new partitions do not enforce
+-- it). Tables with either are out of scope for this version.
 -- =============================================================================
 
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a
