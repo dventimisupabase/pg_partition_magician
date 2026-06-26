@@ -18,8 +18,9 @@ psql, or other tooling needed on the host.
 ./test.sh 15        # PG 15: build a pg_cron+pgtap image, install each channel,
                     # load fixtures, run the pgTAP suite, verify uninstall
 ./test.sh           # the full matrix: PG 15, 16, 17, 18
-./test.sh timescale # the from_hypertable track: TimescaleDB 2.16.1 / PG15 only,
-                    # its own image, NOT part of the default matrix
+./test.sh timescale # the from_hypertable track: TimescaleDB 2.9.1 + 2.16.1 / PG15
+                    # (the big fleet clusters), its own image, NOT in the default matrix
+                    # (TS_VERSIONS='2.9.1' ./test.sh timescale runs just one)
 ```
 
 `test.sh` exercises all three install channels (`psql`, bundle, dbdev) against a

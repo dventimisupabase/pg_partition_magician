@@ -49,13 +49,17 @@ services:
     container_name: pgpm_test-18
     ports: ["5518:5432"]
 
-  # The from_hypertable track: TimescaleDB on PG15 (pinned to the Supabase fleet version). Built from a
-  # separate Dockerfile (Alpine base + pgTAP), driven by `./test.sh timescale`, excluded from the default
-  # 15/16/17/18 matrix (its own profile, never "all").
+  # The from_hypertable track: TimescaleDB on PG15. TS_VERSION (set per-version by `./test.sh timescale`)
+  # selects the Supabase fleet version to build/run; defaults to 2.16.1. Built from a separate Dockerfile
+  # (Alpine base + pgTAP), excluded from the default 15/16/17/18 matrix (its own profile, never "all").
   timescale:
     <<: *pg-base
     profiles: ["timescale"]
-    build: { context: ., dockerfile: tests/timescale/Dockerfile }
-    image: pgpm_test:timescale-216
+    build:
+      context: .
+      dockerfile: tests/timescale/Dockerfile
+      args:
+        TS_VERSION: ${TS_VERSION:-2.16.1}
+    image: pgpm_test:timescale-${TS_VERSION:-2.16.1}
     container_name: pgpm_test-timescale
     ports: ["5519:5432"]

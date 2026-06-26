@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- **The `from_hypertable` CI track runs against the fleet's TimescaleDB versions, not just one.** It is now
+  a matrix over the two big Supabase clusters, **2.9.1** (~224 projects) and **2.16.1** (~434), on PG15
+  (set `TS_VERSIONS` to override). The full track passes on both, confirming the migration (including the
+  `drop_chunks` retention auto-translation, which reads the version-sensitive jobs catalog) works on 2.9.1.
 - **`from_hypertable` exposes its phases, with an online append-only catch-up.** The migration is split
   into `from_hypertable_copy` (build the destination and bulk-copy the existing chunks to a watermark,
   source stays live) and `from_hypertable_cutover` (catch up rows that arrived after the watermark, swap

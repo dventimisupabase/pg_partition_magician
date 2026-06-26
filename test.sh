@@ -108,52 +108,56 @@ run_version() {  # <pg_version>
   echo "PostgreSQL $v: PASS"
 }
 
-# The from_hypertable track. TimescaleDB-only, PG15. Each tests/timescale/db/*.sql runs against a fresh
-# throwaway database (disposable-db) because from_hypertable is a procedure that COMMITs (per chunk and
-# at cutover) and so cannot be wrapped in a rolled-back transaction. We drive psql directly and scan the
-# TAP output for failures (the Alpine image carries pgTAP but not pg_prove).
+# The from_hypertable track. TimescaleDB-only, PG15, run against each version in the Supabase fleet that
+# matters (TS_VERSIONS, default the two big clusters: 2.9.1 and 2.16.1). Each tests/timescale/db/*.sql runs
+# against a fresh throwaway database (disposable-db) because from_hypertable is a procedure that COMMITs
+# (per chunk and at cutover) and so cannot be wrapped in a rolled-back transaction. We drive psql directly
+# and scan the TAP output for failures (the Alpine image carries pgTAP but not pg_prove).
 run_timescale() {
-  local prof="timescale" svc="timescale" fail=0 f db out
-  echo; echo "========================================="
-  echo "TimescaleDB track (2.16.1-pg15) -- from_hypertable"
-  echo "========================================="
-  $DC --profile "$prof" down -v 2>/dev/null || true
-  $DC --profile "$prof" build $BUILD_PROGRESS
-  $DC --profile "$prof" up -d
-  # Wait for the REAL server. The official postgres entrypoint runs a temporary init server on the unix
-  # socket only (no TCP listener); probing over TCP therefore succeeds ONLY once the real server is up,
-  # avoiding the "database system is shutting down" race where a socket probe catches the temp init
-  # server right before it restarts (TimescaleDB's heavier init widens that window).
-  for _ in $(seq 1 90); do
-    $DC --profile "$prof" exec -T -e PGPASSWORD=postgres "$svc" \
-      psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1 && break
-    sleep 1
-  done
+  local prof="timescale" svc="timescale" fail=0 f db out ver
+  for ver in ${TS_VERSIONS:-2.9.1 2.16.1}; do
+    export TS_VERSION="$ver"   # docker-compose interpolates this into the image tag + build arg
+    echo; echo "========================================="
+    echo "TimescaleDB $ver / pg15 -- from_hypertable"
+    echo "========================================="
+    $DC --profile "$prof" down -v 2>/dev/null || true
+    $DC --profile "$prof" build $BUILD_PROGRESS
+    $DC --profile "$prof" up -d
+    # Wait for the REAL server. The official postgres entrypoint runs a temporary init server on the unix
+    # socket only (no TCP listener); probing over TCP therefore succeeds ONLY once the real server is up,
+    # avoiding the "database system is shutting down" race where a socket probe catches the temp init
+    # server right before it restarts (TimescaleDB's heavier init widens that window).
+    for _ in $(seq 1 90); do
+      $DC --profile "$prof" exec -T -e PGPASSWORD=postgres "$svc" \
+        psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1 && break
+      sleep 1
+    done
 
-  for f in tests/timescale/db/*.sql; do
-    db="t_$(basename "$f" .sql | tr -cd 'a-z0-9_')"
-    echo "--- ${f##*/} (db: $db) ---"
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
-      -c "drop database if exists $db" -c "create database $db" \
-      -c "alter database $db set client_min_messages = warning" >/dev/null
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
-      -c "create extension if not exists timescaledb; create extension if not exists pgtap;" >/dev/null
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
-      --single-transaction -f /repo/sql/pg_partition_magician.sql >/dev/null
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
-      -f /repo/sql/from_hypertable.sql >/dev/null
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
-      -f /repo/tests/timescale/fixtures.sql >/dev/null
-    # -tA gives clean TAP (no table chrome); no ON_ERROR_STOP so every assertion reports.
-    out=$($DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -tAq -f "/repo/$f" 2>&1)
-    echo "$out" | grep -E '^(ok|not ok|1\.\.|# )' || true
-    if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then
-      echo "FAIL: $f"; fail=1
-    fi
-    $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -q -c "drop database if exists $db" >/dev/null
-  done
+    for f in tests/timescale/db/*.sql; do
+      db="t_$(basename "$f" .sql | tr -cd 'a-z0-9_')"
+      echo "--- ${f##*/} (db: $db) ---"
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+        -c "drop database if exists $db" -c "create database $db" \
+        -c "alter database $db set client_min_messages = warning" >/dev/null
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+        -c "create extension if not exists timescaledb; create extension if not exists pgtap;" >/dev/null
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+        --single-transaction -f /repo/sql/pg_partition_magician.sql >/dev/null
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+        -f /repo/sql/from_hypertable.sql >/dev/null
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -q \
+        -f /repo/tests/timescale/fixtures.sql >/dev/null
+      # -tA gives clean TAP (no table chrome); no ON_ERROR_STOP so every assertion reports.
+      out=$($DC --profile "$prof" exec -T "$svc" psql -U postgres -d "$db" -tAq -f "/repo/$f" 2>&1)
+      echo "$out" | grep -E '^(ok|not ok|1\.\.|# )' || true
+      if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then
+        echo "FAIL ($ver): $f"; fail=1
+      fi
+      $DC --profile "$prof" exec -T "$svc" psql -U postgres -d postgres -q -c "drop database if exists $db" >/dev/null
+    done
 
-  $DC --profile "$prof" down -v
+    $DC --profile "$prof" down -v
+  done
   if [ "$fail" -ne 0 ]; then echo "TimescaleDB track: FAIL"; return 1; fi
   echo "TimescaleDB track: PASS"
 }
