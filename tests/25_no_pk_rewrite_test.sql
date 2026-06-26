@@ -1,7 +1,8 @@
 -- pgpm never rewrites the primary key (REDESIGN.md). transmute reuses the existing PK when the
 -- control column is a MEMBER of it (Postgres requires a partitioned PK only to INCLUDE the partition
--- key, not lead it), refuses a table whose PK excludes the control column rather than widening it, and
--- refuses a table with no primary key at all (issue #89: pgpm does not support no-PK tables).
+-- key, not lead it), and refuses a table whose PK excludes the control column rather than widening it.
+-- (A keyless table is now accepted when the control column is NOT NULL -- see tests/52; here the no-key
+-- table has a nullable control column, so it is refused for the NOT NULL requirement.)
 create extension if not exists pgtap;
 
 begin;
@@ -25,14 +26,14 @@ select is(
   (select count(*)::int from pg_index where indexrelid = (select idx from _pk_before)),
   1, 'the existing PK index object survives (reused in place on the monolith, never rebuilt)');
 
--- (B) no-PK table: refused up front (issue #89) -- pgpm requires the control column to be part of
---     the primary key, and there is none here to anchor on.
-create table public.nopk (id bigint, body text);
+-- (B) no-key table with a NULLABLE control column: refused up front -- a keyless table is partitionable
+--     only when the control column is NOT NULL (a partition key cannot be null, and pgpm never scans).
+create table public.nopk (id bigint, body text);   -- id is nullable, and there is no key
 insert into public.nopk (id, body) select g, 'x' from generate_series(1, 100) g;
 select throws_like(
   $$ select pgpm.transmute('public.nopk', 'id', 100000) $$,
-  'pg_partition_magician:%primary key%',
-  'transmute refuses a table with no primary key, naming the requirement');
+  'pg_partition_magician:%NOT NULL%',
+  'transmute refuses a keyless table whose control column is nullable, naming NOT NULL');
 select is(
   (select relkind::text from pg_class where oid = 'public.nopk'::regclass),
   'r', 'the refusal is up front: nopk is left a plain table, not transmuted');

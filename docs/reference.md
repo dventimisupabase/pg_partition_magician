@@ -42,11 +42,12 @@ until you `resume` it and maintenance runs.
 
 Parameters:
 
-- `p_control` -- the partition-key column. It **must already be a member of a reusable key: a primary key
-  or a unique constraint** (Postgres requires a partitioned table's key to include the partition key;
-  `pgpm` reuses the existing key in place and never rewrites it). The column must be `NOT NULL` (a primary
-  key guarantees this; for a unique constraint it is checked). A bare unique index (not a constraint) is
-  refused with guidance to promote it first; a table with no usable key at all is refused.
+- `p_control` -- the partition-key column. It **must be `NOT NULL`** (a partition key cannot be null;
+  `pgpm` never scans to enforce it). A key is not required: if a **primary key or unique constraint**
+  includes the control column, `pgpm` reuses it in place and never rewrites it; otherwise the table is
+  partitioned **keyless** (no key synthesized). A key that *excludes* the control column is refused (no
+  rewrite), as is a *bare* unique index (promote it to a constraint first). Note: `refine` is unavailable
+  on a keyless monolith, so its history stays as one coarse child unless a key is added before transmute.
 - `p_interval` -- the grid width (`interval '1 day'`, `'1 month'`, `'1 year'`, ...). Cast a bare literal:
   `interval '1 month'` (it disambiguates from the `bigint` overload).
 - `p_obtain` -- how many partitions to keep ahead of the frontier.

@@ -24,7 +24,7 @@
 -- returns normally when the hypertable is migratable by this version.
 create or replace function pgpm.from_hypertable_preflight(p_hypertable regclass, p_control name)
 returns void language plpgsql as $$
-declare v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int; v_has_key boolean;
+declare v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int;
 begin
   if not exists (select 1 from pg_extension where extname = 'timescaledb') then
     raise exception 'pg_partition_magician: from_hypertable requires the timescaledb extension to be installed';
@@ -52,21 +52,14 @@ begin
       p_hypertable, v_dims;
   end if;
 
-  -- (3) the control column must be part of a PK or UNIQUE constraint -- the key pgpm reuses (Proposal
-  -- B). A keyless hypertable (the common shape) has none, so it is refused here with the prep step
-  -- rather than failing deeper in transmute. (transmute re-checks the full key/NOT-NULL contract.)
+  -- (3) the control column must exist. The key/NOT-NULL contract is left to transmute (the single source
+  -- of truth): it reuses a primary key or unique constraint if one includes the control column, and
+  -- otherwise partitions the table keyless -- which is exactly the common hypertable shape, since
+  -- create_hypertable makes the time column NOT NULL but adds no key. So a keyless hypertable migrates.
   select a.attnum into v_ctl_attnum
     from pg_attribute a where a.attrelid = p_hypertable and a.attname = p_control and not a.attisdropped;
   if v_ctl_attnum is null then
     raise exception 'pg_partition_magician: column % not found on %', p_control, p_hypertable;
-  end if;
-  select exists (
-    select 1 from pg_constraint con
-     where con.conrelid = p_hypertable and con.contype in ('p', 'u') and v_ctl_attnum = any(con.conkey)
-  ) into v_has_key;
-  if not v_has_key then
-    raise exception 'pg_partition_magician: cannot migrate hypertable % -- its control column % is not part of a primary key or unique constraint, so pgpm has no key to reuse (this is the common keyless hypertable). Add a unique constraint that includes % first (e.g. ALTER TABLE % ADD CONSTRAINT %_uq UNIQUE (%, <your id column>)), then re-run from_hypertable.',
-      p_hypertable, quote_ident(p_control), quote_ident(p_control), p_hypertable, v_rel, p_control;
   end if;
 end $$;
 

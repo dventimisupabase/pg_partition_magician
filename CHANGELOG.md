@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`transmute` partitions keyless tables; `from_hypertable` migrates keyless hypertables.** The key is
+  now optional: the only hard requirement is a **`NOT NULL` control column**. A primary key or unique
+  constraint that includes the control column is still reused in place when present, but a table with
+  neither is now partitioned **keyless** (no key synthesized, faithful to the source) instead of refused.
+  This is the common "Timescale as a partition manager" shape -- `create_hypertable` makes the time column
+  `NOT NULL` but adds no key -- so `from_hypertable` drops its keyless refusal and migrates those
+  hypertables (tests/timescale/db/03; tests/timescale/db/01 updated). A nullable control column, a key that
+  *excludes* the control column, and a bare unique index are still refused with guidance. One limitation:
+  `refine` is unavailable on a keyless monolith (no key to dedup a resumable copy), so its history stays as
+  one coarse, queryable child; `refine` raises a clear error rather than failing obscurely. (tests/52;
+  tests/32 removed as obsolete, tests/25 updated.)
+- **`refine` reuses the same key `transmute` did (bug fix).** `refine`'s resumable copy identifies rows by
+  the reused key, but it was built from the **primary key only** -- so on a monolith whose reused key is a
+  *unique constraint* (the case the previous entry added) it produced malformed SQL (`... where )`) and
+  failed. It now uses the primary key or the unique constraint, matching `transmute`. (tests/53)
 - **`transmute` reuses a unique constraint, not just a primary key.** The key contract is relaxed: the
   control column must be part of a **primary key OR a unique constraint** (Postgres requires a partitioned
   table's key only to *include* the partition key). `transmute` reuses whichever exists in place, with no

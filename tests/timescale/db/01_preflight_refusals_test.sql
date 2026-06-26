@@ -10,12 +10,12 @@ select lives_ok(
   $$ select pgpm.from_hypertable_preflight('ph_ok', 'ts') $$,
   'preflight accepts a hypertable whose control column is in a unique constraint');
 
--- a keyless hypertable (no PK / unique constraint) is refused with the prep guidance
+-- a keyless hypertable (no PK / unique constraint) is ALSO accepted: transmute partitions it keyless
+-- (create_hypertable makes the time column NOT NULL, so the keyless contract is satisfied)
 select mk_plain_hypertable('ph_keyless');
-select throws_like(
+select lives_ok(
   $$ select pgpm.from_hypertable_preflight('ph_keyless', 'ts') $$,
-  'pg_partition_magician:%keyless%',
-  'preflight refuses a keyless hypertable, naming the prep step');
+  'preflight accepts a keyless hypertable (migrated keyless)');
 
 -- a continuous aggregate is refused (no native-partition equivalent)
 select mk_hypertable_cagg('ph_cagg');

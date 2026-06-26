@@ -94,9 +94,9 @@ select pgpm.set_refine('public.events', '1 month');
 That is it. The conversion is a deliberate two-step: `transmute` registers the table paused so you can
 inspect it, and maintenance does nothing until you `resume`. Once live, it keeps real partitions ahead of
 the frontier and the `DEFAULT` empty; the historical bulk stays in the monolith until you choose to
-`refine` it (by hand or via auto-refine). `transmute` never rewrites your key, so it just requires the
-control column to already be part of a primary key or a unique constraint, which it reuses in place (else
-it refuses). See the [transmute walkthrough](docs/guide.md#transmute-a-table).
+`refine` it (by hand or via auto-refine). `transmute` never rewrites your key: it reuses a primary key or
+unique constraint that includes the control column, or partitions the table keyless if it has neither. The
+one requirement is a `NOT NULL` control column. See the [transmute walkthrough](docs/guide.md#transmute-a-table).
 
 ## Documentation
 

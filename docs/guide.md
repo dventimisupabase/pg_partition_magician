@@ -153,24 +153,26 @@ the only `O(rows)` work is a single non-blocking read -- no index rebuild, no ro
 (Contrast the old model, which paid no scan up front but then rewrote every historical row through a
 perpetual drain.)
 
-The one requirement is that the control column already be part of a reusable key: a **primary key** or a
-**unique constraint**. Postgres only requires a partitioned key to *include* the partition key, not lead
-it, so a single-column key on the control column qualifies, and so does a composite one that contains it
-(e.g. `(tenant_id, id)` partitioned by `id`, or `UNIQUE (device_id, ts)` partitioned by `ts`). `transmute`
-reuses that key in place (the parent adopts the monolith's existing index, no rebuild), and the control
-column it covers is required to be `NOT NULL` (a primary key guarantees this; for a unique constraint it
-is checked, never scanned). A few shapes are refused with a clear error rather than partitioned on a weak
+The one hard requirement is that the **control column be `NOT NULL`** (a partition key cannot be null, and
+`transmute` never scans to enforce it). A key is *not* required: if the table has a **primary key** or a
+**unique constraint** that includes the control column, `transmute` reuses it in place (the parent adopts
+the monolith's existing index, no rebuild); if it has neither, the table is partitioned **keyless** and no
+key is synthesized (faithful to a keyless source, e.g. a plain hypertable). Postgres only requires a
+partitioned key to *include* the partition key, not lead it, so a single-column key qualifies, and so does
+a composite one that contains it (e.g. `(tenant_id, id)` partitioned by `id`, or `UNIQUE (device_id, ts)`
+partitioned by `ts`). A few shapes are still refused with a clear error rather than partitioned on a weak
 key:
 
-- **No primary key and no unique constraint** on the control column: add one that includes it first (the
-  simplest modern data model is a single-column time-ordered key, bigint/Snowflake/UUIDv7/ULID).
+- **A nullable control column**: run `ALTER TABLE ... ALTER COLUMN <control> SET NOT NULL` first.
 - **A key that *excludes* the control column** (the classic `events(id PRIMARY KEY, created_at)` wanting
   time partitioning): make the control column part of the key first, or widen it with `CREATE UNIQUE INDEX
   CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`.
 - **Only a *bare* unique index** (not a constraint) covers the control column: `ADD UNIQUE` would rebuild
   it, so promote it metadata-only first with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`.
 
-Then re-transmute.
+Then re-transmute. One consequence of going keyless: `refine` is unavailable on a keyless monolith (it has
+no key to identify rows for a resumable copy), so the history stays as one coarse, queryable monolith. Add
+a key before transmuting if you want to refine the history into fine partitions later.
 
 `transmute` is reversible until you commit to it: while the monolith is intact and holds the whole table,
 [`untransmute`](reference.md#untransmute) cleanly restores the original. It becomes a one-way door once a
@@ -551,8 +553,8 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **The empty `DEFAULT` is the safety net** (`keep_default`); `check_default()` flags any stray.
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on refine.
 - **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.
-- **The key is never rewritten;** the control column must already be part of a primary key or unique
-  constraint, which `transmute` reuses in place.
+- **The key is never rewritten;** a primary key or unique constraint that includes the control column is
+  reused in place, and a keyless table is partitioned keyless. The control column must be `NOT NULL`.
 - **Incoming foreign keys** are refused by default, or preserved (dropped for the conversion, re-added
   against the new parent) with `p_incoming_fks => 'preserve'`.
 - **Mid-move reads undercount on the paced paths; writes to moved rows no-op.** Inherent to an online

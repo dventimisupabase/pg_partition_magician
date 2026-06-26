@@ -650,7 +650,7 @@ create or replace function pgpm.refine_step(
   p_parent regclass, p_child name, p_target_step text default null, p_batch int default null
 ) returns text language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text; v_ncast text; v_pkjoin text;
+  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text; v_ncast text; v_pkjoin text; v_keyidx oid;
   v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
@@ -671,13 +671,25 @@ begin
   v_child := format('%I.%I', v_nsp, p_child)::regclass;
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
-  -- the primary-key equijoin (d.<pk> = s.<pk>, every PK column): the copy is an anti-join against it, so a
-  -- resumed batch never re-copies a row already in the child even when the control column is non-unique.
-  select string_agg(format('d.%I = s.%I', a.attname, a.attname), ' and ' order by k.ord) into v_pkjoin
-    from pg_index i
-    cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
-    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
-   where i.indrelid = p_parent and i.indisprimary;
+  -- the reused-key equijoin (d.<key> = s.<key>, every key column): the copy is an anti-join against it, so
+  -- a resumed batch never re-copies a row already in the child even when the control column is non-unique.
+  -- The key is whatever transmute reused: a PRIMARY KEY, or (relaxed key contract) a UNIQUE constraint.
+  -- A truly KEYLESS monolith has no key to identify rows by, so a resumable copy cannot dedup -- refine is
+  -- refused for it below ('nokey'); the coarse monolith stays a correct, queryable permanent state.
+  select coalesce(
+           (select i.indexrelid from pg_index i where i.indrelid = p_parent and i.indisprimary limit 1),
+           (select con.conindid from pg_constraint con join pg_index i on i.indexrelid = con.conindid
+             where con.conrelid = p_parent and con.contype = 'u'
+               and i.indpred is null and i.indexprs is null limit 1))
+    into v_keyidx;
+  if v_keyidx is not null then
+    select string_agg(format('d.%I = s.%I', a.attname, a.attname), ' and ' order by k.ord) into v_pkjoin
+      from pg_index i
+      cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+     where i.indexrelid = v_keyidx;
+  end if;
+  if v_pkjoin is null then return 'nokey'; end if;
 
   -- frozen? (whole range at/below the current grid floor, so no live write still lands in it)
   v_frontier := pgpm._frontier_native(p_parent);
@@ -821,12 +833,13 @@ begin
   loop
     v_status := pgpm.refine_step(p_parent, p_child, p_target_step, null);
     if v_status like 'swapped:%' then return split_part(v_status, ':', 2)::int; end if;
-    if v_status in ('active', 'default_dirty', 'nosubdiv', 'idle') then
+    if v_status in ('active', 'default_dirty', 'nosubdiv', 'nokey', 'idle') then
       raise exception 'pg_partition_magician: cannot refine % -- %', p_child,
         case v_status
           when 'active' then 'it is still active (not frozen); wait until the frontier passes its upper bound'
           when 'default_dirty' then 'the DEFAULT holds rows inside its range; drain them first'
           when 'nosubdiv' then 'the target step does not subdivide its range'
+          when 'nokey' then 'it has no primary key or unique constraint, so a resumable copy cannot identify rows; refine is unavailable for keyless tables (the coarse monolith remains a valid, queryable state)'
           else 'nothing to refine' end;
     end if;
     v_iter := v_iter + 1;
@@ -1026,8 +1039,18 @@ begin
         raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite keys, and the primary key (%) does not include %, nor does any unique constraint. Make % part of the primary key or add a unique constraint that includes it, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen it via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
           p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control;
       else
-        raise exception 'pg_partition_magician: cannot transmute % -- it has no primary key, and no unique constraint includes the control column (%). pgpm requires the control column to be part of a primary key or a unique constraint (a partitioned table''s key must include the partition key, which also makes the control column NOT NULL). Add one that includes % first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID).',
-          p_parent, p_control, p_control;
+        -- truly keyless: no key to reuse. pgpm still partitions it -- the parent gets no primary key or
+        -- unique constraint, faithful to a keyless source (e.g. a plain hypertable un-hypertabled by
+        -- from_hypertable). The one requirement is that the control column be NOT NULL: a partition key
+        -- cannot be null, and pgpm never scans to enforce it, so a nullable control column is refused.
+        -- (refine is unavailable for a keyless monolith -- it has no key to dedup a resumed copy -- but
+        -- the coarse monolith is a correct, queryable permanent state; see refine_step.)
+        if not (select a.attnotnull from pg_attribute a
+                  where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) then
+          raise exception 'pg_partition_magician: cannot transmute % on % -- the table has no primary key or unique constraint to reuse, and % is nullable. A partition key must be NOT NULL: run ALTER TABLE % ALTER COLUMN % SET NOT NULL first, then re-run transmute. (A primary key or unique constraint including % would also satisfy this.)',
+            p_parent, p_control, p_control, p_parent::text, p_control, p_control;
+        end if;
+        -- proceed keyless: v_pkcols stays null, v_add_pk and v_add_uniq stay false.
       end if;
     end if;
   end if;
