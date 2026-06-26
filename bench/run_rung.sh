@@ -6,7 +6,7 @@
 # rung's config through bench/run.sh. The conversion runs on green so the run exercises the
 # real path (managed PG, pgfr, the NAT'd connection) -- which is where the surprises live.
 #
-#   bench/run_rung.sh R0|R1|R2|R3 [stress|gentle]
+#   bench/run_rung.sh R0|R1|R2|R3|R4|R5 [stress|gentle]
 #
 # PROFILE (2nd arg, default stress) selects the drain intensity + how we observe:
 #   stress -- aggressive drain (2s maintenance, large batch), run-to-completion (observe until the
@@ -17,7 +17,7 @@
 #             instance's I/O baseline, so the disk never tires and the measurement is reproducible.
 set -euo pipefail
 
-RUNG="${1:?usage: run_rung.sh R0|R1|R2|R3 [stress|gentle]}"
+RUNG="${1:?usage: run_rung.sh R0|R1|R2|R3|R4|R5 [stress|gentle]}"
 PROFILE="${2:-stress}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -48,12 +48,17 @@ export BENCH_OBSERVE_INTERVAL=10
 export BENCH_PGFR=1   # no PK pre-build: transmute never rewrites the PK, so the cutover is always metadata-only
 
 # ---- per-rung scale (see bench/SIZE_LADDER.md) ----
+# BENCH_ID_STEP ~= BENCH_ROWS/5 so the monolith [0,B) refines into ~6 fine id-partitions per rung.
+# The refine COPIES the WHOLE monolith (all BENCH_ROWS history rows), so it is the bulk O(rows) move the
+# ladder measures -- and it needs transient ~2x storage (the copies before the swap drops the source).
 case "$RUNG" in
-  R0) export BENCH_ROWS=1000000  BENCH_PHASE_SECS=45 BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=45 BENCH_DRAIN_MAX_SECS=600 ;;
-  R1) export BENCH_ROWS=3000000  BENCH_PHASE_SECS=45 BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=45 BENCH_DRAIN_MAX_SECS=600 ;;
-  R2) export BENCH_ROWS=10000000 BENCH_PHASE_SECS=60 BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=60 BENCH_DRAIN_MAX_SECS=1200 ;;
-  R3) export BENCH_ROWS=40000000 BENCH_PHASE_SECS=90 BENCH_DRAIN_BATCH=150000 BENCH_DRAIN_IDLE_SECS=90 BENCH_DRAIN_MAX_SECS=2700 ;;
-  *)  echo "unknown rung '$RUNG' (want R0|R1|R2|R3)"; exit 2 ;;
+  R0) export BENCH_ROWS=1000000   BENCH_ID_STEP=200000   BENCH_PHASE_SECS=45  BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=45  BENCH_DRAIN_MAX_SECS=600 ;;
+  R1) export BENCH_ROWS=3000000   BENCH_ID_STEP=600000   BENCH_PHASE_SECS=45  BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=45  BENCH_DRAIN_MAX_SECS=900 ;;
+  R2) export BENCH_ROWS=10000000  BENCH_ID_STEP=2000000  BENCH_PHASE_SECS=60  BENCH_DRAIN_BATCH=100000 BENCH_DRAIN_IDLE_SECS=60  BENCH_DRAIN_MAX_SECS=1800 ;;
+  R3) export BENCH_ROWS=40000000  BENCH_ID_STEP=8000000  BENCH_PHASE_SECS=90  BENCH_DRAIN_BATCH=150000 BENCH_DRAIN_IDLE_SECS=90  BENCH_DRAIN_MAX_SECS=3600 ;;
+  R4) export BENCH_ROWS=120000000 BENCH_ID_STEP=24000000 BENCH_PHASE_SECS=180 BENCH_DRAIN_BATCH=250000 BENCH_DRAIN_IDLE_SECS=120 BENCH_DRAIN_MAX_SECS=36000 ;;
+  R5) export BENCH_ROWS=350000000 BENCH_ID_STEP=70000000 BENCH_PHASE_SECS=180 BENCH_DRAIN_BATCH=500000 BENCH_DRAIN_IDLE_SECS=120 BENCH_DRAIN_MAX_SECS=90000 ;;
+  *)  echo "unknown rung '$RUNG' (want R0|R1|R2|R3|R4|R5)"; exit 2 ;;
 esac
 
 # ---- per-profile drain intensity + observe mode (overrides the rung's stress defaults) ----
