@@ -4,6 +4,18 @@ Proves `pg_partition_magician` converts a **giant, live, query-loaded** table to
 partitioned **online**, and measures latency / throughput / health *before*,
 *during*, and *after* the conversion.
 
+> **Model note: monolith + refine.** Since the redesign, `transmute()` is an instant metadata cutover
+> that parks all history in one bounded *monolith* partition; the bulk O(rows) move is now `refine()`
+> (COPY the monolith into fine children, one atomic swap, drop the source), not the drain. `refine`
+> only runs on a *frozen* coarse child (whole range below the write frontier). A time key's frontier is
+> wall-clock `now()`, so a fresh time monolith cannot freeze inside a benchmark window; an id key's
+> frontier is `max(id)`, which the harness advances past the monolith's upper bound with one sentinel
+> row to freeze it on demand (the same trick pgpm's own refine tests use). So the harness partitions
+> `bench.events` by its bigint `id` (it is in the PK, so `transmute` reuses the PK in place) and
+> measures the refine of the id-monolith under load. A rung is green when refine completes
+> (`coarse_partitions` reaches 0), every history row is conserved across the swap, and convert-phase
+> latency tracks baseline with zero workload failures.
+
 ## What it builds
 
 A small multi-table OLTP schema (`bench`) with one deliberately huge table:
@@ -39,25 +51,27 @@ and the month-spread is unchanged).
 
 ## The phases (a passive observer)
 
-pgpm is **self-driving**: you call `transmute()` once and pgpm's own pg_cron maintenance
-obtains and drains the default autonomously, inside the database. So this harness does
-**not** perform the partitioning: it sets pgpm up the way an operator would, drives an
+pgpm is **self-driving**: you call `transmute()` once, enable auto-refine, and pgpm's own pg_cron
+maintenance refines the monolith (and obtains/drains) autonomously, inside the database. So this
+harness does **not** perform the partitioning: it sets pgpm up the way an operator would, drives an
 ambient workload, and *observes*. Three phases:
 
 1. **baseline**: ambient workload against the *unpartitioned* table.
-2. **convert**: fire `pgpm.transmute()` once (`p_paused => false`) and schedule
-   `pgpm.maintain` on pg_cron, then **pgpm** obtains and drains the default on its
-   own while the harness drives the workload and watches `pgpm.log` until the drain settles.
-   The harness never calls `drain_step`; because the conversion runs server-side, a
-   dropped harness connection can't stop it.
-3. **post**: ambient workload against the now-partitioned table.
+2. **convert**: fire `pgpm.transmute()` once (`p_paused => false`), freeze the monolith (advance the id
+   frontier past it with a sentinel row), enable auto-refine (`set_refine`), and schedule
+   `pgpm.maintain` on pg_cron. Then **pgpm** refines the monolith into fine partitions on its own
+   (COPY into new children, one atomic swap, drop the source) while the harness drives the workload and
+   watches `pgpm.log` until the refine completes (`coarse_partitions` reaches 0). The harness never
+   calls `refine_step`; because the conversion runs server-side, a dropped harness connection can't
+   stop it.
+3. **post**: ambient workload against the now fully-partitioned table.
 
-The report compares client tps + p50/p95/p99 latency across the three phases and summarizes
-pgpm's own conversion (drain/obtain from `pgpm.log`). The system-metric time-series (WAL,
-checkpoints, `pg_stat_io`, wait/lock events) is **pg_flight_recorder's** job: it records them
-continuously and server-side, and the report slices its series to the conversion window. So
-degradation *while pgpm converts the table under load* is visible without the harness
-hand-rolling gauges.
+The report compares client tps + p50/p95/p99 latency across the three phases, summarizes pgpm's own
+conversion (refine/obtain from `pgpm.log`), and asserts **row conservation** (every history row still
+present after the swap). The system-metric time-series (WAL, checkpoints, `pg_stat_io`, wait/lock
+events) is **pg_flight_recorder's** job: it records them continuously and server-side, and the report
+slices its series to the conversion window. So degradation *while pgpm converts the table under load*
+is visible without the harness hand-rolling gauges.
 
 ## Running it
 
@@ -96,7 +110,9 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_CHUNK` | `2000000` | generator commit chunk |
 | `BENCH_GEN_JOBS` | `1` | parallel generator sessions: set to ≈vCPU to fan generation across cores (one `INSERT…SELECT` is single-core-bound) |
 | `BENCH_DEFER_INDEX` | `0` | drop the secondary index during bulk load, rebuild after; avoids scattered per-row index maintenance across hundreds of millions of inserts |
-| `BENCH_INTERVAL` | `1 month` | partition width |
+| `BENCH_INTERVAL` | `1 month` | partition width (time-key only; the ladder partitions by `id`, see `BENCH_ID_STEP`) |
+| `BENCH_ID_STEP` | `10000000` | id-grid step: the bench partitions `bench.events` by its bigint `id`; the monolith `[0,B)` refines into ~`B/step` fine partitions |
+| `BENCH_REFINE` | `1` | `1` = freeze the monolith and drive auto-refine (the bulk mover) and observe it to completion; `0` = transmute-only (no bulk move) |
 | `BENCH_OBTAIN` | `3` | future partitions pgpm obtains (configured on transmute; pgpm's maintenance does it) |
 | `BENCH_CLIENTS` / `BENCH_JOBS` | `16` / `4` | ambient-workload pgbench concurrency |
 | `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |

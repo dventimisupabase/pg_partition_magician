@@ -16,12 +16,17 @@ create table if not exists bench.events (
   user_id    int      not null,
   kind       smallint not null,
   payload    text     not null,
-  -- the partition key (created_at) is part of the PK, so pgpm reuses it in place at transmute (no PK
-  -- rewrite; see REDESIGN.md). A bare id PK would be refused for time partitioning now.
-  primary key (created_at, id)
+  -- The bench partitions by `id` (the only monotonic key whose frontier can be advanced to freeze the
+  -- monolith for an in-window refine; see bench/README.md). pgpm reuses the PK in place at transmute, so
+  -- the partition key must be IN the PK -- AND, for refine's range-COPY (`where id >= X order by id`) to
+  -- use an index instead of seq-scanning the whole monolith every microbatch, `id` must LEAD it. So the
+  -- PK leads with id. created_at stays in the PK too, so the table is still time-partitionable.
+  primary key (id, created_at)
 );
--- the lookup index real apps keep (per-user recent activity)
-create index if not exists events_user_created_idx on bench.events (user_id, created_at desc);
+-- the lookup index real apps keep (per-user recent activity). The bench partitions by id, and its hot
+-- read is "a user's most-recent rows" expressed as an id range (which PRUNES to the newest partition --
+-- a created_at predicate cannot prune an id-partitioned table), so the index leads user_id then id desc.
+create index if not exists events_user_id_idx on bench.events (user_id, id desc);
 
 -- a small companion so the workload touches more than the giant table
 create table if not exists bench.user_seen (

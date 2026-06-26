@@ -78,6 +78,16 @@ BENCH_PGFR_DIR="${BENCH_PGFR_DIR:-$BENCH_DIR/vendor/pg_flight_recorder}"  # pgfr
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-0}"  # 1 = data already loaded, skip 00/10
 BENCH_DEFER_INDEX="${BENCH_DEFER_INDEX:-0}"      # 1 = drop the secondary index during bulk load, rebuild after (much faster at scale)
 
+# In the monolith model the bulk O(rows) conversion work is refine() (split the coarse monolith into
+# fine children by COPY + atomic swap), not the drain. refine only runs on a FROZEN coarse child (whole
+# range below the write frontier). A time key's frontier is wall-clock now(), so a fresh time monolith
+# never freezes inside a benchmark window; an id key's frontier is max(id), which we advance past the
+# monolith's upper bound with one sentinel row to freeze it on demand (exactly how pgpm's own refine
+# tests do). So the bench partitions bench.events by its bigint id (it is in the PK -> transmute reuses
+# the PK in place) and measures the refine of the id-monolith under load. See bench/README.md.
+BENCH_ID_STEP="${BENCH_ID_STEP:-10000000}"  # id-grid step; monolith [0,B) refines into ~B/step fine partitions
+BENCH_REFINE="${BENCH_REFINE:-1}"           # 1 = freeze the monolith + auto-refine it (the bulk mover) and observe it
+
 # TCP keepalives on every connection (libpq defaults them OFF). Synchronous server-side calls
 # sit idle ON THE WIRE while the backend works -- transmute's cutover (metadata-only),
 # the bulk generators, the convert-phase pgbench between rows. Over a NAT'd
@@ -291,7 +301,7 @@ else
   qf "$BENCH_DIR/sql/10_generate.sql" >/dev/null
   if [ "$BENCH_DEFER_INDEX" = "1" ]; then
     echo "  deferring secondary index during bulk load (rebuilt after)"
-    q "drop index if exists bench.events_user_created_idx" >/dev/null
+    q "drop index if exists bench.events_user_id_idx" >/dev/null
   fi
   if [ "$BENCH_GEN_JOBS" -le 1 ]; then
     echo "  generating $BENCH_ROWS rows across $BENCH_MONTHS months (1 session, in-database, nothing on the wire)..."
@@ -319,7 +329,7 @@ else
   fi
   if [ "$BENCH_DEFER_INDEX" = "1" ]; then
     echo "  rebuilding secondary index on the full table (sort build, no statement_timeout)..."
-    q "create index if not exists events_user_created_idx on bench.events (user_id, created_at desc)" >/dev/null
+    q "create index if not exists events_user_id_idx on bench.events (user_id, id desc)" >/dev/null
   fi
   if [ "$BENCH_PREFREEZE" = "1" ]; then
     # Settle the post-bulk-load freeze/hint-bit WAL NOW, synchronously, before baseline. A fresh
@@ -340,45 +350,48 @@ echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_si
 run_phase baseline "$BENCH_PHASE_SECS"
 assert_workload_healthy baseline   # bail now if the workload is timing out, before transmute/drain/post
 
-# ---- 4. conversion: trigger pgpm ONCE, then OBSERVE it self-drive -----------
-# The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator
-# does -- fire transmute() once (unpaused) and schedule pgpm.maintain on pg_cron -- and then
-# pgpm's OWN cron jobs obtain + drain the default autonomously, inside the database. The
-# harness only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the
-# drain settles. Nothing here calls drain_step or obtain; a dropped observer connection
-# can't stop the conversion, because the conversion isn't running on this connection.
-say "conversion: trigger pgpm.transmute, then observe pgpm self-drive (pg_cron) under load"
+# ---- 4. conversion: transmute, FREEZE the monolith, then OBSERVE pgpm refine it under load ----
+# The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator does --
+# transmute() once (unpaused), enable auto-refine, schedule pgpm.maintain on pg_cron -- and then pgpm's
+# OWN cron job refines the monolith (and obtains/drains) autonomously, inside the database. The harness
+# only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the refine completes.
+# Nothing here calls refine_step/drain_step/obtain in the loop; a dropped observer connection can't stop
+# the conversion. See the BENCH_ID_STEP/BENCH_REFINE notes above for why this is an id-key, frozen-monolith run.
+say "conversion: transmute(id) + freeze the monolith, then observe pgpm auto-refine it under load"
 pgss_reset
 rm -f "$RESULTS/pgb_convert".*
-# one continuous ambient workload spanning the whole conversion (prep + transmute + drain).
-# Background pgbench DIRECTLY (not inside a `( ... ) &` subshell): $! must be the pgbench pid
-# itself, or cleanup() kills only the subshell wrapper and pgbench is reparented and orphaned --
-# left hammering the server (holding connections/locks) and corrupting the next run.
-conv_bg_secs=$(( BENCH_DRAIN_MAX_SECS + 1200 ))
-conv_args=( -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5
-            -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert" )
-if [ -n "$BENCH_DSN" ]; then
-  "$PGBENCH" "$BENCH_DSN" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
-else
-  "$PGBENCH" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
-fi
-load_pid=$!; BG_PIDS+=("$load_pid")
-convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
 
-# 4. the single operator trigger: transmute() unpaused. pgpm takes it from here. No PK pre-build is
-# needed any more -- pgpm never rewrites the PK (the partition key leads the PK, so it is reused in
-# place), so the cutover is always metadata-only. See REDESIGN.md.
-echo "  firing pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', paused=>false)..."
+N0=$(q "select count(*) from bench.events")   # history rows -- all land in the monolith at cutover (conservation anchor)
+echo "  firing pgpm.transmute('bench.events','id', step $BENCH_ID_STEP, paused=>false)..."
 transmute_t0=$(q "select extract(epoch from clock_timestamp())")
-q "select pgpm.transmute('bench.events','created_at', interval '$BENCH_INTERVAL', $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+q "select pgpm.transmute('bench.events','id', ${BENCH_ID_STEP}::bigint, $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 transmute_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 
-# 4b. adaptive feathering (REDESIGN.md, mode 2): let the drain ride its budget against checkpoint
-#     pressure (AIMD) instead of the fixed drain_batch. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
+# the monolith is the smallest-lo attached child; MONO_HI = B = the grid boundary just above the history.
+MONO_HI=$(q "select hi from pgpm.part where parent_table='bench.events'::regclass and attached order by lo::numeric asc limit 1")
+echo "  monolith covers [0, $MONO_HI) holding $N0 history rows (one coarse child to refine)"
+
+if [ "$BENCH_REFINE" = "1" ]; then
+  # FREEZE the monolith so refine can run NOW (not a real month later): build the forward partitions,
+  # advance the id frontier past B with a single sentinel row, and bump the identity sequence past the
+  # sentinel so the live workload's inserts land ABOVE the monolith (in forward partitions) -- never back
+  # into the frozen range being copied (which the copy's resume-anti-join would miss => lost rows at swap).
+  q "select pgpm.obtain('bench.events')" >/dev/null
+  SENTINEL=$(( MONO_HI + BENCH_ID_STEP ))
+  q "insert into bench.events (id, created_at, user_id, kind, payload) values ($SENTINEL, now(), 1, 0, 'pgpm-bench-frontier')" >/dev/null
+  q "select setval(pg_get_serial_sequence('bench.events','id'), $((SENTINEL + 1)), false)" >/dev/null
+  q "select pgpm.set_refine('bench.events', '${BENCH_ID_STEP}')" >/dev/null
+  echo "  monolith FROZEN (id frontier advanced to $SENTINEL); auto-refine enabled toward step $BENCH_ID_STEP"
+else
+  echo "  BENCH_REFINE=0: transmute-only run (no frozen monolith, no bulk move to observe)"
+fi
+
+# 4b. adaptive feathering (REDESIGN.md, mode 2): the per-tick budget rides checkpoint/ambient pressure via
+#     AIMD and feathers BOTH the drain and the refine COPY. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
 if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
   q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
-  echo "  adaptive feathering ENABLED (drain budget self-tunes around drain_batch=$BENCH_DRAIN_BATCH)"
+  echo "  adaptive feathering ENABLED (budget self-tunes around batch=$BENCH_DRAIN_BATCH; feathers drain + refine)"
   # Optionally arm the SELF-CALIBRATING ambient signal: learn the recent waiter baseline (EWMA) and
   # back off on a relative surge above it. BENCH_DRAIN_AMBIENT_FACTOR>0 turns it on (e.g. 2.0 = back off
   # when live waiters exceed 2x the learned normal). This is the box-independent successor to the fixed
@@ -393,47 +406,62 @@ if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
     echo "  ambient absolute cap ENABLED (yield when > $BENCH_DRAIN_AMBIENT_WAITERS workload backends are IO/lock-stuck)"
   fi
 else
-  echo "  adaptive feathering off (mode 1: fixed drain_batch=$BENCH_DRAIN_BATCH)"
+  echo "  adaptive feathering off (mode 1: fixed batch=$BENCH_DRAIN_BATCH)"
 fi
 
-# 4c. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives obtain + drain
-#     (standard pgpm operation; the operator schedules it once; pg_cron skips overlapping runs)
+# 4c. start the continuous ambient workload NOW -- AFTER the freeze, so every workload insert gets an id
+# above the sentinel (a forward partition), never inside the frozen monolith. Background pgbench DIRECTLY
+# (not inside a `( ... ) &` subshell): $! must be the pgbench pid itself, or cleanup() kills only the
+# wrapper and pgbench is reparented and orphaned -- left hammering the server and corrupting the next run.
+conv_bg_secs=$(( BENCH_DRAIN_MAX_SECS + 1200 ))
+conv_args=( -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$conv_bg_secs" -P 5
+            -D "ops=$BENCH_OPS" -f "$BENCH_DIR/workload.pgbench" --log "--log-prefix=$RESULTS/pgb_convert" )
+if [ -n "$BENCH_DSN" ]; then
+  "$PGBENCH" "$BENCH_DSN" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
+else
+  "$PGBENCH" "${conv_args[@]}" > "$RESULTS/convert.pgbench.txt" 2>&1 &
+fi
+load_pid=$!; BG_PIDS+=("$load_pid")
+convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
+
+# 4d. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives refine (+ obtain + drain).
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
 q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_all()')" >/dev/null
-echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now draining itself"
+echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now refining itself"
 
-# 4d. OBSERVE. settle mode -> watch pgpm.log until the drain STARTS (>=1 op) and then goes quiet
-#     for BENCH_DRAIN_IDLE_SECS (closed tail fully drained). window mode -> warm up until the
-#     drain is steadily running (>=1 op and BENCH_CONVERT_WARMUP_SECS elapsed), then measure for
-#     BENCH_CONVERT_WINDOW_SECS without waiting for completion; convert metrics are restricted to
-#     [conv_win_lo,conv_win_hi] so the one-time transmute cutover is excluded. A failed poll is
-#     non-fatal (transient WAN blip) -- retry; the drain runs server-side regardless. The stall
-#     detector (drain never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
+# 4e. OBSERVE. settle mode -> watch until refine STARTS (>=1 copy microbatch) then the coarse monolith is
+#     GONE (coarse_partitions: 1 -> 0, the atomic swap completed, history fully split into fine children).
+#     window mode -> warm up until refine is steadily running, then measure the workload over a fixed
+#     window without waiting for completion (the "is the refine unnoticeable?" arm); convert metrics are
+#     restricted to [conv_win_lo,conv_win_hi]. A failed poll is non-fatal (transient WAN blip) -- retry.
+#     The stall detector (refine never starts) and the BENCH_DRAIN_MAX_SECS cap apply in both modes.
 : > "$RESULTS/drain.progress.csv"
-echo "observed_s,default_rows,partitions,drain_ops,last_drain_age_s,drain_budget,ambient_waiters,ambient_baseline,surge_active" >> "$RESULTS/drain.progress.csv"
+echo "observed_s,default_rows,partitions,coarse,refine_copies,rows_copied,last_refine_age_s,budget,ambient_waiters,ambient_baseline,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
-drain_started=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
-warned_stall_settle=0; last_closed_check=0
+refine_started=0; coarse_seen=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 surge_pid=""; surge_launched=0; surge_active=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
-  # ONE round-trip per poll (fewer fresh connections over the NAT'd path = less churn/risk):
-  #   epoch | default n_live_tup | partition count | drain ops | secs since last drain op (-1) | drain_budget (-1 if not adaptive)
-  poll=$(q "select extract(epoch from clock_timestamp())::bigint
+  # ONE round-trip per poll. status() yields coarse_partitions (the refine backlog: 1 while the monolith
+  # stands, 0 after the swap). _ambient_lock_waiters() is the role-independent ambient signal.
+  poll=$(q "with s as (select * from pgpm.status() where parent='bench.events'::regclass)
+            select extract(epoch from clock_timestamp())::bigint
             ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
             ||'|'|| (select count(*) from pg_inherits where inhparent='bench.events'::regclass)
-            ||'|'|| (select count(*) from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach'))
+            ||'|'|| coalesce((select coarse_partitions from s),-1)
+            ||'|'|| coalesce((select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='refine_copy'),0)
+            ||'|'|| coalesce((select sum(rows) from pgpm.log where parent_table='bench.events'::regclass and action='refine_copy'),0)
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
-                              from pgpm.log where parent_table='bench.events'::regclass and action in ('drain_move','drain_attach')),-1)
+                              from pgpm.log where parent_table='bench.events'::regclass and action in ('refine_copy','refine_attach','refine')),-1)
             ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)
-            ||'|'|| coalesce(pgpm._ambient_io_waiters(),-1)
+            ||'|'|| coalesce(pgpm._ambient_lock_waiters(),-1)
             ||'|'|| coalesce((select round(drain_ambient_baseline,2) from pgpm.config where parent_table='bench.events'::regclass),-1)" 2>/dev/null) \
     || { echo "  (observe poll failed -- retrying)"; continue; }
-  IFS='|' read -r now_s drows nparts moves age budget waiters baseline <<<"$poll"
+  IFS='|' read -r now_s drows nparts coarse copies copied refage budget waiters baseline <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
 
   # ambient write-surge: launch a write-heavy pgbench burst BENCH_SURGE_AFTER_SECS into the observe
-  # phase, stop it BENCH_SURGE_SECS later. The drain_budget column should dip while surge_active=1.
+  # phase, stop it BENCH_SURGE_SECS later. The budget column should dip while surge_active=1.
   if [ "${BENCH_SURGE_CLIENTS:-0}" -gt 0 ]; then
     if [ "$surge_launched" = 0 ] && [ "$elapsed" -ge "$BENCH_SURGE_AFTER_SECS" ]; then
       say "AMBIENT SURGE: launching $BENCH_SURGE_CLIENTS write-heavy clients for ${BENCH_SURGE_SECS}s (rows/call=$BENCH_SURGE_ROWS)"
@@ -450,57 +478,52 @@ while :; do
     fi
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$moves" "$age" "$budget" "$waiters" "$baseline" "$surge_active" >> "$RESULTS/drain.progress.csv"
-  if [ "$moves" -ge 1 ]; then drain_started=1; fi
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$elapsed" "$drows" "$nparts" "$coarse" "$copies" "$copied" "$refage" "$budget" "$waiters" "$baseline" "$surge_active" >> "$RESULTS/drain.progress.csv"
+  [ "${copies:-0}" -ge 1 ] 2>/dev/null && refine_started=1
+  [ "${coarse:-0}" -ge 1 ] 2>/dev/null && coarse_seen=1
 
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
-    if [ "$window_start" = 0 ] && [ "$drain_started" = 1 ] && [ "$elapsed" -ge "$BENCH_CONVERT_WARMUP_SECS" ]; then
+    if [ "$window_start" = 0 ] && [ "$refine_started" = 1 ] && [ "$elapsed" -ge "$BENCH_CONVERT_WARMUP_SECS" ]; then
       window_start="$now_s"; conv_win_lo="$now_s"
-      echo; echo "  warmed up ($moves drain ops in ${elapsed}s) -- measuring a ${BENCH_CONVERT_WINDOW_SECS}s steady-state window"
+      echo; echo "  warmed up ($copies refine copies, $copied rows in ${elapsed}s) -- measuring a ${BENCH_CONVERT_WINDOW_SECS}s steady-state window"
     fi
     if [ "$window_start" != 0 ]; then
       win_el=$(awk -v a="$window_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
-      printf '\r  measuring: window %ss/%ss, default~%s rows, %s drain ops   ' "$win_el" "$BENCH_CONVERT_WINDOW_SECS" "$drows" "$moves"
+      printf '\r  measuring: window %ss/%ss, %s rows copied, coarse=%s   ' "$win_el" "$BENCH_CONVERT_WINDOW_SECS" "$copied" "$coarse"
       if [ "$win_el" -ge "$BENCH_CONVERT_WINDOW_SECS" ]; then
         conv_win_hi="$now_s"
-        echo; echo "  measurement window complete (${win_el}s steady-state; $moves drain ops; drain left running server-side)"; break
+        echo; echo "  measurement window complete (${win_el}s steady-state; $copied rows copied; refine left running server-side)"; break
       fi
     else
-      printf '\r  warming up: %ss, default~%s rows, %s drain ops   ' "$elapsed" "$drows" "$moves"
+      printf '\r  warming up: %ss, %s rows copied, coarse=%s   ' "$elapsed" "$copied" "$coarse"
     fi
   else
-    printf '\r  observing: %ss, default~%s rows, %s partitions, %s drain ops, last drain %ss ago   ' "$elapsed" "$drows" "$nparts" "$moves" "$age"
-    if [ "$drain_started" = 1 ] && [ "$age" != '-1' ] && [ "$age" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
-      # Idle for IDLE_SECS. In run-to-completion (settle) mode, "settled" must mean the closed tail is
-      # actually EMPTY -- not merely that the drain log went quiet. An I/O stall (a forced-checkpoint
-      # storm on a burst-limited disk) also looks idle, and breaking on it falsely reports completion
-      # with millions of rows still in the DEFAULT. Distinguish the two with a closed-rows check, run at
-      # most once per idle window (the count scan is not free at scale): closed==0 => truly done;
-      # closed>0 => a stall, so keep observing until the drain resumes or we hit the cap.
-      if [ "$last_closed_check" = 0 ] || awk -v n="$now_s" -v l="$last_closed_check" -v w="$BENCH_DRAIN_IDLE_SECS" 'BEGIN{exit !(n-l >= w)}'; then
-        last_closed_check="$now_s"
-        closed=$(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)" 2>/dev/null || echo -1)
-        if [ "$closed" = 0 ]; then
-          echo; echo "  pgpm drain settled -- $moves drain ops, closed tail empty (0 rows below the frontier)"; break
-        elif [ "$warned_stall_settle" = 0 ]; then
-          warned_stall_settle=1
-          echo; echo "  NOTE: drain idle ${age}s but ${closed} closed rows remain -- I/O stall, not completion; observing to the cap"
-        fi
+    printf '\r  observing: %ss, %s rows copied, coarse=%s, %s partitions, last refine %ss ago   ' "$elapsed" "$copied" "$coarse" "$nparts" "$refage"
+    if [ "$BENCH_REFINE" = "1" ]; then
+      # settled (run-to-completion): the monolith was refined away -- coarse went >=1 then back to 0 (the
+      # atomic swap) and at least one copy microbatch ran (it actually did the work).
+      if [ "$coarse_seen" = 1 ] && [ "$coarse" = 0 ] && [ "$refine_started" = 1 ]; then
+        echo; echo "  pgpm refine settled -- monolith fully split ($copies copy microbatches, $copied rows), 0 coarse children remain"; break
+      fi
+    else
+      # transmute-only: nothing to refine; the conversion IS the metadata cutover. Stop once quiet.
+      if [ "$elapsed" -ge "$BENCH_DRAIN_IDLE_SECS" ]; then
+        echo; echo "  transmute-only run: no refine to observe; conversion is the metadata cutover above"; break
       fi
     fi
   fi
 
-  # Stall detector (both modes): maintenance was scheduled but no drain op has landed.
-  if [ "$drain_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" -ge 60 ]; then
+  # Stall detector: refine enabled but no copy microbatch has landed.
+  if [ "$BENCH_REFINE" = "1" ] && [ "$refine_started" = 0 ] && [ "$warned_stall" = 0 ] && [ "$elapsed" -ge 60 ]; then
     warned_stall=1
-    echo; echo "  WARNING: no drain activity after ${elapsed}s -- pgpm.maintain may be failing. Recent cron runs:"
+    echo; echo "  WARNING: no refine activity after ${elapsed}s -- pgpm.maintain may be failing. Recent cron runs:"
     q "select start_time::time(0)||' '||status||' '||left(coalesce(return_message,''),80)
          from cron.job_run_details where jobid in (select jobid from cron.job where jobname='pgpm_maint_bench')
          order by start_time desc limit 3" 2>/dev/null | sed 's/^/    /' || true
   fi
   # Cap backstop (both modes).
   if awk -v e="$elapsed" -v m="$BENCH_DRAIN_MAX_SECS" 'BEGIN{exit !(e+0 > m+0)}'; then
-    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping (mode=$BENCH_OBSERVE_MODE, drain_started=$drain_started, $moves ops)"
+    echo; echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s; stopping (mode=$BENCH_OBSERVE_MODE, refine_started=$refine_started, coarse=$coarse, $copied rows copied)"
     if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$window_start" != 0 ]; then conv_win_hi="$now_s"; fi
     break
   fi
@@ -508,11 +531,31 @@ done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
 q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
-# if window mode never closed a window (drain never warmed up), fall back to whole-convert metrics
+# if window mode never closed a window (refine never warmed up), fall back to whole-convert metrics
 if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$conv_win_hi" = 0 ]; then conv_win_lo=0; fi
 pgss_snapshot convert; temp_snapshot convert
 printf '%s\n' "$(pctiles convert "$conv_win_lo" "$conv_win_hi")" > "$RESULTS/convert.pctiles.txt"
 echo "  ambient-workload latency through the conversion: $(cat "$RESULTS/convert.pctiles.txt")"
+
+# 4f. CONSERVATION GATE: every history row (id < B) must still be present after the refine swap. refine
+# COPIES then DROPs the source, so a missed row would silently vanish -- assert it did not, and record
+# whether the monolith was fully refined (0 coarse children) for the report / rung verdict.
+REFINE_CONSERVED=na; REFINE_HIST_AFTER=na; REFINE_COARSE_FINAL=na
+if [ "$BENCH_REFINE" = "1" ]; then
+  REFINE_HIST_AFTER=$(q "select count(*) from bench.events where id < $MONO_HI")
+  REFINE_COARSE_FINAL=$(q "select coalesce((select coarse_partitions from pgpm.status() where parent='bench.events'::regclass),-1)")
+  echo "  conservation: history rows id<$MONO_HI  before=$N0  after=$REFINE_HIST_AFTER ; coarse_partitions=$REFINE_COARSE_FINAL"
+  if [ "$REFINE_HIST_AFTER" != "$N0" ]; then
+    echo "  FAIL: refine changed the history row count ($N0 -> $REFINE_HIST_AFTER) -- rows lost/duplicated. CORRECTNESS DEFECT."
+    REFINE_CONSERVED=0
+  elif [ "$REFINE_COARSE_FINAL" != "0" ]; then
+    echo "  PARTIAL: all $N0 history rows conserved, but $REFINE_COARSE_FINAL coarse child(ren) remain (refine did not finish in-window; see cap/stall)."
+    REFINE_CONSERVED=partial
+  else
+    echo "  OK: all $N0 history rows conserved and the monolith is fully refined (0 coarse children)."
+    REFINE_CONSERVED=1
+  fi
+fi
 
 # ---- 5. post (partitioned, under load) -------------------------------------
 # Pure observer: no operator VACUUM here. pgpm tuned autovacuum aggressively on the
@@ -551,29 +594,33 @@ say "report"
   echo
   echo "## conversion (pgpm self-driven, from pgpm.log)"
   echo
+  echo "- model: **monolith + refine** -- transmute(id) parks all history in one bounded coarse child (a"
+  echo "  metadata cutover), then pgpm's scheduled maintain feathers refine() -- COPY into fine children,"
+  echo "  one atomic swap, drop the source -- splitting the monolith under live load. The bulk O(rows) move"
+  echo "  is the refine COPY (no DELETE -> no dead tuples, no vacuum); the monolith was frozen for the run by"
+  echo "  advancing the id frontier past it with a sentinel row (see bench/README.md)."
   if [ "$BENCH_OBSERVE_MODE" = window ]; then
-    echo "- mode: **gentle / steady-state window** -- measured ~${BENCH_CONVERT_WINDOW_SECS}s of draining"
-    echo "  after a ${BENCH_CONVERT_WARMUP_SECS}s warm-up; the drain was deliberately NOT run to completion."
-    echo "  **Verdict = the latency comparison** (convert p50/p95/p99 vs baseline): if they track, the drain"
+    echo "- mode: **gentle / steady-state window** -- measured ~${BENCH_CONVERT_WINDOW_SECS}s of refining"
+    echo "  after a ${BENCH_CONVERT_WARMUP_SECS}s warm-up; the refine was deliberately NOT run to completion."
+    echo "  **Verdict = the latency comparison** (convert p50/p95/p99 vs baseline): if they track, the refine"
     echo "  is unnoticeable. Throughput (tps) over the window is NOT the verdict -- for a fixed client count"
     echo "  tps is ~clients/latency, so it only drops if latency rises OR if the workload driver loses its"
     echo "  connection mid-window (a client/network stall reads as a tps drop with UNCHANGED latency). See"
     echo "  \`convert.pgbench.txt\` progress lines for per-interval steady-state tps."
   else
-    echo "- mode: **stress / run-to-completion** -- drove the drain until the closed tail fully drained."
+    echo "- mode: **stress / run-to-completion** -- drove refine until the monolith was fully split (0 coarse children)."
   fi
   echo "- conversion window: \`$convert_start\` -> \`$convert_end\`"
-  echo "- drain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_attach'") partition attaches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") rows moved"
+  echo "- transmute: metadata cutover; monolith \`[0, $MONO_HI)\` held \`$N0\` history rows"
+  echo "- refine: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='refine_copy'") copy microbatches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='refine_copy'") rows copied, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='refine'") fine children created (swap), $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='refine_skip'") skips"
   echo "- obtain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='obtain'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='obtain_skip'") deferred under lock contention"
+  echo "- drain (default janitor): $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") stray rows (expected ~0: workload writes go to forward partitions)"
   if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
     echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe'") backoffs ($(q "select coalesce(string_agg(method||':'||c,', '),'none') from (select method, count(*) c from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe' group by method order by 2 desc) s") )"
   fi
-  if [ "$BENCH_OBSERVE_MODE" = window ]; then
-    echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (still draining -- not expected to be 0 in a windowed run)"
-  else
-    echo "- default closed-tail rows remaining: $(q "select coalesce((select closed_rows from pgpm.check_default('bench.events')),-1)") (0 = closed tail fully converted)"
-  fi
-  echo "- drain rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, drain_ops, drain_budget, ambient_waiters, ambient_baseline, surge_active)"
+  echo "- coarse (un-refined) children remaining: \`$REFINE_COARSE_FINAL\` (0 = history fully refined into fine partitions)"
+  echo "- **row conservation**: history rows \`id < $MONO_HI\` = \`$REFINE_HIST_AFTER\` (expected \`$N0\`) -> $([ "$REFINE_CONSERVED" = 1 ] && echo 'CONSERVED ✅' || ([ "$REFINE_CONSERVED" = partial ] && echo 'conserved (refine partial)' || echo "MISMATCH ❌"))"
+  echo "- refine rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, coarse, refine_copies, rows_copied, last_refine_age_s, budget, ambient_waiters, ambient_baseline, surge_active)"
   echo
   if [ "$have_pgfr" = "1" ]; then
     echo "## system metrics (pg_flight_recorder)"
