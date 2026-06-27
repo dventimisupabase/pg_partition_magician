@@ -1178,10 +1178,16 @@ begin
     end loop;
   end if;
 
-  -- 5. create the partitioned parent under the original name (no PK yet)
-  execute format('create table %I.%I (like %s including defaults including generated including storage) partition by range (%I)',
+  -- 5. create the partitioned parent under the original name (no PK yet). INCLUDING CONSTRAINTS carries the
+  -- user's CHECK constraints onto the parent so every partition (the monolith, the DEFAULT, and future
+  -- forward children) enforces them -- without it, only the monolith would. LIKE also copies the transient
+  -- pgpm_monolith_bound CHECK (it is on the monolith at this point), which must NOT constrain the parent
+  -- (it would reject any row at/after B), so drop it from the parent immediately; the monolith keeps its
+  -- own copy for the metadata-only attach below, dropped separately afterward.
+  execute format('create table %I.%I (like %s including defaults including generated including storage including constraints) partition by range (%I)',
                  v_nsp, v_rel, v_monreg::text, p_control);
   v_parent := format('%I.%I', v_nsp, v_rel)::regclass;
+  execute format('alter table %s drop constraint if exists pgpm_monolith_bound', v_parent::text);
 
   -- 6. re-establish identity on the parent
   if v_idcols is not null then

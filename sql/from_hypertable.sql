@@ -14,14 +14,13 @@
 -- cutover. The control column's key is whatever transmute reuses -- a PRIMARY KEY
 -- or UNIQUE constraint that includes it, or keyless if it has neither (the common
 -- hypertable shape). Identity columns are preserved (re-established before the
--- handoff, since CREATE TABLE LIKE does not carry identity), and generated columns
--- are preserved too (the copy omits them from its column list and they recompute
--- on insert). Refused up front: continuous aggregates and space partitioning (>1
--- dimension); transmute also refuses a nullable control column, a key that excludes
--- it, or a bare unique index. A trigger-based delta for update/delete workloads is
--- a follow-up. Known gap (shared with core transmute, tracked separately): a CHECK
--- constraint is carried to the monolith but not propagated to the partitioned
--- parent (so new partitions do not enforce it).
+-- handoff, since CREATE TABLE LIKE does not carry identity), generated columns are
+-- preserved (the copy omits them from its column list and they recompute on
+-- insert), and CHECK constraints, defaults, and NOT NULL are carried onto the
+-- partitioned parent by transmute. Refused up front: continuous aggregates and
+-- space partitioning (>1 dimension); transmute also refuses a nullable control
+-- column, a key that excludes it, or a bare unique index. A trigger-based delta
+-- for update/delete workloads is a follow-up.
 -- =============================================================================
 
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a

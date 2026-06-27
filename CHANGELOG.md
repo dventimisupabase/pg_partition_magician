@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- **CHECK constraints reach the partitioned parent (bug fix).** `transmute` built the parent with `LIKE`
+  but without `INCLUDING CONSTRAINTS`, so the user's CHECK constraints stayed on the monolith child only --
+  the parent, the DEFAULT, and future forward partitions did not enforce them (a silent gap: new rows in
+  new partitions escaped the CHECK). The parent is now built `INCLUDING CONSTRAINTS`; the transient
+  `pgpm_monolith_bound` CHECK that `LIKE` also copies is dropped from the parent (the monolith keeps its
+  own copy for the metadata-only attach). CHECK constraints now propagate to every partition. (tests/55;
+  tests/timescale/db/07)
 - **Generated columns are supported (bug fix).** `drain`, `refine`, and `from_hypertable` move rows by
   building an explicit column list, which wrongly **included generated columns** -- so the move failed
   with `cannot insert a non-DEFAULT value into a generated column`. Two fixes: omit generated columns from
@@ -14,9 +21,7 @@
   `retain`), schema fidelity (the parent carries the primary key including the control column, secondary
   indexes, column defaults, and NOT NULL), and abort/rollback (nothing is irreversible before cutover; a
   failure inside the cutover transaction rolls back whole and leaves the source intact) -- run across both
-  fleet TimescaleDB versions. One pre-existing limitation remains documented and out of scope until
-  addressed in core: a **CHECK constraint** is carried to the monolith but not propagated to the
-  partitioned parent (so new partitions do not enforce it). (tests/timescale/db/06-08)
+  fleet TimescaleDB versions. (tests/timescale/db/06-08)
 
 - **The `from_hypertable` CI track runs against the fleet's TimescaleDB versions, not just one.** It is now
   a matrix over the two big Supabase clusters, **2.9.1** (~224 projects) and **2.16.1** (~434), on PG15

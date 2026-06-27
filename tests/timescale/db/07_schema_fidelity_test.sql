@@ -1,9 +1,8 @@
 -- Schema fidelity (B5). The migrated table must carry the source's schema, not just its rows. Asserts the
--- guarantees that hold on the partitioned PARENT: the primary key (and that it includes the control
--- column), declared secondary indexes (by name), column defaults, and NOT NULL. (Two known gaps, tracked
--- separately, are deliberately NOT asserted here: a CHECK constraint does not reach the parent, and a
--- generated column cannot be migrated at all.) Autocommit, disposable-db.
-select plan(5);
+-- guarantees on the partitioned PARENT: the primary key (and that it includes the control column),
+-- declared secondary indexes, column defaults, NOT NULL, and CHECK constraints. (Generated columns are
+-- covered in tests/timescale/db/09.) Autocommit, disposable-db.
+select plan(6);
 
 select mk_hypertable_rich('hp_fid', 30);
 
@@ -33,6 +32,11 @@ select is(
 select is(
   (select attnotnull from pg_attribute where attrelid = 'hp_fid'::regclass and attname = 'status'),
   true, 'the NOT NULL carried over');
+select is(
+  (select count(*)::int from pg_constraint
+    where conrelid = 'hp_fid'::regclass and contype = 'c'
+      and pg_get_constraintdef(oid) ilike '%amount%>=%0%'),
+  1, 'the CHECK constraint (amount >= 0) carried onto the parent');
 
 select * from finish();
 -- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).
