@@ -1,8 +1,9 @@
 -- Pre-flight refusals for from_hypertable. Tests pgpm.from_hypertable_preflight (a side-effect-free
 -- function, so the refusals are savepoint-wrappable by throws_ok/lives_ok). Fixtures are loaded by the
--- harness before this file. Runs in autocommit (no outer transaction) and cleans up its own shapes,
--- because the continuous-aggregate fixture cannot be built inside a transaction block.
-select plan(4);
+-- harness before this file. Apache-only: pgpm targets Apache TimescaleDB, which has no continuous
+-- aggregates (a TSL/Community feature), so a hypertable on the target fleet can never carry one and that
+-- refusal is not exercised here. Runs in autocommit (disposable-db), like the rest of the db/ track.
+select plan(3);
 
 -- a keyed hypertable (UNIQUE on the control column) is accepted
 select mk_keyed_hypertable('ph_ok');
@@ -16,13 +17,6 @@ select mk_plain_hypertable('ph_keyless');
 select lives_ok(
   $$ select pgpm.from_hypertable_preflight('ph_keyless', 'ts') $$,
   'preflight accepts a keyless hypertable (migrated keyless)');
-
--- a continuous aggregate is refused (no native-partition equivalent)
-select mk_hypertable_cagg('ph_cagg');
-select throws_like(
-  $$ select pgpm.from_hypertable_preflight('ph_cagg', 'ts') $$,
-  'pg_partition_magician:%continuous aggregate%',
-  'preflight refuses a hypertable with a continuous aggregate');
 
 -- a second (space) dimension is refused (pgpm is single-key RANGE)
 select mk_hypertable_space('ph_space');
