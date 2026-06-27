@@ -2,15 +2,21 @@
 
 ## [Unreleased]
 
-- **`from_hypertable` hardening tests + documented limitations.** Added retention translation (a
-  `drop_chunks` policy becomes pgpm `retain`), schema fidelity (the parent carries the primary key
-  including the control column, secondary indexes, column defaults, and NOT NULL), and abort/rollback
-  (nothing is irreversible before cutover; a failure inside the cutover transaction rolls back whole and
-  leaves the source intact) -- run across both fleet TimescaleDB versions. These surfaced two pre-existing
-  limitations, now documented and out of scope for the migration until addressed in core: a **generated
-  column** cannot be migrated (the copy/drain/refine column list includes it, so the INSERT is rejected),
-  and a **CHECK constraint** is carried to the monolith but not propagated to the partitioned parent.
-  (tests/timescale/db/06-08)
+- **Generated columns are supported (bug fix).** `drain`, `refine`, and `from_hypertable` move rows by
+  building an explicit column list, which wrongly **included generated columns** -- so the move failed
+  with `cannot insert a non-DEFAULT value into a generated column`. Two fixes: omit generated columns from
+  those INSERT lists (they recompute on insert), and create the destination/partition child with
+  `INCLUDING GENERATED` so its generated column matches the parent (otherwise the attach failed with
+  `column ... must be a generated column`). A table with a STORED generated column now drains, refines, and
+  migrates correctly, with the generated value recomputed on the destination. (tests/54;
+  tests/timescale/db/09)
+- **`from_hypertable` hardening tests.** Added retention translation (a `drop_chunks` policy becomes pgpm
+  `retain`), schema fidelity (the parent carries the primary key including the control column, secondary
+  indexes, column defaults, and NOT NULL), and abort/rollback (nothing is irreversible before cutover; a
+  failure inside the cutover transaction rolls back whole and leaves the source intact) -- run across both
+  fleet TimescaleDB versions. One pre-existing limitation remains documented and out of scope until
+  addressed in core: a **CHECK constraint** is carried to the monolith but not propagated to the
+  partitioned parent (so new partitions do not enforce it). (tests/timescale/db/06-08)
 
 - **The `from_hypertable` CI track runs against the fleet's TimescaleDB versions, not just one.** It is now
   a matrix over the two big Supabase clusters, **2.9.1** (~224 projects) and **2.16.1** (~434), on PG15

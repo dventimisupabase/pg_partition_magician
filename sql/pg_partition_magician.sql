@@ -499,7 +499,7 @@ begin
   end if;
 
   if to_regclass(format('%I.%I', v_nsp, v_name)) is null then
-    execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
+    execute format('create table %I.%I (like %I.%I including defaults including generated including storage including indexes including constraints excluding identity)',
                    v_nsp, v_name, v_nsp, v_rel);
     execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                    v_nsp, v_name, (v_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
@@ -510,7 +510,8 @@ begin
   end if;
 
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
+    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped
+      and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
 
   -- ORDER BY the control column: the default's PK leads with the control column (transmute builds
   -- it that way), so this makes the batch select an INDEX SCAN that reads exactly p_batch rows
@@ -670,7 +671,8 @@ begin
   end if;
   v_child := format('%I.%I', v_nsp, p_child)::regclass;
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped;
+    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped
+      and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
   -- the reused-key equijoin (d.<key> = s.<key>, every key column): the copy is an anti-join against it, so
   -- a resumed batch never re-copies a row already in the child even when the control column is non-unique.
   -- The key is whatever transmute reused: a PRIMARY KEY, or (relaxed key contract) a UNIQUE constraint.
@@ -763,7 +765,7 @@ begin
     v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi);
     v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
     if to_regclass(format('%I.%I', v_nsp, v_sub_name)) is null then
-      execute format('create table %I.%I (like %I.%I including defaults including storage including indexes including constraints excluding identity)',
+      execute format('create table %I.%I (like %I.%I including defaults including generated including storage including indexes including constraints excluding identity)',
                      v_nsp, v_sub_name, v_nsp, v_rel);
       execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                      v_nsp, v_sub_name, (v_sub_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
