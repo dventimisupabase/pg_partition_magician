@@ -195,7 +195,10 @@ Phase 2: the cutover (the one non-online window). Takes a brief `ACCESS EXCLUSIV
 up the writes that arrived during the copy (append-only, or a full delta replay when `from_hypertable_copy`
 ran with `p_track_changes => true` -- auto-detected via the delta table, so the two phases cannot disagree),
 drops the hypertable, renames the copy into place, rebuilds the key, secondary indexes, and identity columns
-(which `CREATE TABLE LIKE` does not carry), then hands off to `transmute`. The swap is one transaction: it
+(which `CREATE TABLE LIKE` does not carry), then hands off to `transmute`. It also preserves each identity
+sequence's exact position: `transmute` seeds past `max(id)`, but if the source sequence was further ahead
+(gaps from rollbacks, caching, or deleted high rows) the migrated sequence is advanced to the source's next
+value so those ids are not re-issued. The swap is one transaction: it
 commits whole or rolls back whole, leaving the source intact on any failure. Requires `from_hypertable_copy`
 to have run (the destination must exist). Parameters past `p_interval` pass through to `transmute`.
 

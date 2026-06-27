@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` preserves the source identity sequence's exact position.** `transmute` seeds a
+  migrated identity sequence to `max(id) + 1`, which is correct only when the sequence sits right at its
+  max. A sequence that is **ahead** of `max(id)` -- from rolled-back inserts, sequence caching, or deleted
+  high rows -- would then re-issue ids the source had already moved past. `from_hypertable` now captures each
+  source sequence's next value before the cutover and advances the migrated sequence to it (when higher)
+  after the transmute handoff, so the next generated id continues from where the source left off. (Plain
+  `transmute` of a non-hypertable still seeds to `max(id) + 1`; this preservation is specific to the
+  `from_hypertable` path, which discards the source sequence object during the copy.) (tests/timescale/db/11)
 - **`from_hypertable` can migrate update/delete workloads online (trigger-based change capture).** The
   default cutover catch-up is append-only (rows past the copy watermark), which silently loses UPDATEs and
   DELETEs to already-copied rows that arrive during the online window. Pass `p_track_changes => true` and
