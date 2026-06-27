@@ -239,3 +239,107 @@ conversion summary, but no system-metric time-series; set `BENCH_PGFR=1` for the
 - Target server has `pg_cron` (required by pgpm) and ideally `pg_stat_statements`.
 - Enough disk for the target table size **plus** drain headroom (the drain copies
   each historical month into a new partition before the default shrinks).
+
+## Migrating a TimescaleDB hypertable (`run_fh.sh`)
+
+`bench/run.sh` converts a plain id-keyed table with `transmute` + `refine`.
+**`bench/run_fh.sh`** is its sibling for the `from_hypertable` path: it converts a
+TimescaleDB **hypertable** (Apache edition, the Supabase fleet) to pgpm-managed native
+partitioning, online, under live OLTP load. It needs **PostgreSQL 15 with Apache
+TimescaleDB** (timescaledb is deprecated on PG17), plus `pg_cron` and ideally
+`pg_stat_statements` and `pgtap`. The local `supabase/postgres:15` image and Supabase
+green PG15 both qualify.
+
+### What it does
+
+Same passive-observer model as `run.sh`, but the candidate `bench.events` is built as a
+time-partitioned **hypertable** (keyed: the PK includes the `created_at` control column,
+with an identity `id` and a secondary index), and the conversion is `from_hypertable`,
+exposed as two phases so writes keep arriving across them. Three observed phases:
+
+1. **baseline**: ambient workload against the live hypertable.
+2. **convert**:
+   - `from_hypertable_copy(..., p_track_changes => true)`: online per-chunk copy into a
+     plain destination while the source stays live; an AFTER-row trigger logs every
+     in-flight insert/update/delete.
+   - `from_hypertable_cutover(...)`: a brief `ACCESS EXCLUSIVE` window that catches up and
+     reconciles the delta, drops the hypertable, renames the copy into place, rebuilds the
+     key/indexes/identity, and hands off to `transmute`. (At scale this window is **not**
+     negligible: `CREATE TABLE LIKE` carries no indexes, so the rebuild of the PK and
+     secondary index on the full table happens inside it.)
+   - **refine**: split the resulting time-monolith into `BENCH_FH_INTERVAL` partitions (see
+     the wall-clock note below).
+3. **post**: ambient workload against the now pgpm-partitioned table.
+
+### Conservation under continuous load
+
+An exact total-row count can't be asserted while the workload mutates rows, so
+`bench.workload_step_fh` only ever touches users `1..49000` and reserves users
+`49001..50000` as an **immutable cohort** spread across all of history. The harness
+asserts that cohort is unchanged across the migration: a clean "no rows lost or
+duplicated" check even under continuous insert/update/delete. (Delta-reconcile
+*correctness* is covered by the pgTAP suite, `tests/timescale/db/10`; the bench measures
+at-scale behavior and load, not correctness.)
+
+### Refine and the wall-clock frontier (a bench instrument)
+
+pgpm refines a partition only once the write frontier has passed its upper bound, and for
+a **time** key the frontier is wall-clock `now()`. A `from_hypertable` monolith spans
+`[min, next-period-boundary]`, so its upper bound is in the future and it is the *active
+current partition*: pgpm correctly refuses to refine it until the calendar rolls past the
+boundary. To exercise refine inside a bench window, `run_fh.sh`:
+
+- runs the refine-phase workload at an effective clock pushed **past** the monolith (the
+  `p_clock_secs` argument), so its writes land in **forward** partitions and the monolith
+  range stays quiescent, and
+- drives `refine_history` in a session whose `now()` is shadowed to a future time (a
+  `shadow.now()` in a schema ahead of `pg_catalog`; pgpm functions do not pin
+  `search_path`).
+
+This is a **bench instrument only**: it lets pgpm act on a genuinely-quiescent historical
+range as if frozen. In production you never do this; the monolith refines naturally as the
+calendar advances.
+
+### Running it
+
+```bash
+# local smoke (supabase/postgres:15 -- PG15 + Apache timescaledb + pg_cron + pgtap)
+BENCH_DSN='postgres://postgres:postgres@localhost:5516/postgres' \
+  BENCH_ROWS=20000 BENCH_MONTHS=3 BENCH_CHUNK_INTERVAL='1 week' BENCH_FH_INTERVAL='1 month' \
+  BENCH_PHASE_SECS=8 BENCH_CLIENTS=4 BENCH_OPS=5 \
+  bench/run_fh.sh
+
+# at scale on a green PG15 instance (Apache timescaledb), via the session pooler
+BENCH_DSN='postgresql://postgres.<ref>:...@aws-0-<region>.pooler.supabase.green:5432/postgres?sslmode=require' \
+  BENCH_ROWS=40000000 BENCH_MONTHS=6 BENCH_CHUNK_INTERVAL='1 day' BENCH_FH_INTERVAL='1 month' \
+  BENCH_GEN_JOBS=8 BENCH_CLIENTS=16 BENCH_PGFR=1 BENCH_PGFR_DIR=bench/vendor/pg_flight_recorder \
+  bench/run_fh.sh
+```
+
+`from_hypertable` is a procedure that COMMITs, so the harness drives it as top-level
+`CALL`s. Run the driver close to the database: over a WAN the client tps is round-trip
+bound, so read the result through the **server-side** signals (the conversion timings,
+conservation, and pgfr/pgss latency), not client tps.
+
+### Knobs (in addition to the shared `BENCH_*` above)
+
+| env | default | meaning |
+|-----|---------|---------|
+| `BENCH_CHUNK_INTERVAL` | `1 week` | hypertable chunk width (sets how many chunks the copy iterates) |
+| `BENCH_FH_INTERVAL` | `1 month` | pgpm partition width `from_hypertable` transmutes to, and the refine target |
+| `BENCH_TRACK_CHANGES` | `1` | install the delta trigger so in-flight update/delete are reconciled at cutover (needs a key; refused on a keyless table) |
+| `BENCH_REFINE` | `1` | after cutover, refine the time-monolith via the now()-shadow instrument; `0` = stop after cutover |
+| `BENCH_OBTAIN` | `4` | forward partitions obtained at cutover |
+| `BENCH_DRAIN_BATCH` | `50000` | rows per refine microbatch |
+| `BENCH_DRAIN_MAX_SECS` | `1800` | safety cap on the refine observation window |
+
+`BENCH_ROWS`, `BENCH_MONTHS`, `BENCH_GEN_JOBS`, `BENCH_CLIENTS`/`BENCH_JOBS`, `BENCH_OPS`,
+`BENCH_PHASE_SECS`, `BENCH_PGFR`/`BENCH_PGFR_DIR`, and `BENCH_SKIP_GENERATE` behave as in
+`run.sh`.
+
+### Output
+
+The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pctiles.txt`/
+`*.pgss.csv`, and pgfr when enabled), plus `copy.progress.csv` (the online copy: dest rows
+and pending delta keys over time) and `refine.progress.csv` (coarse children counting down
+to 0).
