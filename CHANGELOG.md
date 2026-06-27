@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` can migrate update/delete workloads online (trigger-based change capture).** The
+  default cutover catch-up is append-only (rows past the copy watermark), which silently loses UPDATEs and
+  DELETEs to already-copied rows that arrive during the online window. Pass `p_track_changes => true` and
+  `from_hypertable_copy` installs an `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
+  touched key values to a `<rel>_pgpm_delta` table; the cutover reconciles every touched key against the
+  live source (delete each dirty key's copied row, then re-insert its current source row, which is
+  idempotent and order-independent and covers inserts, updates, and deletes). The cutover auto-detects the
+  apparatus, so the two phases cannot disagree, and cleans it up inside the swap transaction. Reconciliation
+  is by the key `transmute` reuses (a primary key or unique constraint), so tracking is refused up front on
+  a keyless table rather than silently falling back. Default stays `false` (append-only, no trigger
+  overhead). (tests/timescale/db/10)
 - **CHECK constraints reach the partitioned parent (bug fix).** `transmute` built the parent with `LIKE`
   but without `INCLUDING CONSTRAINTS`, so the user's CHECK constraints stayed on the monolith child only --
   the parent, the DEFAULT, and future forward partitions did not enforce them (a silent gap: new rows in
