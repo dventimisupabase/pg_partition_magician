@@ -34,12 +34,29 @@
 -- delta table) rather than taking a matching flag, so the two phases cannot disagree.
 -- =============================================================================
 
+-- from_hypertable_disk_estimate: the approximate extra disk the online migration needs. The copy writes a
+-- full second table (heap, and the indexes/identity rebuilt at cutover), so free roughly the source's
+-- current on-disk size -- summed across all chunks (heap + indexes + toast) -- until the old hypertable is
+-- dropped at cutover and the space is reclaimed. Callable on its own for sizing a volume ahead of time.
+create or replace function pgpm.from_hypertable_disk_estimate(p_hypertable regclass)
+returns bigint language plpgsql as $$
+declare v_nsp name; v_rel name; v_bytes bigint;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  select coalesce(sum(pg_total_relation_size(format('%I.%I', chunk_schema, chunk_name)::regclass)), 0)
+    into v_bytes
+    from timescaledb_information.chunks
+   where hypertable_schema = v_nsp and hypertable_name = v_rel;
+  return v_bytes;
+end $$;
+
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a
 -- dry-run gate) and unit-testable inside a transaction. Raises a pgpm-prefixed error on any blocker;
--- returns normally when the hypertable is migratable by this version.
+-- returns normally when the hypertable is migratable by this version (with a NOTICE estimating the disk).
 create or replace function pgpm.from_hypertable_preflight(p_hypertable regclass, p_control name)
 returns void language plpgsql as $$
-declare v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int;
+declare v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int; v_bytes bigint;
 begin
   if not exists (select 1 from pg_extension where extname = 'timescaledb') then
     raise exception 'pg_partition_magician: from_hypertable requires the timescaledb extension to be installed';
@@ -76,6 +93,12 @@ begin
   if v_ctl_attnum is null then
     raise exception 'pg_partition_magician: column % not found on %', p_control, p_hypertable;
   end if;
+
+  -- disk: the online copy writes a full second table, so warn how much extra space the migration needs until
+  -- cutover drops the old hypertable. Informational (a NOTICE), never a refusal.
+  v_bytes := pgpm.from_hypertable_disk_estimate(p_hypertable);
+  raise notice 'pg_partition_magician: from_hypertable will copy % into a second table before cutover (about %); ensure that much free disk until the old hypertable is dropped at cutover and the space is reclaimed.',
+    p_hypertable, pg_size_pretty(v_bytes);
 end $$;
 
 -- from_hypertable runs in two phases, exposed as separate procedures so writes can keep arriving between

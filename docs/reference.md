@@ -133,6 +133,9 @@ Scope and caveats:
   `NOT NULL` are all preserved (see `transmute`).
 - The copy is **online** (the source serves traffic throughout); only the cutover takes a brief
   `ACCESS EXCLUSIVE` lock.
+- The copy writes a **full second table**, so the migration transiently needs roughly the source's current
+  size in extra disk until cutover drops the old hypertable. `from_hypertable_preflight` raises a `NOTICE`
+  with the estimate; `from_hypertable_disk_estimate` returns it for sizing a volume ahead of time.
 - A carried-over `drop_chunks` retention policy is auto-translated into `pgpm`'s `retain`, but retention over
   the unrefined **monolith is dormant** until you `refine` it (`retain` only drops attached fine partitions),
   and `refine` is unavailable on a keyless monolith. So a keyless migration that relied on `drop_chunks` will
@@ -219,7 +222,19 @@ The refusal gate, factored out so you can dry-run it inside a transaction. Raise
 normally otherwise. **Refuses** when: the `timescaledb` extension is absent; `p_hypertable` is not a
 hypertable; it has one or more **continuous aggregates** (no native-partition equivalent, and dropping them is
 data-destructive); it has more than one **dimension** (space partitioning); or the `p_control` column does not
-exist. Both `from_hypertable_copy` and `from_hypertable` call it first.
+exist. On success it raises a `NOTICE` estimating the transient extra disk the migration needs (see
+`from_hypertable_disk_estimate`). Both `from_hypertable_copy` and `from_hypertable` call it first.
+
+### `from_hypertable_disk_estimate`
+
+```sql
+pgpm.from_hypertable_disk_estimate(p_hypertable regclass) returns bigint
+```
+
+The approximate extra disk the online migration needs: the source hypertable's current on-disk size (heap,
+indexes, and toast summed across all chunks) in bytes. The copy writes a full second table, so free roughly
+this much until cutover drops the old hypertable and the space is reclaimed. `preflight` reports it as a
+`NOTICE`; call this directly (with `pg_size_pretty`) to size a volume before starting.
 
 ## Maintenance steps
 

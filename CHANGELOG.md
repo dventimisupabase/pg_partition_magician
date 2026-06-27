@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` warns about transient disk use up front.** The online copy writes a full second table
+  before cutover, so the migration transiently needs roughly the source's current size in extra disk
+  (reclaimed when the old hypertable is dropped at cutover). `from_hypertable_preflight` now raises a
+  `NOTICE` with that estimate, and a new `from_hypertable_disk_estimate(p_hypertable)` returns it as `bigint`
+  (the total on-disk size across all chunks) so a volume can be sized ahead of time. (tests/timescale/db/12)
 - **`from_hypertable` preserves the source identity sequence's exact position.** `transmute` seeds a
   migrated identity sequence to `max(id) + 1`, which is correct only when the sequence sits right at its
   max. A sequence that is **ahead** of `max(id)` -- from rolled-back inserts, sequence caching, or deleted
