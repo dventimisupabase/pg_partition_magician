@@ -14,14 +14,14 @@
 -- cutover. The control column's key is whatever transmute reuses -- a PRIMARY KEY
 -- or UNIQUE constraint that includes it, or keyless if it has neither (the common
 -- hypertable shape). Identity columns are preserved (re-established before the
--- handoff, since CREATE TABLE LIKE does not carry identity). Refused up front:
--- continuous aggregates and space partitioning (>1 dimension); transmute also
--- refuses a nullable control column, a key that excludes it, or a bare unique
--- index. A trigger-based delta for update/delete workloads is a follow-up.
--- Known gaps (shared with core transmute/drain/refine, tracked separately): a GENERATED column cannot be
--- migrated (the copy's column list includes it and the INSERT is rejected), and a CHECK constraint is
--- carried to the monolith but not propagated to the partitioned parent (so new partitions do not enforce
--- it). Tables with either are out of scope for this version.
+-- handoff, since CREATE TABLE LIKE does not carry identity), and generated columns
+-- are preserved too (the copy omits them from its column list and they recompute
+-- on insert). Refused up front: continuous aggregates and space partitioning (>1
+-- dimension); transmute also refuses a nullable control column, a key that excludes
+-- it, or a bare unique index. A trigger-based delta for update/delete workloads is
+-- a follow-up. Known gap (shared with core transmute, tracked separately): a CHECK
+-- constraint is carried to the monolith but not propagated to the partitioned
+-- parent (so new partitions do not enforce it).
 -- =============================================================================
 
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a
@@ -86,7 +86,8 @@ begin
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped;
+    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
+      and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
 
   -- destination skeleton: structure but no indexes/key, so the bulk load maintains no per-row index.
   execute format('drop table if exists %I.%I', v_nsp, v_dest);
@@ -138,7 +139,8 @@ begin
      where proc_name = 'policy_retention' and hypertable_schema = v_nsp and hypertable_name = v_rel limit 1;
   end if;
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped;
+    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
+      and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
 
   execute format('lock table %I.%I in access exclusive mode', v_nsp, v_rel);
   execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;

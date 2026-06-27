@@ -33,6 +33,19 @@ begin
     from generate_series(1, %s) g$i$, p_name, p_span, p_span, p_rows, p_rows);
 end $$;
 
+-- a keyless hypertable with a STORED generated column (for generated-column migration).
+create or replace function mk_hypertable_generated(p_name text, p_rows int default 30) returns void language plpgsql as $$
+begin
+  execute format('drop table if exists %I cascade', p_name);
+  execute format($d$create table %I (
+      ts     timestamptz not null,
+      amount numeric not null,
+      cents  bigint generated always as (amount * 100) stored)$d$, p_name);
+  perform create_hypertable(p_name, 'ts', chunk_time_interval => interval '1 day');
+  execute format($i$insert into %I (ts, amount)
+    select now() - (g || ' hours')::interval, g from generate_series(1, %s) g$i$, p_name, p_rows);
+end $$;
+
 -- a hypertable with a composite PK (id, ts) and an IDENTITY sequence on id (for identity continuity).
 -- The PK includes the time column (Timescale's rule); id auto-generates so inserts omit it.
 create or replace function mk_hypertable_composite_pk(p_name text, p_rows int default 100) returns void language plpgsql as $$
