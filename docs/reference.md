@@ -38,7 +38,10 @@ The cutover moves no rows: it validates a bound on the live table (one online `S
 scan), then in a brief metadata-only step renames the original to a coarse-child name, creates the
 partitioned parent, attaches the original as the bounded **monolith** child via the validated `CHECK`
 (scan-skipping), and creates a fresh empty `DEFAULT`. The table registers **paused**; nothing happens
-until you `resume` it and maintenance runs.
+until you `resume` it and maintenance runs. An identity column is carried onto the parent and its sequence
+advanced to the greater of `max(id) + 1` and the original sequence's own next value, so auto-generated ids
+never collide and never re-issue a value the sequence had already moved past (`untransmute` restores it the
+same way).
 
 Parameters:
 

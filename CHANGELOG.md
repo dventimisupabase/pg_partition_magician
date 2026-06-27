@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **`transmute` and `untransmute` preserve an identity sequence's exact position.** Both reseeded the
+  identity sequence to `max(id) + 1`, which is correct only when the sequence sits at its max. A sequence
+  **ahead** of `max(id)` -- from rolled-back inserts, sequence caching, or deleted high rows -- would then
+  re-issue ids it had already handed out. Both now capture the original sequence's next value up front and
+  seed to the greater of `max(id) + 1` and that value, so a transmute (and a transmute/untransmute round
+  trip) never moves the sequence backward over ids already issued. The common case (a sequence at its max)
+  is unchanged. (This generalises the `from_hypertable`-specific preservation to plain `transmute`.)
+  (tests/56)
 - **`from_hypertable` warns about transient disk use up front.** The online copy writes a full second table
   before cutover, so the migration transiently needs roughly the source's current size in extra disk
   (reclaimed when the old hypertable is dropped at cutover). `from_hypertable_preflight` now raises a
