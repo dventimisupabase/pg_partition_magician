@@ -61,8 +61,9 @@ Parameters:
 - `p_drain_adaptive` -- enable closed-loop feathering for the drain (see `set_drain_adaptive`).
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
 
-Refuses up front (leaving the table untouched) when: there is no primary key, or the PK excludes
-`p_control`; the control column is `float`/`double` (imprecise boundaries); a `time`-kind control column
+Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
+excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
+control column is `float`/`double` (imprecise boundaries); a `time`-kind control column
 is not a timestamp/date, or a `uuidv7` control is not `uuid`; a `uuid` control samples as overwhelmingly
 random (UUIDv4) and `p_force_uuidv7` is not set; a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
@@ -109,6 +110,113 @@ attached partition with the smallest `lo`.
 It is a **one-way door** once any row lives outside the monolith's range -- a forward partition after the
 frontier crosses `B`, a backdated stray in the `DEFAULT`, or finer children from a refinement -- because a
 metadata-only reverse would lose those rows. (Tier-2 fold-back and Tier-3 merge are not built.)
+
+## Migrating from TimescaleDB (`from_hypertable`)
+
+An **optional add-on** (`sql/from_hypertable.sql`) for migrating a TimescaleDB **Apache-edition** hypertable
+to a `pgpm`-managed native `RANGE` partition set. Load it on top of the core, only in a database where the
+`timescaledb` extension exists (the core's lone runtime dependency stays `pg_cron`). It un-hypertables the
+table by a full **online copy** into a plain table under the original name, then hands off to `transmute`, so
+it stays version- and catalog-agnostic, which is what the deprecated Apache builds need. Verified on
+TimescaleDB 2.9.1 and 2.16.1 (PG15).
+
+The procedures `COMMIT` (per chunk during the copy, and at the swap), so they must be invoked at the top
+level (a plain `CALL`, never inside a surrounding transaction or an atomic block).
+
+Scope and caveats:
+
+- A single time/`RANGE` dimension. **Continuous aggregates** and **space partitioning** (more than one
+  dimension) are refused up front.
+- The control column's key is whatever `transmute` reuses: a primary key or unique constraint that includes
+  it, else **keyless** (the common hypertable shape, since `create_hypertable` makes the time column
+  `NOT NULL` but adds no key). Identity columns, generated columns, `CHECK` constraints, defaults, and
+  `NOT NULL` are all preserved (see `transmute`).
+- The copy is **online** (the source serves traffic throughout); only the cutover takes a brief
+  `ACCESS EXCLUSIVE` lock.
+- A carried-over `drop_chunks` retention policy is auto-translated into `pgpm`'s `retain`, but retention over
+  the unrefined **monolith is dormant** until you `refine` it (`retain` only drops attached fine partitions),
+  and `refine` is unavailable on a keyless monolith. So a keyless migration that relied on `drop_chunks` will
+  not reclaim disk until a key is added and the monolith is refined.
+
+### `from_hypertable`
+
+```sql
+pgpm.from_hypertable(
+  p_hypertable regclass, p_control name, p_interval interval,
+  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_paused boolean default true, p_track_changes boolean default false
+)
+```
+
+The one-shot driver: runs `from_hypertable_copy` then `from_hypertable_cutover` back to back. Use it when the
+migration does not need to interleave application writes between the phases. `p_interval` and the
+`p_obtain`/`p_retain`/`p_keep_default`/`p_drain_batch`/`p_anchor`/`p_paused` parameters pass straight through
+to `transmute` (see there); `p_control` is the time column; `p_track_changes` is described under
+`from_hypertable_copy`. When `p_retain` is left `null`, the source's `drop_chunks` policy interval (if any) is
+carried in.
+
+```sql
+call pgpm.from_hypertable('public.metrics', 'ts', interval '1 day', p_paused => false);
+```
+
+### `from_hypertable_copy`
+
+```sql
+pgpm.from_hypertable_copy(p_hypertable regclass, p_control name, p_track_changes boolean default false)
+```
+
+Phase 1: build the plain destination (`<rel>_pgpm_dest`) and bulk-copy the existing chunks into it online, one
+chunk-range per transaction, clustered by the control column. The source keeps serving traffic. Run this, let
+the workload continue, then run `from_hypertable_cutover` when ready.
+
+- `p_track_changes` -- capture in-flight **updates and deletes**, not just appends. When `false` (the
+  default), the cutover catches up **append-only** (rows whose control column is past the copy watermark),
+  which is correct for append-only workloads but **silently loses updates and deletes** to already-copied
+  rows. When `true`, the copy installs an `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
+  touched key values to a `<rel>_pgpm_delta` table, and the cutover reconciles every touched key against the
+  live source (delete the copied row, re-insert the current source row). Reconciliation is by the key
+  `transmute` reuses (a primary key or unique constraint), so `p_track_changes => true` is **refused on a
+  keyless table** (no key to reconcile by). Set it for any workload that updates or deletes rows during the
+  migration window.
+
+### `from_hypertable_cutover`
+
+```sql
+pgpm.from_hypertable_cutover(
+  p_hypertable regclass, p_control name, p_interval interval,
+  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_paused boolean default true
+)
+```
+
+Phase 2: the cutover (the one non-online window). Takes a brief `ACCESS EXCLUSIVE` lock on the source, catches
+up the writes that arrived during the copy (append-only, or a full delta replay when `from_hypertable_copy`
+ran with `p_track_changes => true` -- auto-detected via the delta table, so the two phases cannot disagree),
+drops the hypertable, renames the copy into place, rebuilds the key, secondary indexes, and identity columns
+(which `CREATE TABLE LIKE` does not carry), then hands off to `transmute`. The swap is one transaction: it
+commits whole or rolls back whole, leaving the source intact on any failure. Requires `from_hypertable_copy`
+to have run (the destination must exist). Parameters past `p_interval` pass through to `transmute`.
+
+```sql
+call pgpm.from_hypertable_copy('public.metrics', 'ts', p_track_changes => true);
+-- ... the application keeps writing (inserts, updates, deletes) ...
+call pgpm.from_hypertable_cutover('public.metrics', 'ts', interval '1 day', p_paused => false);
+```
+
+### `from_hypertable_preflight`
+
+```sql
+pgpm.from_hypertable_preflight(p_hypertable regclass, p_control name) returns void
+```
+
+The refusal gate, factored out so you can dry-run it inside a transaction. Raises a
+`pg_partition_magician:`-prefixed error when the hypertable cannot be migrated by this version, and returns
+normally otherwise. **Refuses** when: the `timescaledb` extension is absent; `p_hypertable` is not a
+hypertable; it has one or more **continuous aggregates** (no native-partition equivalent, and dropping them is
+data-destructive); it has more than one **dimension** (space partitioning); or the `p_control` column does not
+exist. Both `from_hypertable_copy` and `from_hypertable` call it first.
 
 ## Maintenance steps
 
