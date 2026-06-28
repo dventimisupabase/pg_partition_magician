@@ -106,9 +106,10 @@ then hands off to `transmute`. The copy preserves your keys, secondary indexes, 
 exact sequence position), generated columns, CHECK constraints, defaults, and NOT NULL, and a `drop_chunks`
 retention policy is carried into pgpm `retain`. Only the brief cutover takes a lock. Keyed and keyless
 hypertables are both supported. Append workloads catch up automatically; for workloads that update or delete
-rows during the copy, pass `p_track_changes => true` to capture those changes. The captured backlog is
-reconciled **online, in micro-batches, before the cutover** (`from_hypertable_drain_delta`, run
-automatically by the cutover), so the lock applies only a tiny residual instead of the whole-copy backlog.
+rows during the copy, pass `p_track_changes => true` to capture those changes. Either way the catch-up
+backlog (appended rows, or the tracked change delta) is drained **online, in micro-batches, before the
+cutover** (`from_hypertable_drain_appends` / `from_hypertable_drain_delta`, run automatically by the
+cutover), so the lock applies only a tiny residual instead of the whole-copy backlog.
 
 ```sql
 -- one shot: copy online, then cut over and hand off to transmute

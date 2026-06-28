@@ -403,6 +403,90 @@ begin
   end loop;
 end $$;
 
+-- Append-only online pre-drain (issue #174). The non-tracking catch-up (the cutover's append-only branch)
+-- copies every row appended past the copy watermark, which grows with the copy duration -- so the locked
+-- window grows with the migration, the same wound #170 closed for the tracking path. Pre-drain that tail
+-- ONLINE, in bounded batches that advance the watermark, so the locked catch-up applies only the final tail.
+-- Simpler than the delta drain: append-only means already-copied rows never change, so it is purely additive
+-- -- no delta, no reconcile, no key, no dest index, and no race (the watermark marches forward; an append
+-- that lands mid-batch has a higher control value and is taken next pass). It assumes the append-only
+-- contract (no updates/deletes to copied rows), exactly as the under-lock catch-up already does -- use
+-- p_track_changes for update/delete workloads.
+
+-- from_hypertable_drain_appends_step copies ONE batch of appends past p_watermark and returns the new
+-- watermark (the batch's upper control bound, as text); no commit (the driver commits per batch). The batch
+-- is bounded to ~p_batch rows by the control value p_batch rows past the watermark, INCLUSIVE of ties at that
+-- bound (a row-count LIMIT with a strict > would drop ties straddling the boundary, the next pass skipping
+-- them). Bounds are LITERAL constants so TimescaleDB excludes untouched chunks.
+create or replace function pgpm.from_hypertable_drain_appends_step(
+  p_hypertable regclass, p_control name, p_batch int, p_watermark text
+) returns text language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_dest name; v_cols text; v_ctl_type text; v_hi text;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  v_dest := v_rel || '_pgpm_dest';
+  select format_type(atttypid, atttypmod) into v_ctl_type
+    from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped and attgenerated = '';
+
+  -- the batch's upper control bound: the control value p_batch rows past the watermark (or the source's max
+  -- past it when fewer remain). The <= insert below includes ALL rows at this value, so no tie is split.
+  execute format('select coalesce(
+                    (select %I::text from %I.%I where %I > %L::%s order by %I offset %s limit 1),
+                    (select max(%I)::text from %I.%I where %I > %L::%s))',
+                 p_control, v_nsp, v_rel, p_control, p_watermark, v_ctl_type, p_control, greatest(p_batch - 1, 0),
+                 p_control, v_nsp, v_rel, p_control, p_watermark, v_ctl_type) into v_hi;
+  if v_hi is null then return p_watermark; end if;   -- nothing past the watermark
+
+  execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L::%s and %I <= %L::%s order by %I',
+                 v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel,
+                 p_control, p_watermark, v_ctl_type, p_control, v_hi, v_ctl_type, p_control);
+  return v_hi;
+end $$;
+
+-- from_hypertable_drain_appends loops the step with a per-batch COMMIT (WAL recycles), mirroring drain_all
+-- and from_hypertable_drain_delta (#170). It carries the watermark across batches (the dest's max control,
+-- read once up front, then advanced by each step) so it never re-scans the dest for max(). Stops when the
+-- residual past the watermark is at/below p_threshold (EXISTS at offset, chunk-excluded). p_max_iter bounds
+-- the loop -- raises a loud error UNLESS p_best_effort, in which case it returns so the caller (the cutover)
+-- finishes the residual under the lock.
+create or replace procedure pgpm.from_hypertable_drain_appends(
+  p_hypertable regclass, p_control name, p_batch int default 5000,
+  p_threshold bigint default 0, p_max_iter int default 1000000, p_best_effort boolean default false
+) language plpgsql as $$
+declare
+  v_nsp name; v_rel name; v_dest name; v_ctl_type text; v_watermark text; v_more boolean; v_iter int := 0;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  v_dest := v_rel || '_pgpm_dest';
+  if to_regclass(format('%I.%I', v_nsp, v_dest)) is null then
+    raise exception 'pg_partition_magician: from_hypertable_drain_appends(%) found no copy to drain -- run from_hypertable_copy first', p_hypertable;
+  end if;
+  select format_type(atttypid, atttypmod) into v_ctl_type
+    from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
+  -- the initial frontier: the copy watermark (max control in the dest). Read once; each step advances it.
+  execute format('select max(%I)::text from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
+  if v_watermark is null then return; end if;   -- nothing copied (empty dest)
+  loop
+    -- residual past the watermark <= threshold? EXISTS at offset (chunk-excluded by control > watermark)
+    execute format('select exists(select 1 from %I.%I where %I > %L::%s order by %I offset %s limit 1)',
+                   v_nsp, v_rel, p_control, v_watermark, v_ctl_type, p_control, p_threshold) into v_more;
+    exit when not v_more;
+    v_watermark := pgpm.from_hypertable_drain_appends_step(p_hypertable, p_control, p_batch, v_watermark);
+    commit;
+    v_iter := v_iter + 1;
+    if v_iter > p_max_iter then
+      if p_best_effort then return; end if;
+      raise exception 'pg_partition_magician: from_hypertable_drain_appends(%) did not converge within % iterations -- appends are arriving faster than the drain copies them. Raise p_batch, raise p_threshold to accept a larger final cutover batch, or pause writes before cutting over.',
+        p_hypertable, p_max_iter;
+    end if;
+  end loop;
+end $$;
+
 -- Phase 2: the cutover (the one non-online window). Brief ACCESS EXCLUSIVE on the source; an append-only
 -- catch-up of rows that arrived after the copy watermark (control > max copied); drop the hypertable
 -- (Timescale's event trigger clears its chunks and catalog); rename the copy into place; rebuild the key,
@@ -455,13 +539,26 @@ begin
   -- reconcile finishes whatever is left -- correctness never depends on the pre-drain. p_drain_batch sizes
   -- both the micro-batch and the residual threshold (stop online once the residual is within one batch).
   -- (Commits per batch; the swap transaction below starts fresh after it.)
-  if v_track and p_predrain then
+  if p_predrain and v_track then
     call pgpm.from_hypertable_drain_delta(p_hypertable, p_control, p_drain_batch, p_drain_batch,
                                           1000000, p_best_effort => true);
+  elsif p_predrain and not v_track then
+    -- append-only path: pre-drain the post-watermark tail online too (#174), so the under-lock catch-up
+    -- below applies only the final tail instead of the whole copy's worth of appends.
+    call pgpm.from_hypertable_drain_appends(p_hypertable, p_control, p_drain_batch, p_drain_batch,
+                                            1000000, p_best_effort => true);
   end if;
   -- the pre-drain (or an operator's from_hypertable_drain_delta) builds a throwaway key index on the dest;
   -- drop it so it never survives the rename onto the final table (the real key index is built + adopted below).
   execute format('drop index if exists %I.%I', v_nsp, left(v_rel || '_pgpm_drainkey', 63));
+  -- append-only: read the catch-up watermark (max control in the dest) BEFORE the lock. The dest is private
+  -- and stable from here to the lock (only CREATE INDEX runs, which does not change rows), so this is the
+  -- same value the under-lock catch-up would read -- but doing it here keeps an O(rows) max() seqscan on a
+  -- keyless dest OUT of the locked window (#174). New appends after this read have a higher control value
+  -- and are still caught by the under-lock `control > watermark`.
+  if not v_track then
+    execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
+  end if;
 
   -- Pre-build the destination's indexes BEFORE taking the exclusive lock, while the destination is still a
   -- private table and the source keeps serving traffic. This is the O(rows) work; doing it OUTSIDE the lock
@@ -529,8 +626,8 @@ begin
                      v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel);
     end if;
   else
-    -- append-only catch-up: rows whose control column is past the copy watermark
-    execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
+    -- append-only catch-up: insert the tail past the watermark (read pre-lock above, off the locked window;
+    -- the pre-drain, if it ran, already advanced the dest to within one batch of the head, so this is small).
     if v_watermark is not null then
       execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L',
                      v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, p_control, v_watermark);

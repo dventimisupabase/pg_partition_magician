@@ -139,8 +139,10 @@ Scope and caveats:
   its lock. The cutover's `ACCESS EXCLUSIVE` window is therefore **brief and metadata-bound** -- it catches up
   the delta, swaps the table in, and *adopts* the pre-built indexes (`USING INDEX`); it does not rebuild them
   under the lock, so the blocking window does not grow with table size the way an under-lock rebuild would.
-  With `p_track_changes`, the captured backlog is also reconciled **online, in micro-batches, before the
-  lock** (`from_hypertable_drain_delta`), so the window does not grow with the accumulated change lag either.
+  The catch-up backlog is also drained **online, in micro-batches, before the lock** -- the tracked change
+  delta (`from_hypertable_drain_delta`, with `p_track_changes`) or the appended-rows tail
+  (`from_hypertable_drain_appends`, the default append-only path) -- so the window does not grow with the
+  accumulated lag either.
 - The copy writes a **full second table**, so the migration transiently needs roughly the source's current
   size in extra disk until cutover drops the old hypertable. `from_hypertable_preflight` raises a `NOTICE`
   with the estimate; `from_hypertable_disk_estimate` returns it for sizing a volume ahead of time.
@@ -184,7 +186,9 @@ the workload continue, then run `from_hypertable_cutover` when ready.
 - `p_track_changes` -- capture in-flight **updates and deletes**, not just appends. When `false` (the
   default), the cutover catches up **append-only** (rows whose control column is past the copy watermark),
   which is correct for append-only workloads but **silently loses updates and deletes** to already-copied
-  rows. When `true`, the copy installs an `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
+  rows. That append-only tail is pre-drained online before the lock too
+  (`from_hypertable_drain_appends`, run automatically by the cutover). When `true`, the copy installs an
+  `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
   touched key values (plus a monotonic `pgpm_seq` ordering column) to a `<rel>_pgpm_delta` table. That
   backlog is reconciled **online, in micro-batches, before the cutover** (`from_hypertable_drain_delta`, run
   automatically by the cutover), and the cutover applies only the residual under the lock. Reconciliation is
@@ -224,6 +228,32 @@ index on the private destination so the per-batch delete is index-assisted; the 
   driver raises a loud, actionable error -- unless `p_best_effort`, in which case it returns so the caller
   (the cutover) can take the lock and finish the residual under it.
 
+### `from_hypertable_drain_appends` / `from_hypertable_drain_appends_step`
+
+```sql
+pgpm.from_hypertable_drain_appends(
+  p_hypertable regclass, p_control name, p_batch int default 5000,
+  p_threshold bigint default 0, p_max_iter int default 1000000, p_best_effort boolean default false
+)
+pgpm.from_hypertable_drain_appends_step(p_hypertable regclass, p_control name, p_batch int, p_watermark text)
+  returns text
+```
+
+The **append-only** counterpart of `from_hypertable_drain_delta` (issue #174), for the default
+(non-`p_track_changes`) path: copy the rows appended past the copy watermark **online, while the source stays
+live**, so the cutover's lock applies only the final tail. The cutover runs it automatically (`p_predrain`)
+for the non-tracking path; you can also drive it directly during a long two-phase window.
+
+It is purely additive (append-only means already-copied rows never change), so unlike the delta drain it
+needs no delta, no reconcile, no key, and no destination index, and works on a **keyless** hypertable. Each
+batch copies the rows in `(watermark, hi]` where `hi` is the control value `p_batch` rows past the watermark
+(inclusive of ties at `hi`, so the next batch's strict `>` skips none), as literal bounds for chunk exclusion;
+it then advances the watermark to `hi`. The driver carries the watermark across batches (read once up front,
+never re-scanning the destination for `max()`) and **commits per batch**; `_step` does one batch (no commit,
+returns the advanced watermark). `p_threshold`, `p_max_iter`, and `p_best_effort` behave as in
+`from_hypertable_drain_delta`. Assumes the append-only contract (no updates/deletes to copied rows), exactly
+as the under-lock catch-up does; use `p_track_changes` for update/delete workloads.
+
 ### `from_hypertable_cutover`
 
 ```sql
@@ -235,11 +265,14 @@ pgpm.from_hypertable_cutover(
 )
 ```
 
-Phase 2: the cutover. When change-tracking is on and `p_predrain` is `true` (the default), it first
-**pre-drains the delta online** (`from_hypertable_drain_delta`, best-effort, using `p_drain_batch` as the
-batch size and residual threshold) so only a tiny residual is left for the lock. Then it **pre-builds the
+Phase 2: the cutover. When `p_predrain` is `true` (the default), it first **pre-drains the catch-up backlog
+online** (best-effort, using `p_drain_batch` as the batch size and residual threshold) -- the change delta
+(`from_hypertable_drain_delta`) when tracking is on, else the appended-rows tail
+(`from_hypertable_drain_appends`) -- so only a tiny residual is left for the lock. Then it **pre-builds the
 destination's primary key and secondary indexes online** (on the private copy, before any lock -- this is the
-O(rows) work, deliberately kept out of the blocking window).
+O(rows) work, deliberately kept out of the blocking window). For the append-only path the catch-up watermark
+(`max(control)` on the destination) is also read here, before the lock, so an `O(rows)` `max()` seqscan on a
+keyless destination is not in the blocking window.
 Then it takes a **brief, metadata-only `ACCESS EXCLUSIVE` window**: catch up the writes that arrived during
 the copy (append-only, or a full delta replay when `from_hypertable_copy` ran with `p_track_changes => true`
 -- auto-detected via the delta table, so the two phases cannot disagree), drop the hypertable, rename the copy

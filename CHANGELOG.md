@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` pre-drains the append-only catch-up online too (default, non-tracking path).** Without
+  `p_track_changes`, the cutover caught up every row appended past the copy watermark in one `insert ...
+  where control > watermark` *under the lock*, so that window grew with the copy -- the same wound #170
+  closed for the tracking path, still open for the default. New `from_hypertable_drain_appends` (a `_step` +
+  driver, mirroring the #170 delta drain) copies that tail **online, in bounded batches that advance the
+  watermark**, so the locked catch-up applies only the final tail. It is purely additive (append-only means
+  copied rows never change), so unlike the delta drain it needs no delta, no reconcile, no key, and no dest
+  index, and works on a **keyless** hypertable (the common shape); each batch is bounded to the control
+  value `p_batch` rows past the watermark and **inclusive of ties** at that bound (so no tie straddling a
+  batch boundary is dropped), as literal constants for chunk exclusion. The cutover runs it automatically
+  (`p_predrain`, default `true`) for the non-tracking path, and the watermark read that drives the under-lock
+  catch-up now happens **before** the lock, so an `O(rows)` `max()` seqscan on a keyless dest is no longer in
+  the blocking window. (issue #174; tests/timescale/db/15)
 - **`from_hypertable` drains the change-capture delta online, before the cutover lock.** With
   `p_track_changes`, the cutover reconciled the *entire* delta under the `ACCESS EXCLUSIVE` lock -- and the
   delta is every key touched for the whole online-copy duration, so the locked window grew with the table it
