@@ -49,17 +49,21 @@ services:
     container_name: pgpm_test-18
     ports: ["5518:5432"]
 
-  # The from_hypertable track: TimescaleDB on PG15. TS_VERSION (set per-version by `./test.sh timescale`)
-  # selects the Supabase fleet version to build/run; defaults to 2.16.1. Built from a separate Dockerfile
-  # (Alpine base + pgTAP), excluded from the default 15/16/17/18 matrix (its own profile, never "all").
+  # The from_hypertable track: PG15 + Apache TimescaleDB, on the Supabase fleet image
+  # (public.ecr.aws/supabase/postgres). That is the edition the migration actually targets, and it ships
+  # timescaledb (Apache), pgTAP, and the timescaledb shared_preload preloaded -- so no build step is needed.
+  # TS_PG_TAG (set by `./test.sh timescale`) selects the image tag; default 15.14.1.127 bundles TimescaleDB
+  # 2.16.1. Excluded from the default 15/16/17/18 matrix (its own profile, never "all").
   timescale:
     <<: *pg-base
     profiles: ["timescale"]
-    build:
-      context: .
-      dockerfile: tests/timescale/Dockerfile
-      args:
-        TS_VERSION: ${TS_VERSION:-2.16.1}
-    image: pgpm_test:timescale-${TS_VERSION:-2.16.1}
+    image: public.ecr.aws/supabase/postgres:${TS_PG_TAG:-15.14.1.127}
     container_name: pgpm_test-timescale
+    # Override pg-base's environment: the supabase/postgres image bootstraps its own superuser
+    # (supabase_admin) and a postgres role, and its first-boot migrate.sh connects AS supabase_admin --
+    # so setting POSTGRES_USER=postgres (as pg-base does) makes that role the superuser instead, and
+    # migrate.sh fails ("role supabase_admin does not exist") and the container exits. Pass only the
+    # password; the image still creates the `postgres` role the harness connects with.
+    environment:
+      POSTGRES_PASSWORD: postgres
     ports: ["5519:5432"]
