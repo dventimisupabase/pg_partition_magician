@@ -186,7 +186,6 @@ assert_workload_healthy baseline
 say "conversion: from_hypertable_copy under load (track_changes=$BENCH_TRACK_CHANGES) -> cutover -> refine"
 pgss_reset; rm -f "$RESULTS/pgb_convert".*
 TRACK=$([ "$BENCH_TRACK_CHANGES" = "1" ] && echo true || echo false)
-T0=$(q "select to_char(now(),'YYYY-MM-DD\"T\"HH24:MI:SS')")
 ANCHOR0=$(q "select count(*) from bench.events where user_id >= $ANCHOR_USER_LO")   # immutable cohort, pre-convert
 echo "  conservation anchor: $ANCHOR0 rows for users >= $ANCHOR_USER_LO (workload never touches them)"
 convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")
