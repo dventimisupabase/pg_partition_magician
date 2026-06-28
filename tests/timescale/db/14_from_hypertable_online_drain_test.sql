@@ -5,7 +5,7 @@
 -- cutover still finishes any post-drain residual, that a threshold leaves a residual for the cutover, that a
 -- single step reconciles a bounded batch, and that tracking is refused on a nullable key column.
 -- Autocommit, disposable-db.
-select plan(26);
+select plan(27);
 
 -- =====================================================================================================
 -- Main flow: copy with tracking, change rows, drain ONLINE, assert the dest converged before any cutover.
@@ -68,7 +68,10 @@ select is((select count(*)::int from hp_drain where device_id >= 1000), 3,
 select ok(to_regclass('public.hp_drain_pgpm_delta') is null,
   'the change-capture delta table is cleaned up at cutover');
 select ok(to_regclass('public.hp_drain_pgpm_drainkey') is null,
-  'the throwaway drain key index is dropped at cutover (no pollution on the final table)');
+  'no throwaway drain key index is created -- the copy-built reused-key index is used and adopted (#175)');
+select ok(
+  exists(select 1 from pg_constraint where conrelid = 'hp_drain'::regclass and contype = 'u'),
+  'the reused unique key was adopted onto the migrated parent (from the copy-built index, #175)');
 select ok(
   not exists(select 1 from information_schema.columns where table_name = 'hp_drain' and column_name = 'pgpm_seq'),
   'the final table carries no pgpm_seq column');

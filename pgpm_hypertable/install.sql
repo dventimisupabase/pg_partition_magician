@@ -155,6 +155,7 @@ language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_dest name; v_cols text; r record;
   v_delta name; v_trgfn name; v_trg name; v_keyidx oid; v_keycols text; v_newvals text; v_oldvals text;
+  v_keyconname name; v_keytmp text;
 begin
   perform pgpm.from_hypertable_preflight(p_hypertable, p_control);
   select n.nspname, c.relname into v_nsp, v_rel
@@ -262,6 +263,21 @@ begin
   -- core's shared mint-then-populate ANALYZE helper (#164).
   perform pgpm._analyze(format('%I.%I', v_nsp, v_dest)::regclass);
   commit;
+
+  -- #175: when change-tracking is on, build the reused-key index on the dest NOW -- off the lock, while the
+  -- dest is still private -- with the SAME temp name and definition the cutover will ADOPT
+  -- (left(conname || '_pgpm_new', 63), via pg_get_indexdef). The online delta drain then uses it for its
+  -- per-batch key lookups (no separate throwaway index), and the cutover adopts it instead of rebuilding it
+  -- -- one key-index build instead of two. (v_keyidx was chosen above for tracking; tracking is refused on a
+  -- keyless table, so it is always set here.)
+  if p_track_changes then
+    select conname into v_keyconname from pg_constraint where conindid = v_keyidx;
+    v_keytmp := left(v_keyconname || '_pgpm_new', 63);
+    execute regexp_replace(pg_get_indexdef(v_keyidx),
+      '^(CREATE (UNIQUE )?INDEX )[^ ]+ ON [^ ]+',
+      '\1' || quote_ident(v_keytmp) || ' ON ' || quote_ident(v_nsp) || '.' || quote_ident(v_dest));
+    commit;
+  end if;
 end $$;
 
 -- Online delta drain (issue #170): reconcile the change-capture delta in bounded micro-batches WHILE the
@@ -285,7 +301,7 @@ create or replace function pgpm.from_hypertable_drain_delta_step(
   p_hypertable regclass, p_control name, p_batch int default 5000
 ) returns bigint language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_dest name; v_delta name; v_drainkey name;
+  v_nsp name; v_rel name; v_dest name; v_delta name;
   v_keycols text; v_dkey text; v_skey text; v_cols text;
   v_ctl_type text; v_min_ctl text; v_max_ctl text; v_watermark bigint; v_keys bigint;
 begin
@@ -309,12 +325,8 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped and attgenerated = '';
 
-  -- the dest has no indexes after the bulk copy; without a key index every batch's dest delete seqscans the
-  -- whole dest. Build it once (if-not-exists; the driver normally builds it before the loop).
-  v_drainkey := left(v_rel || '_pgpm_drainkey', 63);
-  if to_regclass(format('%I.%I', v_nsp, v_drainkey)) is null then
-    execute format('create index %I on %I.%I (%s)', v_drainkey, v_nsp, v_dest, v_keycols);
-  end if;
+  -- the dest's per-batch delete uses the reused-key index that from_hypertable_copy built on the dest (#175,
+  -- the same index the cutover adopts); no separate throwaway index is built here.
 
   -- batch boundary: the pgpm_seq of the p_batch-th oldest delta row (or max when fewer remain)
   execute format('select coalesce((select pgpm_seq from %I.%I order by pgpm_seq offset %s limit 1), (select max(pgpm_seq) from %I.%I))',
@@ -357,14 +369,14 @@ end $$;
 -- offset (like drain_step's EXISTS-not-count). Under sustained write load the residual may never reach the
 -- threshold; p_max_iter bounds the loop -- it raises a loud, actionable error UNLESS p_best_effort, in which
 -- case it returns so the caller (the cutover) can take the lock and finish the now-smaller residual under it.
--- The first batch with work builds the dest's drain key index (in its own transaction, skipped when there is
--- nothing to drain) and leaves it for the cutover to drop, so repeated operator calls reuse it.
+-- The per-batch dest delete uses the reused-key index from_hypertable_copy built on the dest (#175) -- the
+-- same index the cutover adopts -- so the drain builds no index of its own.
 create or replace procedure pgpm.from_hypertable_drain_delta(
   p_hypertable regclass, p_control name, p_batch int default 5000,
   p_threshold bigint default 0, p_max_iter int default 1000000, p_best_effort boolean default false
 ) language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_dest name; v_delta name; v_drainkey name; v_keycols text;
+  v_nsp name; v_rel name; v_dest name; v_delta name;
   v_iter int := 0; v_more boolean;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
@@ -375,23 +387,11 @@ begin
     raise exception 'pg_partition_magician: from_hypertable_drain_delta(%) found no delta -- change tracking was not enabled by from_hypertable_copy', p_hypertable;
   end if;
 
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_keycols
-    from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
-      and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
-  v_drainkey := left(v_rel || '_pgpm_drainkey', 63);
-
   loop
     -- residual <= threshold? EXISTS at offset stops at the first row past the threshold (count > threshold)
     execute format('select exists(select 1 from %I.%I order by pgpm_seq offset %s limit 1)',
                    v_nsp, v_delta, p_threshold) into v_more;
     exit when not v_more;
-    -- there is work to drain: build the dest's drain key index once, in its own transaction (without it the
-    -- per-batch dest delete seqscans the whole dest), keeping the O(rows) build out of the first batch and
-    -- skipping it entirely when there is nothing to drain.
-    if to_regclass(format('%I.%I', v_nsp, v_drainkey)) is null then
-      execute format('create index %I on %I.%I (%s)', v_drainkey, v_nsp, v_dest, v_keycols);
-      commit;
-    end if;
     perform pgpm.from_hypertable_drain_delta_step(p_hypertable, p_control, p_batch);
     commit;
     v_iter := v_iter + 1;
@@ -548,9 +548,6 @@ begin
     call pgpm.from_hypertable_drain_appends(p_hypertable, p_control, p_drain_batch, p_drain_batch,
                                             1000000, p_best_effort => true);
   end if;
-  -- the pre-drain (or an operator's from_hypertable_drain_delta) builds a throwaway key index on the dest;
-  -- drop it so it never survives the rename onto the final table (the real key index is built + adopted below).
-  execute format('drop index if exists %I.%I', v_nsp, left(v_rel || '_pgpm_drainkey', 63));
   -- append-only: read the catch-up watermark (max control in the dest) BEFORE the lock. The dest is private
   -- and stable from here to the lock (only CREATE INDEX runs, which does not change rows), so this is the
   -- same value the under-lock catch-up would read -- but doing it here keeps an O(rows) max() seqscan on a
@@ -571,9 +568,15 @@ begin
   for k in select conname, contype, conindid from pg_constraint
             where conrelid = p_hypertable and contype in ('p', 'u') loop
     v_tmp := left(k.conname || '_pgpm_new', 63);
-    execute regexp_replace(pg_get_indexdef(k.conindid),
-      '^(CREATE (UNIQUE )?INDEX )[^ ]+ ON [^ ]+',
-      '\1' || quote_ident(v_tmp) || ' ON ' || quote_ident(v_nsp) || '.' || quote_ident(v_dest));
+    -- #175: skip the build if it already exists -- from_hypertable_copy pre-builds the reused-key index
+    -- under this same name when tracking, so the drain can use it and the swap below adopts it. Other
+    -- constraints (and the append-only / non-tracking path) are built here as before. Always record the
+    -- conname -> temp-name mapping so the swap adopts every key index, copy-built or built here.
+    if to_regclass(format('%I.%I', v_nsp, v_tmp)) is null then
+      execute regexp_replace(pg_get_indexdef(k.conindid),
+        '^(CREATE (UNIQUE )?INDEX )[^ ]+ ON [^ ]+',
+        '\1' || quote_ident(v_tmp) || ' ON ' || quote_ident(v_nsp) || '.' || quote_ident(v_dest));
+    end if;
     v_key_names := array_append(v_key_names, k.conname::text);
     v_key_types := array_append(v_key_types, k.contype::text);
     v_key_tmps  := array_append(v_key_tmps, v_tmp);
