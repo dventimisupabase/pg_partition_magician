@@ -1,7 +1,11 @@
 name: TimescaleDB track
 
-# The from_hypertable migration track. Separate from the main matrix: it needs a TimescaleDB image
-# (its own Dockerfile), is PG15-only, and is pinned to the Supabase fleet version (TimescaleDB 2.16.1).
+# The from_hypertable migration track. Separate from the main matrix: it needs a TimescaleDB image, is
+# PG15-only, and runs on the Supabase fleet image (public.ecr.aws/supabase/postgres) -- the Apache edition
+# the migration actually targets. TS_PG_TAG selects the image tag; the default 15.14.1.127 bundles
+# TimescaleDB 2.16.1 (the larger fleet cluster, ~434 projects). The 2.9.x cluster (~224 projects) is not
+# covered here yet: the image bundles one TS version per tag, so a 2.9.x leg needs a supabase/postgres:15
+# tag that ships TimescaleDB 2.9.1 (deferred; tracked in the PR that introduced this).
 # Path-filtered so it runs only when the migration code, its tests, or the harness change.
 on:
   push:
@@ -26,15 +30,9 @@ on:
 
 jobs:
   timescale:
-    name: from_hypertable on TimescaleDB ${{ matrix.ts_version }} / PG15
+    name: from_hypertable on Apache TimescaleDB (supabase/postgres) / PG15
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # the two big Supabase fleet clusters (2.9.1: ~224 projects, 2.16.1: ~434)
-        ts_version: ['2.9.1', '2.16.1']
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
       - name: Run the from_hypertable track
-        run: TS_VERSIONS='${{ matrix.ts_version }}' ./test.sh timescale
+        run: TS_PG_TAGS='15.14.1.127' ./test.sh timescale
