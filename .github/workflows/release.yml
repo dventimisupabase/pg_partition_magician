@@ -27,9 +27,15 @@ jobs:
       - name: Channel test matrix (PG 15-18)
         run: ./test.sh
 
+  # The from_hypertable / TimescaleDB track is part of the full release gate too, so a release cannot ship a
+  # broken migration path. Reuses the same workflow the default Test Suite calls.
+  timescale:
+    name: TimescaleDB track
+    uses: ./.github/workflows/timescale.yml
+
   release:
     name: Create GitHub Release
-    needs: validate
+    needs: [validate, timescale]
     runs-on: ubuntu-latest
     permissions:
       contents: write

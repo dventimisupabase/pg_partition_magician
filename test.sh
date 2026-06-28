@@ -14,8 +14,10 @@
 #   bundle  scripts/build_install_bundle.sh output            (dashboard SQL editor)
 #   dbdev   scripts/build_dbdev_package.sh output (minified)  (dbdev / TLE / CREATE EXTENSION)
 #
-# The `timescale` track is separate: it needs TimescaleDB (its own image), is PG15-only, and is NOT part
-# of the default matrix. It exercises pgpm.from_hypertable against real hypertables (tests/timescale/).
+# The `timescale` track is a separate invocation (it needs TimescaleDB on its own image and is PG15-only, so
+# `./test.sh` with no args does not run it), but CI's default Test Suite calls it on every push/PR via the
+# reusable .github/workflows/timescale.yml. It exercises pgpm.from_hypertable against real hypertables
+# (tests/timescale/).
 #
 # The `observe` track is also separate: it installs the OPTIONAL pgpm_observe module on top of the core,
 # both with and without pg_flight_recorder present, and asserts the gate + the impact_report /

@@ -35,13 +35,21 @@ jobs:
             echo "ERROR: a package still contains psql metacommands"; exit 1
           fi
 
+  # The from_hypertable / TimescaleDB track, a first-class member of the default suite. It runs on a separate
+  # image (Apache TimescaleDB on supabase/postgres, PG15) so it lives in its own reusable workflow rather than
+  # the PG-version matrix above; calling it here makes it run on every push/PR alongside the matrix.
+  timescale:
+    name: TimescaleDB track
+    uses: ./.github/workflows/timescale.yml
+
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [test, packages]
+    needs: [test, packages, timescale]
     if: always()
     steps:
       - run: |
           [ "${{ needs.test.result }}" = "success" ] || { echo "matrix tests failed"; exit 1; }
           [ "${{ needs.packages.result }}" = "success" ] || { echo "package build failed"; exit 1; }
-          echo "All tests and package builds passed."
+          [ "${{ needs.timescale.result }}" = "success" ] || { echo "from_hypertable (TimescaleDB) track failed"; exit 1; }
+          echo "All tests, the TimescaleDB track, and package builds passed."

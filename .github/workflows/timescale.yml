@@ -1,32 +1,29 @@
 name: TimescaleDB track
 
-# The from_hypertable migration track. Separate from the main matrix: it needs a TimescaleDB image, is
-# PG15-only, and runs on the Supabase fleet image (public.ecr.aws/supabase/postgres) -- the Apache edition
-# the migration actually targets. TS_PG_TAG selects the image tag; the default 15.14.1.127 bundles
-# TimescaleDB 2.16.1 (the larger fleet cluster, ~434 projects). The 2.9.x cluster (~224 projects) is not
-# covered here yet: the image bundles one TS version per tag, so a 2.9.x leg needs a supabase/postgres:15
-# tag that ships TimescaleDB 2.9.1 (deferred; tracked in the PR that introduced this).
-# Path-filtered so it runs only when the migration code, its tests, or the harness change.
+# The from_hypertable migration track. It is PG15-only and runs on the Supabase fleet image
+# (public.ecr.aws/supabase/postgres) -- the Apache edition the migration actually targets -- so it cannot
+# share the main PG-version matrix's locally built image. Instead of a separate path-filtered workflow it is
+# a REUSABLE workflow: the default Test Suite calls it (so it is part of the default suite, run on every
+# push/PR), and it stays independently dispatchable for ad-hoc runs against another image tag.
+#
+# ts_pg_tags selects the image tag(s); the default 15.14.1.127 bundles TimescaleDB 2.16.1 (the larger fleet
+# cluster, ~434 projects). The 2.9.x cluster (~224 projects) is not covered here yet: the image bundles one
+# TS version per tag, so a 2.9.x leg needs a supabase/postgres:15 tag that ships TimescaleDB 2.9.1 -- pass it
+# via a manual dispatch (deferred as a standing CI leg). ECR Public rate-limits anonymous pulls, so test.sh
+# retries the pull with backoff.
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'pgpm_hypertable/install.sql'
-      - 'pgpm_core/install.sql'
-      - 'tests/timescale/**'
-      - 'test.sh'
-      - 'docker-compose.yml'
-      - '.github/workflows/timescale.yml'
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'pgpm_hypertable/install.sql'
-      - 'pgpm_core/install.sql'
-      - 'tests/timescale/**'
-      - 'test.sh'
-      - 'docker-compose.yml'
-      - '.github/workflows/timescale.yml'
+  workflow_call:
+    inputs:
+      ts_pg_tags:
+        description: 'Space-separated supabase/postgres image tag(s) to test'
+        type: string
+        default: '15.14.1.127'
   workflow_dispatch:
+    inputs:
+      ts_pg_tags:
+        description: 'Space-separated supabase/postgres image tag(s) to test'
+        type: string
+        default: '15.14.1.127'
 
 jobs:
   timescale:
@@ -35,4 +32,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run the from_hypertable track
-        run: TS_PG_TAGS='15.14.1.127' ./test.sh timescale
+        run: TS_PG_TAGS='${{ inputs.ts_pg_tags }}' ./test.sh timescale
