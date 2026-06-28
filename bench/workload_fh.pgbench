@@ -1,0 +1,4 @@
+-- pgbench transaction: one server-side from_hypertable-track workload step (many ops per round-trip).
+-- ops-per-call is injected with `pgbench -D ops=N`; clock_secs shifts the effective "now" forward (0 for
+-- the live phases, a positive offset during refine so writes land in forward partitions).
+SELECT bench.workload_step_fh(:ops, :clock_secs);
