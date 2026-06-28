@@ -2,7 +2,7 @@
 -- guarantees on the partitioned PARENT: the primary key (and that it includes the control column),
 -- declared secondary indexes, column defaults, NOT NULL, and CHECK constraints. (Generated columns are
 -- covered in tests/timescale/db/09.) Autocommit, disposable-db.
-select plan(6);
+select plan(7);
 
 select mk_hypertable_rich('hp_fid', 30);
 
@@ -37,6 +37,11 @@ select is(
     where conrelid = 'hp_fid'::regclass and contype = 'c'
       and pg_get_constraintdef(oid) ilike '%amount%>=%0%'),
   1, 'the CHECK constraint (amount >= 0) carried onto the parent');
+-- the cutover pre-builds the destination's indexes under temp `_pgpm_new` names (before its brief lock),
+-- then adopts/renames them; none of those temp indexes should survive the swap.
+select is(
+  (select count(*)::int from pg_class where relkind = 'i' and relname like '%\_pgpm\_new'),
+  0, 'no temporary *_pgpm_new index survives the cutover (pre-built indexes adopted/renamed cleanly)');
 
 select * from finish();
 -- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).
