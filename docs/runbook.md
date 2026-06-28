@@ -21,6 +21,8 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 - [Monitoring a non-empty DEFAULT](#monitoring-a-non-empty-default)
 - [A stray is stuck in the DEFAULT (the drain is behind)](#a-stray-is-stuck-in-the-default-the-drain-is-behind)
 - [Disk is filling during a refine](#disk-is-filling-during-a-refine)
+- [Storage is not dropping despite a retention policy](#storage-is-not-dropping-despite-a-retention-policy)
+- [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
 
 ## Referential-integrity violations after a `preserve` drain
 
@@ -343,3 +345,106 @@ select coarse_partitions, inflight_partitions from pgpm.status() where parent = 
 **Prevent.** Before refining a large history on a fixed volume, prearrange about 2x the headroom of the
 span you will refine, or refine hierarchically so the transient footprint stays bounded to one unit at a
 time. On an elastic volume, no special preparation is needed.
+
+## Storage is not dropping despite a retention policy
+
+**Symptom.** `config.retain` is set, but disk is not falling as old data ages out: aged partitions linger,
+or the below-horizon tail sits in the `DEFAULT` and never goes away.
+
+**What it means.** Retention is enforced only while maintenance runs and the drain keeps pace. Two
+mechanisms reclaim aged data, both driven by `maintain` on pg_cron:
+
+- `retain()` drops whole materialized partitions older than the horizon (a `retain_drop` log row).
+- since #91, the drain also reclaims below-horizon rows still in the `DEFAULT` **in place**, instead of
+  materializing a partition only to drop it next tick (a `retain_reclaim` log row).
+
+So retention is **best-effort**: if the table is `paused`, if `maintain_all` is not scheduled, or if the
+drain is lagging (a large `closed_rows` backlog, so the aged tail never reaches a partition), aged data
+lingers and storage does not fall. It bounds storage only when maintenance runs and the drain keeps up.
+(Watch the unit, too: `retain` is an **interval** for `time`/`uuidv7` and a **count of intervals** for
+`id` -- a misread makes the horizon far longer than intended.)
+
+**Steps.**
+
+1. Confirm the policy is set and that maintenance can act on it:
+
+   ```sql
+   select parent, paused, closed_rows from pgpm.status() where parent = 'public.events'::regclass;
+   select retain from pgpm.config where parent_table = 'public.events'::regclass;
+   ```
+
+   `paused = true` means maintenance is doing nothing; a large `closed_rows` means the drain is behind, so
+   the aged tail has not been homed (or reclaimed) yet.
+
+2. Run a maintenance pass, or force the reclaim by hand:
+
+   ```sql
+   select pgpm.maintain('public.events');     -- one pass: obtain, retain, drain (and auto-refine)
+   -- or catch up now, synchronously:
+   select pgpm.drain_all('public.events');    -- evacuate / reclaim the closed tail
+   select pgpm.retain('public.events');       -- drop aged partitions now
+   ```
+
+3. Confirm reclamation actually happened:
+
+   ```sql
+   select at, action, lo, hi, rows from pgpm.log
+    where parent_table = 'public.events'::regclass and action in ('retain_drop', 'retain_reclaim')
+    order by id desc limit 20;
+   ```
+
+**Verify.**
+
+```sql
+-- aged partitions are gone and the closed tail has drained; storage falls once the drops are reclaimed
+select n_partitions, closed_rows from pgpm.status() where parent = 'public.events'::regclass;
+```
+
+**Prevent.** Keep `maintain_all` scheduled on pg_cron and the drain keeping pace (raise `drain_batch` / run
+the cron more often) so the aged tail always reaches a partition in time to be dropped, and do not leave a
+managed table `paused` if you rely on retention to bound storage. A lagging or paused drain turns retention
+into best-effort.
+
+## Re-transmute fails with an orphan-table error
+
+**Symptom.** `transmute` refuses up front with an error like:
+
+> pg_partition_magician: public.events_p2026_03 already exists as a standalone table matching this
+> parent's partition naming -- most likely an orphan left by an interrupted drain. Drop it
+> (drop table public.events_p2026_03) and retry transmute.
+
+**What it means.** The drain (and refine) builds each child as a **standalone** table and only `ATTACH`es
+it when the interval finishes. A standalone child has no dependency on the parent, so a
+`DROP TABLE <parent> CASCADE` does **not** remove an un-attached child -- it survives the cascade. If the
+parent is then recreated and re-transmuted, the next drain would reuse that orphan by name and collide on
+its stale keys. So `transmute` refuses when it finds a standalone table matching the parent's
+child-partition naming (`<rel>_p<digits>`), rather than silently adopting stale data (the orphan guard;
+`tests/18`). Since #94, an in-flight child is also tracked in `pgpm.part` with `attached = false`.
+
+**Steps.**
+
+1. The error names the orphan. Confirm it is a leftover standalone table, not a live attached partition --
+   it is a partition of no parent, and (post-#94) it may show in `pgpm.partitions` with `attached = false`:
+
+   ```sql
+   select inhparent::regclass from pg_inherits
+    where inhrelid = 'public.events_p2026_03'::regclass;            -- expect no rows (not attached anywhere)
+   select * from pgpm.partitions where child_name = 'events_p2026_03';  -- attached = false, if still tracked
+   ```
+
+2. Drop the orphan and retry:
+
+   ```sql
+   drop table public.events_p2026_03;   -- the table the error named
+   -- then re-run your transmute(...) call
+   ```
+
+**Verify.**
+
+```sql
+select * from pgpm.status() where parent = 'public.events'::regclass;   -- transmute succeeded; the table is managed
+```
+
+**Prevent.** Do not `DROP`/recreate a parent mid-conversion. Let an interrupted drain finish (it attaches
+the child, so it becomes a real partition rather than an orphan), or `untransmute` while the conversion is
+still reversible, rather than dropping the parent out from under its in-flight children.
