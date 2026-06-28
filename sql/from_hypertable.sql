@@ -256,6 +256,7 @@ declare
   v_delta name; v_trgfn name; v_track boolean; v_keycols text; v_dkey text; v_skey text; v_subsel text;
   v_ident_cols name[]; v_ident_next bigint[]; v_srcseq text; v_srcnext bigint; v_col name;
   v_pseq text; v_curnext bigint; v_i int;
+  v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
@@ -279,6 +280,35 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
+
+  -- Pre-build the destination's indexes BEFORE taking the exclusive lock, while the destination is still a
+  -- private table and the source keeps serving traffic. This is the O(rows) work; doing it OUTSIDE the lock
+  -- is what keeps the cutover's ACCESS EXCLUSIVE window brief -- otherwise the PK + secondary index rebuilds
+  -- on the whole table run under the lock (minutes of downtime at scale). Each index is built with a temp
+  -- name (the source still owns the originals); the locked swap below then ADOPTS the unique ones as their
+  -- original PK/UNIQUE constraints (ALTER TABLE ... USING INDEX -- metadata-only, and it renames the index to
+  -- the constraint name) and RENAMES the remaining secondary indexes to their original names (metadata-only).
+  -- Builds happen in the same transaction as the swap, so an aborted cutover rolls them back with everything.
+  for k in select conname, contype, conindid from pg_constraint
+            where conrelid = p_hypertable and contype in ('p', 'u') loop
+    v_tmp := left(k.conname || '_pgpm_new', 63);
+    execute regexp_replace(pg_get_indexdef(k.conindid),
+      '^(CREATE (UNIQUE )?INDEX )[^ ]+ ON [^ ]+',
+      '\1' || quote_ident(v_tmp) || ' ON ' || quote_ident(v_nsp) || '.' || quote_ident(v_dest));
+    v_key_names := array_append(v_key_names, k.conname::text);
+    v_key_types := array_append(v_key_types, k.contype::text);
+    v_key_tmps  := array_append(v_key_tmps, v_tmp);
+  end loop;
+  for k in select ic.relname as origname, i.indexrelid from pg_index i join pg_class ic on ic.oid = i.indexrelid
+            where i.indrelid = p_hypertable and not i.indisprimary
+              and not exists (select 1 from pg_constraint con where con.conindid = i.indexrelid) loop
+    v_tmp := left(k.origname || '_pgpm_new', 63);
+    execute regexp_replace(pg_get_indexdef(k.indexrelid),
+      '^(CREATE (UNIQUE )?INDEX )[^ ]+ ON [^ ]+',
+      '\1' || quote_ident(v_tmp) || ' ON ' || quote_ident(v_nsp) || '.' || quote_ident(v_dest));
+    v_idx_orig := array_append(v_idx_orig, k.origname::text);
+    v_idx_tmps := array_append(v_idx_tmps, v_tmp);
+  end loop;
 
   execute format('lock table %I.%I in access exclusive mode', v_nsp, v_rel);
   if v_track then
@@ -304,14 +334,8 @@ begin
                      v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, p_control, v_watermark);
     end if;
   end if;
-  create temporary table _fh_keys on commit drop as
-    select conname::text as nm, pg_get_constraintdef(oid) as def
-      from pg_constraint where conrelid = p_hypertable and contype in ('p', 'u');
-  create temporary table _fh_idx on commit drop as
-    select pg_get_indexdef(i.indexrelid) as def
-      from pg_index i
-     where i.indrelid = p_hypertable and not i.indisprimary
-       and not exists (select 1 from pg_constraint con where con.conindid = i.indexrelid);
+  -- (the key constraints + secondary indexes were captured and pre-built on the destination above, before
+  -- the lock; the swap below only adopts/renames them -- metadata-only.)
   -- identity columns: CREATE TABLE (LIKE ...) does NOT carry identity, so the destination's column is a
   -- plain (already-populated) column. Capture which columns were identity on the source so we can re-add
   -- the property after the rename. Also capture each source sequence's NEXT value: transmute only reseeds
@@ -338,11 +362,17 @@ begin
     execute format('drop function if exists %I.%I()', v_nsp, v_trgfn);
   end if;
   execute format('alter table %I.%I rename to %I', v_nsp, v_dest, v_rel);
-  for k in select nm, def from _fh_keys loop
-    execute format('alter table %I.%I add constraint %I %s', v_nsp, v_rel, k.nm, k.def);
+  -- adopt the pre-built unique indexes as the original PK/UNIQUE constraints (metadata-only; USING INDEX
+  -- also renames the adopted index to the constraint name)
+  for v_i in 1 .. coalesce(array_length(v_key_names, 1), 0) loop
+    execute format('alter table %I.%I add constraint %I %s using index %I',
+                   v_nsp, v_rel, v_key_names[v_i],
+                   case when v_key_types[v_i] = 'p' then 'primary key' else 'unique' end,
+                   v_key_tmps[v_i]);
   end loop;
-  for k in select def from _fh_idx loop
-    execute k.def;   -- names the original index and (post-rename) the original table name
+  -- rename the pre-built secondary indexes to their original names (metadata-only)
+  for v_i in 1 .. coalesce(array_length(v_idx_orig, 1), 0) loop
+    execute format('alter index %I.%I rename to %I', v_nsp, v_idx_tmps[v_i], v_idx_orig[v_i]);
   end loop;
   if v_ident_cols is not null then
     foreach v_col in array v_ident_cols loop

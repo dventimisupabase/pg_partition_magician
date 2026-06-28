@@ -134,8 +134,11 @@ Scope and caveats:
   it, else **keyless** (the common hypertable shape, since `create_hypertable` makes the time column
   `NOT NULL` but adds no key). Identity columns, generated columns, `CHECK` constraints, defaults, and
   `NOT NULL` are all preserved (see `transmute`).
-- The copy is **online** (the source serves traffic throughout); only the cutover takes a brief
-  `ACCESS EXCLUSIVE` lock.
+- The copy is **online** (the source serves traffic throughout), and so is the index rebuild: the
+  destination's primary key and secondary indexes are built on the private copy **before** the cutover takes
+  its lock. The cutover's `ACCESS EXCLUSIVE` window is therefore **brief and metadata-bound** -- it catches up
+  the delta, swaps the table in, and *adopts* the pre-built indexes (`USING INDEX`); it does not rebuild them
+  under the lock, so the blocking window does not grow with table size the way an under-lock rebuild would.
 - The copy writes a **full second table**, so the migration transiently needs roughly the source's current
   size in extra disk until cutover drops the old hypertable. `from_hypertable_preflight` raises a `NOTICE`
   with the estimate; `from_hypertable_disk_estimate` returns it for sizing a volume ahead of time.
@@ -197,11 +200,16 @@ pgpm.from_hypertable_cutover(
 )
 ```
 
-Phase 2: the cutover (the one non-online window). Takes a brief `ACCESS EXCLUSIVE` lock on the source, catches
-up the writes that arrived during the copy (append-only, or a full delta replay when `from_hypertable_copy`
-ran with `p_track_changes => true` -- auto-detected via the delta table, so the two phases cannot disagree),
-drops the hypertable, renames the copy into place, rebuilds the key, secondary indexes, and identity columns
-(which `CREATE TABLE LIKE` does not carry), then hands off to `transmute`. It also preserves each identity
+Phase 2: the cutover. First it **pre-builds the destination's primary key and secondary indexes online** (on
+the private copy, before any lock -- this is the O(rows) work, deliberately kept out of the blocking window).
+Then it takes a **brief, metadata-only `ACCESS EXCLUSIVE` window**: catch up the writes that arrived during
+the copy (append-only, or a full delta replay when `from_hypertable_copy` ran with `p_track_changes => true`
+-- auto-detected via the delta table, so the two phases cannot disagree), drop the hypertable, rename the copy
+into place, **adopt** the pre-built unique indexes as the original `PRIMARY KEY`/`UNIQUE` constraints
+(`ALTER TABLE ... USING INDEX`, metadata-only) and rename the secondary indexes back to their original names,
+re-add the identity columns (which `CREATE TABLE LIKE` does not carry), then hand off to `transmute`. Because
+the index builds happen before the lock, the blocking window is bounded by the catch-up + metadata, not by the
+table size. It also preserves each identity
 sequence's exact position: `transmute` seeds past `max(id)`, but if the source sequence was further ahead
 (gaps from rollbacks, caching, or deleted high rows) the migrated sequence is advanced to the source's next
 value so those ids are not re-issued. The swap is one transaction: it
@@ -226,7 +234,8 @@ normally otherwise. **Refuses** when: the `timescaledb` extension is absent; `p_
 hypertable; it has one or more **continuous aggregates** (no native-partition equivalent, and dropping them is
 data-destructive); it has more than one **dimension** (space partitioning); or the `p_control` column does not
 exist. On success it raises a `NOTICE` estimating the transient extra disk the migration needs (see
-`from_hypertable_disk_estimate`). Both `from_hypertable_copy` and `from_hypertable` call it first.
+`from_hypertable_disk_estimate`) and a rough copy-time ETA (see `from_hypertable_time_estimate`). Both
+`from_hypertable_copy` and `from_hypertable` call it first.
 
 ### `from_hypertable_disk_estimate`
 
@@ -238,6 +247,42 @@ The approximate extra disk the online migration needs: the source hypertable's c
 indexes, and toast summed across all chunks) in bytes. The copy writes a full second table, so free roughly
 this much until cutover drops the old hypertable and the space is reclaimed. `preflight` reports it as a
 `NOTICE`; call this directly (with `pg_size_pretty`) to size a volume before starting.
+
+### `from_hypertable_time_estimate`
+
+```sql
+pgpm.from_hypertable_time_estimate(p_hypertable regclass, p_copy_mibps numeric default null) returns interval
+```
+
+A **rough** estimate of the online-copy duration, the dominant cost of migrating a hypertable. (Converting a
+plain table with `transmute` is metadata-only and takes seconds regardless of size; a hypertable's rows must
+be physically copied out, which is O(rows).) It divides `from_hypertable_disk_estimate` by an assumed
+effective copy throughput. `p_copy_mibps` overrides that throughput (MiB/s of logical data); when `null` it is
+chosen by comparing the estimated size to `effective_cache_size` (cache-resident vs disk-bound). The default
+rates (~40 MiB/s cache-resident, ~16 MiB/s disk-bound) are order-of-magnitude figures measured on a 2XL on
+gp3 and scale with RAM/IOPS/throughput. It covers **only the copy**; the (online) index build and the brief
+cutover are additional. `preflight` reports it as a `NOTICE`.
+
+### Performance: how long, and how to speed it up
+
+The migration time is dominated by two O(rows) but **online** (non-blocking) phases, the per-chunk copy and
+the index pre-build, plus a brief metadata cutover. To go faster (with the limits):
+
+- **More RAM** is the single biggest lever when the working set is near RAM size: a cache-resident copy runs
+  several times faster than a disk-bound one (measured ~2.5x). Many times past RAM you are firmly I/O-bound
+  and RAM stops helping.
+- **More disk IOPS / throughput** (gp3 to io2, higher MiB/s): the copy reads the source chunks and writes the
+  destination (~2x the bytes over the disk), so disk throughput caps the disk-bound rate, bounded by the
+  instance's sustained-throughput ceiling.
+- **Raise `max_wal_size`** for the migration. The copy and index build are write-heavy, and on a stock
+  `max_wal_size` they outrun it and force checkpoints that throttle progress (at-scale runs showed dozens of
+  forced checkpoints and long checkpoint write times). A larger `max_wal_size` (and `checkpoint_timeout`)
+  removes that stall.
+- **`maintenance_work_mem`** and **`max_parallel_maintenance_workers`** speed the index pre-build.
+
+Hard floors: every byte is read and written once (the copy); the migration transiently needs roughly 2x the
+source size in disk until cutover drops the old hypertable; and the cutover's metadata window cannot go below
+the delta catch-up.
 
 ## Maintenance steps
 
