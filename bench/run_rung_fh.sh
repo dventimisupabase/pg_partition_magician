@@ -57,7 +57,11 @@ printf '\n==== run_rung_fh %s : %s rows, %s months, chunk=%s, fh_interval=%s ===
   "$RUNG" "$BENCH_ROWS" "$BENCH_MONTHS" "$BENCH_CHUNK_INTERVAL" "$BENCH_FH_INTERVAL"
 
 # ---- reset to a clean slate (idempotent; cheap on a fresh instance, safety on a reused one) ----
-pkill -f 'workload_fh.pgbench' 2>/dev/null || true
+# Kill only THIS run's leftover pgbench, matched by the project ref (which is in the DSN on the pgbench
+# command line), not every workload_fh.pgbench on the machine -- otherwise running rungs/arms in parallel
+# (one fresh project each) would clobber each other's workloads at reset time (issue #177). The server-side
+# RESET_KILL below is already scoped to this project's database via current_database().
+pkill -f "${BENCH_PROJECT_REF}.*workload_fh.pgbench" 2>/dev/null || true
 RESET_KILL="select count(pg_terminate_backend(pid)) from pg_stat_activity where datname=current_database() and pid<>pg_backend_pid() and (query ilike '%bench.%' or query ilike '%pgpm%' or query ilike '%generate_events%' or application_name ilike '%pgbench%')"
 RESET_CRON="select count(cron.unschedule(jobid)) from cron.job where jobname like 'pgfr%' or jobname like 'pgpm%' or jobname like '%bench%'"
 RESET_DROP="drop extension if exists pgfr_analyze cascade; drop extension if exists pgfr_record cascade; drop schema if exists pgfr_analyze cascade; drop schema if exists pgfr_record cascade; drop schema if exists bench cascade; drop schema if exists pgpm cascade"
