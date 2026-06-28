@@ -238,8 +238,9 @@ begin
   -- The destination was just CREATE TABLE LIKE'd and bulk-loaded, so it has no planner stats (reltuples=0).
   -- ANALYZE it now -- while it is still private and unlocked -- so the cutover's delta reconcile plans
   -- against the real row count. Without this the planner thinks the dest is empty and seqscans the whole
-  -- table for the reconcile, making the (locked) cutover O(rows) instead of O(delta).
-  execute format('analyze %I.%I', v_nsp, v_dest);
+  -- table for the reconcile, making the (locked) cutover O(rows) instead of O(delta). pgpm._analyze is the
+  -- core's shared mint-then-populate ANALYZE helper (#164).
+  perform pgpm._analyze(format('%I.%I', v_nsp, v_dest)::regclass);
   commit;
 end $$;
 
@@ -331,8 +332,8 @@ begin
         and attnum > 0 and not attisdropped;
     v_subsel := format('select distinct %s from %I.%I', v_keycols, v_nsp, v_delta);
     -- The delta was just populated by the trigger, so it has no stats; ANALYZE it so the planner sizes
-    -- the semi-joins correctly (the dest was already ANALYZEd at the end of the copy).
-    execute format('analyze %I.%I', v_nsp, v_delta);
+    -- the semi-joins correctly (the dest was already ANALYZEd at the end of the copy). Shared helper (#164).
+    perform pgpm._analyze(format('%I.%I', v_nsp, v_delta)::regclass);
     -- Bound the source read to the delta's touched control-column range, as LITERAL constants, so
     -- TimescaleDB excludes untouched chunks at plan time -- the reconcile then reads only the chunks that
     -- actually changed, not the whole hypertable. (A min()/max() subquery is a runtime value and does NOT

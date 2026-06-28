@@ -335,6 +335,20 @@ $$;
 
 -- ============================== engine ==============================
 
+-- ANALYZE a freshly minted + bulk-loaded table so the planner has real row stats before anything relies
+-- on it. A CREATE TABLE LIKE'd child that has just been INSERT'd into still shows reltuples = -1 (unknown)
+-- until autovacuum catches up, so any plan that touches it in the interim -- a later refine/drain batch,
+-- the swap/attach, or a user query right after -- misplans against a phantom-empty table. That is exactly
+-- the seqscan that made the from_hypertable cutover reconcile O(rows) (#164/#166). ANALYZE is sampled, so
+-- its cost is bounded by default_statistics_target, not the table size; call it everywhere a table is
+-- minted-then-populated, and (where possible) on the still-private child before any exclusive lock.
+create or replace function pgpm._analyze(p_rel regclass)
+returns void language plpgsql as $$
+begin
+  execute format('analyze %s', p_rel::text);
+end;
+$$;
+
 -- create an EMPTY partition for native [p_lo, p_hi); skips the DEFAULT scan when
 -- the default is non-empty (NOT VALID exclusion CHECK + VALIDATE).
 create or replace function pgpm._create_partition(
@@ -537,6 +551,12 @@ begin
   execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
                  v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
   if v_more then return 'moved:' || v_moved; end if;
+
+  -- the interval is fully drained and the child is still private (not yet attached): ANALYZE it now, off
+  -- the attach's exclusive lock, so the planner has real stats before the attach exposes it to user queries
+  -- and subsequent ticks. Without this it sits at reltuples = -1 until autovacuum, and anything touching it
+  -- misplans (#164).
+  perform pgpm._analyze(format('%I.%I', v_nsp, v_name)::regclass);
 
   if v_open or not cfg.keep_default then
     execute format('alter table %I.%I attach partition %I.%I for values from (%L) to (%L)',
@@ -785,7 +805,13 @@ begin
     if v_moved > 0 then
       insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'refine_copy', v_sub_lo, v_sub_hi, v_moved);
     end if;
-    if v_moved < v_batch then v_cursor := v_sub_hi; end if;          -- sub-range fully copied: advance
+    if v_moved < v_batch then
+      v_cursor := v_sub_hi;                                          -- sub-range fully copied: advance
+      -- the fine child holds all its rows now and is still standalone (it is attached later, at the swap):
+      -- ANALYZE it here, off the swap's exclusive-lock window, so the swap and any query that hits it after
+      -- see real stats, not reltuples = -1 (#164).
+      perform pgpm._analyze(format('%I.%I', v_nsp, v_sub_name)::regclass);
+    end if;
     update pgpm.config set refine_cursor = v_cursor where parent_table = p_parent;
     return 'copied:' || v_moved;
   end if;
