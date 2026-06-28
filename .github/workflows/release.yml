@@ -65,11 +65,11 @@ jobs:
           VER="${{ steps.v.outputs.version }}"; NUM="${VER#v}"
           mkdir -p release-assets
           # Self-contained bundle (dashboard SQL editor) and minified dbdev/TLE package.
-          scripts/build_install_bundle.sh sql/pg_partition_magician.sql "release-assets/pg_partition_magician-${VER}-bundle.sql"
-          scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql "release-assets/pg_partition_magician--${NUM}.sql"
+          scripts/build_install_bundle.sh pgpm_core/install.sql "release-assets/pg_partition_magician-${VER}-bundle.sql"
+          scripts/build_dbdev_package.sh  pgpm_core/install.sql "release-assets/pg_partition_magician--${NUM}.sql"
           # Source tarball.
           tar -czf "release-assets/pg_partition_magician-${VER}.tar.gz" \
-            sql/pg_partition_magician.sql sql/uninstall.sql extension.control README.md ONBOARDING.md \
+            pgpm_core/install.sql pgpm_core/uninstall.sql pgpm_core/extension.control README.md ONBOARDING.md \
             $([ -f CHANGELOG.md ] && echo CHANGELOG.md)
           ls -la release-assets
 

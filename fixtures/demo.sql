@@ -4,7 +4,7 @@
 -- Builds three unpartitioned tables and transmutes one of each kind, so the pgTAP
 -- suite has realistic data to exercise. Load it AFTER the module is installed:
 --
---   psql -f sql/pg_partition_magician.sql        # (or any install channel)
+--   psql -f pgpm_core/install.sql        # (or any install channel)
 --   psql -f fixtures/demo.sql
 --   pg_prove tests/*.sql
 --

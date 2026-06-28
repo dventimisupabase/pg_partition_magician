@@ -271,7 +271,7 @@ fi
 
 # ---- 1. install pgpm (+ optional pg_flight_recorder) -----------------------
 say "install pg_partition_magician"
-qf "$REPO_ROOT/sql/pg_partition_magician.sql" >/dev/null
+qf "$REPO_ROOT/pgpm_core/install.sql" >/dev/null
 echo "  pgpm installed: $(q "select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='pgpm'") functions"
 if [ "$BENCH_PGFR" = "1" ]; then
   if [ -f "$BENCH_PGFR_DIR/pgfr_record/install.sql" ]; then

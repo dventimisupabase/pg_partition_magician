@@ -6,7 +6,7 @@ on:
     paths:
       - index.html
       - install.html
-      - sql/uninstall.sql
+      - pgpm_core/uninstall.sql
       - .github/workflows/pages.yml
   # Re-deploy after a Release so the install page picks up the new bundle.
   # workflow_run (not `release: published`) because GitHub doesn't cascade
@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p _site
           cp index.html install.html _site/
-          cp sql/uninstall.sql _site/pg_partition_magician-uninstall.sql
+          cp pgpm_core/uninstall.sql _site/pg_partition_magician-uninstall.sql
 
           TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
           if [ -n "$TAG" ]; then
@@ -56,7 +56,7 @@ jobs:
             sed -i "s/RELEASE_VERSION/${TAG}/g; s/DBDEV_VERSION/${TAG#v}/g" _site/install.html
           else
             echo "No release yet, bundle fetch will degrade gracefully."
-            DEFV=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" extension.control | head -1)
+            DEFV=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" pgpm_core/extension.control | head -1)
             sed -i "s/RELEASE_VERSION/(unreleased)/g; s/DBDEV_VERSION/${DEFV}/g" _site/install.html
           fi
           ls -la _site

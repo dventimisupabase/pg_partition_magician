@@ -3,12 +3,12 @@
 # process psql metacommands -- e.g. a dashboard SQL editor. Paste the result in
 # and run. Wrapped in BEGIN/COMMIT so a partial failure rolls back.
 #
-# pg_partition_magician's source (sql/pg_partition_magician.sql) is already a flat
+# pg_partition_magician's source (pgpm_core/install.sql) is already a flat
 # single file with no metacommands, so this is mostly a wrap. The `\ir`/`\i`
 # inlining is kept for forward-compatibility if the source is ever split.
 #
 # Usage:   scripts/build_install_bundle.sh <src.sql> <out.sql>
-# Example: scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
+# Example: scripts/build_install_bundle.sh pgpm_core/install.sql dist/pg_partition_magician-bundle.sql
 set -euo pipefail
 
 SRC="${1:?usage: $0 <src.sql> <out.sql>}"

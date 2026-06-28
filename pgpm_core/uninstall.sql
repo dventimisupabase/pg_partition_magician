@@ -5,7 +5,7 @@
 -- rows are untouched. Only the tooling (config, registry, functions, views, the
 -- pg_cron job) goes away.
 --
--- Run with: psql --single-transaction -f sql/uninstall.sql
+-- Run with: psql --single-transaction -f pgpm_core/uninstall.sql
 
 -- Unschedule every pgpm cron job (matched by prefix so this stays correct as the
 -- cron surface evolves). Best-effort and tolerant of missing pg_cron / privileges.

@@ -9,7 +9,7 @@
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #
 # Channels:
-#   psql    sql/pg_partition_magician.sql via psql -f         (the source)
+#   psql    pgpm_core/install.sql via psql -f         (the source)
 #   bundle  scripts/build_install_bundle.sh output            (dashboard SQL editor)
 #   dbdev   scripts/build_dbdev_package.sh output (minified)  (dbdev / TLE / CREATE EXTENSION)
 #
@@ -35,14 +35,14 @@ if command -v docker-compose &>/dev/null; then DC="docker-compose"; else DC="doc
 [ "$CHANNEL" = "all" ] && CHANNELS=(psql bundle dbdev) || CHANNELS=("$CHANNEL")
 [ -n "${CI:-}" ] && BUILD_PROGRESS="--progress=plain" || BUILD_PROGRESS=""
 
-VER=$(awk -F"'" '/default_version/ {print $2}' extension.control)
+VER=$(awk -F"'" '/default_version/ {print $2}' pgpm_core/extension.control)
 DBDEV_PKG="dist/pg_partition_magician--${VER}.sql"
 BUNDLE="dist/pg_partition_magician-bundle.sql"
 
 # Build the channel artifacts on the host (version-independent).
 echo ">>> Building install artifacts..."
-scripts/build_install_bundle.sh sql/pg_partition_magician.sql "$BUNDLE"
-scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql "$DBDEV_PKG"
+scripts/build_install_bundle.sh pgpm_core/install.sql "$BUNDLE"
+scripts/build_dbdev_package.sh  pgpm_core/install.sql "$DBDEV_PKG"
 if grep -nE '^\\' "$BUNDLE" "$DBDEV_PKG"; then
   echo "ERROR: a packaged artifact still contains psql metacommands"; exit 1
 fi
@@ -51,7 +51,7 @@ psql_run() { $DC --profile "$1" exec -T "$2" psql -U postgres -d postgres -v ON_
 
 install_channel() {  # <channel> <profile> <service>
   case "$1" in
-    psql)   psql_run "$2" "$3" --single-transaction -f /repo/sql/pg_partition_magician.sql >/dev/null ;;
+    psql)   psql_run "$2" "$3" --single-transaction -f /repo/pgpm_core/install.sql >/dev/null ;;
     bundle) psql_run "$2" "$3" -f "/repo/$BUNDLE" >/dev/null ;;
     dbdev)  psql_run "$2" "$3" --single-transaction -f "/repo/$DBDEV_PKG" >/dev/null ;;
     *) echo "unknown channel $1"; exit 1 ;;
@@ -66,7 +66,7 @@ load_fixtures() {  # <profile> <service> -- build the demo tables for the pgTAP 
 
 uninstall_and_verify() {  # <profile> <service>
   local p="$1" s="$2" result
-  psql_run "$p" "$s" --single-transaction -f /repo/sql/uninstall.sql >/dev/null
+  psql_run "$p" "$s" --single-transaction -f /repo/pgpm_core/uninstall.sql >/dev/null
   result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
     select (select count(*) from pg_namespace where nspname='pgpm'),
            (select count(*) from cron.job where jobname like 'pgpm%')")
@@ -144,8 +144,8 @@ run_timescale() {
       $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q \
         -c "create extension if not exists timescaledb; create extension if not exists pgtap;" >/dev/null
       $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q \
-        --single-transaction -f /repo/sql/pg_partition_magician.sql >/dev/null
-      $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f /repo/sql/from_hypertable.sql >/dev/null
+        --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+      $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f /repo/pgpm_hypertable/install.sql >/dev/null
       $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f /repo/tests/timescale/fixtures.sql >/dev/null
       # -tA gives clean TAP (no table chrome); no ON_ERROR_STOP so every assertion reports.
       out=$($DC "${px[@]}" -d "$db" -tAq -f "/repo/$f" 2>&1)

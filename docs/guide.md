@@ -81,20 +81,20 @@ it is split. See [Refine the history](#refine-the-history).
 
 ## Install
 
-`sql/pg_partition_magician.sql` is the single source of truth: pure, idempotent SQL with no psql
+`pgpm_core/install.sql` is the single source of truth: pure, idempotent SQL with no psql
 metacommands. It ships through three channels, all built from that one file.
 
 The simplest path, on any Postgres you can run SQL against:
 
 ```bash
-psql "$DATABASE_URL" -f sql/pg_partition_magician.sql
+psql "$DATABASE_URL" -f pgpm_core/install.sql
 ```
 
 For a SQL client that does not process psql metacommands (a dashboard editor, say), build a
 self-contained `BEGIN/COMMIT`-wrapped bundle and paste it in:
 
 ```bash
-scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
+scripts/build_install_bundle.sh pgpm_core/install.sql dist/pg_partition_magician-bundle.sql
 ```
 
 On a managed Postgres with `pg_tle`, it can also be installed as a Trusted Language Extension from
@@ -111,7 +111,7 @@ You also need `pg_cron` enabled to run scheduled maintenance.
 intact:
 
 ```bash
-psql "$DATABASE_URL" -f sql/uninstall.sql
+psql "$DATABASE_URL" -f pgpm_core/uninstall.sql
 ```
 
 ## Transmute a table

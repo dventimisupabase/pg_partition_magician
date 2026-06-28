@@ -2,7 +2,7 @@
 -- pg_partition_magician :: from_hypertable  --  migrate a TimescaleDB hypertable
 -- to a pgpm-managed native RANGE partition set.
 --
--- OPTIONAL add-on, loaded ON TOP of the core (sql/pg_partition_magician.sql) and
+-- OPTIONAL add-on, loaded ON TOP of the core (pgpm_core/install.sql) and
 -- ONLY in a database where the timescaledb extension exists. It is kept out of the
 -- core install so pgpm's only runtime dependency stays pg_cron.
 --

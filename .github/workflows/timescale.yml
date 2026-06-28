@@ -11,8 +11,8 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'sql/from_hypertable.sql'
-      - 'sql/pg_partition_magician.sql'
+      - 'pgpm_hypertable/install.sql'
+      - 'pgpm_core/install.sql'
       - 'tests/timescale/**'
       - 'test.sh'
       - 'docker-compose.yml'
@@ -20,8 +20,8 @@ on:
   pull_request:
     branches: [ main ]
     paths:
-      - 'sql/from_hypertable.sql'
-      - 'sql/pg_partition_magician.sql'
+      - 'pgpm_hypertable/install.sql'
+      - 'pgpm_core/install.sql'
       - 'tests/timescale/**'
       - 'test.sh'
       - 'docker-compose.yml'

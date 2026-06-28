@@ -31,7 +31,7 @@ container up yourself:
 docker compose --profile pg15 up -d
 psql 'postgresql://postgres:postgres@127.0.0.1:5515/postgres' \
   -c 'create extension pg_cron; create extension pgtap;' \
-  -f sql/pg_partition_magician.sql -f fixtures/demo.sql
+  -f pgpm_core/install.sql -f fixtures/demo.sql
 psql 'postgresql://postgres:postgres@127.0.0.1:5515/postgres' -c 'select * from pgpm.status();'
 docker compose --profile pg15 down -v
 ```
@@ -40,10 +40,10 @@ docker compose --profile pg15 down -v
 
 | Path | What it is |
 |---|---|
-| `sql/pg_partition_magician.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
-| `sql/from_hypertable.sql` | Optional TimescaleDB-only add-on: migrate a hypertable to a pgpm-managed partition set. Loaded on top of the core, only where `timescaledb` exists |
-| `sql/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
-| `extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
+| `pgpm_core/install.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
+| `pgpm_hypertable/install.sql` | Optional TimescaleDB-only add-on: migrate a hypertable to a pgpm-managed partition set. Loaded on top of the core, only where `timescaledb` exists |
+| `pgpm_core/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
+| `pgpm_core/extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
 | `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
 | `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
@@ -74,14 +74,14 @@ attach). See REDESIGN.md for the full story.
 **TDD is the norm** (see `~/.claude` global guidance and the existing suite). Add a
 failing pgTAP test, then make it pass.
 
-`sql/pg_partition_magician.sql` is the single source of truth; edit it directly.
+`pgpm_core/install.sql` is the single source of truth; edit it directly.
 The bundle and dbdev packages are built from it (`scripts/build_*.sh`); nothing else
 needs to be kept in sync.
 
 ### The inner loop
 
 ```bash
-# edit sql/pg_partition_magician.sql, then:
+# edit pgpm_core/install.sql, then:
 ./test.sh 15                  # one version, all channels (~3-5 min on a cold image)
 ./test.sh 15 --channel=psql   # fastest: just the psql channel
 ./test.sh                     # full matrix PG 15-18 (what CI runs) before pushing
@@ -165,7 +165,7 @@ with the bundle + minified dbdev package + a source tarball (release notes pulle
   guide and the full function/catalog reference.
 - [`REDESIGN.md`](./REDESIGN.md): the operating model and design rationale (the bounded-child transmute,
   the refine machinery, and the foundational supply/demand principles).
-- `sql/pg_partition_magician.sql`: heavily commented; the adapter layer
+- `pgpm_core/install.sql`: heavily commented; the adapter layer
   (`_grid_floor`/`_grid_next`/`_encode`/`_decode`/`_frontier_native`/`_part_name`) is
   where new partition kinds plug in.
 - `postgresql_online_partition_migration_summary.md`: the origin design doc.

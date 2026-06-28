@@ -647,7 +647,7 @@
         <h2 class="display">One file. Run it with psql.</h2>
         <p>Pure SQL, no compiled extension, no superuser. Point <code style="font-family:var(--font-mono);font-size:0.9em;color:var(--brass)">psql</code> at the single source file and you're done:</p>
         <div class="codecopy">
-          <code id="install-cmd">psql "$DATABASE_URL" -f sql/pg_partition_magician.sql</code>
+          <code id="install-cmd">psql "$DATABASE_URL" -f pgpm_core/install.sql</code>
           <button class="btn btn-ghost" id="copy-install" type="button">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M5 11H3.5A1.5 1.5 0 012 9.5v-7A1.5 1.5 0 013.5 1h7A1.5 1.5 0 0112 2.5V5"/></svg>
             <span class="lbl">Copy</span>

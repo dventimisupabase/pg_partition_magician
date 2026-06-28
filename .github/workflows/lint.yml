@@ -44,4 +44,4 @@ jobs:
               if (dq % 2 != 0) { print "Unbalanced $$ dollar quotes"; exit 1 }
               print "dollar-quote check passed"
             }
-          ' sql/pg_partition_magician.sql
+          ' pgpm_core/install.sql

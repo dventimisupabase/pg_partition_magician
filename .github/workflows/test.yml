@@ -28,8 +28,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build bundle + dbdev package and verify
         run: |
-          scripts/build_install_bundle.sh sql/pg_partition_magician.sql dist/pg_partition_magician-bundle.sql
-          scripts/build_dbdev_package.sh  sql/pg_partition_magician.sql dist/pg_partition_magician--0.1.0.sql
+          scripts/build_install_bundle.sh pgpm_core/install.sql dist/pg_partition_magician-bundle.sql
+          scripts/build_dbdev_package.sh  pgpm_core/install.sql dist/pg_partition_magician--0.1.0.sql
           # bundle must be free of psql metacommands (dashboard SQL editor target)
           if grep -nE '^\\' dist/pg_partition_magician-bundle.sql dist/pg_partition_magician--0.1.0.sql; then
             echo "ERROR: a package still contains psql metacommands"; exit 1

@@ -59,7 +59,7 @@ and schedule a job.
 
 ```bash
 # the simplest path on any Postgres: run the single source file
-psql "$DATABASE_URL" -f sql/pg_partition_magician.sql
+psql "$DATABASE_URL" -f pgpm_core/install.sql
 ```
 
 Need copy-paste for a dashboard SQL editor, or the registry command? The
@@ -117,7 +117,7 @@ It is an optional add-on, loaded only where the `timescaledb` extension exists, 
 dependency-free:
 
 ```bash
-psql "$DATABASE_URL" -f sql/from_hypertable.sql
+psql "$DATABASE_URL" -f pgpm_hypertable/install.sql
 ```
 
 See the [reference](docs/reference.md#migrating-from-timescaledb-from_hypertable) for the phases,

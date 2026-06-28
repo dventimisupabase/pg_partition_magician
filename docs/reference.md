@@ -116,7 +116,7 @@ metadata-only reverse would lose those rows. (Tier-2 fold-back and Tier-3 merge 
 
 ## Migrating from TimescaleDB (`from_hypertable`)
 
-An **optional add-on** (`sql/from_hypertable.sql`) for migrating a TimescaleDB **Apache-edition** hypertable
+An **optional add-on** (`pgpm_hypertable/install.sql`) for migrating a TimescaleDB **Apache-edition** hypertable
 to a `pgpm`-managed native `RANGE` partition set. Load it on top of the core, only in a database where the
 `timescaledb` extension exists (the core's lone runtime dependency stays `pg_cron`). It un-hypertables the
 table by a full **online copy** into a plain table under the original name, then hands off to `transmute`, so

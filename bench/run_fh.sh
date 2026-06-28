@@ -141,8 +141,8 @@ else echo "  pg_stat_statements: unavailable"; fi
 
 # ---- 1. install pgpm + from_hypertable ----
 say "install pg_partition_magician + from_hypertable"
-qf "$REPO_ROOT/sql/pg_partition_magician.sql" >/dev/null
-qf "$REPO_ROOT/sql/from_hypertable.sql" >/dev/null
+qf "$REPO_ROOT/pgpm_core/install.sql" >/dev/null
+qf "$REPO_ROOT/pgpm_hypertable/install.sql" >/dev/null
 echo "  pgpm: $(q "select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='pgpm'") functions; from_hypertable present: $(q "select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='pgpm' and p.proname='from_hypertable'")"
 if [ "$BENCH_PGFR" = "1" ] && [ -f "$BENCH_PGFR_DIR/pgfr_record/install.sql" ]; then
   say "install pg_flight_recorder"

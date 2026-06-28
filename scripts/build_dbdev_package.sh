@@ -5,7 +5,7 @@
 # bodies and inline quoted literals are preserved verbatim.
 #
 # Usage:   scripts/build_dbdev_package.sh <src.sql> <out.sql>
-# Example: scripts/build_dbdev_package.sh sql/pg_partition_magician.sql dist/pg_partition_magician--0.1.0.sql
+# Example: scripts/build_dbdev_package.sh pgpm_core/install.sql dist/pg_partition_magician--0.1.0.sql
 set -euo pipefail
 
 SRC="${1:?usage: $0 <src.sql> <out.sql>}"
