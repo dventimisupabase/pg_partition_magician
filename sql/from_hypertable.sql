@@ -51,12 +51,40 @@ begin
   return v_bytes;
 end $$;
 
+-- from_hypertable_time_estimate: a ROUGH order-of-magnitude estimate of the online-copy duration -- the
+-- dominant cost of migrating a hypertable. (transmute on a plain table is metadata-only and takes seconds
+-- regardless of size, but a hypertable's rows must be physically copied out, which is O(rows).) The copy
+-- reads every chunk and writes a second heap, so the time is governed by data volume and effective
+-- throughput, which is REGIME-dependent: a working set that fits in cache copies far faster than one that
+-- is heap-random-I/O bound. p_copy_mibps overrides the assumed effective throughput (MiB/s of logical data
+-- copied); when null it is chosen by comparing the estimated size to effective_cache_size. The defaults
+-- (~40 MiB/s cache-resident, ~16 MiB/s disk-bound) are order-of-magnitude figures measured on a Supabase
+-- 2XL on gp3 and scale with RAM/IOPS/throughput. This covers ONLY the copy -- the cutover's index rebuild
+-- and an optional later refine are additional. Callable on its own for sizing.
+create or replace function pgpm.from_hypertable_time_estimate(
+  p_hypertable regclass, p_copy_mibps numeric default null
+) returns interval language plpgsql as $$
+declare v_bytes bigint; v_cache bigint; v_mibps numeric;
+begin
+  v_bytes := pgpm.from_hypertable_disk_estimate(p_hypertable);
+  v_mibps := p_copy_mibps;
+  if v_mibps is null then
+    begin v_cache := pg_size_bytes(current_setting('effective_cache_size'));
+    exception when others then v_cache := null; end;
+    v_mibps := case when v_cache is not null and v_bytes > v_cache then 16 else 40 end;
+  end if;
+  if v_mibps <= 0 then v_mibps := 16; end if;   -- guard against a nonsensical override
+  return make_interval(secs => (v_bytes / (v_mibps * 1048576.0))::double precision);
+end $$;
+
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a
 -- dry-run gate) and unit-testable inside a transaction. Raises a pgpm-prefixed error on any blocker;
 -- returns normally when the hypertable is migratable by this version (with a NOTICE estimating the disk).
 create or replace function pgpm.from_hypertable_preflight(p_hypertable regclass, p_control name)
 returns void language plpgsql as $$
-declare v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int; v_bytes bigint;
+declare
+  v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int; v_bytes bigint;
+  v_cache bigint; v_mibps numeric; v_regime text; v_eta interval;
 begin
   if not exists (select 1 from pg_extension where extname = 'timescaledb') then
     raise exception 'pg_partition_magician: from_hypertable requires the timescaledb extension to be installed';
@@ -99,6 +127,16 @@ begin
   v_bytes := pgpm.from_hypertable_disk_estimate(p_hypertable);
   raise notice 'pg_partition_magician: from_hypertable will copy % into a second table before cutover (about %); ensure that much free disk until the old hypertable is dropped at cutover and the space is reclaimed.',
     p_hypertable, pg_size_pretty(v_bytes);
+
+  -- time: a rough ETA for the online copy (the dominant cost). The regime is guessed from
+  -- effective_cache_size; both are order-of-magnitude. Informational, never a refusal.
+  begin v_cache := pg_size_bytes(current_setting('effective_cache_size'));
+  exception when others then v_cache := null; end;
+  if v_cache is not null and v_bytes > v_cache then v_mibps := 16; v_regime := 'disk-bound: estimated size exceeds effective_cache_size';
+  else v_mibps := 40; v_regime := 'cache-resident: estimated size fits effective_cache_size'; end if;
+  v_eta := pgpm.from_hypertable_time_estimate(p_hypertable, v_mibps);
+  raise notice 'pg_partition_magician: estimated online copy time ~ % (% at ~% MiB/s, %). This covers the copy only -- the cutover then rebuilds the primary key and secondary indexes (extra, scales with row count) and a later refine (if used) is a similar second pass. Rough (measured on a 2XL gp3): more RAM/IOPS/throughput is faster. Override the rate with pgpm.from_hypertable_time_estimate(table, mibps).',
+    v_eta, pg_size_pretty(v_bytes), v_mibps, v_regime;
 end $$;
 
 -- from_hypertable runs in two phases, exposed as separate procedures so writes can keep arriving between
