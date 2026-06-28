@@ -132,6 +132,15 @@ run_timescale() {
     echo "Apache TimescaleDB via supabase/postgres:$tag / pg15 -- from_hypertable"
     echo "========================================="
     $DC --profile "$prof" down -v 2>/dev/null || true
+    # ECR Public rate-limits ANONYMOUS pulls, and CI runners share source IPs, so a single image pull often
+    # trips "toomanyrequests: Rate exceeded" and the suite never runs. Pull explicitly with growing backoff
+    # first (the throttle is transient); once the image is cached, `up` reuses it (default pull policy =
+    # missing). Left operand of `&&`, so a failed pull is not fatal under `set -e`.
+    for attempt in 1 2 3 4 5; do
+      $DC --profile "$prof" pull "$svc" && break
+      echo "  image pull attempt $attempt hit a rate limit; backing off $((attempt * 15))s..."
+      sleep $((attempt * 15))
+    done
     $DC --profile "$prof" up -d
     # Wait for the REAL server over TCP. The postgres entrypoint runs a temporary init server on the unix
     # socket only, so a TCP probe succeeds ONLY once the real server is up -- avoiding the "database system
