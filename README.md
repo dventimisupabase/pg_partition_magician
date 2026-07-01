@@ -10,22 +10,22 @@ by running one file. The only runtime dependency is **pg_cron**, and only to run
 It partitions on any **monotonic** key (time, integer/bigint ids including Snowflake, or **UUIDv7 / ULID**)
 and manages the whole lifecycle:
 
-- **`transmute()`**: convert a live, unpartitioned table to partitioned **online, with no row movement**. The
+- **`transmute`**: convert a live, unpartitioned table to partitioned **online, with no row movement**. The
   original is renamed aside and attached intact as one bounded **monolith** child; a fresh `DEFAULT` is the
   safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no downtime. Reversible
-  with **`untransmute()`** until the history outgrows the monolith.
-- **obtain**: keep N partitions ahead of the write frontier.
-- **`regrain()`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
+  with **`untransmute`** until the history outgrows the monolith.
+- **`obtain`**: keep N partitions ahead of the write frontier.
+- **`regrain`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
-- **drain**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
+- **`drain`**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
   self-tuning against checkpoint pressure (`set_drain_adaptive`).
-- **retain**: drop partitions past a policy.
-- **maintain**: the one procedure `pg_cron` calls (obtain, drain, retain, optional auto-regrain).
+- **`retain`**: drop partitions past a policy.
+- **`maintain`**: the one procedure `pg_cron` calls (`obtain`, `drain`, `retain`, optional auto-`regrain`).
 
 The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."
 
-Two caveats, both covered in the [guide](docs/guide.md): the scheduled **drain** moves rows through an
-unattached child, so a mid-move read briefly undercounts the in-flight range (`regrain`, `drain_all()`, and
+Two caveats, both covered in the [guide](docs/guide.md): the scheduled **`drain`** moves rows through an
+unattached child, so a mid-move read briefly undercounts the in-flight range (`regrain`, `drain_all`, and
 `pgpm.snapshot` don't). And **incoming foreign keys** are preserved, not ignored (`transmute` never rewrites
 your key; `p_incoming_fks => 'preserve'` re-adds each one once the move is idle).
 
