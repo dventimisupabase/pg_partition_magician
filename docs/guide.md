@@ -68,8 +68,8 @@ per table:
 
 - **obtain**: create up to N partitions ahead of the frontier, so live writes always land in a real
   partition. With the `DEFAULT` empty this is a cheap, scan-free attach.
-- **drain (the magician's assistant)**: keep the `DEFAULT` empty by evacuating the occasional stray into
-  its proper partition. This is no longer the bulk mover -- it is a janitor for the leading-edge net.
+- **drain**: keep the `DEFAULT` empty by evacuating the occasional stray into
+  its proper partition. This is no longer the bulk mover -- it is housekeeping for the leading-edge net.
 - **retain**: drop partitions older than your policy.
 - **regrain** (optional): split the coarse monolith into finer partitions, on demand or paced across ticks.
 
@@ -219,7 +219,7 @@ checkpoints (`max_wal_size` / `checkpoint_timeout`); if it is outrunning that, a
 I/O storm are on the way, so pgpm eases the budget down *before* the storm and recovers gently once there
 is slack again -- the additive-increase / halve-on-congestion idea TCP uses. Your `drain_batch` is the
 ceiling; it only feathers *down* from there, as far as one-sixteenth of `drain_batch` under sustained
-pressure. The same budget paces both the assistant drain and regrain's microbatches.
+pressure. The same budget paces both the drain and regrain's microbatches.
 
 A second, complementary signal yields to *ambient query load* (which the WAL signal misses, since a
 starved workload makes little WAL). Turn it on with `pgpm.set_drain_ambient('public.events', 2.0)`: it
@@ -286,7 +286,7 @@ select * from pgpm.status();        -- one row per managed table: partitions, ba
 - **`coarse_partitions` and `history_unregrained`** -- how many attached partitions are still coarse
   (wider than one step), and whether any remain. `history_unregrained = true` is the regraining backlog:
   pruning and fine retention are suspended over that coarse span until it is regrained.
-- **`closed_rows` / `default_rows`** -- the assistant drain's backlog: rows in the `DEFAULT` that should
+- **`closed_rows` / `default_rows`** -- the drain's backlog: rows in the `DEFAULT` that should
   have a real partition. In steady state this is **zero** (the monolith holds the history; the `DEFAULT`
   is the empty net). A non-zero `closed_rows` means a stray landed there and has not yet been evacuated.
 - **`last_drained` / `drain_skips`** -- progress versus stall: a non-zero `closed_rows` with a stale
@@ -340,7 +340,7 @@ brief lock). Two consequences in the monolith model:
   discarded with the source at the swap) instead of materializing partitions only to drop them. So on a
   table you want aggressively retained, enable
   auto-regrain (or regrain by hand) to let retention reach the history.
-- **The assistant drain reclaims aged strays in place.** If a stray ages past the horizon while still in
+- **The drain reclaims aged strays in place.** If a stray ages past the horizon while still in
   the `DEFAULT`, the drain `DELETE`s it straight out (logged `retain_reclaim`) rather than materializing a
   doomed partition.
 
@@ -355,11 +355,11 @@ the policy.
 **Drops can also be driven from outside the schedule.** `pgpm.retire(parent, child)` is the sanctioned
 single-partition drop -- the same protocol `retain` runs (pre-drop hooks, `DROP`, bookkeeping), callable
 one partition at a time. It never drops anything retention would not (the partition's whole range must
-be past the horizon), and each partition is claim-guarded so several cooperating "janitors" -- say, an
+be past the horizon), and each partition is claim-guarded so several cooperating "assistants" -- say, an
 external archiver that uploads a partition to long-term storage and then retires it immediately -- can
 work alongside the scheduled `retain` without stepping on each other. See `retire` in the
-[reference](reference.md#retire), and the complete worked janitor in
-[the archive janitor](archive-janitor.md).
+[reference](reference.md#retire), and the complete worked assistant in
+[the archive assistant](archive-assistant.md).
 
 ### Pre-drop hooks
 
@@ -367,14 +367,16 @@ To do something with a partition's data before it is dropped -- the common case 
 long-term storage (e.g. S3) -- register a `pre_drop` hook:
 
 ```sql
-create function public.archive_to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
+create schema if not exists archive;   -- keep hook machinery out of API-exposed schemas
+
+create function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 begin
   -- e.g. perform aws_s3.query_export_to_s3(...) against p_child, or notify an external worker
 end;
 $$;
 
-select pgpm.hook_register('public.events', 'pre_drop', 'public.archive_to_s3(regclass,name,text,text)');
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
 ```
 
 If the hook raises, the partition is not dropped -- retention retries on a later cycle instead of
@@ -385,7 +387,7 @@ complete, working `archive_to_s3` (the `http` extension for the PUT, SigV4 signi
 credentials in Vault, verified against real signature enforcement), see
 [Archive partitions to S3](archive-to-s3.md).
 
-A hook runs inside the calling transaction (`retain`'s tick, or a janitor's `retire` call), so a slow
+A hook runs inside the calling transaction (`retain`'s tick, or an assistant's `retire` call), so a slow
 hook (a synchronous copy to long-term storage) holds it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick
 then attempts at most one partition's hooks + drop (oldest first), and an aged-out backlog paces across
 subsequent ticks instead of one call carrying it all. `status().retain_backlog` tracks the eligible
@@ -399,7 +401,7 @@ those FKs are handled, not ignored. Because `transmute` never rewrites the prima
 unique key always survives partitioning, so an incoming FK to the primary key is always preservable: no
 composite key, no denormalization, ever.
 
-There is one mechanical wrinkle. The assistant drain moves referenced rows through a standalone,
+There is one mechanical wrinkle. The drain moves referenced rows through a standalone,
 not-yet-attached child, so a referenced row is briefly outside the parent, which a `NO ACTION` FK would
 reject and a `CASCADE`/`SET NULL` FK would silently honour. So the FK cannot ride through in place during a
 drain: it is dropped for the conversion and re-added against the new parent. (Regrain is different -- it
@@ -496,7 +498,7 @@ lives inside it, and regrain only touches frozen children.
 This is the one correctness caveat worth understanding. We would rather state it plainly than bury it,
 and in this model it is much narrower than it used to be.
 
-**The gap belongs to the assistant drain alone.** When the paced drain evacuates a stray it `DELETE`s the
+**The gap belongs to the drain alone.** When the paced drain evacuates a stray it `DELETE`s the
 row out of the `DEFAULT` and re-`INSERT`s it into a standalone, not-yet-attached child across separate
 transactions. A query against the parent only scans attached partitions, so a plain `SELECT ... FROM parent`
 issued mid-move **undercounts** the range being moved. The rows are never lost; they are temporarily not
@@ -537,7 +539,7 @@ transaction, no gap) and `pause` the table while you do, or partition on a diffe
 ## WAL and checkpoint sizing
 
 Moving rows rewrites them (a cross-partition `DELETE` + `INSERT`), so a **regrain** is a burst of WAL
-concentrated over the regrain window (the steady-state assistant drain is tiny by comparison). If
+concentrated over the regrain window (the steady-state drain is tiny by comparison). If
 `max_wal_size` is small relative to that WAL rate plus your ambient write load, Postgres fires *requested*
 (forced) checkpoints whenever WAL hits the limit, rather than gentle *timed* checkpoints. A forced
 checkpoint flushes a burst of dirty buffers; on a throughput-limited disk that flush can stall the
@@ -573,7 +575,7 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`. A
   paused table is registered but untouched by `maintain` (you can still drive `drain_*`/`regrain` by hand).
 - **A stray is stuck in the `DEFAULT`.** `check_default()` shows `closed_rows > 0`: the table is unpaused
-  but the assistant drain has not evacuated it. Raise `drain_batch`, run the cron more often, or
+  but the drain has not evacuated it. Raise `drain_batch`, run the cron more often, or
   `drain_all()` once.
 - **History is not being split.** `status().history_unregrained` is true and you want fine partitions:
   enable auto-regrain (`set_regrain`) or run `regrain_history` by hand once the monolith has frozen.

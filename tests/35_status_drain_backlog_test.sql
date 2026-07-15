@@ -1,4 +1,4 @@
--- Regression test for issue #92, in the monolith model. pgpm.status() surfaces the assistant drain's
+-- Regression test for issue #92, in the monolith model. pgpm.status() surfaces the drain's
 -- backlog (closed_rows -- strays awaiting evacuation) and a stall signal (last_drained + drain_skips),
 -- so a WEDGED drain (closed_rows stuck > 0, no recent progress, climbing drain_skips) is distinguishable
 -- from a merely slow one. The backlog here is a closed STRAY interval in the otherwise-empty DEFAULT.

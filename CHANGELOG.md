@@ -2,10 +2,20 @@
 
 ## [Unreleased]
 
-- **Docs: the archive janitor (`docs/archive-janitor.md`).** The scanner variant of the S3 archival
+- **The metaphor gets its cast sorted, and the archival examples leave `public`.** The drain is no
+  longer called the magician's "assistant" anywhere: pgpm does its own drain work (it is all one big
+  act), and **assistant** now names the archive-then-retire scanner (`docs/archive-janitor.md` is now
+  `docs/archive-assistant.md`). Separately, every object in the worked archival examples moved from
+  `public` into a dedicated `archive` schema (`archive.to_s3`, `archive.s3_signed_request`,
+  `archive.ledger`, `archive.gate`, `archive.partition`, `archive.scan`): on Supabase, `public` is
+  typically exposed through the Data API, which serves tables over REST and functions as RPC
+  (PostgreSQL grants `EXECUTE` to `PUBLIC` on new functions by default); archival machinery has no
+  business being API-visible. The relocated SQL was re-verified end-to-end against MinIO (both hooks'
+  happy paths and the assistant's full matrix: vetoes, self-repair, crash cleanup).
+- **Docs: the archive assistant (`docs/archive-assistant.md`).** The scanner variant of the S3 archival
   example: a standing pg_cron procedure that archives aged partitions **with per-part commits**, so
   the vacuum horizon is held for one part's network time instead of a whole partition's upload, and
-  then drops each partition itself via `pgpm.retire()`, with the lean `archive_gate` `pre_drop` hook
+  then drops each partition itself via `pgpm.retire()`, with the lean `archive.gate` `pre_drop` hook
   keeping `retain()` an honest backstop (defers unarchived or changed partitions loudly). Ledger
   table records the fact; the gate owns the veto; the archiver owns the repair. Verified end-to-end
   against MinIO: happy path (multipart + empty fast-path, retired via `retire()`), the unarchived
@@ -14,25 +24,25 @@
   since PL/pgSQL forbids transaction control inside a block with an `EXCEPTION` clause, so a
   committing procedure cannot abort-on-exit), and the horizon claim measured directly: 1 distinct
   `backend_xmin` across the synchronous hook's whole run versus 11 advancing values under the
-  janitor, same ~110MB payload, same ~1s wall-clock. Re-verified on a live Supabase project against
+  assistant, same ~110MB payload, same ~1s wall-clock. Re-verified on a live Supabase project against
   Supabase Storage (same matrix, same deterministic ETags; the full-scale measurement: a ~110MB
   10-part archive over the real network showed 20 advancing `backend_xmin` values in 27 samples for
-  the janitor versus one pinned value for the synchronous hook). The live run surfaced two Supabase
+  the assistant versus one pinned value for the synchronous hook). The live run surfaced two Supabase
   ceilings, now documented loudly on both archival pages: Storage enforces the project upload file
   size limit (default 50MB, `HTTP 413` `EntityTooLarge`, boundary-verified at 49MB pass / 51MB fail,
   raised under Dashboard Storage -> Files -> Settings) on the S3 protocol per whole object, multipart
   included; and `statement_timeout` is 2 minutes (server configuration file, pooler and direct
-  alike), the synchronous hook's wall-clock ceiling, which the janitor's per-part statements
+  alike), the synchronous hook's wall-clock ceiling, which the assistant's per-part statements
   sidestep.
 
 - **`pgpm.retire(parent, child)`: the sanctioned single-partition drop.** `retain()`'s per-partition
   body -- claim, `pre_drop` hooks in registration order, `DROP`, catalog + log, per-partition failure
-  isolation -- factored into a public verb, so an external janitor (e.g. an archive-then-drop scanner)
+  isolation -- factored into a public verb, so an external assistant (e.g. an archive-then-drop scanner)
   or several cooperating ones can drive retirement directly without hand-rolling pgpm's protocol.
   `retire` never widens what retention may drop (it refuses anything not entirely past the retention
   horizon; a caller only picks which eligible partition and when), and the `pgpm.part` row is claimed
-  `FOR UPDATE SKIP LOCKED`, giving each partition exactly one owner at a time: concurrent janitors, or
-  a janitor and `retain()`, never double-invoke hooks and never log a spurious `retain_hook_fail` from
+  `FOR UPDATE SKIP LOCKED`, giving each partition exactly one owner at a time: concurrent assistants, or
+  an assistant and `retain()`, never double-invoke hooks and never log a spurious `retain_hook_fail` from
   a lock race. `retain()` is now a loop over `retire()`, with its signature, return value,
   `retain_batch` pacing, and failure isolation unchanged. (issues #195, #188; tests/60, including a
   live two-session claim test via dblink)
@@ -225,8 +235,8 @@
   **`regrain()`** splits it into proper partitions by **copying** (no dead tuples, no vacuum), atomically
   (synchronous `regrain` / `regrain_history`) or paced across maintenance ticks (`set_regrain` auto-regrain,
   budget-feathered like the drain). Regrain is retention-aware (below-horizon sub-ranges are skipped, not
-  materialized) and optional (a coarse monolith is a correct, permanent state). The drain is demoted to the
-  **assistant**: it keeps the empty `DEFAULT` empty by evacuating strays, so `obtain` takes a cheap
+  materialized) and optional (a coarse monolith is a correct, permanent state). The drain is demoted to a
+  **sideline**: it keeps the empty `DEFAULT` empty by evacuating strays, so `obtain` takes a cheap
   scan-free attach. `status()` gains `coarse_partitions` and `history_unregrained` (the regraining backlog);
   `untransmute`'s gate is now monolith/data-based (reversible until a row lands outside the monolith or
   regraining begins); `maintain` suspends preserve-managed incoming FKs around the drain's row movement (a

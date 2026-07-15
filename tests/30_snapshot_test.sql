@@ -25,7 +25,7 @@ insert into public.snap (created_at, body)
 select is((select count(*)::int from public.snap), 40, 'all 40 rows are visible through the parent before any drain');
 
 select ok(pgpm.drain_step('public.snap') like 'moved:%',
-  'first assistant-drain step moves a batch but does not attach (interval not yet empty)');
+  'first drain step moves a batch but does not attach (interval not yet empty)');
 
 select cmp_ok(
   (select count(*)::int from public.snap), '<', 40,

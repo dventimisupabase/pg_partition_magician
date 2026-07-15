@@ -49,13 +49,19 @@ The role that runs maintenance (on the pg_cron path, the job's owner) needs `sel
 
 ## The hook function
 
+Everything lives in a dedicated `archive` schema, not `public`: on Supabase, `public` is typically
+exposed through the Data API, which serves `public` functions as RPC (and PostgreSQL grants
+`EXECUTE` to `PUBLIC` on new functions by default). PostgREST only serves schemas you explicitly
+expose, so a dedicated schema keeps the archival machinery dark.
+
 ```sql
 create extension if not exists http;
 create extension if not exists pgcrypto;
+create schema if not exists archive;
 
 -- Export the partition's rows to S3 as NDJSON, synchronously, and raise if the upload did not
 -- succeed (so retain() keeps the partition and retries next tick).
-create or replace function public.archive_to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
+create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
   -- deployment constants: edit these four
@@ -77,7 +83,7 @@ begin
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
   select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
   if v_key_id is null or v_secret is null then
-    raise exception 'archive_to_s3: credentials missing from vault (s3_archive_access_key_id / s3_archive_secret_access_key)';
+    raise exception 'archive.to_s3: credentials missing from vault (s3_archive_access_key_id / s3_archive_secret_access_key)';
   end if;
 
   -- the partition's rows as newline-delimited JSON, ordered by the control column (round-trips any
@@ -136,7 +142,7 @@ begin
 
   -- a non-2xx means the copy is NOT safely in S3: raise, so retain() keeps the partition and retries
   if v_resp.status not between 200 and 299 then
-    raise exception 'archive_to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+    raise exception 'archive.to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
   end if;
 end;
 $$;
@@ -149,7 +155,7 @@ archive.
 ## Register and pace it
 
 ```sql
-select pgpm.hook_register('public.events', 'pre_drop', 'public.archive_to_s3(regclass,name,text,text)');
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
 update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
 ```
 
@@ -201,7 +207,7 @@ needed. See the runbook's
   setting, so it applies over the pooler and direct connections alike): the whole upload runs inside
   one statement, so that is this hook's wall-clock ceiling on Supabase; override with a session
   `set statement_timeout = ...` if a partition legitimately needs longer, or use the
-  [archive janitor](archive-janitor.md), whose per-part statements each only need to fit one part in
+  [archive assistant](archive-assistant.md), whose per-part statements each only need to fit one part in
   the window.
 
 ## When one PUT is not enough: the multipart variant
@@ -215,12 +221,14 @@ percent-encoder, one shared SigV4 signer (initiate, part, complete, and abort al
 the multipart requests just add a canonical query string), and the hook:
 
 ```sql
--- Multipart variant of the archive_to_s3 pre_drop hook: bounded memory for partitions of any size.
+create schema if not exists archive;
+
+-- Multipart variant of the archive.to_s3 pre_drop hook: bounded memory for partitions of any size.
 -- Three pieces: a URL-encoder, one shared SigV4 request signer (every S3 call signs the same way),
 -- and the hook, which streams the partition in part-sized chunks via keyset pagination.
 
 -- RFC 3986 percent-encoding of everything but the unreserved set, byte-wise (UTF-8), as SigV4 requires.
-create or replace function public.s3_url_encode(p_raw text)
+create or replace function archive.s3_url_encode(p_raw text)
 returns text language sql immutable as $$
   select coalesce(string_agg(
     case when b.byte in (45, 46, 95, 126)                    -- - . _ ~
@@ -236,7 +244,7 @@ $$;
 -- One signed S3 request. p_query must already be the CANONICAL query string (keys sorted,
 -- keys and values percent-encoded, '' for none); it is used verbatim in both the signature
 -- and the URL, so they cannot drift apart.
-create or replace function public.s3_signed_request(
+create or replace function archive.s3_signed_request(
   p_method text, p_endpoint text, p_bucket text, p_region text,
   p_key text, p_query text, p_ctype text, p_payload text,
   p_key_id text, p_secret text
@@ -294,7 +302,7 @@ $$;
 
 -- The hook. Small partitions (one part's worth or less) take a plain single PUT; bigger ones
 -- stream through S3 multipart, holding at most one part in memory at a time.
-create or replace function public.archive_to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
+create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
   -- deployment constants: edit these four
@@ -316,7 +324,7 @@ begin
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
   select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
   if v_key_id is null or v_secret is null then
-    raise exception 'archive_to_s3: credentials missing from vault (s3_archive_access_key_id / s3_archive_secret_access_key)';
+    raise exception 'archive.to_s3: credentials missing from vault (s3_archive_access_key_id / s3_archive_secret_access_key)';
   end if;
 
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
@@ -349,30 +357,30 @@ begin
 
     -- everything fit in the first part: a plain single PUT, no multipart bookkeeping to manage
     if v_part = 0 and v_done then
-      v_resp := public.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+      v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key, '',
                                          v_ctype, v_part_payload, v_key_id, v_secret);
       if v_resp.status not between 200 and 299 then
-        raise exception 'archive_to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+        raise exception 'archive.to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
       end if;
       return;
     end if;
 
     -- first oversized part: initiate the multipart upload (the UploadId comes back as XML)
     if v_part = 0 then
-      v_resp := public.s3_signed_request('POST', c_endpoint, c_bucket, c_region, v_key, 'uploads=',
+      v_resp := archive.s3_signed_request('POST', c_endpoint, c_bucket, c_region, v_key, 'uploads=',
                                          v_ctype, '', v_key_id, v_secret);
       if v_resp.status not between 200 and 299 then
-        raise exception 'archive_to_s3: initiate multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+        raise exception 'archive.to_s3: initiate multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
       end if;
       v_upload_id := (xpath('//*[local-name()=''UploadId'']/text()', v_resp.content::xml))[1]::text;
     end if;
 
     v_part := v_part + 1;
-    v_resp := public.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key,
-                                       'partNumber=' || v_part || '&uploadId=' || public.s3_url_encode(v_upload_id),
+    v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key,
+                                       'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
                                        v_ctype, v_part_payload, v_key_id, v_secret);
     if v_resp.status not between 200 and 299 then
-      raise exception 'archive_to_s3: part % of % failed: HTTP % %', v_part, p_child, v_resp.status, left(v_resp.content, 200);
+      raise exception 'archive.to_s3: part % of % failed: HTTP % %', v_part, p_child, v_resp.status, left(v_resp.content, 200);
     end if;
     v_etag := null;
     foreach h in array v_resp.headers loop
@@ -384,13 +392,13 @@ begin
   end loop;
 
   -- complete. S3's one famous quirk: complete can return HTTP 200 with an <Error> body, so check both.
-  v_resp := public.s3_signed_request('POST', c_endpoint, c_bucket, c_region, v_key,
-                                     'uploadId=' || public.s3_url_encode(v_upload_id),
+  v_resp := archive.s3_signed_request('POST', c_endpoint, c_bucket, c_region, v_key,
+                                     'uploadId=' || archive.s3_url_encode(v_upload_id),
                                      'application/xml',
                                      '<CompleteMultipartUpload>' || v_parts_xml || '</CompleteMultipartUpload>',
                                      v_key_id, v_secret);
   if v_resp.status not between 200 and 299 or v_resp.content like '%<Error>%' then
-    raise exception 'archive_to_s3: complete multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+    raise exception 'archive.to_s3: complete multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
   end if;
 exception when others then
   -- abort the in-flight upload so no invisible incomplete parts accrue storage, then re-raise so
@@ -398,8 +406,8 @@ exception when others then
   -- incomplete multipart uploads, for the day even this abort cannot reach S3.)
   if v_upload_id is not null then
     begin
-      perform public.s3_signed_request('DELETE', c_endpoint, c_bucket, c_region, v_key,
-                                       'uploadId=' || public.s3_url_encode(v_upload_id),
+      perform archive.s3_signed_request('DELETE', c_endpoint, c_bucket, c_region, v_key,
+                                       'uploadId=' || archive.s3_url_encode(v_upload_id),
                                        'text/plain', '', v_key_id, v_secret);
     exception when others then null;
     end;
@@ -417,7 +425,7 @@ What changes, honestly:
   limits (10,000 parts) put the protocol ceiling around 80GB at this part size; the polite ceiling
   is far lower and set by how long you are willing to hold a transaction open. To bound that hold
   to one part's network time, entirely in-database, see the
-  [archive janitor](archive-janitor.md) (a committing scanner procedure plus `pgpm.retire`); past
+  [archive assistant](archive-assistant.md) (a committing scanner procedure plus `pgpm.retire`); past
   that, hand the work to an external worker with a real AWS SDK.
 - **A failed upload is aborted, not leaked.** An incomplete multipart upload is invisible in
   listings but accrues storage. On any failure after initiation, the hook's exception handler sends

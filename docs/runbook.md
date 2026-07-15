@@ -31,7 +31,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 `NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `validate_incoming_fk_blocked`
 rows; or a periodic RI audit (or an application error) flags dangling references into the parent.
 
-**What it means.** You converted with `p_incoming_fks => 'preserve'`. While the **assistant drain** moved
+**What it means.** You converted with `p_incoming_fks => 'preserve'`. While the **drain** moved
 referenced rows (evacuating a stray from the `DEFAULT` through an unattached child), the incoming FK was
 dropped, so referential integrity was off on the referencing table for that window. (This is by design and
 visible as `status().fks_suspended`; see the guide's
@@ -106,7 +106,7 @@ then finds a true orphan.)
 **Prevent.** Referential integrity is necessarily off while the **drain** relocates referenced rows: the FK
 must be dropped so a row can move through an unattached child, and that cannot be avoided. In the monolith
 model the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
-(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later assistant drain
+(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later drain
 actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never accumulate, so the drain
 rarely runs; or `pause` heavy referencing-table write bursts while the drain catches up. A `regrain` (manual
 or auto) opens no RI window of its own -- the copy never moves a referenced row out of the parent, and the
@@ -154,7 +154,7 @@ cannot make progress yet.
 
    - A `maintain` summary of `regrain=active` means the monolith has **not frozen yet** (the current
      interval still lands in it); it will regrain once the frontier crosses `B`.
-   - `regrain=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the assistant
+   - `regrain=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the
      drain clear it (see the next entry), then regrain resumes.
    - `regrain=copied:N` is healthy forward progress (one budget-sized copy microbatch); `regrain=swapped:K`
      is a completed regrain (K fine children attached). A `regrain_skip` log row is a lock-race deferral, and
@@ -182,7 +182,7 @@ select coarse_partitions, history_unregrained from pgpm.status() where parent = 
 predicted, `obtain` stayed ahead of the frontier). Any occupancy means reality diverged from the model --
 worth knowing even when it self-heals, because a race lost briefly tends to be lost less briefly later.
 Landing in the `DEFAULT` *routinely* is an anti-pattern: a net you use every day is a hammock, and a
-load-bearing `DEFAULT` quietly signs you up for the assistant drain and its
+load-bearing `DEFAULT` quietly signs you up for the drain and its
 [read-consistency window](guide.md#read-consistency-during-a-move). Keep it a **tripwire** -- alarmed and
 empty.
 
@@ -229,7 +229,7 @@ empty.
      points at a scheme assumption that does not hold (a key kind or range you did not expect), worth
      chasing at the source.
 
-3. In every case the rows are safe in the `DEFAULT` and the assistant drain will home them; the alarm
+3. In every case the rows are safe in the `DEFAULT` and the drain will home them; the alarm
    exists to fix the *cause* so the `DEFAULT` returns to empty, not to rescue the rows.
 
 **Verify.**
@@ -250,7 +250,7 @@ insurance you are glad to hold and alarmed to ever use.
 
 **What it means.** In the monolith model the `DEFAULT` is the empty leading-edge net; in steady state it
 holds nothing. A non-zero `closed_rows` means a stray landed there (obtain fell behind the frontier, a
-backdated row, or a gap) and the **assistant drain** has not yet evacuated it into a proper partition. A
+backdated row, or a gap) and the **drain** has not yet evacuated it into a proper partition. A
 falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_rows` with a stale
 `last_drained` and a climbing `drain_skips` is a **wedged** drain. Since the monolith+regrain redesign a
 true wedge is rare: the bulk move is `regrain`, which copies and cannot strand a duplicate; the drain only

@@ -1,5 +1,5 @@
 -- Regression test for issue #91, carried into the monolith model. Retention bounds storage even when
--- strays land in the DEFAULT below the horizon: the assistant drain DELETEs an interval entirely below
+-- strays land in the DEFAULT below the horizon: the drain DELETEs an interval entirely below
 -- the retention horizon straight out of the DEFAULT (retain_reclaim) instead of materializing a doomed
 -- partition that retain() would immediately drop. Within-horizon strays are materialized as normal.
 create extension if not exists pgtap;

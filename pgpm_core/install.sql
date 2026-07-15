@@ -664,7 +664,7 @@ end;
 $$;
 
 -- retire(): the sanctioned single-partition drop (issue #195) -- retain()'s per-partition body,
--- public and claim-guarded, so an external janitor (e.g. an archive-then-drop scanner) or several
+-- public and claim-guarded, so an external assistant (e.g. an archive-then-drop scanner) or several
 -- cooperating ones can drive retirement themselves through the same protocol retain() uses: claim,
 -- pre_drop hooks in registration order, DROP, catalog + log. It never widens what retention may
 -- drop: the child's whole range must sit at/below the retention horizon, so a caller only picks
@@ -672,7 +672,7 @@ $$;
 --
 -- Returns false, without side effects, when the pgpm.part row is absent (already retired by another
 -- actor) or claimed by a concurrent transaction: FOR UPDATE SKIP LOCKED (issue #188) gives each
--- partition exactly one owner at a time, so two janitors -- or a janitor and retain() -- never
+-- partition exactly one owner at a time, so two assistants -- or an assistant and retain() -- never
 -- double-invoke hooks (not assumed idempotent) and never log a spurious retain_hook_fail from a
 -- lock-race loser. Also returns false when a pre_drop hook raises: the hooks+drop are isolated in a
 -- subtransaction, the failure is logged (retain_hook_fail, retried on a later call), and the
@@ -743,7 +743,7 @@ begin
   -- retire() carries the per-partition protocol (claim, hooks, drop, bookkeeping, per-partition
   -- failure isolation -- see there); this loop only picks the eligible set, oldest first, capped by
   -- retain_batch (issue #189; 'limit all' when null). A retire() that returns false (hook failure,
-  -- or claimed/retired by a concurrent janitor) still consumed its batch slot: the cap bounds
+  -- or claimed/retired by a concurrent assistant) still consumed its batch slot: the cap bounds
   -- ATTEMPTS, not successes.
   for r in execute format(
     'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s limit %s',
@@ -842,7 +842,7 @@ begin
     return 'nosubdiv';
   end if;
   -- the DEFAULT must hold no rows inside the range (else a fine-child ATTACH at the swap would fail) --
-  -- a stray there is the assistant drain's job first
+  -- a stray there is the drain's job first
   execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',
                  v_nsp, cfg.default_table, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
                  cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
@@ -1392,7 +1392,7 @@ begin
 
   -- 9c. create a fresh EMPTY default LAST as the leading-edge safety net (REDESIGN.md section 3). Created
   -- after the parent's PK and secondary indexes exist, it auto-inherits matching (empty) indexes. Kept
-  -- empty, it keeps obtain on its cheap plain path; the janitor drain evacuates any stray that lands here.
+  -- empty, it keeps obtain on its cheap plain path; the drain evacuates any stray that lands here.
   execute format('create table %I.%I partition of %I.%I default', v_nsp, v_default, v_nsp, v_rel);
   v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
