@@ -16,10 +16,11 @@
   keyset-paginates the partition on the control column and streams it through S3 multipart upload
   holding at most one ~8MiB part in memory (small/empty partitions short-circuit to the plain PUT),
   aborting the in-flight upload on any failure so no invisible incomplete parts accrue. Verified
-  against MinIO through the real `retain()` path: 3-part uploads with every row account-checked across
-  part seams, the fast path, a simulated mid-part network failure (abort confirmed on the store, drop
-  blocked), and a clean retry. Linked from the guide's pre-drop-hooks section, `hook_register` in the
-  reference, and the README.
+  through the real `retain()` path against both MinIO and a live Supabase project on Supabase
+  Storage's S3 endpoint: 3-part uploads with every row account-checked across part seams (identical
+  composite ETags on both stores), the fast path, a simulated mid-part network failure (abort
+  confirmed on the store via `ListMultipartUploads`, drop blocked), and a clean retry. Linked from
+  the guide's pre-drop-hooks section, `hook_register` in the reference, and the README.
 - **`retain_batch`: pace retention drops across maintenance ticks.** `config.retain_batch` caps how many
   eligible partitions one `retain()` call will attempt (hooks + drop), oldest first; the rest of an
   aged-out backlog waits for later ticks, each its own transaction on the `pg_cron` path -- the
