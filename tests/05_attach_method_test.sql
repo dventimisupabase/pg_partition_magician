@@ -1,5 +1,5 @@
 -- Attach methods in the monolith model. obtain plain-attaches forward partitions (the DEFAULT is empty,
--- so no exclusion-CHECK dance is needed); the assistant drain attaches a closed stray via the
+-- so no exclusion-CHECK dance is needed); the drain attaches a closed stray via the
 -- scan-skipping check_skip path (an exclusion CHECK on the DEFAULT, validated then dropped); and no
 -- temporary exclusion constraints linger on the DEFAULT afterward.
 create extension if not exists pgtap;
@@ -15,7 +15,7 @@ create table public.am (
 insert into public.am (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 20) g;
 select pgpm.transmute('public.am', 'created_at', interval '1 month', p_paused => false);
 select pgpm.obtain('public.am');   -- forward partitions, plain-attached (empty DEFAULT, no scan)
--- a backdated stray for the assistant drain to evacuate via check_skip
+-- a backdated stray for the drain to evacuate via check_skip
 insert into public.am (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 10) g;
 select pgpm.drain_all('public.am', p_include_open => true);
@@ -28,7 +28,7 @@ select cmp_ok(
 select cmp_ok(
   (select count(*) from pgpm.log where parent_table = 'public.am'::regclass and action = 'drain_attach' and method = 'check_skip')::int,
   '>', 0,
-  'the assistant drain attaches a closed stray via the scan-skipping check_skip path');
+  'the drain attaches a closed stray via the scan-skipping check_skip path');
 
 select is(
   (select count(*) from pg_constraint

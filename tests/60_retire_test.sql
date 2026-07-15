@@ -1,5 +1,5 @@
 -- pgpm.retire (issue #195): the sanctioned single-partition drop -- retain()'s per-partition body
--- made public and claim-guarded, so an external janitor (e.g. an archive-then-drop scanner) or
+-- made public and claim-guarded, so an external assistant (e.g. an archive-then-drop scanner) or
 -- several cooperating ones can drive retirement themselves through the same protocol retain() uses:
 -- claim, pre_drop hooks in registration order, DROP, catalog + log. The contract under test:
 --   * retire() never widens what retention may drop: it refuses (raises) an unmanaged table, a

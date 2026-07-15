@@ -1,6 +1,6 @@
--- The assistant drain (REDESIGN.md sections 3, 9): in the monolith model transmute moves no rows (the
+-- The drain (REDESIGN.md sections 3, 9): in the monolith model transmute moves no rows (the
 -- bulk lands in the monolith, the DEFAULT is born empty), so the drain is no longer the bulk mover --
--- regrain() is. The drain demotes to the magician's assistant: it keeps the DEFAULT empty by evacuating
+-- regrain() is. The drain demotes to a sideline: it keeps the DEFAULT empty by evacuating
 -- the occasional STRAY (here a backdated row in a closed interval below the monolith) into a proper
 -- partition. drain_all is synchronous (ignores pause), so this does not depend on pg_cron.
 create extension if not exists pgtap;
@@ -27,12 +27,12 @@ select cmp_ok(
 select cmp_ok(
   pgpm.drain_all('public.dr', p_include_open => true),
   '>', 0,
-  'the assistant drain performs at least one batch evacuating the stray');
+  'the drain performs at least one batch evacuating the stray');
 
 select is(
   (select count(*) from public.dr_default)::int,
   0,
-  'the DEFAULT is empty again after the assistant drain');
+  'the DEFAULT is empty again after the drain');
 
 select * from finish();
 rollback;

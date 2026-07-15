@@ -29,7 +29,7 @@ At transmute, rename the original to a coarse-child name, create the empty parti
 the original name, and attach the original as **one bounded child** covering
 `[grid_floor(min), B)` (the "monolith"), using a validated `CHECK` so the attach skips its scan.
 Create a fresh **empty `DEFAULT`** as a pure safety net. Going forward, `obtain` makes
-normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to the assistant
+normal-sized partitions ahead, `retain` drops whole children, and the drain shrinks to the sideline
 that keeps the `DEFAULT` empty. The monolith can later be **regrained** (coarse to fine, hierarchically)
 on demand. The `DEFAULT` keystone is kept; it just no longer stores the history.
 
@@ -48,7 +48,7 @@ headroom after the real workload has taken its share -- smaller than nameplate c
 to minute. "Unnoticeable" means living within the leftover. Demand has two shapes: a one-time, conditional
 **setup** cost (a PK-widening `CONCURRENTLY` build, only when the partition key is not already in the PK,
 so zero in the common case) and the **steady** cost of moving rows (the bulk `regrain`, plus the tiny
-obtain, assistant drain, and retain).
+obtain, drain, and retain).
 
 **The block is the unit of account.** A row is not a unit of constant cost (a wide TOASTed row can cost
 megabytes), and wall-clock is hardware-variant. The 8 KB block is hardware-invariant and subsumes TOAST
@@ -128,9 +128,9 @@ this only bites if the frontier reaches `B` before the scan finishes.
 - **NULL control values cannot occur.** The control column must be a member of the PK, and PK columns
   are `NOT NULL`, so the net never sees a NULL and the design never depends on it for NULL handling.
   This also satisfies range partitioning's own non-null-key requirement for free.
-- **The drain is demoted to the magician's assistant.** It no longer moves the bulk; it evacuates the occasional
+- **The drain is demoted to a sideline.** It no longer moves the bulk; it evacuates the occasional
   stray to keep the net empty so `obtain` stays on its plain path. `obtain` already declines to cover
-  a range the `DEFAULT` still holds rows for, which defines the assistant's remit.
+  a range the `DEFAULT` still holds rows for, which defines the drain's remit.
 
 ### 4. The trilemma and the chosen strategy
 
@@ -235,8 +235,8 @@ exists (
 Because regraining copies and never deletes, and the swap is atomic, **the read-consistency caveat
 nearly disappears**. The `snapshot()` gap existed because the drain moved rows through an unattached
 child; regraining leaves rows visible in the monolith until the swap commits, so it never opens the
-gap, and the demoted assistant drain only ever touches a thin stray population. `snapshot()` remains
-for that residual assistant case, but the honest caveat that shaped the current design is largely
+gap, and the demoted drain only ever touches a thin stray population. `snapshot()` remains
+for that residual drain case, but the honest caveat that shaped the current design is largely
 retired here.
 
 ### 10. The regraining procedure
@@ -384,14 +384,14 @@ Extend the existing return shape:
 - **Surface the regraining backlog**, the new notion of outstanding work now that `default_rows` is
   normally about zero: an `unregrained_span text` (the extent covered by coarse children) plus a
   `history_unregrained boolean`, so the operator sees that pruning and fine retention are suspended over
-  that span. Keep `default_rows` / `closed_rows`, which now report only the strays the assistant evacuates.
+  that span. Keep `default_rows` / `closed_rows`, which now report only the strays the drain evacuates.
 - **Reuse `inflight_partitions`** (the `attached = false` count, issue #94) to show
-  regraining-in-progress. To tell a regraining child from an assistant-drain child, add a small
+  regraining-in-progress. To tell a regraining child from a drain child, add a small
   `purpose text` tag to `pgpm.part` (`'drain'` or `'regrain'`) and report it; deriving it from "range
   sits inside an attached coarse child" also works, but the tag is clearer.
 
-The quiet payoff: because regraining copies-then-swaps and the drain is demoted to the stray-evacuating
-assistant, the `snapshot()` read gap nearly disappears, surviving only for that residual case, not the bulk
+The quiet payoff: because regraining copies-then-swaps and the drain is demoted to stray
+evacuation, the `snapshot()` read gap nearly disappears, surviving only for that residual case, not the bulk
 (echoing section 9).
 
 ## Build order (SHIPPED)

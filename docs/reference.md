@@ -8,7 +8,7 @@ The mental model in one breath: `transmute` converts a live table into a native 
 by renaming the original aside and attaching it, with **zero row movement**, as one bounded **monolith**
 child (covering `[grid_floor(min), B)`), under a fresh empty `DEFAULT`. Going forward, `obtain` keeps
 real partitions ahead of the write frontier, `retain` drops whole partitions past a policy, the **drain**
-(the magician's assistant) keeps the `DEFAULT` empty by evacuating strays, and `regrain` splits the coarse
+keeps the `DEFAULT` empty by evacuating strays, and `regrain` splits the coarse
 monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
@@ -379,7 +379,7 @@ pgpm.drain_step(p_parent regclass, p_batch int default null, p_include_open bool
   returns text
 ```
 
-One microbatch of the **assistant drain**: it takes the oldest closed interval still sitting in the
+One microbatch of the **drain**: it takes the oldest closed interval still sitting in the
 `DEFAULT` (a stray) and moves up to `p_batch` rows (default `config.drain_batch`, capped by
 `drain_max_blocks`) into a proper child, attaching the child once the interval is fully moved. An interval
 entirely below the retention horizon is reclaimed by a direct `DELETE` instead of materialized. Returns a
@@ -425,7 +425,7 @@ pgpm.retire(p_parent regclass, p_child name) returns boolean
 ```
 
 The sanctioned single-partition drop: `retain()`'s per-partition body, public and claim-guarded, for an
-external janitor (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
+external assistant (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
 retirement directly. It runs the same protocol `retain()` uses: claim the `pgpm.part` row, run the
 enabled `pre_drop` hooks in registration order, `DROP`, delete the catalog row, log `retain_drop`.
 Returns `true` iff this call dropped the partition.
@@ -437,11 +437,11 @@ null), a partition whose range is not entirely at/below the retention horizon, a
 
 It returns `false`, without side effects, when the `pgpm.part` row is absent (already retired by another
 actor) or claimed by a concurrent transaction: the claim is `FOR UPDATE SKIP LOCKED`, so each partition
-has exactly one owner at a time and concurrent janitors -- or a janitor and `retain()` -- never
+has exactly one owner at a time and concurrent assistants -- or an assistant and `retain()` -- never
 double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
 `pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
-under `retain()`. A complete worked janitor built on `retire` is in
-[the archive janitor](archive-janitor.md).
+under `retain()`. A complete worked assistant built on `retire` is in
+[the archive assistant](archive-assistant.md).
 
 ### `regrain`
 
@@ -523,7 +523,7 @@ pgpm.hook_register(
 Registers a user function to run at a lifecycle event. `pre_drop` is the only event today:
 [`retire`](#retire) calls every enabled `pre_drop` hook for a partition, in registration order,
 immediately before dropping it -- e.g. to copy the partition's contents to long-term storage first.
-Because `retire` is the one sanctioned drop path (`retain()` loops over it, and an external janitor
+Because `retire` is the one sanctioned drop path (`retain()` loops over it, and an external assistant
 calls it directly), the hooks fire on **every** retention drop, whoever initiates it. `p_hook` is
 `regprocedure` (e.g. `'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a
 signature that doesn't match the event's contract is refused here, not discovered later at drop time. A
@@ -535,7 +535,7 @@ by `status().retain_hook_failures`) and retried on the next `retire()`/`retain()
 affects only that one partition -- drops already made earlier in the same `retain()` call are not
 undone, and hooks already run for those partitions are not re-invoked.
 
-A hook runs inside the calling transaction (`retain()`'s tick, or a janitor's `retire()` call), so a
+A hook runs inside the calling transaction (`retain()`'s tick, or an assistant's `retire()` call), so a
 slow hook (a synchronous long-term-storage copy) holds that transaction open for as long as it runs. On
 the scheduled path, pair a slow hook with `config.retain_batch = 1` (see [`retain`](#retain)) so each
 maintenance tick attempts at most one partition's hooks + drop, and the rest of an aged-out backlog
@@ -640,7 +640,7 @@ One row per managed table. Beyond the static config it surfaces:
   rows are durable but not visible through the parent until attach -- use `snapshot()` for a complete
   read).
 - `default_rows` / `closed_rows` -- total and drainable-now rows in the `DEFAULT` (normally near zero;
-  these are strays the assistant drain evacuates). `default_oldest` / `newest_bound` bracket the data.
+  these are strays the drain evacuates). `default_oldest` / `newest_bound` bracket the data.
 - `last_drained` / `drain_skips` -- progress and stall signals: a non-zero `closed_rows` with a stale
   `last_drained` and a climbing `drain_skips` is a wedged drain; falling `closed_rows` with
   `drain_skips ~ 0` is merely slow.

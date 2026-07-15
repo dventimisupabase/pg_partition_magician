@@ -62,7 +62,7 @@ docker compose --profile pg15 down -v
 You can't convert a table to partitioned in place, so `transmute()` renames it aside,
 makes a partitioned parent under the original name, and attaches the old table **intact**
 as one bounded **monolith** child (zero data movement), under a fresh empty **`DEFAULT`**
-net. New writes route to premade partitions; the `DEFAULT` stays empty (the assistant
+net. New writes route to premade partitions; the `DEFAULT` stays empty (the
 **drain** evacuates any stray that lands there). The historical bulk stays in the monolith
 until you **regrain** it into proper partitions on demand, by copying (so no dead tuples, no
 vacuum). The unifying idea is the **frontier** (`now()` for time, `max(control)` for
