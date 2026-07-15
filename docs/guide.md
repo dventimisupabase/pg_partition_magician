@@ -372,6 +372,13 @@ If the hook raises, `retain` does not drop that partition -- it retries on the n
 instead of silently dropping data whose copy failed. See `hook_register` in the [reference](reference.md)
 for the full contract (signature, multiple hooks, disabling one, and how failures are isolated).
 
+A hook runs inside `retain`'s transaction, so a slow hook (a synchronous copy to long-term storage) holds
+it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick
+then attempts at most one partition's hooks + drop (oldest first), and an aged-out backlog paces across
+subsequent ticks instead of one call carrying it all. `status().retain_backlog` tracks the eligible
+partitions still awaiting their turn; it falling tick over tick is a paced backlog draining, while flat
+with `retain_hook_failures` climbing is retention wedged on a failing hook.
+
 ## Incoming foreign keys
 
 If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
