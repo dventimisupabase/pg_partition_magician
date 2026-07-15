@@ -6,10 +6,14 @@
   hook that copies a partition's rows to S3 as NDJSON before `retain()` drops it, and blocks the drop
   when the copy fails: the `http` extension for the synchronous PUT (with the honest account of why
   `pg_net` cannot do this job), AWS SigV4 signing via `pgcrypto`, credentials in Vault, paced by
-  `retain_batch = 1`. The exact function was verified end-to-end against MinIO's SigV4 enforcement
-  through the real `retain()` path: archive + drop, outage blocking the drop, and the paced backlog
-  draining after recovery. Linked from the guide's pre-drop-hooks section, `hook_register` in the
-  reference, and the README.
+  `retain_batch = 1`. The exact function was verified end-to-end through the real `retain()` path,
+  twice: against MinIO's SigV4 enforcement (archive + drop, outage blocking the drop, the paced backlog
+  draining after recovery), and against a live Supabase project archiving to Supabase Storage's
+  S3-compatible endpoint (same lifecycle, plus a real S3 rejection logged verbatim and deferring the
+  drop). The Storage run hardened the example's path-style branch: an endpoint may carry a path prefix
+  (Storage's `/storage/v1/s3`), so the Host header and the canonical URI are split out of the endpoint
+  instead of assuming a bare host. Linked from the guide's pre-drop-hooks section, `hook_register` in
+  the reference, and the README.
 - **`retain_batch`: pace retention drops across maintenance ticks.** `config.retain_batch` caps how many
   eligible partitions one `retain()` call will attempt (hooks + drop), oldest first; the rest of an
   aged-out backlog waits for later ticks, each its own transaction on the `pg_cron` path -- the

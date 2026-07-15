@@ -6,10 +6,15 @@ of a user-supplied hook**, not part of pg_partition_magician: copy it, edit the 
 The [guide](guide.md#pre-drop-hooks) introduces the hook mechanism; `hook_register` in the
 [reference](reference.md#hook_register) has the full contract.
 
-The function below was verified end-to-end against MinIO's full AWS Signature Version 4 enforcement,
-driven by the real `retain()` path: a 50,000-row partition archived and dropped; an outage (endpoint
-down) blocking the drop with the failure logged and surfaced; and the paced backlog draining to zero
-after recovery, empty partitions included.
+The function below was verified end-to-end, twice, driven by the real `retain()` path each time:
+against MinIO's full AWS Signature Version 4 enforcement (a 50,000-row partition archived and dropped;
+an endpoint outage blocking the drop with the failure logged and surfaced; the paced backlog draining
+to zero after recovery, empty partitions included), and against a live Supabase project archiving to
+[Supabase Storage's S3-compatible endpoint](https://supabase.com/docs/guides/storage/s3/authentication)
+(same lifecycle, plus a real S3 rejection: a PUT to a missing bucket came back HTTP 404 with the S3 XML
+error captured verbatim in the `retain_hook_fail` log, and the drop deferred). Storage's endpoint also
+carries a path prefix (`/storage/v1/s3`), which is why the path-style branch below splits the host and
+the URI prefix apart instead of assuming a bare host.
 
 ## The moving parts
 
@@ -57,7 +62,8 @@ declare
   c_bucket   text := 'my-archive-bucket';
   c_region   text := 'us-east-1';
   c_prefix   text := 'events/';   -- key prefix inside the bucket ('' for none)
-  c_endpoint text := null;        -- null = AWS S3; an URL (e.g. 'http://minio:9000') for S3-compatible
+  c_endpoint text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
+                                  -- (e.g. 'https://<ref>.storage.supabase.co/storage/v1/s3')
 
   v_key_id text; v_secret text; v_nsp name; v_control name; v_payload text;
   v_key text; v_host text; v_uri text; v_url text;
@@ -89,9 +95,12 @@ begin
     v_uri  := '/' || v_key;
     v_url  := 'https://' || v_host || v_uri;
   else
-    v_host := regexp_replace(c_endpoint, '^https?://', '');         -- path style (MinIO et al.)
-    v_uri  := '/' || c_bucket || '/' || v_key;
-    v_url  := c_endpoint || v_uri;
+    -- path style (MinIO, Supabase Storage, et al.). The endpoint may carry a path prefix
+    -- (e.g. Supabase Storage's /storage/v1/s3): the Host header wants only the host, while the
+    -- canonical URI must include that prefix, so split them apart.
+    v_host := regexp_replace(c_endpoint, '^https?://([^/]+).*$', '\1');
+    v_uri  := regexp_replace(c_endpoint, '^https?://[^/]+', '') || '/' || c_bucket || '/' || v_key;
+    v_url  := c_endpoint || '/' || c_bucket || '/' || v_key;
   end if;
 
   -- AWS Signature Version 4, straight from the published recipe
