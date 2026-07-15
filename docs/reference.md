@@ -508,7 +508,8 @@ hooks already run for those partitions are not re-invoked.
 A hook runs inside `retain()`'s transaction, so a slow hook (a synchronous long-term-storage copy) holds
 that transaction open for as long as it runs. Pair a slow hook with `config.retain_batch = 1` (see
 [`retain`](#retain)) so each maintenance tick attempts at most one partition's hooks + drop, and the rest
-of an aged-out backlog paces across subsequent ticks.
+of an aged-out backlog paces across subsequent ticks. A complete, working S3-archival hook is worked
+through in [Archive partitions to S3](archive-to-s3.md).
 
 ### `hook_unregister`
 

@@ -370,7 +370,10 @@ select pgpm.hook_register('public.events', 'pre_drop', 'public.archive_to_s3(reg
 
 If the hook raises, `retain` does not drop that partition -- it retries on the next maintenance cycle
 instead of silently dropping data whose copy failed. See `hook_register` in the [reference](reference.md)
-for the full contract (signature, multiple hooks, disabling one, and how failures are isolated).
+for the full contract (signature, multiple hooks, disabling one, and how failures are isolated). For a
+complete, working `archive_to_s3` (the `http` extension for the PUT, SigV4 signing via `pgcrypto`,
+credentials in Vault, verified against real signature enforcement), see
+[Archive partitions to S3](archive-to-s3.md).
 
 A hook runs inside `retain`'s transaction, so a slow hook (a synchronous copy to long-term storage) holds
 it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick

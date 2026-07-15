@@ -127,6 +127,8 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
   troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
+- **[Archive to S3](docs/archive-to-s3.md)**: a worked `pre_drop` hook that copies partitions to S3
+  before retention drops them.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
 
