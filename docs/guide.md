@@ -352,6 +352,14 @@ succeeds; a later, separate maintenance transaction removes the row per policy. 
 data kept for a window *from arrival*, retain on an ingestion timestamp rather than event time, or widen
 the policy.
 
+**Drops can also be driven from outside the schedule.** `pgpm.retire(parent, child)` is the sanctioned
+single-partition drop -- the same protocol `retain` runs (pre-drop hooks, `DROP`, bookkeeping), callable
+one partition at a time. It never drops anything retention would not (the partition's whole range must
+be past the horizon), and each partition is claim-guarded so several cooperating "janitors" -- say, an
+external archiver that uploads a partition to long-term storage and then retires it immediately -- can
+work alongside the scheduled `retain` without stepping on each other. See `retire` in the
+[reference](reference.md#retire).
+
 ### Pre-drop hooks
 
 To do something with a partition's data before it is dropped -- the common case is copying it to
@@ -368,15 +376,16 @@ $$;
 select pgpm.hook_register('public.events', 'pre_drop', 'public.archive_to_s3(regclass,name,text,text)');
 ```
 
-If the hook raises, `retain` does not drop that partition -- it retries on the next maintenance cycle
-instead of silently dropping data whose copy failed. See `hook_register` in the [reference](reference.md)
-for the full contract (signature, multiple hooks, disabling one, and how failures are isolated). For a
+If the hook raises, the partition is not dropped -- retention retries on a later cycle instead of
+silently dropping data whose copy failed. The hooks fire on **every** retention drop, whether `retain`
+or a direct `retire` call initiates it. See `hook_register` in the [reference](reference.md) for the
+full contract (signature, multiple hooks, disabling one, and how failures are isolated). For a
 complete, working `archive_to_s3` (the `http` extension for the PUT, SigV4 signing via `pgcrypto`,
 credentials in Vault, verified against real signature enforcement), see
 [Archive partitions to S3](archive-to-s3.md).
 
-A hook runs inside `retain`'s transaction, so a slow hook (a synchronous copy to long-term storage) holds
-it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick
+A hook runs inside the calling transaction (`retain`'s tick, or a janitor's `retire` call), so a slow
+hook (a synchronous copy to long-term storage) holds it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick
 then attempts at most one partition's hooks + drop (oldest first), and an aged-out backlog paces across
 subsequent ticks instead of one call carrying it all. `status().retain_backlog` tracks the eligible
 partitions still awaiting their turn; it falling tick over tick is a paced backlog draining, while flat
