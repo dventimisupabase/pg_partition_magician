@@ -12,8 +12,14 @@
   S3-compatible endpoint (same lifecycle, plus a real S3 rejection logged verbatim and deferring the
   drop). The Storage run hardened the example's path-style branch: an endpoint may carry a path prefix
   (Storage's `/storage/v1/s3`), so the Host header and the canonical URI are split out of the endpoint
-  instead of assuming a bare host. Linked from the guide's pre-drop-hooks section, `hook_register` in
-  the reference, and the README.
+  instead of assuming a bare host. A **multipart variant** lifts the single-PUT memory ceiling: it
+  keyset-paginates the partition on the control column and streams it through S3 multipart upload
+  holding at most one ~8MiB part in memory (small/empty partitions short-circuit to the plain PUT),
+  aborting the in-flight upload on any failure so no invisible incomplete parts accrue. Verified
+  against MinIO through the real `retain()` path: 3-part uploads with every row account-checked across
+  part seams, the fast path, a simulated mid-part network failure (abort confirmed on the store, drop
+  blocked), and a clean retry. Linked from the guide's pre-drop-hooks section, `hook_register` in the
+  reference, and the README.
 - **`retain_batch`: pace retention drops across maintenance ticks.** `config.retain_batch` caps how many
   eligible partitions one `retain()` call will attempt (hooks + drop), oldest first; the rest of an
   aged-out backlog waits for later ticks, each its own transaction on the `pg_cron` path -- the
