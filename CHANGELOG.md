@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **`pgpm.retire(parent, child)`: the sanctioned single-partition drop.** `retain()`'s per-partition
+  body -- claim, `pre_drop` hooks in registration order, `DROP`, catalog + log, per-partition failure
+  isolation -- factored into a public verb, so an external janitor (e.g. an archive-then-drop scanner)
+  or several cooperating ones can drive retirement directly without hand-rolling pgpm's protocol.
+  `retire` never widens what retention may drop (it refuses anything not entirely past the retention
+  horizon; a caller only picks which eligible partition and when), and the `pgpm.part` row is claimed
+  `FOR UPDATE SKIP LOCKED`, giving each partition exactly one owner at a time: concurrent janitors, or
+  a janitor and `retain()`, never double-invoke hooks and never log a spurious `retain_hook_fail` from
+  a lock race. `retain()` is now a loop over `retire()`, with its signature, return value,
+  `retain_batch` pacing, and failure isolation unchanged. (issues #195, #188; tests/60, including a
+  live two-session claim test via dblink)
+
 - **Docs: a worked S3-archival `pre_drop` hook (`docs/archive-to-s3.md`).** A complete, user-supplied
   hook that copies a partition's rows to S3 as NDJSON before `retain()` drops it, and blocks the drop
   when the copy fails: the `http` extension for the synchronous PUT (with the honest account of why

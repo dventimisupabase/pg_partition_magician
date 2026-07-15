@@ -415,6 +415,33 @@ shows as a flat `status().retain_backlog` with climbing `retain_hook_failures`).
 `1`) when a registered hook is slow -- e.g. a synchronous copy to long-term storage -- to bound each
 tick's lock and transaction time to one partition's hooks + drop.
 
+`retain()` is a loop over [`retire`](#retire): it picks the eligible set and `retire` carries the
+per-partition protocol.
+
+### `retire`
+
+```sql
+pgpm.retire(p_parent regclass, p_child name) returns boolean
+```
+
+The sanctioned single-partition drop: `retain()`'s per-partition body, public and claim-guarded, for an
+external janitor (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
+retirement directly. It runs the same protocol `retain()` uses: claim the `pgpm.part` row, run the
+enabled `pre_drop` hooks in registration order, `DROP`, delete the catalog row, log `retain_drop`.
+Returns `true` iff this call dropped the partition.
+
+`retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
+**when**. It refuses (raises) an unmanaged table, a table with no retention policy (`config.retain` is
+null), a partition whose range is not entirely at/below the retention horizon, and an in-flight
+(unattached) drain/regrain child.
+
+It returns `false`, without side effects, when the `pgpm.part` row is absent (already retired by another
+actor) or claimed by a concurrent transaction: the claim is `FOR UPDATE SKIP LOCKED`, so each partition
+has exactly one owner at a time and concurrent janitors -- or a janitor and `retain()` -- never
+double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
+`pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
+under `retain()`.
+
 ### `regrain`
 
 ```sql
