@@ -118,6 +118,15 @@ alter table pgpm.config add column if not exists regrain_to text;
 -- deletes), so the source never shrinks and cannot drive progress the way the drain's deletes do; this
 -- cursor is the explicit progress state instead. null = no regrain in flight; reset to null at the swap.
 alter table pgpm.config add column if not exists regrain_cursor text;
+-- retain() pacing (issue #189): cap how many eligible partitions ONE retain() call will attempt (hooks
+-- + drop), so an aged-out backlog spreads across maintenance ticks (each tick its own transaction via
+-- pg_cron) instead of one call carrying the whole backlog -- the drain_batch shape, applied to drops.
+-- The cap bounds ATTEMPTS, oldest first: with a failing pre_drop hook at the head, the partitions
+-- behind it are not attempted that call (bounded per-tick work is the point; the wedge is surfaced by
+-- status().retain_hook_failures alongside a flat retain_backlog). null = unbounded (prior behavior).
+-- An operator registering a slow synchronous pre_drop hook (e.g. a long-term-storage copy) should set
+-- this low, typically 1, trading retention promptness for bounded per-tick lock/transaction time.
+alter table pgpm.config add column if not exists retain_batch int;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -637,10 +646,27 @@ begin
 end;
 $$;
 
+-- the retention horizon on the native grid: the grid-floored boundary at/below which a partition's
+-- whole range has aged out. null = no retention policy. Shared by retain() (what to drop now) and
+-- status() (retain_backlog: what is eligible but not yet dropped).
+create or replace function pgpm._retain_boundary(cfg pgpm.config)
+returns text language plpgsql as $$
+begin
+  if cfg.retain is null then return null; end if;
+  if cfg.control_kind = 'id' then
+    return pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                            (pgpm._frontier_native(cfg.parent_table)::numeric - cfg.retain::numeric)::text);
+  else
+    return pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                            (now() - cfg.retain::interval)::text);
+  end if;
+end;
+$$;
+
 create or replace function pgpm.retain(p_parent regclass)
 returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_boundary text; v_frontier text; v_ncast text; r record; v_dropped int := 0;
+  cfg pgpm.config; v_nsp name; v_boundary text; v_ncast text; r record; v_dropped int := 0;
   v_hook record;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -648,19 +674,14 @@ begin
   if cfg.retain is null then return 0; end if;
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  if cfg.control_kind = 'id' then
-    v_frontier := pgpm._frontier_native(p_parent);
-    v_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                   (v_frontier::numeric - cfg.retain::numeric)::text);
-  else
-    v_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                   (now() - cfg.retain::interval)::text);
-  end if;
+  v_boundary := pgpm._retain_boundary(cfg);
   v_ncast := pgpm._native_type(cfg.control_kind);
 
+  -- retain_batch caps how many partitions this call ATTEMPTS, oldest first (issue #189); 'limit all'
+  -- when null keeps the unbounded prior behavior.
   for r in execute format(
-    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
-    p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast)
+    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s limit %s',
+    p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast, coalesce(cfg.retain_batch::text, 'all'))
   loop
     -- Each partition's hooks+drop are isolated in their own subtransaction: a failing pre_drop hook (e.g.
     -- a long-term-storage copy) blocks ONLY that partition's drop, logged as retain_hook_fail and retried
@@ -2097,7 +2118,8 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
-  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_hook_failures bigint
+  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_hook_failures bigint,
+  retain_backlog bigint
 )
 language plpgsql as $$
 declare
@@ -2106,6 +2128,7 @@ declare
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
   v_fks_susp bigint; v_fks_unval bigint;
   v_last_retain_id bigint; v_hook_fails bigint;
+  v_retain_boundary text; v_retain_backlog bigint;
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
@@ -2141,12 +2164,24 @@ begin
     select count(*) into v_hook_fails from pgpm.log
       where parent_table = r.parent_table and action = 'retain_hook_fail'
         and id > coalesce(v_last_retain_id, 0);
+    -- retain_backlog: eligible-but-undropped partitions (whole range at/below the retention horizon,
+    -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks -- it should fall
+    -- tick over tick; flat with retain_hook_failures climbing = wedged on a failing pre_drop hook.
+    v_retain_backlog := 0;
+    v_retain_boundary := pgpm._retain_boundary(r);
+    if v_retain_boundary is not null then
+      execute format(
+        'select count(*) from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s',
+        r.parent_table::text, pgpm._native_type(r.control_kind), v_retain_boundary, pgpm._native_type(r.control_kind))
+        into v_retain_backlog;
+    end if;
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_hook_failures := v_hook_fails;
+    retain_backlog := v_retain_backlog;
     return next;
   end loop;
 end;

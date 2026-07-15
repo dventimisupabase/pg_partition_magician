@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **`retain_batch`: pace retention drops across maintenance ticks.** `config.retain_batch` caps how many
+  eligible partitions one `retain()` call will attempt (hooks + drop), oldest first; the rest of an
+  aged-out backlog waits for later ticks, each its own transaction on the `pg_cron` path -- the
+  `drain_batch` shape, applied to drops. `null` (the default) is unbounded, the prior behavior. The cap
+  bounds attempts, not successes: a failing `pre_drop` hook at the head of the backlog defers everything
+  behind it until it clears. The motivating case is a slow synchronous `pre_drop` hook (e.g. copying a
+  partition to long-term storage before it ages out): `retain_batch = 1` bounds each tick's lock and
+  transaction time to one partition's hooks + drop. `pgpm.status()` gains `retain_backlog` -- eligible
+  partitions not yet dropped; falling tick over tick is a paced backlog draining, flat with
+  `retain_hook_failures` climbing is retention wedged on a failing hook. (issue #189; tests/59)
 - **Lifecycle hooks: a `pre_drop` hook fires before `retain()` drops a partition.** The first hook in what
   is meant to grow into a general registry (`pgpm.hook`), for use cases like copying a partition's
   contents to long-term storage (e.g. S3) before it ages out. Register with `pgpm.hook_register(parent,

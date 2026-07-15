@@ -407,6 +407,14 @@ the count dropped. A coarse partition that merely straddles the horizon is **not
 is suspended over un-regrained coarse history until `regrain` splits it (or `regrain` reclaims the aged
 sub-ranges directly). `null` retention drops nothing.
 
+`config.retain_batch` caps how many eligible partitions one call will **attempt** (hooks + drop), oldest
+first; the rest of the backlog waits for later calls -- on the scheduled path, later `maintain` ticks,
+each its own transaction. `null` (the default) is unbounded. The cap bounds attempts, not successes: a
+failing `pre_drop` hook at the head of the backlog defers everything behind it until it clears (the wedge
+shows as a flat `status().retain_backlog` with climbing `retain_hook_failures`). Set it low (typically
+`1`) when a registered hook is slow -- e.g. a synchronous copy to long-term storage -- to bound each
+tick's lock and transaction time to one partition's hooks + drop.
+
 ### `regrain`
 
 ```sql
@@ -497,6 +505,11 @@ surfaced by `status().retain_hook_failures`) and retried on the next `retain()` 
 only that one partition -- drops already made earlier in the same `retain()` call are not undone, and
 hooks already run for those partitions are not re-invoked.
 
+A hook runs inside `retain()`'s transaction, so a slow hook (a synchronous long-term-storage copy) holds
+that transaction open for as long as it runs. Pair a slow hook with `config.retain_batch = 1` (see
+[`retain`](#retain)) so each maintenance tick attempts at most one partition's hooks + drop, and the rest
+of an aged-out backlog paces across subsequent ticks.
+
 ### `hook_unregister`
 
 ```sql
@@ -582,7 +595,7 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint, default_oldest text, newest_bound text,
   last_drained timestamptz, drain_skips bigint, fks_suspended bigint, fks_unvalidated bigint,
-  history_unregrained boolean, retain_hook_failures bigint
+  history_unregrained boolean, retain_hook_failures bigint, retain_backlog bigint
 )
 ```
 
@@ -603,6 +616,10 @@ One row per managed table. Beyond the static config it surfaces:
   re-added `NOT VALID` but blocked from full validation by pre-existing orphans.
 - `retain_hook_failures` -- `pre_drop` hook failures since the last successful drop (see `hook_register`);
   non-zero means a partition is stuck waiting on a failing hook.
+- `retain_backlog` -- partitions whose whole range is past the retention horizon but which are not yet
+  dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks and should fall tick over
+  tick; a flat `retain_backlog` with climbing `retain_hook_failures` is retention wedged on a failing
+  hook.
 
 ### `snapshot`
 
@@ -772,6 +789,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `partition_anchor` | `text` | grid origin |
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7, bigint count for id; null = keep) |
+| `retain_batch` | `int` | max partitions one `retain()` call attempts, oldest first (null = unbounded) |
 | `keep_default` | `boolean` | keep the `DEFAULT` safety net |
 | `drain_batch` | `int` | rows per drain/regrain microbatch |
 | `default_table` | `name` | the `DEFAULT` partition's table name |
