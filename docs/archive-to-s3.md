@@ -417,10 +417,13 @@ What changes, honestly:
 - **`CompleteMultipartUpload` can fail inside an HTTP 200.** S3's one famous quirk: the complete
   call can return status 200 with an `<Error>` XML body, so the hook checks both.
 
-This exact variant (constants aside) was verified against MinIO through the real `retain()` path:
-three ~26MiB partitions each archived as 3-part multipart uploads (ETags carrying the `-3` part
-count) with every row account-checked across part boundaries (150,000 contiguous ids per object, no
-lost or doubled line at any seam); an empty partition taking the single-PUT fast path (bare-MD5
-ETag); a simulated network failure during part 2 blocking the drop, with the abort confirmed on the
-store (zero incomplete uploads left behind); and the retried partition re-archiving completely on
-the next tick.
+This exact variant (constants aside) was verified through the real `retain()` path against both
+MinIO and a live Supabase project archiving to Supabase Storage's S3-compatible endpoint, same
+scenario on each: ~26MiB partitions archived as 3-part multipart uploads (ETags carrying the `-3`
+part count) with every row account-checked across part boundaries (150,000 contiguous ids per
+object, no lost or doubled line at any seam); an empty partition taking the single-PUT fast path
+(bare-MD5 ETag); a simulated network failure during part 2 blocking the drop, with the abort
+confirmed on the store (`ListMultipartUploads` showing zero incomplete uploads left behind); and
+the retried partition re-archiving completely on the next tick. The two stores returned
+**identical composite ETags** for the same partitions: the part boundaries are deterministic, so
+the per-part MD5s match wherever the object lands.
