@@ -14,7 +14,16 @@
   since PL/pgSQL forbids transaction control inside a block with an `EXCEPTION` clause, so a
   committing procedure cannot abort-on-exit), and the horizon claim measured directly: 1 distinct
   `backend_xmin` across the synchronous hook's whole run versus 11 advancing values under the
-  janitor, same ~110MB payload, same ~1s wall-clock.
+  janitor, same ~110MB payload, same ~1s wall-clock. Re-verified on a live Supabase project against
+  Supabase Storage (same matrix, same deterministic ETags; the full-scale measurement: a ~110MB
+  10-part archive over the real network showed 20 advancing `backend_xmin` values in 27 samples for
+  the janitor versus one pinned value for the synchronous hook). The live run surfaced two Supabase
+  ceilings, now documented loudly on both archival pages: Storage enforces the project upload file
+  size limit (default 50MB, `HTTP 413` `EntityTooLarge`, boundary-verified at 49MB pass / 51MB fail,
+  raised under Dashboard Storage -> Files -> Settings) on the S3 protocol per whole object, multipart
+  included; and `statement_timeout` is 2 minutes (server configuration file, pooler and direct
+  alike), the synchronous hook's wall-clock ceiling, which the janitor's per-part statements
+  sidestep.
 
 - **`pgpm.retire(parent, child)`: the sanctioned single-partition drop.** `retain()`'s per-partition
   body -- claim, `pre_drop` hooks in registration order, `DROP`, catalog + log, per-partition failure

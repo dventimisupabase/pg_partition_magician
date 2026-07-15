@@ -193,6 +193,16 @@ needed. See the runbook's
 - **On Supabase, extensions install into the `extensions` schema.** If `http_put`/`http` and
   `pgcrypto` functions are not on your `search_path`, schema-qualify them (e.g. `extensions.http(...)`)
   or `set search_path` in the function definition.
+- **Two Supabase ceilings, discovered during live verification.** Supabase Storage enforces the
+  project's upload file size limit (**default 50MB**) on the S3 protocol too, per whole object,
+  multipart included: an archive bigger than the limit fails with `HTTP 413` / `EntityTooLarge` (the
+  hook raises, the drop defers, loudly) until you raise the limit in the Dashboard under **Storage ->
+  Files -> Settings**. And `statement_timeout` is **2 minutes** there (a server configuration-file
+  setting, so it applies over the pooler and direct connections alike): the whole upload runs inside
+  one statement, so that is this hook's wall-clock ceiling on Supabase; override with a session
+  `set statement_timeout = ...` if a partition legitimately needs longer, or use the
+  [archive janitor](archive-janitor.md), whose per-part statements each only need to fit one part in
+  the window.
 
 ## When one PUT is not enough: the multipart variant
 

@@ -330,3 +330,30 @@ enforcement:
   (confirmed by `ListMultipartUploads`: zero in-flight), then re-archived and retired the partition.
 - **The horizon measurement** quoted above: 1 distinct `backend_xmin` (synchronous hook) versus 11
   advancing values (janitor), same payload, same duration.
+
+The same scenario then ran on a live Supabase project against
+[Supabase Storage's S3-compatible endpoint](https://supabase.com/docs/guides/storage/s3/authentication):
+the full matrix again (happy path with the same deterministic composite ETags, both vetoes,
+self-repair, crash cleanup confirmed via `ListMultipartUploads`), plus the horizon measurement at
+full scale over a real network: a ~110MB partition archived as a 10-part upload in ~20s with **20
+distinct advancing `backend_xmin` values in 27 samples**, versus the synchronous hook's **one pinned
+value** for its entire equal-sized run.
+
+## Supabase ceilings, discovered the honest way
+
+Two platform limits surfaced during the live verification; both apply to any of these archival
+patterns on Supabase, and both fail loudly:
+
+- **Storage enforces the project's upload file size limit on the S3 protocol too** -- default
+  **50MB**, counted against the whole object, so a multipart upload is rejected mid-flight
+  (`HTTP 413`, `EntityTooLarge`, on whichever part crosses the line; boundary-verified: a 49MB PUT
+  passes, a 51MB PUT fails). The hook raises, the drop defers, nothing is lost -- but archives
+  bigger than the limit never succeed until you raise it: Dashboard, **Storage -> Files ->
+  Settings**, "Upload file size limit". The janitor's cleanup-on-entry reclaims the rejected
+  upload's parts on the next scan.
+- **`statement_timeout` is 2 minutes on Supabase** (set in the server's configuration file, so it
+  applies over the pooler and direct connections alike). The *synchronous hook* runs a whole
+  partition's upload inside one statement, so that is its hard wall-clock ceiling there; a session
+  `set statement_timeout = ...` overrides it (configuration-file settings yield to session GUCs),
+  e.g. in the pg_cron job command. The janitor barely notices: each of its statements only has to
+  fit one part's read or upload inside the window.
