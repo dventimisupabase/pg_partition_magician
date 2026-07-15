@@ -183,6 +183,22 @@ update pgpm.dropped_fk d set validated_at = d.restored_at
                 where c.conrelid = d.referencing_table and c.conname = d.constraint_name
                   and c.contype = 'f' and c.convalidated);
 
+-- lifecycle hook registry: user functions pgpm invokes at specific points in a parent's lifecycle.
+-- 'pre_drop' (called by retain(), just before it drops an aged-out partition) is the first event; the
+-- check constraint is the extension point for future ones (e.g. a post-attach event), so a typo in the
+-- event name fails at registration, not silently at call time. hook_fn is regprocedure, not text/regproc,
+-- so pgpm.hook_register validates the function exists with the exact expected signature up front, instead
+-- of discovering a bad reference the next time retain() tries to call it.
+create table if not exists pgpm.hook (
+  id           bigint generated always as identity primary key,
+  parent_table regclass     not null,
+  event        text         not null check (event in ('pre_drop')),
+  hook_fn      regprocedure not null,
+  enabled      boolean      not null default true,
+  created_at   timestamptz  not null default now(),
+  unique (parent_table, event, hook_fn)
+);
+
 -- =============================== adapter layer ===============================
 
 -- uuidv7/ULID codec (pure SQL; works on PG 15 -- no native uuidv7() needed):
@@ -602,10 +618,30 @@ begin
 end;
 $$;
 
+-- register/unregister a lifecycle hook. Upsert on (parent_table, event, hook_fn): re-registering the same
+-- function just flips enabled, so toggling a hook off and back on does not lose its created_at history.
+create or replace function pgpm.hook_register(
+  p_parent regclass, p_event text, p_hook regprocedure, p_enabled boolean default true
+)
+returns void language plpgsql as $$
+begin
+  insert into pgpm.hook (parent_table, event, hook_fn, enabled) values (p_parent, p_event, p_hook, p_enabled)
+  on conflict (parent_table, event, hook_fn) do update set enabled = excluded.enabled;
+end;
+$$;
+
+create or replace function pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure)
+returns void language plpgsql as $$
+begin
+  delete from pgpm.hook where parent_table = p_parent and event = p_event and hook_fn = p_hook;
+end;
+$$;
+
 create or replace function pgpm.retain(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_boundary text; v_frontier text; v_ncast text; r record; v_dropped int := 0;
+  v_hook record;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -626,10 +662,27 @@ begin
     'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
     p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast)
   loop
-    execute format('drop table %I.%I', v_nsp, r.child_name);
-    delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
-    insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
-    v_dropped := v_dropped + 1;
+    -- Each partition's hooks+drop are isolated in their own subtransaction: a failing pre_drop hook (e.g.
+    -- a long-term-storage copy) blocks ONLY that partition's drop, logged as retain_hook_fail and retried
+    -- on the next retain() call, without undoing drops this loop already committed for other partitions
+    -- (and without re-invoking those other partitions' hooks, which are not guaranteed idempotent).
+    begin
+      for v_hook in
+        select hook_fn from pgpm.hook
+        where parent_table = p_parent and event = 'pre_drop' and enabled
+        order by id
+      loop
+        execute format('select %s($1,$2,$3,$4)', (v_hook.hook_fn::oid::regproc)::text)
+          using p_parent, r.child_name, r.lo, r.hi;
+      end loop;
+      execute format('drop table %I.%I', v_nsp, r.child_name);
+      delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
+      insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
+      v_dropped := v_dropped + 1;
+    exception when others then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'retain_hook_fail', r.lo, r.hi, left(sqlerrm, 200));
+    end;
   end loop;
   return v_dropped;
 end;
@@ -2044,7 +2097,7 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
-  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean
+  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_hook_failures bigint
 )
 language plpgsql as $$
 declare
@@ -2052,6 +2105,7 @@ declare
   v_drows bigint; v_closed bigint; v_old text;
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
   v_fks_susp bigint; v_fks_unval bigint;
+  v_last_retain_id bigint; v_hook_fails bigint;
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
@@ -2080,12 +2134,19 @@ begin
            count(*) filter (where restored_at is not null and validated_at is null)
       into v_fks_susp, v_fks_unval
       from pgpm.dropped_fk where parent_table = r.parent_table;
+    -- retain_hook_failures: pre_drop hook failures logged AFTER the last successful drop, same
+    -- since-last-progress shape as drain_skips above -- a hook that starts succeeding again zeroes it.
+    select max(id) into v_last_retain_id from pgpm.log
+      where parent_table = r.parent_table and action = 'retain_drop';
+    select count(*) into v_hook_fails from pgpm.log
+      where parent_table = r.parent_table and action = 'retain_hook_fail'
+        and id > coalesce(v_last_retain_id, 0);
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
-    fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval;
+    fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_hook_failures := v_hook_fails;
     return next;
   end loop;
 end;

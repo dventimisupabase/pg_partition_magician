@@ -474,6 +474,37 @@ call pgpm.maintain_all()
 
 A procedure that calls `maintain` for every managed table. This is what the scheduled job runs.
 
+## Lifecycle hooks
+
+### `hook_register`
+
+```sql
+pgpm.hook_register(
+  p_parent regclass, p_event text, p_hook regprocedure, p_enabled boolean default true
+) returns void
+```
+
+Registers a user function to run at a lifecycle event. `pre_drop` is the only event today: `retain()`
+calls every enabled `pre_drop` hook for a partition, in registration order, immediately before dropping
+it -- e.g. to copy the partition's contents to long-term storage first. `p_hook` is `regprocedure`
+(e.g. `'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a signature that
+doesn't match the event's contract is refused here, not discovered later when `retain()` tries to call
+it. A `pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi text) returns
+void`. Re-registering the same `(parent, event, hook)` just updates `enabled`.
+
+If a hook raises, `retain()` does **not** drop that partition: the failure is logged (`retain_hook_fail`,
+surfaced by `status().retain_hook_failures`) and retried on the next `retain()` call. The failure affects
+only that one partition -- drops already made earlier in the same `retain()` call are not undone, and
+hooks already run for those partitions are not re-invoked.
+
+### `hook_unregister`
+
+```sql
+pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure) returns void
+```
+
+Removes a hook registration.
+
 ## Scheduling
 
 ### `schedule`
@@ -551,7 +582,7 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint, default_oldest text, newest_bound text,
   last_drained timestamptz, drain_skips bigint, fks_suspended bigint, fks_unvalidated bigint,
-  history_unregrained boolean
+  history_unregrained boolean, retain_hook_failures bigint
 )
 ```
 
@@ -570,6 +601,8 @@ One row per managed table. Beyond the static config it surfaces:
   `drain_skips ~ 0` is merely slow.
 - `fks_suspended` / `fks_unvalidated` -- preserve-managed incoming FKs currently dropped (RI off) versus
   re-added `NOT VALID` but blocked from full validation by pre-existing orphans.
+- `retain_hook_failures` -- `pre_drop` hook failures since the last successful drop (see `hook_register`);
+  non-zero means a partition is stuck waiting on a failing hook.
 
 ### `snapshot`
 
@@ -791,6 +824,23 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `obtain_skip` / `retain_skip` / `drain_skip` / `regrain_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `restore_incoming_fk_failed` / `validate_incoming_fk_blocked` | a preserve-FK re-add failed / a validation was blocked by an orphan |
+| `retain_hook_fail` | a `pre_drop` hook raised; the partition was not dropped (`method` carries the hook's error) |
+
+### `pgpm.hook`
+
+The lifecycle hook registry (see `hook_register`).
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `bigint` | identity, also the registration-order tiebreak when multiple hooks share an event |
+| `parent_table` | `regclass` | the managed table this hook applies to |
+| `event` | `text` | the lifecycle event (`pre_drop` today) |
+| `hook_fn` | `regprocedure` | the function to call, resolved at registration time |
+| `enabled` | `boolean` | disabled hooks are skipped without losing the registration |
+| `created_at` | `timestamptz` | when registered |
+
+Unique on `(parent_table, event, hook_fn)`; `hook_register` upserts this key, so re-registering the same
+function only ever flips `enabled`.
 
 ### `pgpm.dropped_fk`
 

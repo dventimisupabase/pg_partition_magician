@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **Lifecycle hooks: a `pre_drop` hook fires before `retain()` drops a partition.** The first hook in what
+  is meant to grow into a general registry (`pgpm.hook`), for use cases like copying a partition's
+  contents to long-term storage (e.g. S3) before it ages out. Register with `pgpm.hook_register(parent,
+  'pre_drop', hook_fn)`, where `hook_fn` is a `function(parent regclass, child name, lo text, hi text)
+  returns void`; `hook_register` validates the function exists with that exact signature up front
+  (`regprocedure`), instead of discovering a bad reference the next time `retain()` calls it. Each
+  partition's hooks + drop are isolated in their own subtransaction inside `retain()`'s loop: a hook that
+  raises blocks only that partition's drop (logged `retain_hook_fail`, retried on the next `retain()`
+  call) without undoing drops already committed earlier in the same call, and without re-invoking hooks
+  already run for other partitions (not assumed idempotent). Multiple hooks on the same event run in
+  registration order; a disabled hook (`hook_register(..., p_enabled => false)`) never runs.
+  `pgpm.status()` gains `retain_hook_failures`, counted the same since-last-progress way as `drain_skips`.
+  (tests/58)
 - **`from_hypertable` builds the cutover key index once.** With `p_track_changes`, the destination's
   reused-key index was built twice off the lock: once as a throwaway for the online delta drain's per-batch
   key lookups, then again as the real `PRIMARY KEY`/`UNIQUE` index the cutover adopts. Now `from_hypertable_copy`
