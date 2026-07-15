@@ -663,47 +663,93 @@ begin
 end;
 $$;
 
+-- retire(): the sanctioned single-partition drop (issue #195) -- retain()'s per-partition body,
+-- public and claim-guarded, so an external janitor (e.g. an archive-then-drop scanner) or several
+-- cooperating ones can drive retirement themselves through the same protocol retain() uses: claim,
+-- pre_drop hooks in registration order, DROP, catalog + log. It never widens what retention may
+-- drop: the child's whole range must sit at/below the retention horizon, so a caller only picks
+-- WHICH eligible partition and WHEN. Returns true iff this call dropped the partition.
+--
+-- Returns false, without side effects, when the pgpm.part row is absent (already retired by another
+-- actor) or claimed by a concurrent transaction: FOR UPDATE SKIP LOCKED (issue #188) gives each
+-- partition exactly one owner at a time, so two janitors -- or a janitor and retain() -- never
+-- double-invoke hooks (not assumed idempotent) and never log a spurious retain_hook_fail from a
+-- lock-race loser. Also returns false when a pre_drop hook raises: the hooks+drop are isolated in a
+-- subtransaction, the failure is logged (retain_hook_fail, retried on a later call), and the
+-- partition is kept -- a failing long-term-storage copy never lets the drop happen anyway. The claim
+-- itself is taken OUTSIDE that subtransaction, so a hook failure keeps the row claimed until the
+-- caller's transaction ends (no other actor re-attempts, and re-fails, the same partition mid-call).
+create or replace function pgpm.retire(p_parent regclass, p_child name)
+returns boolean language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_boundary text; r record; v_hook record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  if cfg.retain is null then
+    raise exception 'pg_partition_magician: % has no retention policy (config.retain is null); retire() drops only what retention allows', p_parent;
+  end if;
+
+  -- the claim: one owner per partition at a time
+  select p.lo, p.hi, p.attached into r
+    from pgpm.part p
+   where p.parent_table = p_parent and p.child_name = p_child
+     for update skip locked;
+  if not found then return false; end if;
+  if not r.attached then
+    raise exception 'pg_partition_magician: %.% is not an attached partition (an in-flight drain/regrain child is not retirable)', p_parent, p_child;
+  end if;
+
+  v_boundary := pgpm._retain_boundary(cfg);
+  if pgpm._native_gt(cfg.control_kind, r.hi, v_boundary) then
+    raise exception 'pg_partition_magician: % is not entirely past the retention horizon (hi %, horizon %)', p_child, r.hi, v_boundary;
+  end if;
+
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  begin
+    for v_hook in
+      select hook_fn from pgpm.hook
+      where parent_table = p_parent and event = 'pre_drop' and enabled
+      order by id
+    loop
+      execute format('select %s($1,$2,$3,$4)', (v_hook.hook_fn::oid::regproc)::text)
+        using p_parent, p_child, r.lo, r.hi;
+    end loop;
+    execute format('drop table %I.%I', v_nsp, p_child);
+    delete from pgpm.part where parent_table = p_parent and child_name = p_child;
+    insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
+    return true;
+  exception when others then
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (p_parent, 'retain_hook_fail', r.lo, r.hi, left(sqlerrm, 200));
+    return false;
+  end;
+end;
+$$;
+
 create or replace function pgpm.retain(p_parent regclass)
 returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_boundary text; v_ncast text; r record; v_dropped int := 0;
-  v_hook record;
+  cfg pgpm.config; v_boundary text; v_ncast text; r record; v_dropped int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.retain is null then return 0; end if;
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
   v_boundary := pgpm._retain_boundary(cfg);
   v_ncast := pgpm._native_type(cfg.control_kind);
 
-  -- retain_batch caps how many partitions this call ATTEMPTS, oldest first (issue #189); 'limit all'
-  -- when null keeps the unbounded prior behavior.
+  -- retire() carries the per-partition protocol (claim, hooks, drop, bookkeeping, per-partition
+  -- failure isolation -- see there); this loop only picks the eligible set, oldest first, capped by
+  -- retain_batch (issue #189; 'limit all' when null). A retire() that returns false (hook failure,
+  -- or claimed/retired by a concurrent janitor) still consumed its batch slot: the cap bounds
+  -- ATTEMPTS, not successes.
   for r in execute format(
-    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s limit %s',
+    'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s limit %s',
     p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast, coalesce(cfg.retain_batch::text, 'all'))
   loop
-    -- Each partition's hooks+drop are isolated in their own subtransaction: a failing pre_drop hook (e.g.
-    -- a long-term-storage copy) blocks ONLY that partition's drop, logged as retain_hook_fail and retried
-    -- on the next retain() call, without undoing drops this loop already committed for other partitions
-    -- (and without re-invoking those other partitions' hooks, which are not guaranteed idempotent).
-    begin
-      for v_hook in
-        select hook_fn from pgpm.hook
-        where parent_table = p_parent and event = 'pre_drop' and enabled
-        order by id
-      loop
-        execute format('select %s($1,$2,$3,$4)', (v_hook.hook_fn::oid::regproc)::text)
-          using p_parent, r.child_name, r.lo, r.hi;
-      end loop;
-      execute format('drop table %I.%I', v_nsp, r.child_name);
-      delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
-      insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
-      v_dropped := v_dropped + 1;
-    exception when others then
-      insert into pgpm.log (parent_table, action, lo, hi, method)
-        values (p_parent, 'retain_hook_fail', r.lo, r.hi, left(sqlerrm, 200));
-    end;
+    if pgpm.retire(p_parent, r.child_name) then v_dropped := v_dropped + 1; end if;
   end loop;
   return v_dropped;
 end;

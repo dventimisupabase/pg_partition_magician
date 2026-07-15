@@ -415,6 +415,33 @@ shows as a flat `status().retain_backlog` with climbing `retain_hook_failures`).
 `1`) when a registered hook is slow -- e.g. a synchronous copy to long-term storage -- to bound each
 tick's lock and transaction time to one partition's hooks + drop.
 
+`retain()` is a loop over [`retire`](#retire): it picks the eligible set and `retire` carries the
+per-partition protocol.
+
+### `retire`
+
+```sql
+pgpm.retire(p_parent regclass, p_child name) returns boolean
+```
+
+The sanctioned single-partition drop: `retain()`'s per-partition body, public and claim-guarded, for an
+external janitor (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
+retirement directly. It runs the same protocol `retain()` uses: claim the `pgpm.part` row, run the
+enabled `pre_drop` hooks in registration order, `DROP`, delete the catalog row, log `retain_drop`.
+Returns `true` iff this call dropped the partition.
+
+`retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
+**when**. It refuses (raises) an unmanaged table, a table with no retention policy (`config.retain` is
+null), a partition whose range is not entirely at/below the retention horizon, and an in-flight
+(unattached) drain/regrain child.
+
+It returns `false`, without side effects, when the `pgpm.part` row is absent (already retired by another
+actor) or claimed by a concurrent transaction: the claim is `FOR UPDATE SKIP LOCKED`, so each partition
+has exactly one owner at a time and concurrent janitors -- or a janitor and `retain()` -- never
+double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
+`pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
+under `retain()`.
+
 ### `regrain`
 
 ```sql
@@ -492,24 +519,27 @@ pgpm.hook_register(
 ) returns void
 ```
 
-Registers a user function to run at a lifecycle event. `pre_drop` is the only event today: `retain()`
-calls every enabled `pre_drop` hook for a partition, in registration order, immediately before dropping
-it -- e.g. to copy the partition's contents to long-term storage first. `p_hook` is `regprocedure`
-(e.g. `'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a signature that
-doesn't match the event's contract is refused here, not discovered later when `retain()` tries to call
-it. A `pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi text) returns
+Registers a user function to run at a lifecycle event. `pre_drop` is the only event today:
+[`retire`](#retire) calls every enabled `pre_drop` hook for a partition, in registration order,
+immediately before dropping it -- e.g. to copy the partition's contents to long-term storage first.
+Because `retire` is the one sanctioned drop path (`retain()` loops over it, and an external janitor
+calls it directly), the hooks fire on **every** retention drop, whoever initiates it. `p_hook` is
+`regprocedure` (e.g. `'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a
+signature that doesn't match the event's contract is refused here, not discovered later at drop time. A
+`pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi text) returns
 void`. Re-registering the same `(parent, event, hook)` just updates `enabled`.
 
-If a hook raises, `retain()` does **not** drop that partition: the failure is logged (`retain_hook_fail`,
-surfaced by `status().retain_hook_failures`) and retried on the next `retain()` call. The failure affects
-only that one partition -- drops already made earlier in the same `retain()` call are not undone, and
-hooks already run for those partitions are not re-invoked.
+If a hook raises, the partition is **not** dropped: the failure is logged (`retain_hook_fail`, surfaced
+by `status().retain_hook_failures`) and retried on the next `retire()`/`retain()` call. The failure
+affects only that one partition -- drops already made earlier in the same `retain()` call are not
+undone, and hooks already run for those partitions are not re-invoked.
 
-A hook runs inside `retain()`'s transaction, so a slow hook (a synchronous long-term-storage copy) holds
-that transaction open for as long as it runs. Pair a slow hook with `config.retain_batch = 1` (see
-[`retain`](#retain)) so each maintenance tick attempts at most one partition's hooks + drop, and the rest
-of an aged-out backlog paces across subsequent ticks. A complete, working S3-archival hook is worked
-through in [Archive partitions to S3](archive-to-s3.md).
+A hook runs inside the calling transaction (`retain()`'s tick, or a janitor's `retire()` call), so a
+slow hook (a synchronous long-term-storage copy) holds that transaction open for as long as it runs. On
+the scheduled path, pair a slow hook with `config.retain_batch = 1` (see [`retain`](#retain)) so each
+maintenance tick attempts at most one partition's hooks + drop, and the rest of an aged-out backlog
+paces across subsequent ticks. A complete, working S3-archival hook is worked through in
+[Archive partitions to S3](archive-to-s3.md).
 
 ### `hook_unregister`
 
@@ -837,7 +867,7 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `transmute` / `untransmute` | conversion and its reversal |
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
-| `retain_drop` / `retain_reclaim` | a partition dropped by retention / aged rows deleted from the `DEFAULT` |
+| `retain_drop` / `retain_reclaim` | a partition dropped by retention (via `retain()` or `retire()`) / aged rows deleted from the `DEFAULT` |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |

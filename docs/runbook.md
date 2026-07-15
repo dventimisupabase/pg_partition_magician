@@ -393,6 +393,7 @@ it defers the whole backlog behind it, since the cap attempts oldest first.
    -- or catch up now, synchronously:
    select pgpm.drain_all('public.events');    -- evacuate / reclaim the closed tail
    select pgpm.retain('public.events');       -- drop aged partitions now
+   select pgpm.retire('public.events', 'events_p...');  -- or surgically: drop ONE eligible partition
    ```
 
 3. Confirm reclamation actually happened:
