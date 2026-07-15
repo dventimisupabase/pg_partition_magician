@@ -19,7 +19,9 @@ and manages the whole lifecycle:
   vacuum). Optional, a coarse monolith is a correct permanent state.
 - **`drain`**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
   self-tuning against checkpoint pressure (`set_drain_adaptive`).
-- **`retain`**: drop partitions past a policy.
+- **`retain`**: drop partitions past a policy. Register a `pre_drop` hook (`hook_register`) to run a
+  function -- e.g. archive to long-term storage -- before a partition drops; a failing hook blocks that
+  drop instead of losing data silently.
 - **`maintain`**: the one procedure `pg_cron` calls (`obtain`, `drain`, `retain`, optional auto-`regrain`).
 
 The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."

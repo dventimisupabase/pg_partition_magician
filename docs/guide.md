@@ -352,6 +352,26 @@ succeeds; a later, separate maintenance transaction removes the row per policy. 
 data kept for a window *from arrival*, retain on an ingestion timestamp rather than event time, or widen
 the policy.
 
+### Pre-drop hooks
+
+To do something with a partition's data before it is dropped -- the common case is copying it to
+long-term storage (e.g. S3) -- register a `pre_drop` hook:
+
+```sql
+create function public.archive_to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns void language plpgsql as $$
+begin
+  -- e.g. perform aws_s3.query_export_to_s3(...) against p_child, or notify an external worker
+end;
+$$;
+
+select pgpm.hook_register('public.events', 'pre_drop', 'public.archive_to_s3(regclass,name,text,text)');
+```
+
+If the hook raises, `retain` does not drop that partition -- it retries on the next maintenance cycle
+instead of silently dropping data whose copy failed. See `hook_register` in the [reference](reference.md)
+for the full contract (signature, multiple hooks, disabling one, and how failures are isolated).
+
 ## Incoming foreign keys
 
 If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
