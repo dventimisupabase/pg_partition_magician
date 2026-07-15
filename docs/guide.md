@@ -358,7 +358,8 @@ one partition at a time. It never drops anything retention would not (the partit
 be past the horizon), and each partition is claim-guarded so several cooperating "janitors" -- say, an
 external archiver that uploads a partition to long-term storage and then retires it immediately -- can
 work alongside the scheduled `retain` without stepping on each other. See `retire` in the
-[reference](reference.md#retire).
+[reference](reference.md#retire), and the complete worked janitor in
+[the archive janitor](archive-janitor.md).
 
 ### Pre-drop hooks
 

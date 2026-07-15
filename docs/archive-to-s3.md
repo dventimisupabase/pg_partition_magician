@@ -405,8 +405,10 @@ What changes, honestly:
   memory ceiling, but the whole upload still runs inside `retain()`'s transaction, and a bigger
   feasible partition means a longer-open snapshot (held vacuum horizon) while it uploads. S3's own
   limits (10,000 parts) put the protocol ceiling around 80GB at this part size; the polite ceiling
-  is far lower and set by how long you are willing to hold a transaction open. Past it, hand the
-  work to an external worker with a real AWS SDK.
+  is far lower and set by how long you are willing to hold a transaction open. To bound that hold
+  to one part's network time, entirely in-database, see the
+  [archive janitor](archive-janitor.md) (a committing scanner procedure plus `pgpm.retire`); past
+  that, hand the work to an external worker with a real AWS SDK.
 - **A failed upload is aborted, not leaked.** An incomplete multipart upload is invisible in
   listings but accrues storage. On any failure after initiation, the hook's exception handler sends
   `AbortMultipartUpload` before re-raising (so `retain()` still keeps the partition and retries).

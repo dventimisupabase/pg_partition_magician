@@ -440,7 +440,8 @@ actor) or claimed by a concurrent transaction: the claim is `FOR UPDATE SKIP LOC
 has exactly one owner at a time and concurrent janitors -- or a janitor and `retain()` -- never
 double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
 `pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
-under `retain()`.
+under `retain()`. A complete worked janitor built on `retire` is in
+[the archive janitor](archive-janitor.md).
 
 ### `regrain`
 

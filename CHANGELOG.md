@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **Docs: the archive janitor (`docs/archive-janitor.md`).** The scanner variant of the S3 archival
+  example: a standing pg_cron procedure that archives aged partitions **with per-part commits**, so
+  the vacuum horizon is held for one part's network time instead of a whole partition's upload, and
+  then drops each partition itself via `pgpm.retire()`, with the lean `archive_gate` `pre_drop` hook
+  keeping `retain()` an honest backstop (defers unarchived or changed partitions loudly). Ledger
+  table records the fact; the gate owns the veto; the archiver owns the repair. Verified end-to-end
+  against MinIO: happy path (multipart + empty fast-path, retired via `retire()`), the unarchived
+  veto, the stale veto + self-repair (a backdated row caught by the row-count contract), crash
+  cleanup (a mid-part failure leaks an in-flight upload; the next scan's cleanup-on-entry aborts it,
+  since PL/pgSQL forbids transaction control inside a block with an `EXCEPTION` clause, so a
+  committing procedure cannot abort-on-exit), and the horizon claim measured directly: 1 distinct
+  `backend_xmin` across the synchronous hook's whole run versus 11 advancing values under the
+  janitor, same ~110MB payload, same ~1s wall-clock.
+
 - **`pgpm.retire(parent, child)`: the sanctioned single-partition drop.** `retain()`'s per-partition
   body -- claim, `pre_drop` hooks in registration order, `DROP`, catalog + log, per-partition failure
   isolation -- factored into a public verb, so an external janitor (e.g. an archive-then-drop scanner)
