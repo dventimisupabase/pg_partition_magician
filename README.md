@@ -129,6 +129,8 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Archive to S3](docs/archive-to-s3.md)**: a worked `pre_drop` hook that copies partitions to S3
   before retention drops them.
+- **[Archive janitor](docs/archive-janitor.md)**: the scanner variant with bounded vacuum-horizon
+  holds and janitor-owned drops via `pgpm.retire`.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
 
