@@ -45,7 +45,12 @@ def read_with_both_readers(raw):
         path = f.name
     try:
         arrow_rows = pq.read_table(path).to_pylist()
-        duck_rows = duckdb.sql(f"select * from '{path}'").fetchdf().to_dict("records")
+        # NOT .fetchdf(): pandas represents SQL NULL as NaN, not None, which would make
+        # NULL-vs-value comparisons silently pass/fail for the wrong reason. Fetch raw
+        # tuples instead so a null column value round-trips as Python None on both sides.
+        rel = duckdb.sql(f"select * from '{path}'")
+        cols = [d[0] for d in rel.description]
+        duck_rows = [dict(zip(cols, row)) for row in rel.fetchall()]
         return arrow_rows, duck_rows
     finally:
         os.unlink(path)
@@ -248,19 +253,97 @@ def test_large_row_count(conn):
     check("500 rows (multi-byte varint metadata fields)", expected, arrow_rows, duck_rows)
 
 
-def test_nullable_column_refused(conn):
-    make_table(conn, "t_nullable", "n int4", None)
+def test_unsupported_type_refused(conn):
+    make_table(conn, "t_unsupported", "n int4 not null, j jsonb not null", None)
     try:
-        to_parquet_bytes(conn, "t_nullable")
-        FAILURES.append("nullable column: expected an exception, got none")
-        print("FAIL: nullable column correctly refused")
+        to_parquet_bytes(conn, "t_unsupported")
+        FAILURES.append("unsupported type: expected an exception, got none")
+        print("FAIL: unsupported type correctly refused")
     except psycopg2.Error as e:
         conn.rollback()
-        if "NOT NULL" in str(e) or "nullable" in str(e):
-            print("PASS: nullable column correctly refused")
+        if "unsupported column type" in str(e):
+            print("PASS: unsupported type correctly refused")
         else:
-            FAILURES.append(f"nullable column: wrong error: {e}")
-            print("FAIL: nullable column correctly refused")
+            FAILURES.append(f"unsupported type: wrong error: {e}")
+            print("FAIL: unsupported type correctly refused")
+
+
+def test_nullable_int4_mixed(conn):
+    # 12 rows, nulls scattered across both the first and second definition-level
+    # bytes (positions 0-7 pack into byte 0, 8-11 into byte 1), so this exercises
+    # the bit-packed definition-levels encoder crossing a byte boundary.
+    make_table(conn, "t_null_int4", "n int4", None)
+    vals = [1, None, 3, None, None, 6, 7, None, 9, None, 11, 12]
+    for v in vals:
+        run(conn, "insert into t_null_int4 (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_null_int4")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_int4", ["n"])
+    check("nullable int4, mixed nulls crossing a byte boundary", expected, arrow_rows, duck_rows)
+
+
+def test_nullable_all_null(conn):
+    make_table(conn, "t_null_all", "n int4", None)
+    run(conn, "insert into t_null_all (n) select null from generate_series(1, 5)")
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_null_all")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_all", ["n"])
+    check("nullable column, every row null", expected, arrow_rows, duck_rows)
+
+
+def test_nullable_declared_but_no_nulls(conn):
+    # Nullable in the schema (OPTIONAL) but no actual NULL present -- the
+    # definition-level run should be all-1s and every value still round-trips.
+    make_table(conn, "t_null_none", "n int4", "(1), (2), (3)")
+    raw = to_parquet_bytes(conn, "t_null_none")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_none", ["n"])
+    check("nullable column declared, no nulls actually present", expected, arrow_rows, duck_rows)
+
+
+def test_nullable_empty_table(conn):
+    make_table(conn, "t_null_empty", "n int4", None)
+    raw = to_parquet_bytes(conn, "t_null_empty")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_empty", ["n"])
+    check("nullable column, empty table", expected, arrow_rows, duck_rows)
+
+
+def test_nullable_text_with_empty_string(conn):
+    # NULL and '' must stay distinct -- a common place to accidentally conflate them.
+    make_table(conn, "t_null_text", "s text", None)
+    for v in [None, "", "hello", None, "world"]:
+        run(conn, "insert into t_null_text (s) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_null_text")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_text", ["s"])
+    check("nullable text: NULL distinct from ''", expected, arrow_rows, duck_rows)
+
+
+def test_nullable_bool(conn):
+    make_table(conn, "t_null_bool", "b boolean", None)
+    for v in [True, None, False, None, None, True, False, None, True]:
+        run(conn, "insert into t_null_bool (b) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_null_bool")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_null_bool", ["b"])
+    check("nullable boolean, mixed with nulls", expected, arrow_rows, duck_rows)
+
+
+def test_mixed_required_and_optional_columns(conn):
+    make_table(conn, "t_mixed_null", "id int4 not null, note text, score float8", None)
+    run(conn, "insert into t_mixed_null (id, note, score) values (%s, %s, %s)", (1, "a", 1.5))
+    run(conn, "insert into t_mixed_null (id, note, score) values (%s, %s, %s)", (2, None, None))
+    run(conn, "insert into t_mixed_null (id, note, score) values (%s, %s, %s)", (3, "c", None))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_mixed_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_mixed_null", ["id", "note", "score"])
+    check("mixed NOT NULL (id) and nullable (note, score) columns", expected, arrow_rows, duck_rows)
 
 
 def main():
@@ -282,7 +365,14 @@ def main():
         test_many_columns_long_form_header,
         test_quoted_identifiers,
         test_large_row_count,
-        test_nullable_column_refused,
+        test_unsupported_type_refused,
+        test_nullable_int4_mixed,
+        test_nullable_all_null,
+        test_nullable_declared_but_no_nulls,
+        test_nullable_empty_table,
+        test_nullable_text_with_empty_string,
+        test_nullable_bool,
+        test_mixed_required_and_optional_columns,
     ]
     for t in tests:
         try:
