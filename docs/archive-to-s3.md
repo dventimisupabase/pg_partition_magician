@@ -461,11 +461,17 @@ for the fuller design discussion; this is that issue's "minimal-viable Parquet" 
 a real `pre_drop` hook.
 
 **Scope, deliberately narrow.** One row group, one uncompressed PLAIN-encoded data page per
-column, `NOT NULL` columns only (no definition levels -- a nullable column is refused loudly, not
-silently miscoded), and six types: `int4`, `int8`, `float8`, `boolean`, `text` (UTF8), and
+column, and six types: `int4`, `int8`, `float8`, `boolean`, `text` (UTF8), and
 `timestamp`/`timestamptz` (`TIMESTAMP_MICROS`, via `extract(epoch from ...)`, which sidesteps ever
-needing to know Postgres's internal 2000-01-01 epoch). Field IDs and enum values throughout come
-directly from the canonical `apache/parquet-format` `parquet.thrift`, not from memory. Iceberg is
+needing to know Postgres's internal 2000-01-01 epoch). Nullable columns are supported: a flat,
+non-nested schema only ever needs `max_definition_level = 1`, so a nullable column's definition
+levels are a single bit-packed run (a present/null bitmap per Data page v1's RLE/bit-packed-hybrid
+encoding), 4-byte-length-prefixed ahead of the values, which themselves contain only the non-null
+rows. Field IDs, encodings, and enum values throughout come directly from the canonical
+`apache/parquet-format` `parquet.thrift` and `Encodings.md`, not from memory (worth calling out
+specifically here: the level encoding's header is a *plain* ULEB128 varint, unrelated to the
+zigzag varint the Thrift compact-protocol footer uses elsewhere on this page, easy to conflate
+since both are just called "varint"). Iceberg is
 out of scope: it needs a second binary format (Avro, for manifests) plus a catalog commit
 protocol, neither of which reduces to a single PL/pgSQL function the way a flat Parquet file does.
 
@@ -681,6 +687,45 @@ begin
 end;
 $$;
 
+-- Definition levels for an OPTIONAL (nullable) column: a flat, non-nested schema has
+-- max_definition_level = 1, so this is a bitmap (1 = present, 0 = null) encoded with the
+-- RLE/bit-packed-hybrid encoding, one single bit-packed run covering the whole page,
+-- 4-byte-length-prefixed (Data page v1 always prepends the length for levels, per the
+-- Encodings.md table). IMPORTANT: the header's varint is a PLAIN unsigned ULEB128
+-- (Encodings.md point 2), NOT the Thrift zigzag varint used everywhere else in this file --
+-- these are two unrelated encodings that just happen to share the word "varint". At
+-- bit_width=1 the "different packing order" the spec calls out collapses to the same
+-- LSB-first-per-byte packing archive._pq_plain_boolean_array already uses, so this reuses that shape.
+create or replace function archive._pq_definition_levels(is_present boolean[]) returns bytea
+language plpgsql immutable as $$
+declare
+  n int4 := coalesce(array_length(is_present,1),0);
+  nbytes int4;
+  packed bytea;
+  i int4; byte_idx int4; bit_idx int4;
+  header bytea;
+  encoded_data bytea;
+begin
+  if n = 0 then
+    return archive._pq_reverse_bytes(int4send(0));   -- valid empty hybrid stream: zero-length encoded-data
+  end if;
+  nbytes := ceil(n/8.0)::int4;
+  packed := decode(repeat('00', nbytes), 'hex');
+  for i in 1..n loop
+    byte_idx := (i-1) / 8;
+    bit_idx  := (i-1) % 8;
+    if is_present[i] then
+      packed := set_byte(packed, byte_idx, get_byte(packed, byte_idx) | (1 << bit_idx));
+    end if;
+  end loop;
+  -- bit-packed-header := varint-encode(<bit-pack-scaled-run-len> << 1 | 1); scaled-run-len is
+  -- (bit-packed-run-len)/8, and since every byte here packs exactly 8 values, that's just nbytes.
+  header := archive._pq_varint(((nbytes::bigint) << 1) | 1);
+  encoded_data := header || packed;
+  return archive._pq_reverse_bytes(int4send(length(encoded_data))) || encoded_data;
+end;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Struct builders (SchemaElement / DataPageHeader / PageHeader /
 -- ColumnMetaData / ColumnChunk / RowGroup / FileMetaData)
@@ -694,13 +739,13 @@ language sql immutable as $$
 $$;
 
 -- p_converted: parquet ConvertedType code, or -1 for "none"
-create or replace function archive._pq_build_schema_leaf(p_name text, p_ptype int4, p_converted int4) returns bytea
+create or replace function archive._pq_build_schema_leaf(p_name text, p_ptype int4, p_converted int4, p_nullable boolean) returns bytea
 language plpgsql immutable as $$
 declare
   buf bytea;
 begin
   buf := archive._pq_write_i32(0, 1, p_ptype);                                     -- type
-  buf := buf || archive._pq_write_i32(1, 3, 0);                                    -- repetition_type = REQUIRED
+  buf := buf || archive._pq_write_i32(1, 3, case when p_nullable then 1 else 0 end); -- repetition_type
   buf := buf || archive._pq_write_binary(3, 4, convert_to(p_name, 'UTF8'));        -- name
   if p_converted >= 0 then
     buf := buf || archive._pq_write_i32(4, 6, p_converted);                       -- converted_type
@@ -785,42 +830,76 @@ $$;
 -- column's array lines up on the same row order)
 -- ---------------------------------------------------------------------------
 
-create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text) returns bytea
+-- p_nullable columns interleave nulls with real values (array_agg preserves NULLs in
+-- position, so this is a single ctid-ordered pass either way); is_present[i] tracks which
+-- rows had a value so the OPTIONAL path can prepend a definition-levels bitmap, while the
+-- values-only payload always contains just the non-null values, in row order. For a NOT
+-- NULL column every element is guaranteed non-null (Postgres enforces that at the table
+-- level), so this collapses to the old unconditional-encode behavior byte-for-byte; only
+-- p_nullable decides whether the definition-levels block gets prepended at all.
+create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text, p_nullable boolean) returns bytea
 language plpgsql as $$
 declare
-  payload bytea := ''::bytea;
+  values_payload bytea := ''::bytea;
+  is_present boolean[] := '{}';
   arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
+  present_bools boolean[] := '{}';
   i int4; n int4;
 begin
   if p_pgtype = 'int4' then
     execute format('select array_agg(%I::int4 order by ctid) from %s', p_col, p_from_sql) into arr_i4;
     n := coalesce(array_length(arr_i4,1),0);
-    for i in 1..n loop payload := payload || archive._pq_plain_int32(arr_i4[i]); end loop;
+    for i in 1..n loop
+      is_present[i] := (arr_i4[i] is not null);
+      if arr_i4[i] is not null then values_payload := values_payload || archive._pq_plain_int32(arr_i4[i]); end if;
+    end loop;
   elsif p_pgtype = 'int8' then
     execute format('select array_agg(%I::int8 order by ctid) from %s', p_col, p_from_sql) into arr_i8;
     n := coalesce(array_length(arr_i8,1),0);
-    for i in 1..n loop payload := payload || archive._pq_plain_int64(arr_i8[i]); end loop;
+    for i in 1..n loop
+      is_present[i] := (arr_i8[i] is not null);
+      if arr_i8[i] is not null then values_payload := values_payload || archive._pq_plain_int64(arr_i8[i]); end if;
+    end loop;
   elsif p_pgtype = 'float8' then
     execute format('select array_agg(%I::float8 order by ctid) from %s', p_col, p_from_sql) into arr_f8;
     n := coalesce(array_length(arr_f8,1),0);
-    for i in 1..n loop payload := payload || archive._pq_plain_double(arr_f8[i]); end loop;
+    for i in 1..n loop
+      is_present[i] := (arr_f8[i] is not null);
+      if arr_f8[i] is not null then values_payload := values_payload || archive._pq_plain_double(arr_f8[i]); end if;
+    end loop;
   elsif p_pgtype = 'bool' then
     execute format('select array_agg(%I::boolean order by ctid) from %s', p_col, p_from_sql) into arr_bool;
-    payload := archive._pq_plain_boolean_array(arr_bool);
+    n := coalesce(array_length(arr_bool,1),0);
+    for i in 1..n loop
+      is_present[i] := (arr_bool[i] is not null);
+      if arr_bool[i] is not null then present_bools := present_bools || arr_bool[i]; end if;
+    end loop;
+    values_payload := archive._pq_plain_boolean_array(present_bools);
   elsif p_pgtype = 'text' then
     execute format('select array_agg(%I::text order by ctid) from %s', p_col, p_from_sql) into arr_text;
     n := coalesce(array_length(arr_text,1),0);
-    for i in 1..n loop payload := payload || archive._pq_plain_text(arr_text[i]); end loop;
+    for i in 1..n loop
+      is_present[i] := (arr_text[i] is not null);
+      if arr_text[i] is not null then values_payload := values_payload || archive._pq_plain_text(arr_text[i]); end if;
+    end loop;
   elsif p_pgtype in ('timestamptz','timestamp') then
     execute format('select array_agg(%I::timestamptz order by ctid) from %s', p_col, p_from_sql) into arr_ts;
     n := coalesce(array_length(arr_ts,1),0);
     for i in 1..n loop
-      payload := payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
+      is_present[i] := (arr_ts[i] is not null);
+      if arr_ts[i] is not null then
+        values_payload := values_payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
+      end if;
     end loop;
   else
     raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
   end if;
-  return payload;
+
+  if p_nullable then
+    return archive._pq_definition_levels(is_present) || values_payload;
+  else
+    return values_payload;
+  end if;
 end;
 $$;
 
@@ -837,6 +916,7 @@ declare
   v_col_pgtypes text[] := '{}';
   v_col_ptypes int4[] := '{}';
   v_col_converted int4[] := '{}';
+  v_col_nullable boolean[] := '{}';
   v_ncols int4;
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
@@ -861,11 +941,8 @@ begin
     where a.attrelid = p_relation and a.attnum > 0 and not a.attisdropped
     order by a.attnum
   loop
-    if not v_col.attnotnull then
-      raise exception 'archive._pq_to_parquet: column % is nullable; this prototype only supports NOT NULL columns', v_col.attname;
-    end if;
-
     v_col_names := v_col_names || v_col.attname;
+    v_col_nullable := v_col_nullable || (not v_col.attnotnull);
 
     case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
@@ -888,7 +965,7 @@ begin
 
   v_body := v_magic;
   for i in 1..v_ncols loop
-    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i]);
+    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i]);
     v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data));
     v_page_offset := length(v_body);
     v_body := v_body || v_page_header || v_data;
@@ -896,7 +973,7 @@ begin
     v_total_uncompressed := length(v_page_header) + length(v_data);
     v_column_chunks := v_column_chunks || archive._pq_build_column_chunk(
         archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset));
-    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i]);
+    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
   end loop;
 
   v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
@@ -1048,10 +1125,10 @@ same sanctioned drop path `retain()` uses), not a standalone call to the encoder
   multipart upload is mechanically straightforward (S3 multipart just concatenates bytes; it does
   not care that a byte-range boundary falls in the middle of a row group), but it was not built in
   this pass -- said plainly rather than implied.
-- **`NOT NULL` columns only.** A nullable column makes `archive._pq_to_parquet` raise before
-  touching S3, not emit a file with wrong data. Supporting nulls means implementing Parquet's
-  definition-level RLE encoding, a second small binary sub-format nested inside each page; not
-  attempted here.
+- **Nullable columns supported, but only single-level (no nesting).** This schema is always flat
+  (no repeated fields, no groups), so `max_definition_level` never needs to exceed 1 and the
+  definition-levels bitmap stays a single bit-packed run per page. A nested/repeated schema would
+  need more than this rung builds.
 - **Six types.** `int4`, `int8`, `float8`, `boolean`, `text`, `timestamp`/`timestamptz`. Anything
   else (arrays, JSON/JSONB, `numeric`, composite types, `uuid`) is refused loudly by
   `archive._pq_to_parquet` rather than silently coerced; cast to a supported type in a view over
