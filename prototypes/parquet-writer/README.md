@@ -5,6 +5,15 @@ pg_parquet, pg_duckdb, pg_lake, or pg_mooncake). Prototype for
 [pg_partition_magician#199](https://github.com/dventimisupabase/pg_partition_magician/issues/199);
 not shipped code, not wired into pgpm_core.
 
+**This encoder is now also wired into a real `pre_drop` hook**, verified
+end-to-end through `pgpm.retire()` against MinIO: see
+[`docs/archive-to-s3.md`](../../docs/archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson).
+That version renames the `pq.*` functions here into the `archive` schema and
+adds a bytea-native SigV4 signer (`archive.s3_signed_request_bytea`), since
+the existing text-based signer's `convert_to(payload, 'UTF8')` call rejects
+a real Parquet payload's binary content. This directory stays as the
+standalone spike the docs version grew from.
+
 ## Scope
 
 - One row group, one uncompressed PLAIN-encoded data page per column.
