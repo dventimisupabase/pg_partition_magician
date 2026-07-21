@@ -447,3 +447,616 @@ confirmed on the store (`ListMultipartUploads` showing zero incomplete uploads l
 the retried partition re-archiving completely on the next tick. The two stores returned
 **identical composite ETags** for the same partitions: the part boundaries are deterministic, so
 the per-part MD5s match wherever the object lands.
+
+## A columnar variant: Parquet instead of NDJSON
+
+Both hooks above write NDJSON. A Parquet archive is directly queryable by DuckDB, Athena,
+Redshift Spectrum, Spark, Trino, and Snowflake with no separate conversion step -- but on
+Supabase there is currently no in-database extension that emits it (pg_parquet is no longer
+available there; pg_duckdb, pg_lake, and pg_mooncake never were). This variant closes that gap
+without any extension: it hand-rolls a Parquet file, Thrift compact-protocol footer and all, in
+the same PL/pgSQL-plus-`pgcrypto`-plus-`http` toolbox as the hooks above. See
+[pg_partition_magician#199](https://github.com/dventimisupabase/pg_partition_magician/issues/199)
+for the fuller design discussion; this is that issue's "minimal-viable Parquet" rung, wired into
+a real `pre_drop` hook.
+
+**Scope, deliberately narrow.** One row group, one uncompressed PLAIN-encoded data page per
+column, `NOT NULL` columns only (no definition levels -- a nullable column is refused loudly, not
+silently miscoded), and six types: `int4`, `int8`, `float8`, `boolean`, `text` (UTF8), and
+`timestamp`/`timestamptz` (`TIMESTAMP_MICROS`, via `extract(epoch from ...)`, which sidesteps ever
+needing to know Postgres's internal 2000-01-01 epoch). Field IDs and enum values throughout come
+directly from the canonical `apache/parquet-format` `parquet.thrift`, not from memory. Iceberg is
+out of scope: it needs a second binary format (Avro, for manifests) plus a catalog commit
+protocol, neither of which reduces to a single PL/pgSQL function the way a flat Parquet file does.
+
+**This holds the vacuum horizon like the hooks above, not like the archive assistant.** The
+encoder reads every column of a partition via `array_agg(col order by ctid)`, with no `COMMIT` in
+between -- each column's array has to come from the same snapshot as every other column's, or a
+concurrent write between two column reads could misalign rows across columns. That means one
+in-memory value, one upload, exactly the shape (and the same ceiling) as the single-PUT hook at
+the top of this page: no attempt is made here to preserve the
+[archive assistant](archive-assistant.md)'s per-part-committing, bounded-horizon-hold design --
+Parquet's footer needs every row group's byte offsets, known only once its data is built, so a
+streaming, row-group-per-slice writer that commits between slices would be a materially bigger
+rewrite than reusing the assistant's existing pattern. Consider this the Parquet analogue of
+`archive.to_s3`, not of `archive.partition`.
+
+**A binary payload needs one new piece: a bytea-native request signer.** `archive.s3_signed_request`
+above hashes its payload via `digest(convert_to(p_payload, 'UTF8'), 'sha256')`, which requires the
+payload to be well-formed text in the server encoding. A Parquet file is binary -- its
+Thrift-encoded footer alone guarantees stray `0x00` and high-bit-set bytes -- so `convert_to()`
+raises `invalid byte sequence for encoding "UTF8"` on a real payload (confirmed: it does, on
+exactly a literal `0x00`). `archive.s3_signed_request_bytea` below hashes the raw `bytea` directly
+(no encoding involved) and crosses to `text` only once, at the network boundary, via the `http`
+extension's `bytea_to_text()` -- confirmed from its C source to be a raw `memcpy` reinterpretation
+of the same bytes, not a re-encode. That crossing was verified directly: a Parquet payload PUT
+through it and fetched back from MinIO came back byte-for-byte identical, both before and after
+adding SigV4 signing to the request.
+
+```sql
+create schema if not exists archive;   -- if not already created for the hooks above
+
+-- ---------------------------------------------------------------------------
+-- Byte-level primitives
+-- ---------------------------------------------------------------------------
+
+create or replace function archive._pq_byte(b int4) returns bytea
+language sql immutable as $$
+  select set_byte('\x00'::bytea, 0, b);
+$$;
+
+create or replace function archive._pq_reverse_bytes(b bytea) returns bytea
+language plpgsql immutable as $$
+declare
+  n int4 := length(b);
+  buf bytea := b;
+  i int4;
+begin
+  for i in 0..n-1 loop
+    buf := set_byte(buf, i, get_byte(b, n-1-i));
+  end loop;
+  return buf;
+end;
+$$;
+
+-- unsigned LEB128 varint; only ever called with non-negative magnitudes in
+-- this writer (zigzag output, or a raw non-negative count/length).
+create or replace function archive._pq_varint(v bigint) returns bytea
+language plpgsql immutable as $$
+declare
+  n bigint := v;
+  buf bytea := ''::bytea;
+  b int4;
+begin
+  if n < 0 then
+    raise exception 'archive._pq_varint: negative value % not supported', v;
+  end if;
+  loop
+    b := (n & 127)::int4;
+    n := n >> 7;
+    if n <> 0 then
+      buf := buf || archive._pq_byte(b | 128);
+    else
+      buf := buf || archive._pq_byte(b);
+      exit;
+    end if;
+  end loop;
+  return buf;
+end;
+$$;
+
+create or replace function archive._pq_zigzag(v bigint) returns bigint
+language sql immutable as $$
+  select case when v >= 0 then v * 2 else (0 - v) * 2 - 1 end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Thrift compact protocol: field headers, typed field writers, lists, structs
+-- ---------------------------------------------------------------------------
+-- Compact types used here: BOOLEAN_TRUE/FALSE unused (no bool fields in the
+-- subset of the spec this writer touches); I32=5 I64=6 BINARY=8 LIST=9 STRUCT=12.
+
+create or replace function archive._pq_field_hdr(p_last_id int4, p_field_id int4, p_ctype int4) returns bytea
+language plpgsql immutable as $$
+declare
+  delta int4 := p_field_id - p_last_id;
+begin
+  if delta between 1 and 15 then
+    return archive._pq_byte((delta << 4) | p_ctype);
+  else
+    return archive._pq_byte(p_ctype) || archive._pq_varint(archive._pq_zigzag(p_field_id::bigint));
+  end if;
+end;
+$$;
+
+create or replace function archive._pq_stop() returns bytea
+language sql immutable as $$
+  select archive._pq_byte(0);
+$$;
+
+create or replace function archive._pq_write_i32(p_last_id int4, p_field_id int4, p_val int4) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 5) || archive._pq_varint(archive._pq_zigzag(p_val::bigint));
+$$;
+
+create or replace function archive._pq_write_i64(p_last_id int4, p_field_id int4, p_val int8) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 6) || archive._pq_varint(archive._pq_zigzag(p_val));
+$$;
+
+create or replace function archive._pq_write_binary(p_last_id int4, p_field_id int4, p_val bytea) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 8) || archive._pq_varint(length(p_val)::bigint) || p_val;
+$$;
+
+create or replace function archive._pq_write_struct(p_last_id int4, p_field_id int4, p_val bytea) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 12) || p_val;
+$$;
+
+create or replace function archive._pq_list_hdr(p_count int4, p_elem_ctype int4) returns bytea
+language plpgsql immutable as $$
+begin
+  if p_count <= 14 then
+    return archive._pq_byte((p_count << 4) | p_elem_ctype);
+  else
+    return archive._pq_byte((15 << 4) | p_elem_ctype) || archive._pq_varint(p_count::bigint);
+  end if;
+end;
+$$;
+
+create or replace function archive._pq_write_list_struct(p_last_id int4, p_field_id int4, p_elems bytea[]) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 9)
+      || archive._pq_list_hdr(coalesce(array_length(p_elems,1),0), 12)
+      || coalesce((select string_agg(e, ''::bytea order by ord)
+                     from unnest(p_elems) with ordinality as t(e, ord)), ''::bytea);
+$$;
+
+create or replace function archive._pq_write_list_i32(p_last_id int4, p_field_id int4, p_elems int4[]) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 9)
+      || archive._pq_list_hdr(coalesce(array_length(p_elems,1),0), 5)
+      || coalesce((select string_agg(archive._pq_varint(archive._pq_zigzag(e::bigint)), ''::bytea order by ord)
+                     from unnest(p_elems) with ordinality as t(e, ord)), ''::bytea);
+$$;
+
+create or replace function archive._pq_write_list_binary(p_last_id int4, p_field_id int4, p_elems bytea[]) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, 9)
+      || archive._pq_list_hdr(coalesce(array_length(p_elems,1),0), 8)
+      || coalesce((select string_agg(archive._pq_varint(length(e)::bigint) || e, ''::bytea order by ord)
+                     from unnest(p_elems) with ordinality as t(e, ord)), ''::bytea);
+$$;
+
+-- ---------------------------------------------------------------------------
+-- PLAIN encoding (Type physical values; see Encoding.PLAIN doc in the spec)
+-- ---------------------------------------------------------------------------
+
+create or replace function archive._pq_plain_int32(v int4) returns bytea
+language sql immutable as $$
+  select archive._pq_reverse_bytes(int4send(v));
+$$;
+
+create or replace function archive._pq_plain_int64(v int8) returns bytea
+language sql immutable as $$
+  select archive._pq_reverse_bytes(int8send(v));
+$$;
+
+create or replace function archive._pq_plain_double(v float8) returns bytea
+language sql immutable as $$
+  select archive._pq_reverse_bytes(float8send(v));
+$$;
+
+create or replace function archive._pq_plain_bytearray(v bytea) returns bytea
+language sql immutable as $$
+  select archive._pq_reverse_bytes(int4send(length(v))) || v;
+$$;
+
+create or replace function archive._pq_plain_text(v text) returns bytea
+language sql immutable as $$
+  select archive._pq_plain_bytearray(convert_to(v, 'UTF8'));
+$$;
+
+create or replace function archive._pq_plain_boolean_array(vals boolean[]) returns bytea
+language plpgsql immutable as $$
+declare
+  n int4 := coalesce(array_length(vals,1),0);
+  nbytes int4 := ceil(n/8.0)::int4;
+  buf bytea;
+  i int4; byte_idx int4; bit_idx int4;
+begin
+  if n = 0 then
+    return ''::bytea;
+  end if;
+  buf := decode(repeat('00', nbytes), 'hex');
+  for i in 1..n loop
+    byte_idx := (i-1) / 8;
+    bit_idx  := (i-1) % 8;
+    if vals[i] then
+      buf := set_byte(buf, byte_idx, get_byte(buf, byte_idx) | (1 << bit_idx));
+    end if;
+  end loop;
+  return buf;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Struct builders (SchemaElement / DataPageHeader / PageHeader /
+-- ColumnMetaData / ColumnChunk / RowGroup / FileMetaData)
+-- ---------------------------------------------------------------------------
+
+create or replace function archive._pq_build_schema_root(p_num_children int4) returns bytea
+language sql immutable as $$
+  select archive._pq_write_binary(0, 4, convert_to('root', 'UTF8'))
+      || archive._pq_write_i32(4, 5, p_num_children)
+      || archive._pq_stop();
+$$;
+
+-- p_converted: parquet ConvertedType code, or -1 for "none"
+create or replace function archive._pq_build_schema_leaf(p_name text, p_ptype int4, p_converted int4) returns bytea
+language plpgsql immutable as $$
+declare
+  buf bytea;
+begin
+  buf := archive._pq_write_i32(0, 1, p_ptype);                                     -- type
+  buf := buf || archive._pq_write_i32(1, 3, 0);                                    -- repetition_type = REQUIRED
+  buf := buf || archive._pq_write_binary(3, 4, convert_to(p_name, 'UTF8'));        -- name
+  if p_converted >= 0 then
+    buf := buf || archive._pq_write_i32(4, 6, p_converted);                       -- converted_type
+  end if;
+  buf := buf || archive._pq_stop();
+  return buf;
+end;
+$$;
+
+create or replace function archive._pq_build_data_page_header(p_num_values int4) returns bytea
+language sql immutable as $$
+  select archive._pq_write_i32(0, 1, p_num_values)      -- num_values
+      || archive._pq_write_i32(1, 2, 0)                 -- encoding = PLAIN
+      || archive._pq_write_i32(2, 3, 3)                  -- definition_level_encoding = RLE
+      || archive._pq_write_i32(3, 4, 3)                  -- repetition_level_encoding = RLE
+      || archive._pq_stop();
+$$;
+
+create or replace function archive._pq_build_page_header(p_num_values int4, p_data_len int4) returns bytea
+language plpgsql immutable as $$
+declare
+  dph bytea := archive._pq_build_data_page_header(p_num_values);
+  buf bytea;
+begin
+  buf := archive._pq_write_i32(0, 1, 0);                    -- type = DATA_PAGE
+  buf := buf || archive._pq_write_i32(1, 2, p_data_len);     -- uncompressed_page_size
+  buf := buf || archive._pq_write_i32(2, 3, p_data_len);     -- compressed_page_size (codec = UNCOMPRESSED)
+  buf := buf || archive._pq_write_struct(3, 5, dph);         -- data_page_header
+  buf := buf || archive._pq_stop();
+  return buf;
+end;
+$$;
+
+create or replace function archive._pq_build_column_metadata(
+    p_ptype int4, p_colname text, p_num_values bigint,
+    p_total_uncompressed bigint, p_data_page_offset bigint
+) returns bytea
+language plpgsql immutable as $$
+declare
+  buf bytea;
+begin
+  buf := archive._pq_write_i32(0, 1, p_ptype);                                              -- type
+  buf := buf || archive._pq_write_list_i32(1, 2, array[0]);                                 -- encodings = [PLAIN]
+  buf := buf || archive._pq_write_list_binary(2, 3, array[convert_to(p_colname,'UTF8')]);   -- path_in_schema
+  buf := buf || archive._pq_write_i32(3, 4, 0);                                            -- codec = UNCOMPRESSED
+  buf := buf || archive._pq_write_i64(4, 5, p_num_values);                                  -- num_values
+  buf := buf || archive._pq_write_i64(5, 6, p_total_uncompressed);                          -- total_uncompressed_size
+  buf := buf || archive._pq_write_i64(6, 7, p_total_uncompressed);                          -- total_compressed_size
+  buf := buf || archive._pq_write_i64(7, 9, p_data_page_offset);                            -- data_page_offset
+  buf := buf || archive._pq_stop();
+  return buf;
+end;
+$$;
+
+create or replace function archive._pq_build_column_chunk(p_metadata bytea) returns bytea
+language sql immutable as $$
+  select archive._pq_write_i64(0, 2, 0)              -- file_offset (deprecated, 0)
+      || archive._pq_write_struct(2, 3, p_metadata)  -- meta_data
+      || archive._pq_stop();
+$$;
+
+create or replace function archive._pq_build_row_group(p_chunks bytea[], p_total_bytes bigint, p_num_rows bigint) returns bytea
+language sql immutable as $$
+  select archive._pq_write_list_struct(0, 1, p_chunks)      -- columns
+      || archive._pq_write_i64(1, 2, p_total_bytes)         -- total_byte_size
+      || archive._pq_write_i64(2, 3, p_num_rows)            -- num_rows
+      || archive._pq_stop();
+$$;
+
+create or replace function archive._pq_build_file_metadata(p_schema bytea[], p_num_rows bigint, p_row_groups bytea[]) returns bytea
+language sql immutable as $$
+  select archive._pq_write_i32(0, 1, 1)                                                       -- version
+      || archive._pq_write_list_struct(1, 2, p_schema)                                        -- schema
+      || archive._pq_write_i64(2, 3, p_num_rows)                                               -- num_rows
+      || archive._pq_write_list_struct(3, 4, p_row_groups)                                     -- row_groups
+      || archive._pq_write_binary(4, 6, convert_to('pg_partition_magician parquet prototype', 'UTF8')) -- created_by
+      || archive._pq_stop();
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Column data extraction (server-side aggregation, ctid-ordered so every
+-- column's array lines up on the same row order)
+-- ---------------------------------------------------------------------------
+
+create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text) returns bytea
+language plpgsql as $$
+declare
+  payload bytea := ''::bytea;
+  arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
+  i int4; n int4;
+begin
+  if p_pgtype = 'int4' then
+    execute format('select array_agg(%I::int4 order by ctid) from %s', p_col, p_from_sql) into arr_i4;
+    n := coalesce(array_length(arr_i4,1),0);
+    for i in 1..n loop payload := payload || archive._pq_plain_int32(arr_i4[i]); end loop;
+  elsif p_pgtype = 'int8' then
+    execute format('select array_agg(%I::int8 order by ctid) from %s', p_col, p_from_sql) into arr_i8;
+    n := coalesce(array_length(arr_i8,1),0);
+    for i in 1..n loop payload := payload || archive._pq_plain_int64(arr_i8[i]); end loop;
+  elsif p_pgtype = 'float8' then
+    execute format('select array_agg(%I::float8 order by ctid) from %s', p_col, p_from_sql) into arr_f8;
+    n := coalesce(array_length(arr_f8,1),0);
+    for i in 1..n loop payload := payload || archive._pq_plain_double(arr_f8[i]); end loop;
+  elsif p_pgtype = 'bool' then
+    execute format('select array_agg(%I::boolean order by ctid) from %s', p_col, p_from_sql) into arr_bool;
+    payload := archive._pq_plain_boolean_array(arr_bool);
+  elsif p_pgtype = 'text' then
+    execute format('select array_agg(%I::text order by ctid) from %s', p_col, p_from_sql) into arr_text;
+    n := coalesce(array_length(arr_text,1),0);
+    for i in 1..n loop payload := payload || archive._pq_plain_text(arr_text[i]); end loop;
+  elsif p_pgtype in ('timestamptz','timestamp') then
+    execute format('select array_agg(%I::timestamptz order by ctid) from %s', p_col, p_from_sql) into arr_ts;
+    n := coalesce(array_length(arr_ts,1),0);
+    for i in 1..n loop
+      payload := payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
+    end loop;
+  else
+    raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
+  end if;
+  return payload;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Entry point
+-- ---------------------------------------------------------------------------
+
+create or replace function archive._pq_to_parquet(p_relation regclass) returns bytea
+language plpgsql as $$
+declare
+  v_schema name; v_table name; v_from_sql text;
+  v_col record;
+  v_col_names text[] := '{}';
+  v_col_pgtypes text[] := '{}';
+  v_col_ptypes int4[] := '{}';
+  v_col_converted int4[] := '{}';
+  v_ncols int4;
+  v_num_rows bigint;
+  v_magic bytea := convert_to('PAR1', 'UTF8');
+  v_body bytea;
+  v_data bytea; v_page_header bytea; v_page_offset bigint;
+  v_column_chunks bytea[] := '{}';
+  v_schema_elements bytea[] := '{}';
+  v_total_uncompressed bigint;
+  v_row_group bytea;
+  v_schema_list bytea[];
+  v_footer bytea;
+  i int4;
+begin
+  select n.nspname, c.relname into v_schema, v_table
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    where c.oid = p_relation;
+  v_from_sql := format('%I.%I', v_schema, v_table);
+
+  for v_col in
+    select a.attname, a.attnotnull, t.typname
+    from pg_attribute a join pg_type t on t.oid = a.atttypid
+    where a.attrelid = p_relation and a.attnum > 0 and not a.attisdropped
+    order by a.attnum
+  loop
+    if not v_col.attnotnull then
+      raise exception 'archive._pq_to_parquet: column % is nullable; this prototype only supports NOT NULL columns', v_col.attname;
+    end if;
+
+    v_col_names := v_col_names || v_col.attname;
+
+    case v_col.typname
+      when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
+      when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
+      when 'float8'      then v_col_pgtypes := v_col_pgtypes || 'float8'::text;      v_col_ptypes := v_col_ptypes || 5; v_col_converted := v_col_converted || -1;
+      when 'bool'        then v_col_pgtypes := v_col_pgtypes || 'bool'::text;        v_col_ptypes := v_col_ptypes || 0; v_col_converted := v_col_converted || -1;
+      when 'text'        then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+      when 'timestamptz' then v_col_pgtypes := v_col_pgtypes || 'timestamptz'::text; v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+      when 'timestamp'   then v_col_pgtypes := v_col_pgtypes || 'timestamp'::text;   v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+      else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
+    end case;
+  end loop;
+
+  v_ncols := array_length(v_col_names, 1);
+  if v_ncols is null then
+    raise exception 'archive._pq_to_parquet: relation % has no supported columns', p_relation;
+  end if;
+
+  execute format('select count(*) from %s', v_from_sql) into v_num_rows;
+
+  v_body := v_magic;
+  for i in 1..v_ncols loop
+    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i]);
+    v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data));
+    v_page_offset := length(v_body);
+    v_body := v_body || v_page_header || v_data;
+
+    v_total_uncompressed := length(v_page_header) + length(v_data);
+    v_column_chunks := v_column_chunks || archive._pq_build_column_chunk(
+        archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset));
+    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i]);
+  end loop;
+
+  v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
+
+  v_schema_list := array_prepend(archive._pq_build_schema_root(v_ncols), v_schema_elements);
+  v_footer := archive._pq_build_file_metadata(v_schema_list, v_num_rows, array[v_row_group]);
+
+  return v_body || v_footer || archive._pq_reverse_bytes(int4send(length(v_footer))) || v_magic;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Transport: a bytea-native SigV4 signer, and the pre_drop hook
+-- ---------------------------------------------------------------------------
+-- Why a separate signer from archive.s3_signed_request (archive-to-s3.md's multipart
+-- variant): that one hashes the payload via digest(convert_to(p_payload, 'UTF8'), 'sha256'),
+-- which requires p_payload to be well-formed text in the server encoding. A Parquet file is
+-- binary -- its Thrift-encoded footer alone guarantees stray 0x00 and high-bit-set bytes --
+-- so convert_to() raises `invalid byte sequence for encoding "UTF8"` on real payloads
+-- (verified: it does, on exactly a literal 0x00). This overload hashes the RAW bytea directly
+-- (no encoding involved) and only crosses to text at the network boundary, via the http
+-- extension's bytea_to_text() -- a raw memcpy reinterpretation of the same bytes, not a
+-- re-encode (confirmed from the extension's C source). Verified end-to-end against MinIO:
+-- a Parquet payload survives this exact path byte-for-byte and reads back correctly in pyarrow.
+create or replace function archive.s3_signed_request_bytea(
+  p_method text, p_endpoint text, p_bucket text, p_region text,
+  p_key text, p_query text, p_ctype text, p_payload bytea,
+  p_key_id text, p_secret text
+) returns http_response language plpgsql as $$
+declare
+  v_host text; v_uri text; v_url text;
+  v_amz_date text; v_date text; v_payload_hash text; v_scope text;
+  v_signed_headers text := 'content-type;host;x-amz-content-sha256;x-amz-date';
+  v_canonical text; v_sts text; v_kbin bytea; v_sig text; v_auth text;
+  v_resp http_response;
+begin
+  if p_endpoint is null then
+    v_host := p_bucket || '.s3.' || p_region || '.amazonaws.com';
+    v_uri  := '/' || p_key;
+  else
+    v_host := regexp_replace(p_endpoint, '^https?://([^/]+).*$', '\1');
+    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || p_key;
+  end if;
+  v_url := case when p_endpoint is null then 'https://' || v_host || v_uri
+                else p_endpoint || '/' || p_bucket || '/' || p_key end
+        || case when p_query = '' then '' else '?' || p_query end;
+
+  v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
+  v_date         := substr(v_amz_date, 1, 8);
+  v_payload_hash := encode(digest(p_payload, 'sha256'), 'hex');   -- bytea-native: no encoding involved
+  v_scope        := v_date || '/' || p_region || '/s3/aws4_request';
+  v_canonical    := p_method || e'\n' || v_uri || e'\n' || p_query || e'\n'
+                 || 'content-type:' || p_ctype || e'\n'
+                 || 'host:' || v_host || e'\n'
+                 || 'x-amz-content-sha256:' || v_payload_hash || e'\n'
+                 || 'x-amz-date:' || v_amz_date || e'\n'
+                 || e'\n' || v_signed_headers || e'\n' || v_payload_hash;
+  v_sts          := 'AWS4-HMAC-SHA256' || e'\n' || v_amz_date || e'\n' || v_scope || e'\n'
+                 || encode(digest(convert_to(v_canonical, 'UTF8'), 'sha256'), 'hex');
+  v_kbin := hmac(convert_to(v_date, 'UTF8'),        convert_to('AWS4' || p_secret, 'UTF8'), 'sha256');
+  v_kbin := hmac(convert_to(p_region, 'UTF8'),      v_kbin, 'sha256');
+  v_kbin := hmac(convert_to('s3', 'UTF8'),          v_kbin, 'sha256');
+  v_kbin := hmac(convert_to('aws4_request', 'UTF8'), v_kbin, 'sha256');
+  v_sig  := encode(hmac(convert_to(v_sts, 'UTF8'), v_kbin, 'sha256'), 'hex');
+  v_auth := 'AWS4-HMAC-SHA256 Credential=' || p_key_id || '/' || v_scope
+         || ', SignedHeaders=' || v_signed_headers || ', Signature=' || v_sig;
+
+  perform http_set_curlopt('CURLOPT_TIMEOUT_MS', '300000');
+
+  select * into v_resp from http((
+    p_method::http_method, v_url,
+    array[ http_header('x-amz-date', v_amz_date),
+           http_header('x-amz-content-sha256', v_payload_hash),
+           http_header('authorization', v_auth) ],
+    p_ctype, bytea_to_text(p_payload))::http_request);   -- the one crossing to text, at the wire
+  return v_resp;
+end;
+$$;
+
+-- The hook: single PUT, same shape and ceiling as archive.to_s3's basic (non-multipart)
+-- variant -- one in-memory value, one call sends it. That is a deliberate, honest match, not
+-- a shortcut: archive._pq_to_parquet reads every column via array_agg() with no COMMIT in
+-- between (each column's array must come from the same snapshot as every other column's, or
+-- concurrent writes between column reads could misalign rows across columns), so this holds
+-- the vacuum horizon for the whole read+upload -- like the synchronous hook, not like the
+-- per-part-committing archive assistant (archive-assistant.md). A streaming, row-group-per-slice
+-- writer that preserves the assistant's bounded-horizon commit pattern is a bigger rewrite
+-- (Parquet's footer needs every row group's byte offsets, known only once its data is built)
+-- and is not attempted here; see the honest-limits note below.
+create or replace function archive.to_s3_parquet(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns void language plpgsql as $$
+declare
+  -- deployment constants: edit these four
+  c_bucket   text := 'my-archive-bucket';
+  c_region   text := 'us-east-1';
+  c_prefix   text := 'events/';
+  c_endpoint text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
+                                  -- (e.g. 'https://<ref>.storage.supabase.co/storage/v1/s3')
+
+  v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
+begin
+  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
+  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
+  if v_key_id is null or v_secret is null then
+    raise exception 'archive.to_s3_parquet: credentials missing from vault';
+  end if;
+
+  v_payload := archive._pq_to_parquet(p_child::regclass);
+  v_key := c_prefix || p_child || '.parquet';
+
+  v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                            'application/vnd.apache.parquet', v_payload, v_key_id, v_secret);
+  if v_resp.status not between 200 and 299 then
+    raise exception 'archive.to_s3_parquet: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+  end if;
+end;
+$$;
+```
+
+## Register the Parquet hook
+
+Same shape as the hooks above; only the function name changes:
+
+```sql
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3_parquet(regclass,name,text,text)');
+update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
+```
+
+## Verified end-to-end, through the real `retire()` path
+
+Driven against a live `http`-extension Postgres instance and MinIO, through `pgpm.retire()` (the
+same sanctioned drop path `retain()` uses), not a standalone call to the encoder:
+
+- **Happy path**: a real partition (`transmute`d, `obtain`ed, 50 real rows) archived and dropped in
+  one `retire()` call. The object fetched back from MinIO and read by both pyarrow and DuckDB
+  (two independent Parquet implementations, agreeing) matched the source rows exactly -- same ids,
+  same payloads, same order.
+- **Backstop veto**: pointing the hook at a broken endpoint made `retire()` return `false` and
+  leave the partition and its row in place, with `retain_hook_fail` logging the real S3 error
+  verbatim (`HTTP 404`, `NoSuchBucket`) -- the same failure contract as `archive.to_s3` above.
+- **Self-repair**: restoring the working endpoint and calling `retire()` again on the same
+  partition archived and dropped it cleanly, no intervention beyond fixing the endpoint.
+
+## Honest limits, for the Parquet variant
+
+- **Same ceiling as the single-PUT hook, not the multipart one.** The payload is one in-memory
+  `bytea` (Postgres's ~1GB cap, same practical ceiling as the `text` variant above); nothing here
+  streams. Chunking the *already-built* Parquet `bytea` into fixed-size byte ranges for a
+  multipart upload is mechanically straightforward (S3 multipart just concatenates bytes; it does
+  not care that a byte-range boundary falls in the middle of a row group), but it was not built in
+  this pass -- said plainly rather than implied.
+- **`NOT NULL` columns only.** A nullable column makes `archive._pq_to_parquet` raise before
+  touching S3, not emit a file with wrong data. Supporting nulls means implementing Parquet's
+  definition-level RLE encoding, a second small binary sub-format nested inside each page; not
+  attempted here.
+- **Six types.** `int4`, `int8`, `float8`, `boolean`, `text`, `timestamp`/`timestamptz`. Anything
+  else (arrays, JSON/JSONB, `numeric`, composite types, `uuid`) is refused loudly by
+  `archive._pq_to_parquet` rather than silently coerced; cast to a supported type in a view over
+  the child, or extend the encoder, if you need one of these archived this way.
+- **One row group, no dictionary encoding, no compression, no statistics.** All legal Parquet, all
+  readable by every reader tested, none of it as compact as a tuned writer would produce. This is
+  the minimal-viable rung, not the ambitious one; see #199 for pg_parquet/Iceberg as the extension-
+  dependent alternative if that tradeoff matters more than the zero-dependency property does.
