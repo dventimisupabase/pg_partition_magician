@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Docs: unify `archive.gate` and `archive.file_gate` into one gate (#218).** `archive.file_gate`
+  (`docs/archive-chunked-parquet.md`'s fast-path-watermark-plus-decrement veto) replaces the
+  retired `archive.gate` (`docs/archive-assistant.md`'s simpler per-child recount) everywhere; both
+  pages now register the identical function, defined once alongside the ledger in
+  `docs/archive-assistant.md`'s "The ledger and the gate". Live verification against a Postgres 17,
+  `pgsql-http`, and MinIO harness caught a real gap before it shipped: `archive.gate` looked up one
+  partition by `child_name`, independent of anything else, so nothing could fool it; swapping in
+  `archive.file_gate` unmodified let a later partition archived out of order (bypassing
+  `archive.scan`'s own in-order sweep) push the shared watermark past an earlier, still-unarchived
+  partition, and `pgpm.retire()` dropped that earlier partition **with no error and no log entry**.
+  Fixed with a forward-only guard in `archive.partition`: it now refuses to write a ledger row out
+  of order (exempting a legitimate re-archive of an already-ledgered, stale partition), the same
+  discipline `archive._chunk_one` already keeps by construction. Re-verified end-to-end: happy path
+  and both vetoes with `archive.file_gate` registered on the assistant's own tables, the
+  out-of-order sequence now failing fast instead of silently dropping unarchived data, and a second
+  table run through the chunker concurrently with no cross-talk in the shared ledger.
+
 - **Docs: unify `archive.ledger` and `archive.file_ledger` (#217).** The archive assistant
   (`docs/archive-assistant.md`) and the chunked Parquet archiver (`docs/archive-chunked-parquet.md`)
   each recorded the same underlying fact -- a `[lo, hi)` range of the control column durably

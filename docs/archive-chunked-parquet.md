@@ -7,10 +7,11 @@ therefore its vacuum-horizon hold) is a deliberate, bounded choice, never an eme
 consequence of how big a partition happened to grow. It reuses the [Parquet
 encoder](archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson) and the bytea-native
 SigV4 signer from that page rather than duplicating them, and it reuses [the archive
-assistant](archive-assistant.md#the-ledger-and-the-gate)'s `archive.ledger` table rather than
-declaring a second, near-identical one -- deploy that page's schema section first. `archive.gate`
-/ `archive.partition` from the archive assistant are untouched and stay exactly as they are for
-anyone who does not need this; only the ledger table itself is shared. Everything here is
+assistant](archive-assistant.md#the-ledger-and-the-gate)'s `archive.ledger` table, derived
+watermark, and gate (`archive.file_gate`, the one gate both pages now register) rather than
+declaring second, near-identical copies -- deploy that page's schema section first.
+`archive.partition` from the archive assistant is untouched and stays exactly as it is for anyone
+who does not need this; only the shared ledger/watermark/gate move with it. Everything here is
 user-land, like every hook and archival example in this project: pgpm ships none of it.
 
 ## Why partition size is the wrong unit to bound
@@ -35,34 +36,23 @@ external worker.
 ## The one invariant
 
 For a managed parent table `P`, the set of rows covered by `archive.ledger` is always a
-contiguous, non-overlapping, gap-free run of `[lo, hi)` ranges starting from `P`'s grid anchor.
-The **watermark** for `P` is `max(hi)` over that run, and everything below it is guaranteed
-durably archived (uploaded, confirmed, ledgered). Nothing here stores a separate cursor: the
-watermark is *derived* from the ledger on every read, so there is no second piece of state that
-could drift out of sync with what was actually archived.
+contiguous, non-overlapping, gap-free run of `[lo, hi)` ranges starting from wherever the ledger
+starts. The **watermark** for `P` is `max(hi)` over that run, and everything below it is
+guaranteed durably archived (uploaded, confirmed, ledgered). Nothing here stores a separate
+cursor: the watermark is *derived* from the ledger on every read, so there is no second piece of
+state that could drift out of sync with what was actually archived.
 
 This page writes into the same `archive.ledger` table [the archive
 assistant](archive-assistant.md#the-ledger-and-the-gate) does -- `lo` is the primary key, and a
 file's row leaves `child_name` `null` (a chunked file's range need not equal any one partition's
-bounds). Deploy that page's schema section first; nothing here redeclares the table, so there is
-only one definition to keep correct.
-
-```sql
--- the derived watermark: kind-aware (numeric for id, timestamptz otherwise, matching
--- pgpm.config.control_kind), so a plain lexicographic max on the stored text never runs.
-create or replace function archive._file_watermark(p_parent regclass) returns text
-language plpgsql as $$
-declare cfg pgpm.config; v_ncast text; v_wm text;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._file_watermark: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  execute format('select max(hi::%s)::text from archive.ledger where parent_table = %L::regclass',
-                 v_ncast, p_parent::text) into v_wm;
-  return v_wm;
-end;
-$$;
-```
+bounds). `archive._file_watermark` (the derived-watermark helper) and `archive.file_gate` (the
+gate itself, see below) are also defined once, on that page -- deploy its schema section first;
+nothing here redeclares them, so there is only one definition of each to keep correct.
+`archive._chunk_one` (below) only ever extends the watermark forward by construction, which is
+what makes the fast path's plain `max(hi)` trustworthy for this page's own writes; [the archive
+assistant](archive-assistant.md#the-archiver) enforces that same forward-only discipline
+explicitly for its own archiver, since that one takes an arbitrary partition name rather than
+always extending from the current watermark itself.
 
 ## The encoder: reading a range instead of a relation
 
@@ -226,99 +216,28 @@ verifying it independently, lives in
 [`prototypes/parquet-writer/`](../prototypes/parquet-writer/README.md#the-cross-partition-range-variant)
 -- the standalone spike this section grew from, same as the whole-relation encoder before it.
 
-## The two-part gate
+## The gate
 
-`archive.gate` (the archive assistant's veto) compares one child's live row count against one
-recorded number. That does not carry over cleanly here, because one *file* can cover parts of
-several partitions, and the ledger records one count per *file*, not a per-partition breakdown.
-The gate below replaces `archive.gate` for anything using this chunker (the original stays
-exactly as it is for the per-partition model):
+The archive assistant's original veto, `archive.gate` (retired in favor of this one -- see [the
+archive assistant](archive-assistant.md#the-ledger-and-the-gate)), compared one child's live row
+count against one recorded number. That never carried over cleanly to this page,
+because one *file* can cover parts of several partitions, and the ledger records one count per
+*file*, not a per-partition breakdown -- so `archive.file_gate` (defined once, on the assistant's
+page, alongside the ledger and the watermark this page shares with it) replaces it everywhere,
+partition-aligned or not:
 
 1. **Fast path**: `p_hi <= watermark(p_parent)`, derived, no scan. False means the partition
    being considered is not fully archived yet -- defer.
 2. **Defense in depth**: for every ledger row overlapping `[p_lo, p_hi)`, recount that
-   file's *entire* range live and compare to its recorded `rows_archived`. A mismatch anywhere
-   in that file's range defers the drop, even if the actual stray landed in a sibling partition
-   sharing the same file -- intentionally conservative (a shared-file-boundary stray transiently
-   blocks an unrelated partition's drop until the next chunker pass re-archives it clean), and it
-   fails safe rather than silently dropping something that changed.
+   file's *entire* range live and compare to its recorded `rows_archived`, decrementing it by the
+   dropped partition's own overlap once the drop proceeds -- so a later sibling's recount compares
+   against what's actually still expected to be live, not a number frozen at archive time. (This
+   fixes a real misfire: dropping two partitions covered by the same file in separate `retire()`
+   calls, the normal case since `retain_batch` paces drops one at a time. See the archive
+   assistant's page for the full sequential-sibling-drop story and the code itself.)
 
-That description is not quite the whole story, and the gap matters: a naive implementation that
-just compares the live recount against the ledger's original `rows_archived` **every time**
-breaks the moment two partitions covered by the same file are dropped in separate `retire()`
-calls, which is the normal case (`retain_batch` paces drops one at a time; two siblings sharing
-a file are rarely eligible in the same call). Drop partition A first, and partition B's *later*
-check would recount the file's live range and find fewer rows than the original
-`rows_archived` -- A's rows are legitimately gone now -- which is indistinguishable from a real
-stray under a static comparison, and would wedge B's drop forever. Verified by constructing
-exactly that sequence (two partitions in one file, dropped one call at a time): a static
-recount does misfire.
-
-The fix is to keep `rows_archived` in lockstep with reality: once a file's recount passes and a
-partition's drop is about to proceed, decrement that file's `rows_archived` by exactly the
-overlap between the partition being dropped and the file's range (never more, for a partition
-spanning more than one file). The next check's recount then compares against what is *actually
-still expected to be live*, not a number frozen at archive time. This is safe as a `pre_drop`
-hook side effect: `pgpm.retire()` runs its hooks and the `DROP` inside one subtransaction (the
-`EXCEPTION` block is an implicit savepoint), so if the drop fails after the gate passes, the
-decrement rolls back with everything else; if it succeeds, the decrement is durable and correct.
-The `for update` on the ledger rows also serializes two concurrent `retire()` calls racing on
-partitions that share a file, so the decrement is never lost to a concurrent update.
-
-```sql
-create or replace function archive.file_gate(p_parent regclass, p_child name, p_lo text, p_hi text)
-returns void language plpgsql as $$
-declare
-  cfg pgpm.config; v_ncast text; v_wm text; v_nsp name; v_rel name;
-  r record; v_overlap_live bigint; v_ov_lo text; v_ov_hi text; v_child_overlap bigint;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive.file_gate: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-
-  -- fast path: derived, no scan
-  v_wm := archive._file_watermark(p_parent);
-  if v_wm is null or pgpm._native_gt(cfg.control_kind, p_hi, v_wm) then
-    raise exception 'archive.file_gate: % (hi %) is not yet fully covered by the ledger watermark (%); deferring the drop',
-      p_child, p_hi, coalesce(v_wm, '<none>');
-  end if;
-
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
-  -- defense in depth: every ledger row overlapping [p_lo, p_hi), whole-range recounted
-  for r in
-    execute format(
-      'select lo, hi, rows_archived from archive.ledger
-        where parent_table = %L::regclass and hi::%s > %L::%s and lo::%s < %L::%s
-        for update',
-      p_parent::text, v_ncast, p_lo, v_ncast, v_ncast, p_hi, v_ncast)
-  loop
-    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, r.lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, r.hi))
-      into v_overlap_live;
-    if v_overlap_live is distinct from r.rows_archived then
-      raise exception 'archive.file_gate: file % [%, %) changed since it was archived (% rows live, % archived); deferring for re-archive',
-        (select s3_key from archive.ledger where parent_table = p_parent and lo = r.lo),
-        r.lo, r.hi, v_overlap_live, r.rows_archived;
-    end if;
-
-    -- keep rows_archived in lockstep: subtract exactly the overlap between the partition about
-    -- to be dropped and this file's range (a partition can span more than one file; each gets
-    -- only its own slice subtracted).
-    v_ov_lo := case when pgpm._native_gt(cfg.control_kind, p_lo, r.lo) then p_lo else r.lo end;
-    v_ov_hi := case when pgpm._native_gt(cfg.control_kind, r.hi, p_hi) then p_hi else r.hi end;
-    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_hi))
-      into v_child_overlap;
-    update archive.ledger set rows_archived = rows_archived - v_child_overlap
-      where parent_table = p_parent and lo = r.lo;
-  end loop;
-end;
-$$;
-```
+The `Install` section below registers `archive.file_gate` on any table using this chunker; the
+assistant's own install instructions register the identical function.
 
 ## The chunker
 
@@ -558,13 +477,14 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   112, read independently by pyarrow and DuckDB, matched the source rows exactly. `retain()`
   through the real `archive.file_gate` hook dropped the fully-covered partition cleanly and
   correctly deferred the partition its data hadn't reached the ledger watermark for yet.
-- **Shared-table re-verification (#217)**: `archive.chunk_all` writes its range rows into the same
-  `archive.ledger` table [the archive assistant](archive-assistant.md#the-ledger-and-the-gate)
-  uses, leaving `child_name` `null`. Confirmed against a second managed table archived concurrently
-  through the assistant (`child_name` populated there): both tables' rows coexisted in the one
-  table with no key collision, `archive._file_watermark` and `archive.file_gate` both read the
-  chunker's rows correctly, and `archive.gate`'s `child_name` lookup was unaffected by the
-  assistant's own rows sitting in the same table.
+- **Shared-table and shared-gate re-verification (#217, #218)**: `archive.chunk_all` writes its
+  range rows into the same `archive.ledger` table [the archive
+  assistant](archive-assistant.md#the-ledger-and-the-gate) uses, leaving `child_name` `null`.
+  Confirmed against a second managed table archived concurrently through the assistant
+  (`child_name` populated there, `archive.file_gate` registered on both): both tables' rows
+  coexisted in the one table with no key collision, and `archive._file_watermark`/
+  `archive.file_gate` correctly read and gated each table using only its own `[lo, hi)` ranges,
+  with no cross-talk from the other table's rows sitting in the same ledger.
 
 ## Honest limits
 
@@ -605,13 +525,15 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
 ## Positioning
 
 This is a parallel strategy, not a replacement for anything else on this project's archival
-pages. `archive.gate` / `archive.partition` (the per-partition, per-part-committing archive
-assistant) and the single-PUT `archive.to_s3_parquet` hook stay exactly as they are for anyone who
-does not need cross-partition chunking -- most workloads with reasonably bounded partition sizes
-have no reason to reach for this. `archive.file_gate` / `archive.chunk_step` / `archive.chunk_all`
-are additive on top of the shared `archive.ledger` table: none of the existing functions or hooks
-are touched, and everything here can coexist in the same database (registering `archive.file_gate`
-only on the parents that use this chunker). Do not register both `archive.gate` and
-`archive.file_gate` on the same parent: each assumes it owns that parent's ledger rows outright,
-and a partition boundary that happened to coincide with a chunked file's own `lo` would collide on
-`archive.ledger`'s primary key. Pick one strategy per managed table.
+pages. `archive.partition` (the per-partition, per-part-committing archive assistant) and the
+single-PUT `archive.to_s3_parquet` hook stay exactly as they are for anyone who does not need
+cross-partition chunking -- most workloads with reasonably bounded partition sizes have no reason
+to reach for this. `archive.chunk_step` / `archive.chunk_all` are additive on top of the shared
+`archive.ledger` table and gate (`archive.file_gate`, registered by both pages' install
+instructions): none of the existing functions or hooks are touched, and everything here can
+coexist in the same database. Mixing the two *archivers* on one managed table -- calling both
+`archive.partition` and `archive._chunk_one` against the same parent -- is not something this page
+tests or recommends, even though the shared watermark and `archive.partition`'s forward-only guard
+(see [the archive assistant](archive-assistant.md#the-archiver)) would keep either one from
+silently corrupting the other's coverage: pick one strategy per managed table for a simpler
+operational story, one archiver and one schedule per table.

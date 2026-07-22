@@ -57,14 +57,14 @@ These two knobs are independent, so there are four possible configurations. Two 
 The two built cells sit on the diagonal: they differ on both knobs simultaneously, which is
 exactly why "the assistant" and "the chunker" read as two separate architectures rather than two
 settings of the same two switches. Filling in either empty cell would make that visible -- at
-that point the shared gate/paced-worker machinery each page hand-builds separately (`archive.gate`
-vs. `archive.file_gate`) would be duplicated code around the same two knobs, not genuinely
-different designs. (The ledger table itself is no longer duplicated: both pages now write into one
-shared `archive.ledger`, keyed by `[lo, hi)` range rather than by knob -- see [the archive
-assistant](archive-assistant.md#the-ledger-and-the-gate).) Which direction the remaining
-unification would run -- the chunker growing a self-driving mode and becoming the general case, or
-the assistant growing byte-budget boundaries and becoming the general case -- is an open question
-this page doesn't answer; either framing arrives at the same merged shape.
+that point the boundary-rule/drop-trigger-rule dispatch logic each page hand-builds separately
+would be duplicated code around the same two knobs, not genuinely different designs. (The ledger
+table and the gate are no longer duplicated: both pages now write into one shared `archive.ledger`,
+keyed by `[lo, hi)` range rather than by knob, and both register the same `archive.file_gate` --
+see [the archive assistant](archive-assistant.md#the-ledger-and-the-gate).) Which direction the
+remaining unification would run -- the chunker growing a self-driving mode and becoming the general
+case, or the assistant growing byte-budget boundaries and becoming the general case -- is an open
+question this page doesn't answer; either framing arrives at the same merged shape.
 
 ## Two knobs that apply on top of either architecture
 
@@ -129,7 +129,8 @@ to exist exactly as their own pages describe; nothing here changes their behavio
 their own "Honest limits" sections. The reframing above (one fixed architecture, one
 two-knobbed architecture with two built and two open configurations) is a way of reading what's
 already there, not a proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s
-actual code. The ledger schema is already shared (the two pages' `archive.ledger` tables were
-unified into one); a real, separate undertaking remains for the rest -- shared gate logic, one
-worker parameterized by both knobs instead of two hand-built ones -- tracked by whichever of the
-two empty cells above ends up worth building first.
+actual code. The ledger schema and the gate are already shared (the two pages' `archive.ledger`
+tables were unified into one, and `archive.file_gate` replaced both pages' original, separate
+veto functions); a real, separate undertaking remains for the rest -- one worker parameterized by
+both knobs instead of two hand-built ones -- tracked by whichever of the two empty cells above
+ends up worth building first.
