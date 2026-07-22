@@ -6,10 +6,12 @@ file, this decouples Parquet files from partition boundaries entirely, so a file
 therefore its vacuum-horizon hold) is a deliberate, bounded choice, never an emergent
 consequence of how big a partition happened to grow. It reuses the [Parquet
 encoder](archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson) and the bytea-native
-SigV4 signer from that page rather than duplicating them; the per-partition `archive.ledger` /
-`archive.gate` / `archive.partition` from the archive assistant are untouched and stay exactly
-as they are for anyone who does not need this. Everything here is user-land, like every hook
-and archival example in this project: pgpm ships none of it.
+SigV4 signer from that page rather than duplicating them, and it reuses [the archive
+assistant](archive-assistant.md#the-ledger-and-the-gate)'s `archive.ledger` table rather than
+declaring a second, near-identical one -- deploy that page's schema section first. `archive.gate`
+/ `archive.partition` from the archive assistant are untouched and stay exactly as they are for
+anyone who does not need this; only the ledger table itself is shared. Everything here is
+user-land, like every hook and archival example in this project: pgpm ships none of it.
 
 ## Why partition size is the wrong unit to bound
 
@@ -32,28 +34,20 @@ external worker.
 
 ## The one invariant
 
-For a managed parent table `P`, the set of rows covered by `archive.file_ledger` is always a
+For a managed parent table `P`, the set of rows covered by `archive.ledger` is always a
 contiguous, non-overlapping, gap-free run of `[lo, hi)` ranges starting from `P`'s grid anchor.
 The **watermark** for `P` is `max(hi)` over that run, and everything below it is guaranteed
 durably archived (uploaded, confirmed, ledgered). Nothing here stores a separate cursor: the
 watermark is *derived* from the ledger on every read, so there is no second piece of state that
 could drift out of sync with what was actually archived.
 
+This page writes into the same `archive.ledger` table [the archive
+assistant](archive-assistant.md#the-ledger-and-the-gate) does -- `lo` is the primary key, and a
+file's row leaves `child_name` `null` (a chunked file's range need not equal any one partition's
+bounds). Deploy that page's schema section first; nothing here redeclares the table, so there is
+only one definition to keep correct.
+
 ```sql
-create schema if not exists archive;   -- if not already created for the other archival pages
-
-create table if not exists archive.file_ledger (
-  parent_table  regclass    not null,
-  lo            text        not null,   -- native-grid text, same convention as pgpm.config lo/hi
-  hi            text        not null,
-  s3_key        text        not null,
-  etag          text,
-  rows_archived bigint      not null,
-  archived_at   timestamptz not null default now(),
-  primary key (parent_table, lo)        -- lo uniquely identifies a file: ranges never overlap
-);
-create index on archive.file_ledger (parent_table, hi desc);   -- makes max(hi) cheap
-
 -- the derived watermark: kind-aware (numeric for id, timestamptz otherwise, matching
 -- pgpm.config.control_kind), so a plain lexicographic max on the stored text never runs.
 create or replace function archive._file_watermark(p_parent regclass) returns text
@@ -63,7 +57,7 @@ begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'archive._file_watermark: % is not managed', p_parent; end if;
   v_ncast := pgpm._native_type(cfg.control_kind);
-  execute format('select max(hi::%s)::text from archive.file_ledger where parent_table = %L::regclass',
+  execute format('select max(hi::%s)::text from archive.ledger where parent_table = %L::regclass',
                  v_ncast, p_parent::text) into v_wm;
   return v_wm;
 end;
@@ -242,7 +236,7 @@ exactly as it is for the per-partition model):
 
 1. **Fast path**: `p_hi <= watermark(p_parent)`, derived, no scan. False means the partition
    being considered is not fully archived yet -- defer.
-2. **Defense in depth**: for every `file_ledger` row overlapping `[p_lo, p_hi)`, recount that
+2. **Defense in depth**: for every ledger row overlapping `[p_lo, p_hi)`, recount that
    file's *entire* range live and compare to its recorded `rows_archived`. A mismatch anywhere
    in that file's range defers the drop, even if the actual stray landed in a sibling partition
    sharing the same file -- intentionally conservative (a shared-file-boundary stray transiently
@@ -285,17 +279,17 @@ begin
   -- fast path: derived, no scan
   v_wm := archive._file_watermark(p_parent);
   if v_wm is null or pgpm._native_gt(cfg.control_kind, p_hi, v_wm) then
-    raise exception 'archive.file_gate: % (hi %) is not yet fully covered by the file-ledger watermark (%); deferring the drop',
+    raise exception 'archive.file_gate: % (hi %) is not yet fully covered by the ledger watermark (%); deferring the drop',
       p_child, p_hi, coalesce(v_wm, '<none>');
   end if;
 
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  -- defense in depth: every file_ledger row overlapping [p_lo, p_hi), whole-range recounted
+  -- defense in depth: every ledger row overlapping [p_lo, p_hi), whole-range recounted
   for r in
     execute format(
-      'select lo, hi, rows_archived from archive.file_ledger
+      'select lo, hi, rows_archived from archive.ledger
         where parent_table = %L::regclass and hi::%s > %L::%s and lo::%s < %L::%s
         for update',
       p_parent::text, v_ncast, p_lo, v_ncast, v_ncast, p_hi, v_ncast)
@@ -306,7 +300,7 @@ begin
       into v_overlap_live;
     if v_overlap_live is distinct from r.rows_archived then
       raise exception 'archive.file_gate: file % [%, %) changed since it was archived (% rows live, % archived); deferring for re-archive',
-        (select s3_key from archive.file_ledger where parent_table = p_parent and lo = r.lo),
+        (select s3_key from archive.ledger where parent_table = p_parent and lo = r.lo),
         r.lo, r.hi, v_overlap_live, r.rows_archived;
     end if;
 
@@ -319,7 +313,7 @@ begin
                    v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_lo),
                    cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_hi))
       into v_child_overlap;
-    update archive.file_ledger set rows_archived = rows_archived - v_child_overlap
+    update archive.ledger set rows_archived = rows_archived - v_child_overlap
       where parent_table = p_parent and lo = r.lo;
   end loop;
 end;
@@ -466,7 +460,7 @@ begin
     if lower(h.field) = 'etag' then v_etag := h.value; end if;
   end loop;
 
-  insert into archive.file_ledger (parent_table, lo, hi, s3_key, etag, rows_archived)
+  insert into archive.ledger (parent_table, lo, hi, s3_key, etag, rows_archived)
   values (p_parent, v_lo, v_hi, v_key, v_etag, v_rows);
   commit;   -- the horizon-hold window ends here
 end;
@@ -563,7 +557,14 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   page in every one of the 112 fetched objects carried Thrift `codec = GZIP`; the union of all
   112, read independently by pyarrow and DuckDB, matched the source rows exactly. `retain()`
   through the real `archive.file_gate` hook dropped the fully-covered partition cleanly and
-  correctly deferred the partition its data hadn't reached the file-ledger watermark for yet.
+  correctly deferred the partition its data hadn't reached the ledger watermark for yet.
+- **Shared-table re-verification (#217)**: `archive.chunk_all` writes its range rows into the same
+  `archive.ledger` table [the archive assistant](archive-assistant.md#the-ledger-and-the-gate)
+  uses, leaving `child_name` `null`. Confirmed against a second managed table archived concurrently
+  through the assistant (`child_name` populated there): both tables' rows coexisted in the one
+  table with no key collision, `archive._file_watermark` and `archive.file_gate` both read the
+  chunker's rows correctly, and `archive.gate`'s `child_name` lookup was unaffected by the
+  assistant's own rows sitting in the same table.
 
 ## Honest limits
 
@@ -604,10 +605,13 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
 ## Positioning
 
 This is a parallel strategy, not a replacement for anything else on this project's archival
-pages. `archive.ledger` / `archive.gate` / `archive.partition` (the per-partition,
-per-part-committing archive assistant) and the single-PUT `archive.to_s3_parquet` hook stay
-exactly as they are for anyone who does not need cross-partition chunking -- most workloads with
-reasonably bounded partition sizes have no reason to reach for this. `archive.file_ledger` /
-`archive.file_gate` / `archive.chunk_step` / `archive.chunk_all` are additive: none of the
-existing tables, functions, or hooks are touched, and all of them can coexist in the same
-database (registering `archive.file_gate` only on the parents that use this chunker).
+pages. `archive.gate` / `archive.partition` (the per-partition, per-part-committing archive
+assistant) and the single-PUT `archive.to_s3_parquet` hook stay exactly as they are for anyone who
+does not need cross-partition chunking -- most workloads with reasonably bounded partition sizes
+have no reason to reach for this. `archive.file_gate` / `archive.chunk_step` / `archive.chunk_all`
+are additive on top of the shared `archive.ledger` table: none of the existing functions or hooks
+are touched, and everything here can coexist in the same database (registering `archive.file_gate`
+only on the parents that use this chunker). Do not register both `archive.gate` and
+`archive.file_gate` on the same parent: each assumes it owns that parent's ledger rows outright,
+and a partition boundary that happened to coincide with a chunked file's own `lo` would collide on
+`archive.ledger`'s primary key. Pick one strategy per managed table.

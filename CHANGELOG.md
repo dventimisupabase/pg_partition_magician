@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Docs: unify `archive.ledger` and `archive.file_ledger` (#217).** The archive assistant
+  (`docs/archive-assistant.md`) and the chunked Parquet archiver (`docs/archive-chunked-parquet.md`)
+  each recorded the same underlying fact -- a `[lo, hi)` range of the control column durably
+  archived to an S3 key -- in two different table shapes, one keyed by `child_name` and one by
+  `lo`. A partition's own bounds are already a native-grid `[lo, hi)` range, so `archive.ledger`
+  now adopts `archive.file_ledger`'s shape (`lo` as the primary key) with `child_name` kept as an
+  optional, nullable convenience column populated only when a range happens to equal exactly one
+  partition's bounds; `archive.file_ledger` is gone (nothing was deployed against either shape
+  yet, so there was no migration to preserve). `archive.partition` now looks up its partition's
+  `lo`/`hi` from `pgpm.part` before writing the ledger row.
+  `archive.gate`, `archive.scan`, `archive._file_watermark`, `archive.file_gate`, and
+  `archive._chunk_one` needed no behavior change -- only the table each already pointed at. First
+  rung of a six-issue stack (#217-#222) toward one paced-worker mechanism parameterized by the two
+  knobs `docs/archive-strategies-overview.md` names (boundary rule, drop-trigger rule).
+
 - **Docs: chunked, cross-partition Parquet archival (`docs/archive-chunked-parquet.md`).** A third
   archival strategy alongside `archive-to-s3.md` and `archive-assistant.md`: decouples Parquet file
   boundaries from partition boundaries entirely, so the vacuum-horizon hold is bounded by a chosen
