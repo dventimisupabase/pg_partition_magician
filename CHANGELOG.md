@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+- **New `pgpm_archive/install.sql`: the archival harmonization stack (#217-#221), packaged as a
+  real, installable, optional add-on (#222, 1 of a planned 2-3 PR sequence).** Mirrors
+  `pgpm_hypertable/`/`pgpm_observe/`'s existing shape (one `install.sql`, no config table of its
+  own to copy from -- both siblings take parameters directly or read an external catalog, so the
+  config table here is a genuine new design, not a port). Ports every `archive.*` object out of
+  `docs/archive-to-s3.md`/`archive-assistant.md`/`archive-chunked-parquet.md`'s embedded SQL
+  (58 functions/procedures, verbatim where unchanged) into one file, replacing every
+  "deployment constants: edit these N" block with one real table, `archive.config`: one row per
+  managed table, carrying connection settings (bucket/region/endpoint/prefix/vault secret names)
+  and the three knobs the harmonization stack built (`boundary_rule`, `drop_trigger`, `format` +
+  `compress`).
+
+  This is also where the stack's own remaining gap finally closes: `archive.partition` and
+  `archive._chunk_one` -- kept as two separate, hand-built entry points through #217-#221
+  specifically to avoid packaging today's two-implementation shape twice -- are now one truly
+  unified worker. `archive.archive_range`/`archive.archive_partition` do the actual archiving
+  (dispatching to whichever encode/upload step `archive.config.format` names); `archive._tick_one`
+  picks the next range per `archive.config.boundary_rule`; `archive.tick()` (the standing pg_cron
+  entry point) and `archive.run_all(parent)` (the operator's "do it now") both work for every
+  table regardless of which knobs it's configured with.
+
+  Building the true unified worker surfaced one more real gap, caught live before shipping:
+  #220's self-driving retire only ever ran right after a fresh chunk was archived, so a
+  byte-budget-aligned table that quiesced (no new data, so no new chunks, ever) could never retry
+  a partition whose `retire()` failed once for a reason unrelated to archiving -- the same
+  category of gap #219 already fixed for the partition-aligned rule specifically, just not
+  generalized to the other one. Fixed by running the retire sweep unconditionally, every tick, for
+  every self-driving table, regardless of whether that table archived anything new this cycle.
+  Reproduced live: registered a second `pre_drop` hook that fails one specific partition's drop
+  (simulating an unrelated external failure), confirmed it stayed stuck through one `tick()` call
+  that successfully archived and retired everything else, removed the failing hook, and confirmed
+  a *second* `tick()` call -- with nothing new to archive, watermark unchanged -- still retried and
+  correctly dropped the previously-stuck partition.
+
+  Live-verified end-to-end against the same Postgres 17 + `pgsql-http` + MinIO harness used for
+  #217-#221: all four boundary-rule x drop-trigger-rule combinations plus both new format
+  cross-combinations, driven entirely through `archive.config` rows; the tie-break fix and the
+  forward-only guard, unaffected by the config-driven rewiring; and the synchronous hooks
+  (`archive.to_s3`/`archive.to_s3_parquet`) reading their connection settings from
+  `archive.config` too, for one consistent configuration story across every archival strategy in
+  the module. `install.sql` applies cleanly from empty and re-applies idempotently.
+
+  Next in this sequence: permanent CI infrastructure (a MinIO service, a `pgsql-http`-enabled test
+  image, a `./test.sh archive` track, `tests/archive/`'s pgTAP suite) to replace the ad hoc harness
+  this PR (and #217-#221) verified against by hand; then the existing `docs/archive-*.md` pages
+  updated to point at this module as the installable source of truth, keeping their narrative,
+  honest-limits, and live-verification write-ups.
+
 - **Docs: pluggable encode/upload step for the paced worker -- format x compression x commit
   strategy (#221, closes #213, #214).** The last hardwired piece after #217-#220: *how* a range
   becomes bytes and lands in S3. Adds three shared, matching-shaped steps -- `(p_parent, p_lo,
