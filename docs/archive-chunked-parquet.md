@@ -16,6 +16,14 @@ the assistant's NDJSON encode/upload steps -- see [the archive
 assistant](archive-assistant.md#the-archiver) for what moved where. Everything here is user-land,
 like every hook and archival example in this project: pgpm ships none of it.
 
+> **As of #222, this mechanism also ships as an installable module**: `pgpm_archive/install.sql`,
+> configured per table via `archive.config` (`boundary_rule := 'byte_budget'`) instead of
+> hand-editing the `c_`-prefixed constants below. This page's SQL, its names (`archive._chunk_one`,
+> `archive.chunk_step`/`chunk_all`, `c_self_driving`, `c_format`, ...), and everything it verified
+> are all unchanged and kept below as the design rationale; see [Choosing an archival strategy's
+> name mapping](archive-strategies-overview.md#installing-the-module) for how each maps onto the
+> module, and this page's own ["Install"](#install) section for the module-based install path.
+
 ## Why partition size is the wrong unit to bound
 
 The single-PUT Parquet hook and the archive assistant both bound their vacuum-horizon hold in
@@ -439,6 +447,24 @@ see [Archive partitions to S3](archive-to-s3.md#honest-limits)); an unencoded `+
 produces a real `SignatureDoesNotMatch` against S3-compatible stores, caught by trying it.
 
 ## Install
+
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and configure this table
+via `archive.config` instead of hand-editing the constants below:
+
+```sql
+insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
+values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
+        'byte_budget', 'gate_only', 'parquet', true);
+
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
+select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one job, every configured table
+-- or, the operator's "do it now" for just this table:
+call archive.run_all('public.events'::regclass);
+```
+
+Or, build it directly from this page's SQL above (`archive._chunk_one`/`chunk_step`/`chunk_all`,
+not the module's `archive._tick_one`/`archive.tick()`/`archive.run_all` -- see the [name
+mapping](archive-strategies-overview.md#installing-the-module) if you're cross-referencing both):
 
 ```sql
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');

@@ -9,6 +9,14 @@ will not gamble with. It reuses that page's `archive.s3_url_encode` and `archive
 (deploy the multipart section's SQL first); everything here is user-land, like every hook: pgpm
 ships none of it.
 
+> **As of #222, this mechanism also ships as an installable module**: `pgpm_archive/install.sql`,
+> configured per table via `archive.config` instead of hand-editing the `c_`-prefixed constants
+> below. This page's SQL, its names (`archive.partition`, `archive.scan()`, `c_self_driving`,
+> `c_format`, ...), and everything it verified are all unchanged and kept below as the design
+> rationale; see [Choosing an archival strategy's name
+> mapping](archive-strategies-overview.md#installing-the-module) for how each maps onto the
+> module, and this page's own ["Install"](#install) section for the module-based install path.
+
 ## Why: statements hold snapshots
 
 Any code executing inside Postgres executes inside a statement, a statement holds a registered
@@ -722,6 +730,23 @@ double-*archive* (wasted work, safe: a PUT to the same key overwrites) but never
 
 ## Install
 
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and configure this table
+via `archive.config` instead of hand-editing the constants below:
+
+```sql
+insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
+values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
+        'partition_aligned', 'self_driving', 'ndjson_commits', false);
+
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
+select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one job, every configured table
+select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
+```
+
+Or, build it directly from this page's SQL above (`archive.partition`/`archive.scan()`, not the
+module's `archive.archive_partition`/`archive.tick()` -- see the [name
+mapping](archive-strategies-overview.md#installing-the-module) if you're cross-referencing both):
+
 ```sql
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
 select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.scan()');
@@ -730,16 +755,18 @@ select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
 
 Unlike the synchronous hook, this needs **no `retain_batch`**: the gate is a count lookup, so even
 an unbounded `retain()` pass over an archived backlog is quick. The knob that matters here is
-`c_part_bytes`, the horizon-hold bound -- but only for the default `c_format := 'ndjson_commits'`;
-switch to `'ndjson_single'` or `'parquet'` (see "The archiver" above) and `c_part_bytes` no longer
-applies, since neither of those can bound its hold below the whole range's read-and-upload time.
+`c_part_bytes` (`archive.config.part_bytes` on the module) -- the horizon-hold bound -- but only
+for the default `c_format := 'ndjson_commits'`; switch to `'ndjson_single'` or `'parquet'` (see
+"The archiver" above) and it no longer applies, since neither of those can bound its hold below the
+whole range's read-and-upload time.
 
-`archive.scan()`'s `c_self_driving` constant is `true` above -- the scanner retires what it
-archives, same as it always has. Set it to `false` for **gate-only** instead: the scanner becomes
-a pure archiver (it keeps the ledger ahead of `retain()`'s own schedule and no more), and
-`pgpm.schedule()` stops being a further-out backstop and becomes the *only* thing driving drops,
-with `archive.file_gate` doing all of the vetoing. Register the gate hook either way -- gate-only
-depends on it entirely; self-driving still wants it as defense in depth.
+`archive.scan()`'s `c_self_driving` constant is `true` above (`archive.config.drop_trigger :=
+'self_driving'` on the module) -- the scanner retires what it archives, same as it always has. Set
+it to `false` (`'gate_only'`) for **gate-only** instead: the scanner becomes a pure archiver (it
+keeps the ledger ahead of `retain()`'s own schedule and no more), and `pgpm.schedule()` stops being
+a further-out backstop and becomes the *only* thing driving drops, with `archive.file_gate` doing
+all of the vetoing. Register the gate hook either way -- gate-only depends on it entirely;
+self-driving still wants it as defense in depth.
 
 ## Failure semantics, verified
 
