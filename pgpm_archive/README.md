@@ -7,11 +7,8 @@ store) before `pgpm.retain()` drops them.
 
 The [root project](../README.md) manages a partition's *lifecycle* -- when it's created, when it's
 retired. What happens to a partition's data on its way out is a separate concern, and this add-on
-answers it: nothing here is required for ordinary partitioning, `pgpm_core` has zero dependency on
-this schema, and it is **not referenced from the root `README.md`** on purpose. It started as
-worked examples embedded in markdown (a `pre_drop` hook pattern, a paced worker with a ledger), and
-later graduated into this installable module; it may move to its own repo eventually. Until then it
-lives here, one directory, self-contained.
+answers it: nothing here is required for ordinary partitioning, and `pgpm_core` has zero dependency
+on this schema.
 
 ## Install
 
