@@ -71,18 +71,41 @@ which is exactly the pluggable step #221 names next.
 
 ## Two knobs that apply on top of either architecture
 
-- **Format**: NDJSON or Parquet. NDJSON is universal and human-readable, parseable by anything
-  that reads JSON lines. Parquet is columnar and directly queryable by DuckDB, Athena, Redshift
-  Spectrum, Spark, Trino, and Snowflake with no conversion step, at the cost of being a from-scratch,
-  zero-dependency writer with real limits (six types, no dictionary encoding, no statistics, one
-  row group -- see [Archive partitions to S3](archive-to-s3.md#honest-limits-for-the-parquet-variant)).
-- **Compression**: GZIP on or off. The compressor (`archive._pq_gzip_compress`) takes any `bytea`
-  and returns a valid gzip container -- it has nothing to do with Parquet specifically. It is
-  wired in (default on) everywhere Parquet is written; nowhere NDJSON is written, today (#214).
+- **Format**: NDJSON (single-shot or with internal commits) or Parquet (single-shot only -- see
+  below). NDJSON is universal and human-readable, parseable by anything that reads JSON lines, and
+  round-trips any column type. Parquet is columnar and directly queryable by DuckDB, Athena,
+  Redshift Spectrum, Spark, Trino, and Snowflake with no conversion step, at the cost of being a
+  from-scratch, zero-dependency writer with real limits (six types, no dictionary encoding, no
+  statistics, one row group -- see [Archive partitions to
+  S3](archive-to-s3.md#honest-limits-for-the-parquet-variant)).
+- **Commit strategy** (NDJSON only): single-shot (the whole range's read-and-upload happens inside
+  one transaction) or with internal commits (`archive._encode_upload_ndjson_commits` reads a page,
+  commits, `PUT`s a part, commits, repeats). Parquet cannot do internal commits at all: its footer
+  needs every row group's byte offset, known only once the whole file's bytes exist, so there is no
+  way to `COMMIT` partway through building one -- a structural fact about the format
+  ([#211](https://github.com/dventimisupabase/pg_partition_magician/issues/211)), not a missing
+  combination.
+- **Compression**: GZIP on or off, for either format now. The compressor
+  (`archive._pq_gzip_compress`) takes any `bytea` and returns a valid gzip container -- it has
+  nothing to do with Parquet specifically. Parquet defaults it on; NDJSON defaults it off (matching
+  each format's own history) -- flip either page's `c_compress` constant to change it
+  ([#221](https://github.com/dventimisupabase/pg_partition_magician/issues/221) closed #214).
+  Compressing an NDJSON-with-commits range gzips each part independently and lets S3 multipart's
+  own byte-range concatenation produce the final object -- RFC 1952 permits concatenating
+  independent gzip members, and standard decompressors read through all of them transparently.
 
-Today's format split (NDJSON for the assistant, Parquet for the chunker) is an accident of build
-order, not a structural coupling -- nothing about "partition-aligned" or "byte-budget-aligned"
-requires a particular format, and nothing about "gate-only" or "self-driving" does either.
+As of #221, the boundary rule (partition-aligned vs byte-budget-aligned), the drop-trigger rule
+(gate-only vs self-driving), the format (NDJSON vs Parquet), and the commit strategy (single-shot
+vs internal commits, NDJSON only) are all independent, pluggable choices on both
+`archive.partition` and `archive._chunk_one` -- a `c_format` constant on each dispatches to one of
+three shared `archive._encode_upload_*` steps
+([defined once](archive-assistant.md#the-archiver)). Today's original pairing (NDJSON-with-commits
+for the assistant, compressed Parquet for the chunker) remains each page's default, but is no
+longer a structural coupling -- it never really was one, just an accident of build order, and #221
+is what actually lets you pick otherwise. The byte-budget-aligned NDJSON worker
+([#213](https://github.com/dventimisupabase/pg_partition_magician/issues/213)) that was once its
+own open question is exactly `archive._chunk_one` with `c_format := 'ndjson_single'` or
+`'ndjson_commits'` -- no separate implementation needed.
 
 One more knob, but only where it can matter:
 
@@ -97,11 +120,15 @@ One more knob, but only where it can matter:
 - The synchronous hook: NDJSON built (single-PUT and multipart, no compression); Parquet built
   (single-PUT, GZIP default-on) -- multipart Parquet is an open question, not a clear gap (#211).
 - The paced worker: all four boundary-rule x drop-trigger-rule configurations are built -- see the
-  table above.
-- Compression is its own cross-cutting gap: on for both Parquet paths, off for every NDJSON path,
-  and closing that is #214.
-- A byte-budget-aligned, cross-partition NDJSON worker (independent of which drop-trigger rule it
-  uses) is #213.
+  table above -- and, as of #221, all three encode/upload combinations (NDJSON single-shot, NDJSON
+  with internal commits, Parquet single-shot) are pluggable on either one via `c_format`. Parquet
+  with internal commits is the one combination that is not, and cannot be, built (#211's format
+  constraint).
+- Compression is no longer a gap on either format: `c_compress` works on Parquet (default on) and
+  NDJSON (default off, either commit strategy) alike -- #214 closed.
+- The byte-budget-aligned NDJSON worker -- #213 -- closed: it is `archive._chunk_one` with
+  `c_format := 'ndjson_single'` or `'ndjson_commits'`, independent of which drop-trigger rule it
+  uses.
 
 ## Choosing among them
 
@@ -113,14 +140,17 @@ Start from the architecture, not the format:
   an analytics engine without a conversion step.
 - You want the tightest vacuum-horizon bound this project builds, one file per partition, and a
   scanner owning drop timing instead of `retain()`'s own schedule: **the archive assistant**
-  (partition-aligned, self-driving -- its default). NDJSON only, today.
+  (partition-aligned, self-driving -- its default). NDJSON with internal commits by default, but
+  `c_format` also picks single-shot NDJSON or Parquet.
 - Partition sizes are large or uneven, and you want file size to be a deliberate operational
   choice rather than emergent, with `retain()` still deciding when partitions actually drop:
-  **the chunker** (byte-budget-aligned, gate-only -- its default). Parquet only, today.
-- Want the other pairing instead -- partition-aligned but gate-only, or byte-budget-aligned but
-  self-driving? Both pages' `c_self_driving` constant picks either drop-trigger rule independent
-  of which page (and boundary rule) you started from; no need to wait on which combination someone
-  else built first.
+  **the chunker** (byte-budget-aligned, gate-only -- its default). Compressed Parquet by default,
+  but `c_format` also picks either NDJSON variant.
+- Want a different pairing than either page's default -- partition-aligned but gate-only,
+  byte-budget-aligned but self-driving, NDJSON on the chunker, or Parquet on the assistant? Every
+  knob is independent: `c_self_driving` picks the drop-trigger rule and `c_format` picks the
+  encode/upload step, on either page, regardless of which boundary rule you started from -- no
+  need to wait on which combination someone else built first.
 
 Whichever you pick, compression is close to free to turn on wherever it's wired (it costs real,
 non-trivial time -- see [Chunked, cross-partition Parquet archival's byte-budget
@@ -134,9 +164,13 @@ This page is a map, not a fourth mechanism. `archive.to_s3`, `archive.to_s3_parq
 `archive.partition`/`archive.scan`, and `archive._chunk_one`/`chunk_step`/`chunk_all` all continue
 to exist exactly as their own pages describe; nothing here changes their behavior or supersedes
 their own "Honest limits" sections. The reframing above (one fixed architecture, one two-knobbed
-architecture, now with all four configurations built) is a way of reading what's already there,
-not a proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s actual code. The
-ledger, the gate, the boundary-rule dispatch, and the drop-trigger step are all shared machinery
-now (`archive.ledger`, `archive.file_gate`, `archive._next_range_partition_aligned`/
-`archive._next_range_byte_budget`, `archive._retire_covered`); what each page still hand-builds
-separately is the read-and-encode-and-upload step itself, tracked by #221.
+architecture, all four configurations built) is a way of reading what's already there, not a
+proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s actual code. Since #221
+landed, the ledger, the gate, the boundary-rule dispatch, the drop-trigger step, *and* the
+encode/upload step are all shared machinery (`archive.ledger`, `archive.file_gate`,
+`archive._next_range_partition_aligned`/`archive._next_range_byte_budget`,
+`archive._retire_covered`, `archive._encode_upload_ndjson_single`/`_ndjson_commits`/`_parquet`).
+What is left unmerged is just the two entry points themselves, `archive.partition` (told which
+partition by its caller) and `archive._chunk_one` (picks its own range) -- both now thin dispatch
+shells over entirely shared steps, tracked by whichever future issue decides that gap is worth
+closing (#222's `contrib/` graduation is the next, and last, planned step in this stack).

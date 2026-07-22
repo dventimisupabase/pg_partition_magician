@@ -1081,6 +1081,35 @@ language sql immutable as $$
       || archive._pq_stop();
 $$;
 
+-- key discovery, shared by every reader that has to order a read spanning more than one child's
+-- heap (where ctid is no longer comparable): docs/archive-chunked-parquet.md's Parquet range
+-- reader and docs/archive-assistant.md's NDJSON-with-commits range reader (#221) both call this.
+-- Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
+-- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
+-- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
+-- contract regrain() already enforces, an inherited limitation, not a new gap. (On a partitioned
+-- parent, Postgres itself requires any unique constraint to include every partitioning column, so
+-- in practice the control column is always already one of the columns this discovers.)
+create or replace function archive._key_columns(p_relation regclass) returns name[]
+language plpgsql as $$
+declare v_keyidx oid; v_cols name[];
+begin
+  select coalesce(
+           (select i.indexrelid from pg_index i where i.indrelid = p_relation and i.indisprimary limit 1),
+           (select con.conindid from pg_constraint con join pg_index i on i.indexrelid = con.conindid
+             where con.conrelid = p_relation and con.contype = 'u'
+               and i.indpred is null and i.indexprs is null limit 1))
+    into v_keyidx;
+  if v_keyidx is null then return null; end if;
+  select array_agg(a.attname order by k.ord) into v_cols
+    from pg_index i
+    cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+   where i.indexrelid = v_keyidx;
+  return v_cols;
+end;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Column data extraction (server-side aggregation, ctid-ordered by default so
 -- every column's array lines up on the same row order)
