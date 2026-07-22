@@ -5,12 +5,12 @@ assistant](archive-assistant.md), [Chunked, cross-partition Parquet
 archival](archive-chunked-parquet.md)) each build a way to copy a partition's rows to S3 before
 retention drops it. Read together, that can look like a pile of unrelated mechanisms. It isn't:
 there are really only **two architectures**. One of them (the synchronous hook) is a single,
-structurally fixed shape. The other (a paced worker with a ledger) has two independent knobs,
-and today's docs happen to build two of its four possible configurations -- which, because they
-differ on *both* knobs at once, read as two unrelated designs rather than two corners of the same
-small space. This page exists to help you pick an architecture and a configuration before diving
-into any one page's mechanics -- it does not replace those pages, and it does not introduce
-anything new.
+structurally fixed shape. The other (a paced worker with a ledger) has two independent knobs;
+this page originally introduced them with only two of the four possible configurations built,
+which, differing on *both* knobs at once, read as two unrelated designs rather than two corners of
+the same small space. All four are built today (see the table below) -- this page exists to help
+you pick an architecture and a configuration before diving into any one page's mechanics, and it
+still does not replace those pages or introduce a new mechanism of its own.
 
 ## The synchronous hook
 
@@ -47,24 +47,27 @@ it's archived in a ledger. Two knobs choose the rest:
   [`pgpm.retire()`](reference.md#retire) directly once archived, registering a gate hook only as
   defense in depth against anyone else's `retain()` calls landing on the same partition.
 
-These two knobs are independent, so there are four possible configurations. Two are built today:
+These two knobs are independent, so there are four possible configurations. All four are built
+today:
 
 | | Gate-only (`retain()` drives the drop) | Self-driving (the worker calls `retire()` itself) |
 |---|---|---|
-| **Partition-aligned** | Not built. A real combination -- the assistant's per-part-commit horizon bound, without the assistant also owning drop timing -- just not one anyone has asked for. | Built: the archive assistant (`archive.partition`/`archive.scan`), NDJSON only. |
-| **Byte-budget-aligned** | Built: the chunker (`archive._chunk_one`/`chunk_step`/`chunk_all` + `archive.file_gate`), Parquet only, GZIP default-on. | Not built. The chunker already knows (via the same watermark check the gate uses) when a range fully covers a partition; teaching it to call `retire()` itself once that's true is a small addition on what already exists, not a new design. This is the general form of the question [#212](https://github.com/dventimisupabase/pg_partition_magician/issues/212) already raises from the Parquet-assistant angle. |
+| **Partition-aligned** | Built: [the archive assistant](archive-assistant.md#the-scanner)'s `archive.scan()` with `c_self_driving := false` -- archives ahead of `retain()`'s own schedule, retires nothing itself. | Built (the original, and still the default): the archive assistant (`archive.partition`/`archive.scan`), NDJSON only. |
+| **Byte-budget-aligned** | Built (the original, and still the default): the chunker (`archive._chunk_one`/`chunk_step`/`chunk_all` + `archive.file_gate`), Parquet only, GZIP default-on. | Built: [the chunker](archive-chunked-parquet.md#the-chunker)'s `archive._chunk_one` with `c_self_driving := true` -- retires, right after a chunk's ledger row commits, every partition that chunk's new watermark now fully covers. This was the general form of the question [#212](https://github.com/dventimisupabase/pg_partition_magician/issues/212) raised from the Parquet-assistant angle specifically. |
 
-The two built cells sit on the diagonal: they differ on both knobs simultaneously, which is
-exactly why "the assistant" and "the chunker" read as two separate architectures rather than two
-settings of the same two switches. Filling in either empty cell would make that visible -- at
-that point the boundary-rule/drop-trigger-rule dispatch logic each page hand-builds separately
-would be duplicated code around the same two knobs, not genuinely different designs. (The ledger
-table and the gate are no longer duplicated: both pages now write into one shared `archive.ledger`,
-keyed by `[lo, hi)` range rather than by knob, and both register the same `archive.file_gate` --
-see [the archive assistant](archive-assistant.md#the-ledger-and-the-gate).) Which direction the
-remaining unification would run -- the chunker growing a self-driving mode and becoming the general
-case, or the assistant growing byte-budget boundaries and becoming the general case -- is an open
-question this page doesn't answer; either framing arrives at the same merged shape.
+The two originally-built cells sat on the diagonal: they differed on both knobs simultaneously,
+which is exactly why "the assistant" and "the chunker" read as two separate architectures rather
+than two settings of the same two switches. Filling in the other two cells made that visible, and
+turned most of what looked like "the assistant" and "the chunker" into shared, parameterized
+machinery rather than two hand-built designs: one shared `archive.ledger` table keyed by `[lo,
+hi)` range (not by knob), one shared `archive.file_gate`, one shared boundary-rule shape
+(`archive._next_range_partition_aligned`/`archive._next_range_byte_budget`, both `(p_parent)` in,
+`(lo, hi)` or no rows out -- see [the archive assistant](archive-assistant.md#the-scanner)), and
+now one shared drop-trigger step (`archive._retire_covered`, called with the retention boundary by
+a self-driving assistant or with a boundary rule's own newly-advanced watermark by a self-driving
+chunker). What each page still hand-builds separately is the read-and-encode-and-upload step
+itself -- NDJSON with per-part commits for the assistant, whole-range Parquet for the chunker --
+which is exactly the pluggable step #221 names next.
 
 ## Two knobs that apply on top of either architecture
 
@@ -93,8 +96,8 @@ One more knob, but only where it can matter:
 
 - The synchronous hook: NDJSON built (single-PUT and multipart, no compression); Parquet built
   (single-PUT, GZIP default-on) -- multipart Parquet is an open question, not a clear gap (#211).
-- The paced worker: see the boundary-rule x drop-trigger-rule table above for the two built
-  configurations and the two gaps.
+- The paced worker: all four boundary-rule x drop-trigger-rule configurations are built -- see the
+  table above.
 - Compression is its own cross-cutting gap: on for both Parquet paths, off for every NDJSON path,
   and closing that is #214.
 - A byte-budget-aligned, cross-partition NDJSON worker (independent of which drop-trigger rule it
@@ -110,10 +113,14 @@ Start from the architecture, not the format:
   an analytics engine without a conversion step.
 - You want the tightest vacuum-horizon bound this project builds, one file per partition, and a
   scanner owning drop timing instead of `retain()`'s own schedule: **the archive assistant**
-  (partition-aligned, self-driving). NDJSON only, today.
+  (partition-aligned, self-driving -- its default). NDJSON only, today.
 - Partition sizes are large or uneven, and you want file size to be a deliberate operational
   choice rather than emergent, with `retain()` still deciding when partitions actually drop:
-  **the chunker** (byte-budget-aligned, gate-only). Parquet only, today.
+  **the chunker** (byte-budget-aligned, gate-only -- its default). Parquet only, today.
+- Want the other pairing instead -- partition-aligned but gate-only, or byte-budget-aligned but
+  self-driving? Both pages' `c_self_driving` constant picks either drop-trigger rule independent
+  of which page (and boundary rule) you started from; no need to wait on which combination someone
+  else built first.
 
 Whichever you pick, compression is close to free to turn on wherever it's wired (it costs real,
 non-trivial time -- see [Chunked, cross-partition Parquet archival's byte-budget
@@ -126,11 +133,10 @@ NDJSON.
 This page is a map, not a fourth mechanism. `archive.to_s3`, `archive.to_s3_parquet`,
 `archive.partition`/`archive.scan`, and `archive._chunk_one`/`chunk_step`/`chunk_all` all continue
 to exist exactly as their own pages describe; nothing here changes their behavior or supersedes
-their own "Honest limits" sections. The reframing above (one fixed architecture, one
-two-knobbed architecture with two built and two open configurations) is a way of reading what's
-already there, not a proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s
-actual code. The ledger schema and the gate are already shared (the two pages' `archive.ledger`
-tables were unified into one, and `archive.file_gate` replaced both pages' original, separate
-veto functions); a real, separate undertaking remains for the rest -- one worker parameterized by
-both knobs instead of two hand-built ones -- tracked by whichever of the two empty cells above
-ends up worth building first.
+their own "Honest limits" sections. The reframing above (one fixed architecture, one two-knobbed
+architecture, now with all four configurations built) is a way of reading what's already there,
+not a proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s actual code. The
+ledger, the gate, the boundary-rule dispatch, and the drop-trigger step are all shared machinery
+now (`archive.ledger`, `archive.file_gate`, `archive._next_range_partition_aligned`/
+`archive._next_range_byte_budget`, `archive._retire_covered`); what each page still hand-builds
+separately is the read-and-encode-and-upload step itself, tracked by #221.
