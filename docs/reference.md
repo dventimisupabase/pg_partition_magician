@@ -441,7 +441,7 @@ has exactly one owner at a time and concurrent assistants -- or an assistant and
 double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
 `pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
 under `retain()`. A complete worked assistant built on `retire` is in
-[the archive assistant](archive-assistant.md).
+[the archive assistant](../pgpm_archive/docs/assistant.md).
 
 ### `regrain`
 
@@ -540,7 +540,7 @@ slow hook (a synchronous long-term-storage copy) holds that transaction open for
 the scheduled path, pair a slow hook with `config.retain_batch = 1` (see [`retain`](#retain)) so each
 maintenance tick attempts at most one partition's hooks + drop, and the rest of an aged-out backlog
 paces across subsequent ticks. A complete, working S3-archival hook is worked through in
-[Archive partitions to S3](archive-to-s3.md).
+[Archive partitions to S3](../pgpm_archive/docs/to-s3.md).
 
 ### `hook_unregister`
 

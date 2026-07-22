@@ -1,8 +1,8 @@
 # Choosing an archival strategy
 
-Three pages on this project ([Archive partitions to S3](archive-to-s3.md), [The archive
-assistant](archive-assistant.md), [Chunked, cross-partition Parquet
-archival](archive-chunked-parquet.md)) each build a way to copy a partition's rows to S3 before
+Three pages on this project ([Archive partitions to S3](to-s3.md), [The archive
+assistant](assistant.md), [Chunked, cross-partition Parquet
+archival](chunked-parquet.md)) each build a way to copy a partition's rows to S3 before
 retention drops it. Read together, that can look like a pile of unrelated mechanisms. It isn't:
 there are really only **two architectures**. One of them (the synchronous hook) is a single,
 structurally fixed shape. The other (a paced worker with a ledger) has two independent knobs;
@@ -23,7 +23,7 @@ for how each page's names map onto it.
 
 ## The synchronous hook
 
-[`pgpm.retain`](reference.md#retain) (or a direct [`pgpm.retire`](reference.md#retire) call)
+[`pgpm.retain`](../../docs/reference.md#retain) (or a direct [`pgpm.retire`](../../docs/reference.md#retire) call)
 decides to drop a partition and calls a `pre_drop` hook that does the archiving *inline*, inside
 that same drop's transaction. One partition, one file, archived at the exact moment it's dropped
 -- the simplest mental model on this page. The cost: the vacuum-horizon hold spans the whole
@@ -40,7 +40,7 @@ invoked procedure instead, driven by cron or called directly, is what the other 
 
 ## The paced worker
 
-Both `docs/archive-assistant.md` and `docs/archive-chunked-parquet.md` build the same underlying
+Both `docs/assistant.md` and `docs/chunked-parquet.md` build the same underlying
 shape: an independently invoked procedure (cron-paced or called on demand) that archives *ahead
 of* any drop, commits between chunks of work to bound the vacuum-horizon hold, and records what
 it's archived in a ledger. Two knobs choose the rest:
@@ -53,7 +53,7 @@ it's archived in a ledger. Two knobs choose the rest:
   worker never calls `retire()` itself; it just keeps its ledger ahead of `retain()`'s own
   schedule and registers a `pre_drop` hook that vetoes a drop if the ledger hasn't caught up yet.
   *Self-driving*: the worker finds retention-eligible partitions itself and calls
-  [`pgpm.retire()`](reference.md#retire) directly once archived, registering a gate hook only as
+  [`pgpm.retire()`](../../docs/reference.md#retire) directly once archived, registering a gate hook only as
   defense in depth against anyone else's `retain()` calls landing on the same partition.
 
 These two knobs are independent, so there are four possible configurations. All four are built
@@ -61,8 +61,8 @@ today:
 
 | | Gate-only (`retain()` drives the drop) | Self-driving (the worker calls `retire()` itself) |
 |---|---|---|
-| **Partition-aligned** | Built: [the archive assistant](archive-assistant.md#the-scanner)'s `archive.scan()` with `c_self_driving := false` -- archives ahead of `retain()`'s own schedule, retires nothing itself. | Built (the original, and still the default): the archive assistant (`archive.partition`/`archive.scan`), NDJSON only. |
-| **Byte-budget-aligned** | Built (the original, and still the default): the chunker (`archive._chunk_one`/`chunk_step`/`chunk_all` + `archive.file_gate`), Parquet only, GZIP default-on. | Built: [the chunker](archive-chunked-parquet.md#the-chunker)'s `archive._chunk_one` with `c_self_driving := true` -- retires, right after a chunk's ledger row commits, every partition that chunk's new watermark now fully covers. This was the general form of the question [#212](https://github.com/dventimisupabase/pg_partition_magician/issues/212) raised from the Parquet-assistant angle specifically. |
+| **Partition-aligned** | Built: [the archive assistant](assistant.md#the-scanner)'s `archive.scan()` with `c_self_driving := false` -- archives ahead of `retain()`'s own schedule, retires nothing itself. | Built (the original, and still the default): the archive assistant (`archive.partition`/`archive.scan`), NDJSON only. |
+| **Byte-budget-aligned** | Built (the original, and still the default): the chunker (`archive._chunk_one`/`chunk_step`/`chunk_all` + `archive.file_gate`), Parquet only, GZIP default-on. | Built: [the chunker](chunked-parquet.md#the-chunker)'s `archive._chunk_one` with `c_self_driving := true` -- retires, right after a chunk's ledger row commits, every partition that chunk's new watermark now fully covers. This was the general form of the question [#212](https://github.com/dventimisupabase/pg_partition_magician/issues/212) raised from the Parquet-assistant angle specifically. |
 
 The two originally-built cells sat on the diagonal: they differed on both knobs simultaneously,
 which is exactly why "the assistant" and "the chunker" read as two separate architectures rather
@@ -71,7 +71,7 @@ turned most of what looked like "the assistant" and "the chunker" into shared, p
 machinery rather than two hand-built designs: one shared `archive.ledger` table keyed by `[lo,
 hi)` range (not by knob), one shared `archive.file_gate`, one shared boundary-rule shape
 (`archive._next_range_partition_aligned`/`archive._next_range_byte_budget`, both `(p_parent)` in,
-`(lo, hi)` or no rows out -- see [the archive assistant](archive-assistant.md#the-scanner)), and
+`(lo, hi)` or no rows out -- see [the archive assistant](assistant.md#the-scanner)), and
 now one shared drop-trigger step (`archive._retire_covered`, called with the retention boundary by
 a self-driving assistant or with a boundary rule's own newly-advanced watermark by a self-driving
 chunker). What each page still hand-builds separately is the read-and-encode-and-upload step
@@ -86,7 +86,7 @@ which is exactly the pluggable step #221 names next.
   Redshift Spectrum, Spark, Trino, and Snowflake with no conversion step, at the cost of being a
   from-scratch, zero-dependency writer with real limits (six types, no dictionary encoding, no
   statistics, one row group -- see [Archive partitions to
-  S3](archive-to-s3.md#honest-limits-for-the-parquet-variant)).
+  S3](to-s3.md#honest-limits-for-the-parquet-variant)).
 - **Commit strategy** (NDJSON only): single-shot (the whole range's read-and-upload happens inside
   one transaction) or with internal commits (`archive._encode_upload_ndjson_commits` reads a page,
   commits, `PUT`s a part, commits, repeats). Parquet cannot do internal commits at all: its footer
@@ -108,7 +108,7 @@ As of #221, the boundary rule (partition-aligned vs byte-budget-aligned), the dr
 vs internal commits, NDJSON only) are all independent, pluggable choices on both
 `archive.partition` and `archive._chunk_one` -- a `c_format` constant on each dispatches to one of
 three shared `archive._encode_upload_*` steps
-([defined once](archive-assistant.md#the-archiver)). Today's original pairing (NDJSON-with-commits
+([defined once](assistant.md#the-archiver)). Today's original pairing (NDJSON-with-commits
 for the assistant, compressed Parquet for the chunker) remains each page's default, but is no
 longer a structural coupling -- it never really was one, just an accident of build order, and #221
 is what actually lets you pick otherwise. The byte-budget-aligned NDJSON worker
@@ -163,7 +163,7 @@ Start from the architecture, not the format:
 
 Whichever you pick, compression is close to free to turn on wherever it's wired (it costs real,
 non-trivial time -- see [Chunked, cross-partition Parquet archival's byte-budget
-guidance](archive-chunked-parquet.md#the-chunker) for measured numbers -- but no design tradeoff
+guidance](chunked-parquet.md#the-chunker) for measured numbers -- but no design tradeoff
 beyond that), and multipart transport only matters for the synchronous hook, and only really helps
 NDJSON.
 

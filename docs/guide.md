@@ -359,7 +359,7 @@ be past the horizon), and each partition is claim-guarded so several cooperating
 external archiver that uploads a partition to long-term storage and then retires it immediately -- can
 work alongside the scheduled `retain` without stepping on each other. See `retire` in the
 [reference](reference.md#retire), and the complete worked assistant in
-[the archive assistant](archive-assistant.md).
+[the archive assistant](../pgpm_archive/docs/assistant.md).
 
 ### Pre-drop hooks
 
@@ -385,7 +385,7 @@ or a direct `retire` call initiates it. See `hook_register` in the [reference](r
 full contract (signature, multiple hooks, disabling one, and how failures are isolated). For a
 complete, working `archive_to_s3` (the `http` extension for the PUT, SigV4 signing via `pgcrypto`,
 credentials in Vault, verified against real signature enforcement), see
-[Archive partitions to S3](archive-to-s3.md).
+[Archive partitions to S3](../pgpm_archive/docs/to-s3.md).
 
 A hook runs inside the calling transaction (`retain`'s tick, or an assistant's `retire` call), so a slow
 hook (a synchronous copy to long-term storage) holds it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick

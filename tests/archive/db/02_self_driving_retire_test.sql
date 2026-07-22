@@ -9,7 +9,7 @@ insert into public.a2 (id, payload) select g, 'z' from generate_series(70001, 70
 insert into public.a2 (id, payload) values (110000, 'frontier');
 
 -- file_gate is registered as the defense-in-depth backstop, same as a real self_driving
--- deployment would (docs/archive-strategies-overview.md): the sweep below only ever
+-- deployment would (docs/strategies-overview.md): the sweep below only ever
 -- calls pgpm.retire() once the ledger already proves coverage, so it never actually fires.
 select pgpm.hook_register('public.a2', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
 select mk_archive_config('a2', 'partition_aligned', 'self_driving', 'ndjson_single');

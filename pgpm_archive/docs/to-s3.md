@@ -3,8 +3,8 @@
 A complete, working `pre_drop` hook that copies a partition's rows to AWS S3 (or any S3-compatible
 store) before `retain()` drops it, and blocks the drop when the copy fails. This is a **worked example
 of a user-supplied hook**, not part of pg_partition_magician: copy it, edit the constants, and own it.
-The [guide](guide.md#pre-drop-hooks) introduces the hook mechanism; `hook_register` in the
-[reference](reference.md#hook_register) has the full contract.
+The [guide](../../docs/guide.md#pre-drop-hooks) introduces the hook mechanism; `hook_register` in the
+[reference](../../docs/reference.md#hook_register) has the full contract.
 
 The function below was verified end-to-end, twice, driven by the real `retain()` path each time:
 against MinIO's full AWS Signature Version 4 enforcement (a 50,000-row partition archived and dropped;
@@ -21,7 +21,7 @@ the URI prefix apart instead of assuming a bare host.
 > vault secret names) from a per-table `archive.config` row instead of the `c_`-prefixed constants
 > below. This page's worked-example framing, its SQL, and everything it verified are all unchanged
 > and kept below; see [Choosing an archival strategy's name
-> mapping](archive-strategies-overview.md#installing-the-module) for the full picture (including
+> mapping](strategies-overview.md#installing-the-module) for the full picture (including
 > the paced-worker pages' renames), and this page's own ["Register and pace
 > it"](#register-and-pace-it) section for the module-based registration path.
 
@@ -42,7 +42,7 @@ the URI prefix apart instead of assuming a bare host.
 - **`config.retain_batch = 1`** paces retention to one partition's hook + drop per maintenance tick.
   The upload is synchronous inside `retain()`'s transaction, so the cap is what keeps a backlog of
   aged-out partitions from turning one tick into one long transaction. See
-  [`retain`](reference.md#retain).
+  [`retain`](../../docs/reference.md#retain).
 
 ## Store the credentials
 
@@ -199,7 +199,7 @@ select method from pgpm.log where action = 'retain_hook_fail' order by id desc l
 
 Once the outage clears, the next ticks drain the backlog one partition per tick, no intervention
 needed. See the runbook's
-[retention entry](runbook.md#storage-is-not-dropping-despite-a-retention-policy).
+[retention entry](../../docs/runbook.md#storage-is-not-dropping-despite-a-retention-policy).
 
 ## Honest limits
 
@@ -229,7 +229,7 @@ needed. See the runbook's
   setting, so it applies over the pooler and direct connections alike): the whole upload runs inside
   one statement, so that is this hook's wall-clock ceiling on Supabase; override with a session
   `set statement_timeout = ...` if a partition legitimately needs longer, or use the
-  [archive assistant](archive-assistant.md), whose per-part statements each only need to fit one part in
+  [archive assistant](assistant.md), whose per-part statements each only need to fit one part in
   the window.
 
 ## When one PUT is not enough: the multipart variant
@@ -447,7 +447,7 @@ What changes, honestly:
   limits (10,000 parts) put the protocol ceiling around 80GB at this part size; the polite ceiling
   is far lower and set by how long you are willing to hold a transaction open. To bound that hold
   to one part's network time, entirely in-database, see the
-  [archive assistant](archive-assistant.md) (a committing scanner procedure plus `pgpm.retire`); past
+  [archive assistant](assistant.md) (a committing scanner procedure plus `pgpm.retire`); past
   that, hand the work to an external worker with a real AWS SDK.
 - **A failed upload is aborted, not leaked.** An incomplete multipart upload is invisible in
   listings but accrues storage. On any failure after initiation, the hook's exception handler sends
@@ -503,7 +503,7 @@ between -- each column's array has to come from the same snapshot as every other
 concurrent write between two column reads could misalign rows across columns. That means one
 in-memory value, one upload, exactly the shape (and the same ceiling) as the single-PUT hook at
 the top of this page: no attempt is made here to preserve the
-[archive assistant](archive-assistant.md)'s per-part-committing, bounded-horizon-hold design --
+[archive assistant](assistant.md)'s per-part-committing, bounded-horizon-hold design --
 Parquet's footer needs every row group's byte offsets, known only once its data is built, so a
 streaming, row-group-per-slice writer that commits between slices would be a materially bigger
 rewrite than reusing the assistant's existing pattern. Consider this the Parquet analogue of
@@ -1104,8 +1104,8 @@ language sql immutable as $$
 $$;
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
--- heap (where ctid is no longer comparable): docs/archive-chunked-parquet.md's Parquet range
--- reader and docs/archive-assistant.md's NDJSON-with-commits range reader (#221) both call this.
+-- heap (where ctid is no longer comparable): docs/chunked-parquet.md's Parquet range
+-- reader and docs/assistant.md's NDJSON-with-commits range reader (#221) both call this.
 -- Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
@@ -1146,7 +1146,7 @@ $$;
 -- p_nullable decides whether the definition-levels block gets prepended at all.
 --
 -- p_order_by defaults to 'ctid' (this function's original, whole-relation ordering,
--- unchanged byte-for-byte); docs/archive-chunked-parquet.md's cross-partition range reader
+-- unchanged byte-for-byte); docs/chunked-parquet.md's cross-partition range reader
 -- passes an explicit '(control column, key columns)' order-by instead, since ctid is not
 -- comparable once a read spans more than one child's heap. This one definition serves both
 -- callers -- it is deliberately NOT redeclared with a different parameter list anywhere
@@ -1313,7 +1313,7 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Transport: a bytea-native SigV4 signer, and the pre_drop hook
 -- ---------------------------------------------------------------------------
--- Why a separate signer from archive.s3_signed_request (archive-to-s3.md's multipart
+-- Why a separate signer from archive.s3_signed_request (to-s3.md's multipart
 -- variant): that one hashes the payload via digest(convert_to(p_payload, 'UTF8'), 'sha256'),
 -- which requires p_payload to be well-formed text in the server encoding. A Parquet file is
 -- binary -- its Thrift-encoded footer alone guarantees stray 0x00 and high-bit-set bytes --
@@ -1384,7 +1384,7 @@ $$;
 -- between (each column's array must come from the same snapshot as every other column's, or
 -- concurrent writes between column reads could misalign rows across columns), so this holds
 -- the vacuum horizon for the whole read+upload -- like the synchronous hook, not like the
--- per-part-committing archive assistant (archive-assistant.md). A streaming, row-group-per-slice
+-- per-part-committing archive assistant (assistant.md). A streaming, row-group-per-slice
 -- writer that preserves the assistant's bounded-horizon commit pattern is a bigger rewrite
 -- (Parquet's footer needs every row group's byte offsets, known only once its data is built)
 -- and is not attempted here; see the honest-limits note below.
@@ -1475,6 +1475,6 @@ same sanctioned drop path `retain()` uses), not a standalone call to the encoder
   zero-dependency property does.
 - **This hook's horizon-hold is bounded by partition size, which is emergent, not by a chosen
   file size.** If partitions grow large enough (or unevenly enough) that this matters, see
-  [Chunked, cross-partition Parquet archival](archive-chunked-parquet.md), which decouples
+  [Chunked, cross-partition Parquet archival](chunked-parquet.md), which decouples
   Parquet file boundaries from partition boundaries entirely so the hold is bounded by a target
   file size instead.

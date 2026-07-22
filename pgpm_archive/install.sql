@@ -2,9 +2,10 @@
 -- pg_partition_magician :: archive  --  archive a managed table's aged
 -- partitions to S3 before retention drops them, config-driven.
 --
--- OPTIONAL add-on, loaded ON TOP of the core (pgpm_core/install.sql). Graduates
--- docs/archive-to-s3.md, docs/archive-assistant.md, and
--- docs/archive-chunked-parquet.md's embedded SQL into one installable module
+-- OPTIONAL add-on, loaded ON TOP of the core (pgpm_core/install.sql). See
+-- README.md in this directory for the front door. Graduates
+-- docs/to-s3.md, docs/assistant.md, and
+-- docs/chunked-parquet.md's embedded SQL into one installable module
 -- (the harmonization stack, #217-#221, unified the ledger/gate/boundary-rule/
 -- drop-trigger/encode-upload machinery those pages hand-built separately; this
 -- module is what actually ships it). Those three pages remain the narrative:
@@ -61,7 +62,7 @@ create table if not exists archive.config (
   vault_key_id    text        not null default 's3_archive_access_key_id',
   vault_secret    text        not null default 's3_archive_secret_access_key',
 
-  -- the paced worker's two independent knobs (see docs/archive-strategies-overview.md)
+  -- the paced worker's two independent knobs (see docs/strategies-overview.md)
   boundary_rule   text        not null default 'partition_aligned'
                   check (boundary_rule in ('partition_aligned', 'byte_budget')),
   drop_trigger    text        not null default 'self_driving'
@@ -109,8 +110,8 @@ create index if not exists ledger_parent_table_hi_idx on archive.ledger (parent_
 -- ---------------------------------------------------------------------------
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
--- heap (where ctid is no longer comparable): docs/archive-chunked-parquet.md's Parquet range
--- reader and docs/archive-assistant.md's NDJSON-with-commits range reader (#221) both call this.
+-- heap (where ctid is no longer comparable): docs/chunked-parquet.md's Parquet range
+-- reader and docs/assistant.md's NDJSON-with-commits range reader (#221) both call this.
 -- Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
@@ -217,7 +218,7 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Transport: a bytea-native SigV4 signer, and the pre_drop hook
 -- ---------------------------------------------------------------------------
--- Why a separate signer from archive.s3_signed_request (archive-to-s3.md's multipart
+-- Why a separate signer from archive.s3_signed_request (to-s3.md's multipart
 -- variant): that one hashes the payload via digest(convert_to(p_payload, 'UTF8'), 'sha256'),
 -- which requires p_payload to be well-formed text in the server encoding. A Parquet file is
 -- binary -- its Thrift-encoded footer alone guarantees stray 0x00 and high-bit-set bytes --
@@ -883,7 +884,7 @@ $$;
 -- p_nullable decides whether the definition-levels block gets prepended at all.
 --
 -- p_order_by defaults to 'ctid' (this function's original, whole-relation ordering,
--- unchanged byte-for-byte); docs/archive-chunked-parquet.md's cross-partition range reader
+-- unchanged byte-for-byte); docs/chunked-parquet.md's cross-partition range reader
 -- passes an explicit '(control column, key columns)' order-by instead, since ctid is not
 -- comparable once a read spans more than one child's heap. This one definition serves both
 -- callers -- it is deliberately NOT redeclared with a different parameter list anywhere
@@ -1384,7 +1385,7 @@ $$;
 -- one: a Parquet file's footer needs every row group's byte offset, known
 -- only once the whole file's bytes exist, so there is no way to COMMIT
 -- partway through building one -- a structural fact about the format, not a
--- gap (docs/archive-to-s3.md#honest-limits-for-the-parquet-variant, #211).
+-- gap (docs/to-s3.md#honest-limits-for-the-parquet-variant, #211).
 -- ---------------------------------------------------------------------------
 
 -- single read, single PUT (optionally one gzip member for the whole body). No pagination, so no
