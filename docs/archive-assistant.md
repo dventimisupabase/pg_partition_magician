@@ -31,9 +31,9 @@ the top rung -- but the assistant gets the windows down to seconds, entirely in-
 - **The scanner procedure does the work**: find retention-eligible partitions, archive the
   unarchived (or changed) ones part by part, then `pgpm.retire()` each -- the claim-guarded
   sanctioned drop, safe alongside `retain()` and other assistants.
-- **The ledger records the fact**: one row per archived partition (`key`, `ETag`, `rows_archived`),
-  written by the archiver at the moment the store confirmed the object. Never job history: a cron
-  run's "succeeded" is evidence about the mechanism, not the guarantee.
+- **The ledger records the fact**: one row per archived range (`lo`/`hi`, `key`, `ETag`,
+  `rows_archived`), written by the archiver at the moment the store confirmed the object. Never job
+  history: a cron run's "succeeded" is evidence about the mechanism, not the guarantee.
 - **The gate hook owns the veto**: registered as an ordinary `pre_drop` hook, it defers any drop of
   a partition that is unarchived or has changed since archiving. Because `retire()` runs the hooks
   on every drop path, the gate fires for the assistant's own drops (defense in depth) and keeps
@@ -51,17 +51,26 @@ PostgREST only serves schemas you explicitly expose, so a dedicated schema keeps
 ```sql
 create schema if not exists archive;
 
--- the ledger: one row per archived partition, written by the archiver at the moment it verified
--- the upload. The drop gate consults THIS, never job history.
+-- the ledger: one row per archived range, written by the archiver at the moment it verified the
+-- upload. The drop gate consults THIS, never job history. A partition's own bounds are already a
+-- native-grid [lo, hi) range -- the same shape a cross-partition, byte-budget-aligned archiver
+-- (docs/archive-chunked-parquet.md) needs for a range that spans part of one partition or several
+-- -- so this table is shared by both: `lo` is the primary key (ranges never overlap, by either
+-- archiver's own invariant), and `child_name` is an optional convenience column, populated only
+-- when the archived range happens to equal exactly one partition's bounds, so a name-based lookup
+-- (as `archive.gate` below does) stays a cheap equality check instead of a bounds-membership query.
 create table if not exists archive.ledger (
   parent_table  regclass    not null,
-  child_name    name        not null,
+  lo            text        not null,   -- native-grid text, same convention as pgpm.config lo/hi
+  hi            text        not null,
+  child_name    name,                   -- populated iff [lo, hi) is exactly one partition's bounds
   s3_key        text        not null,
   etag          text,
   rows_archived bigint      not null,
   archived_at   timestamptz not null default now(),
-  primary key (parent_table, child_name)
+  primary key (parent_table, lo)
 );
+create index on archive.ledger (parent_table, hi desc);   -- cheap max(hi) for range-based readers
 
 -- the veto: raises (deferring the drop) unless the partition is archived AND the archive still
 -- matches the live partition. Runs on EVERY drop path (retire() runs the hooks), so it passes
@@ -121,7 +130,7 @@ declare
   v_key_id text; v_secret text; v_nsp name; v_control name; v_ctltype text; v_key text;
   v_part_payload text; v_chunk text; v_cursor text; v_done boolean := false;
   v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
-  v_rows bigint := 0; v_n bigint; v_stale text;
+  v_rows bigint := 0; v_n bigint; v_stale text; v_lo text; v_hi text;
   v_resp http_response; h http_header;
 begin
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
@@ -131,6 +140,7 @@ begin
   end if;
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select control_column into v_control from pgpm.config where parent_table = p_parent;
+  select lo, hi into v_lo, v_hi from pgpm.part where parent_table = p_parent and child_name = p_child;
   select a.atttypid::regtype::text into v_ctltype
     from pg_attribute a where a.attrelid = p_parent and a.attname = v_control;
   v_key := c_prefix || p_child || '.ndjson';
@@ -227,11 +237,16 @@ begin
 
   -- the ledger row: written only now, after the store confirmed the object. A crash between the
   -- complete and this insert just re-archives next scan (a PUT to the same key overwrites; the
-  -- cleanup-on-entry finds nothing in flight because the upload completed).
-  insert into archive.ledger (parent_table, child_name, s3_key, etag, rows_archived)
-  values (p_parent, p_child, v_key, v_etag, v_rows)
-  on conflict (parent_table, child_name)
-    do update set s3_key = excluded.s3_key, etag = excluded.etag,
+  -- cleanup-on-entry finds nothing in flight because the upload completed). Keyed by the
+  -- partition's own lo (its native-grid [lo, hi) bounds), with child_name populated since this
+  -- range is exactly one partition -- the shared archive.ledger table (see "The ledger and the
+  -- gate" above) also serves docs/archive-chunked-parquet.md's cross-partition ranges, which have
+  -- no single child_name to record.
+  insert into archive.ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
+  values (p_parent, v_lo, v_hi, p_child, v_key, v_etag, v_rows)
+  on conflict (parent_table, lo)
+    do update set hi = excluded.hi, child_name = excluded.child_name,
+                  s3_key = excluded.s3_key, etag = excluded.etag,
                   rows_archived = excluded.rows_archived, archived_at = now();
   commit;
 end;
@@ -347,6 +362,13 @@ self-repair, crash cleanup confirmed via `ListMultipartUploads`), plus the horiz
 full scale over a real network: a ~110MB partition archived as a 10-part upload in ~20s with **20
 distinct advancing `backend_xmin` values in 27 samples**, versus the synchronous hook's **one pinned
 value** for its entire equal-sized run.
+
+The happy path and backstop veto above were re-verified against the unified `archive.ledger` shape
+(#217): `archive.partition` correctly resolves its partition's own `[lo, hi)` from `pgpm.part` and
+writes a ledger row with `child_name` populated, `archive.gate`'s `child_name` lookup passes on it
+unchanged, and a second managed table archived concurrently through
+[the chunker](archive-chunked-parquet.md) (writing `child_name`-`null` rows into the same table)
+produced no key collisions or lookup cross-talk between the two.
 
 ## Supabase ceilings, discovered the honest way
 
