@@ -58,7 +58,7 @@ create schema if not exists archive;
 -- -- so this table is shared by both: `lo` is the primary key (ranges never overlap, by either
 -- archiver's own invariant), and `child_name` is an optional convenience column, populated only
 -- when the archived range happens to equal exactly one partition's bounds, so a name-based lookup
--- (as `archive.gate` below does) stays a cheap equality check instead of a bounds-membership query.
+-- stays a cheap equality check instead of a bounds-membership query.
 create table if not exists archive.ledger (
   parent_table  regclass    not null,
   lo            text        not null,   -- native-grid text, same convention as pgpm.config lo/hi
@@ -71,37 +71,118 @@ create table if not exists archive.ledger (
   primary key (parent_table, lo)
 );
 create index on archive.ledger (parent_table, hi desc);   -- cheap max(hi) for range-based readers
+```
 
--- the veto: raises (deferring the drop) unless the partition is archived AND the archive still
--- matches the live partition. Runs on EVERY drop path (retire() runs the hooks), so it passes
--- trivially right after the assistant archives, and it blocks retain()'s backstop from ever
--- dropping unarchived or changed data. NOTE the contract is a row-count comparison: it catches
--- late-arriving/backdated rows (the realistic mutation of aged time-series data) but not a
--- same-count mutation (an UPDATE, or an insert+delete pair); aged partitions are assumed
--- effectively append-only, as in most retention workloads.
-create or replace function archive.gate(p_parent regclass, p_child name, p_lo text, p_hi text)
-returns void language plpgsql as $$
-declare v_nsp name; v_rows bigint; v_live bigint;
+The **watermark** for a managed parent `P` is `max(hi)` over its ledger rows: everything below it
+is guaranteed durably archived (uploaded, confirmed, ledgered). Nothing here stores a separate
+cursor -- the watermark is *derived* from the ledger on every read, so there is no second piece of
+state that could drift out of sync with what was actually archived. That guarantee only holds if
+the ledger's coverage is contiguous and gap-free from wherever it starts; `archive.partition`
+(below) enforces that on the write side, so the watermark can stay a cheap `max()` on the read side
+instead of a real contiguity scan.
+
+The gate itself raises (deferring the drop) unless `[p_lo, p_hi)` is durably archived and still
+matches the live rows. It runs on EVERY drop path (`retire()` runs the hooks), so it passes
+trivially right after archiving and blocks `retain()`'s backstop from ever dropping unarchived or
+changed data. Two parts:
+
+1. **Fast path**: `p_hi <= watermark(p_parent)`, derived, no scan. False means `[p_lo, p_hi)` is
+   not fully archived yet -- defer.
+2. **Defense in depth**: for every ledger row overlapping `[p_lo, p_hi)`, recount that row's
+   *entire* range live and compare to its recorded `rows_archived`. A mismatch anywhere defers the
+   drop, even if the actual stray landed in a sibling partition sharing the same ledger row --
+   intentionally conservative, and it fails safe rather than silently dropping something that
+   changed.
+
+The contract is a row-count comparison: it catches late-arriving/backdated rows (the realistic
+mutation of aged time-series data) but not a same-count mutation (an `UPDATE`, or an insert+delete
+pair); aged partitions are assumed effectively append-only, as in most retention workloads.
+
+The recount alone is not quite enough, and the gap matters: a naive comparison against a ledger
+row's *original* `rows_archived` breaks the moment two partitions covered by the same row are
+dropped in separate `retire()` calls -- the normal case once a range spans more than one partition,
+since `retain_batch` paces drops one at a time. Drop the first partition, and the second's *later*
+check would recount the row's live range and find fewer rows than the original `rows_archived` --
+the first partition's rows are legitimately gone now -- which is indistinguishable from a real
+stray under a static comparison, and would wedge the second drop forever. The fix: once a row's
+recount passes and a partition's drop is about to proceed, decrement that row's `rows_archived` by
+exactly the overlap between the partition being dropped and the row's range (never more, for a
+partition spanning more than one row), so the next check compares against what is *actually still
+expected to be live*, not a number frozen at archive time. This is safe as a `pre_drop` hook side
+effect: `pgpm.retire()` runs its hooks and the `DROP` inside one subtransaction (the `EXCEPTION`
+block is an implicit savepoint), so a failed drop rolls the decrement back with everything else,
+and `FOR UPDATE` on the ledger rows serializes concurrent `retire()` calls racing on partitions that
+share a row.
+
+```sql
+-- the derived watermark: kind-aware (numeric for id, timestamptz otherwise, matching
+-- pgpm.config.control_kind), so a plain lexicographic max on the stored text never runs.
+create or replace function archive._file_watermark(p_parent regclass) returns text
+language plpgsql as $$
+declare cfg pgpm.config; v_ncast text; v_wm text;
 begin
-  select rows_archived into v_rows from archive.ledger
-   where parent_table = p_parent and child_name = p_child;
-  if v_rows is null then
-    raise exception 'archive.gate: % is not archived yet; deferring the drop', p_child;
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._file_watermark: % is not managed', p_parent; end if;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  execute format('select max(hi::%s)::text from archive.ledger where parent_table = %L::regclass',
+                 v_ncast, p_parent::text) into v_wm;
+  return v_wm;
+end;
+$$;
+
+create or replace function archive.file_gate(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns void language plpgsql as $$
+declare
+  cfg pgpm.config; v_ncast text; v_wm text; v_nsp name; v_rel name;
+  r record; v_overlap_live bigint; v_ov_lo text; v_ov_hi text; v_child_overlap bigint;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive.file_gate: % is not managed', p_parent; end if;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+
+  -- fast path: derived, no scan
+  v_wm := archive._file_watermark(p_parent);
+  if v_wm is null or pgpm._native_gt(cfg.control_kind, p_hi, v_wm) then
+    raise exception 'archive.file_gate: % (hi %) is not yet fully covered by the ledger watermark (%); deferring the drop',
+      p_child, p_hi, coalesce(v_wm, '<none>');
   end if;
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  execute format('select count(*) from %I.%I', v_nsp, p_child) into v_live;
-  if v_live is distinct from v_rows then
-    raise exception 'archive.gate: % changed since it was archived (% rows live, % archived); deferring for re-archive',
-      p_child, v_live, v_rows;
-  end if;
+
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  -- defense in depth: every ledger row overlapping [p_lo, p_hi), whole-range recounted
+  for r in
+    execute format(
+      'select lo, hi, rows_archived from archive.ledger
+        where parent_table = %L::regclass and hi::%s > %L::%s and lo::%s < %L::%s
+        for update',
+      p_parent::text, v_ncast, p_lo, v_ncast, v_ncast, p_hi, v_ncast)
+  loop
+    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
+                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, r.lo),
+                   cfg.control_column, pgpm._encode(cfg.control_kind, r.hi))
+      into v_overlap_live;
+    if v_overlap_live is distinct from r.rows_archived then
+      raise exception 'archive.file_gate: file % [%, %) changed since it was archived (% rows live, % archived); deferring for re-archive',
+        (select s3_key from archive.ledger where parent_table = p_parent and lo = r.lo),
+        r.lo, r.hi, v_overlap_live, r.rows_archived;
+    end if;
+
+    -- keep rows_archived in lockstep: subtract exactly the overlap between the partition about
+    -- to be dropped and this row's range (a partition can span more than one row; each gets only
+    -- its own slice subtracted).
+    v_ov_lo := case when pgpm._native_gt(cfg.control_kind, p_lo, r.lo) then p_lo else r.lo end;
+    v_ov_hi := case when pgpm._native_gt(cfg.control_kind, r.hi, p_hi) then p_hi else r.hi end;
+    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
+                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_lo),
+                   cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_hi))
+      into v_child_overlap;
+    update archive.ledger set rows_archived = rows_archived - v_child_overlap
+      where parent_table = p_parent and lo = r.lo;
+  end loop;
 end;
 $$;
 ```
-
-The gate compares **row counts**, so it catches the realistic mutation of aged data (a backdated or
-late-arriving row) but not a same-count mutation (an `UPDATE`, or an insert+delete pair). Aged
-partitions are assumed effectively append-only, as in most retention workloads; if yours are not,
-extend the ledger with a content checksum.
 
 ## The archiver
 
@@ -131,6 +212,7 @@ declare
   v_part_payload text; v_chunk text; v_cursor text; v_done boolean := false;
   v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
   v_rows bigint := 0; v_n bigint; v_stale text; v_lo text; v_hi text;
+  v_reledger boolean; v_expected_lo text;
   v_resp http_response; h http_header;
 begin
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
@@ -141,6 +223,24 @@ begin
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select control_column into v_control from pgpm.config where parent_table = p_parent;
   select lo, hi into v_lo, v_hi from pgpm.part where parent_table = p_parent and child_name = p_child;
+
+  -- forward-only guard: archive.file_gate's fast path trusts the ledger's watermark to mean
+  -- "everything below this is archived" -- true only if coverage is gap-free from wherever the
+  -- ledger starts. archive._chunk_one (docs/archive-chunked-parquet.md) enforces that by
+  -- construction, always extending the watermark forward; this procedure takes an arbitrary
+  -- child name, so it enforces the same contract explicitly. A re-archive of an already-ledgered
+  -- partition (the stale-veto self-repair path) is exempt -- it overwrites its own existing row,
+  -- not extending the frontier.
+  select exists(select 1 from archive.ledger where parent_table = p_parent and lo = v_lo) into v_reledger;
+  if not v_reledger then
+    select coalesce(archive._file_watermark(p_parent), (select min(lo) from pgpm.part where parent_table = p_parent))
+      into v_expected_lo;
+    if v_lo is distinct from v_expected_lo then
+      raise exception 'archive.partition: % [lo %] is out of order -- % is next expected to archive lo %; archive partitions in ascending lo order (archive.scan always does) so the shared ledger stays gap-free for archive.file_gate''s fast path',
+        p_child, v_lo, p_parent, coalesce(v_expected_lo, '<none>');
+    end if;
+  end if;
+
   select a.atttypid::regtype::text into v_ctltype
     from pg_attribute a where a.attrelid = p_parent and a.attname = v_control;
   v_key := c_prefix || p_child || '.ndjson';
@@ -323,7 +423,7 @@ double-*archive* (wasted work, safe: a PUT to the same key overwrites) but never
 ## Install
 
 ```sql
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.gate(regclass,name,text,text)');
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
 select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.scan()');
 select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
 ```
@@ -342,13 +442,13 @@ enforcement:
   gate passing on each retire. A ~110MB partition archived as a 10-part upload, account-checked at
   600,000 contiguous rows.
 - **Backstop veto**: an eligible-but-unarchived partition made `retain()` drop nothing, logging
-  `archive.gate: ... is not archived yet` -- the flat-`retain_backlog`, climbing-
-  `retain_hook_failures` wedge signature.
+  `archive.file_gate: ... is not yet fully covered by the ledger watermark` -- the
+  flat-`retain_backlog`, climbing-`retain_hook_failures` wedge signature.
 - **Stale veto and self-repair**: a row backdated into an archived-but-not-yet-retired partition
   made the gate defer with `changed since it was archived (5001 rows live, 5000 archived)`; the next
-  `archive.scan()` re-archived (overwriting the same key) and retired it. The archiver owns the
-  repair; the gate owns the veto (a raising hook's writes roll back, so it could not durably flag
-  anything anyway).
+  `archive.scan()` re-archived (overwriting the same ledger row) and retired it. The archiver owns
+  the repair; the gate owns the veto (a raising hook's writes roll back, so it could not durably
+  flag anything anyway).
 - **Crash cleanup**: a simulated network failure during part 2 killed the scan mid-partition,
   leaving one invisible in-flight upload on the store; the next scan's cleanup-on-entry aborted it
   (confirmed by `ListMultipartUploads`: zero in-flight), then re-archived and retired the partition.
@@ -363,12 +463,29 @@ full scale over a real network: a ~110MB partition archived as a 10-part upload 
 distinct advancing `backend_xmin` values in 27 samples**, versus the synchronous hook's **one pinned
 value** for its entire equal-sized run.
 
-The happy path and backstop veto above were re-verified against the unified `archive.ledger` shape
-(#217): `archive.partition` correctly resolves its partition's own `[lo, hi)` from `pgpm.part` and
-writes a ledger row with `child_name` populated, `archive.gate`'s `child_name` lookup passes on it
-unchanged, and a second managed table archived concurrently through
-[the chunker](archive-chunked-parquet.md) (writing `child_name`-`null` rows into the same table)
-produced no key collisions or lookup cross-talk between the two.
+The happy path, backstop veto, and stale veto + self-repair above were all re-verified against the
+unified `archive.ledger` table and shared `archive.file_gate` (#217, #218): `archive.partition`
+resolves its partition's own `[lo, hi)` from `pgpm.part`, the forward-only guard passes silently on
+in-order archiving and on re-archiving an already-ledgered (stale) partition, and a second managed
+table archived concurrently through [the chunker](archive-chunked-parquet.md) produced no key
+collisions or lookup cross-talk between the two tables' rows in the same ledger.
+
+`archive.file_gate` was not a safe drop-in for the retired `archive.gate` on the first attempt,
+and the gap was caught live, not reasoned about: `archive.gate` looked up one partition by
+`child_name`, independent of anything else in the ledger, so it could never be fooled by another
+row. `archive.file_gate`'s fast path instead trusts a single per-parent watermark (`max(hi)` over
+*all* ledger rows) to mean "everything below this is archived" -- true only if the ledger's
+coverage is gap-free. Archiving a later partition directly via `archive.partition` while an
+earlier one stayed unarchived (skipping it, bypassing `archive.scan`'s own in-order sweep) pushed
+the watermark past the earlier partition's `hi`; `pgpm.retire()` on that earlier, still-unarchived
+partition then **dropped it with no error and no log entry**, because the fast path's watermark
+check passed and the defense-in-depth loop found zero ledger rows overlapping its range (a
+touching-but-not-overlapping half-open range) to recount. The fix is the forward-only guard in
+`archive.partition` above: it refuses to write a ledger row out of order (unless the row is a
+legitimate re-archive of an already-ledgered partition), which is exactly the discipline
+`archive._chunk_one` already keeps by construction. The same out-of-order sequence was re-run
+against the fixed procedure and now fails fast with `archive.partition: ... is out of order`
+instead of silently corrupting the ledger's contiguity.
 
 ## Supabase ceilings, discovered the honest way
 
