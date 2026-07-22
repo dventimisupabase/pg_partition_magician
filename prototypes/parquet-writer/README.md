@@ -88,6 +88,62 @@ docker-compose --profile pg17 up -d
 ./.venv/bin/python verify_range.py
 ```
 
+## GZIP compression
+
+`pq.to_parquet(regclass, p_compress default false)` and `pq.to_parquet_range(..., p_compress
+default false)` take an optional flag to GZIP-compress each column's page bytes instead of
+writing them uncompressed. This is a real DEFLATE (RFC 1951) encoder written from scratch --
+LZ77 matching plus fixed-Huffman entropy coding, not a call out to any compression library --
+plus a CRC-32 (RFC 1952) trailer, all in PL/pgSQL with zero extension dependencies. Confirmed
+empirically (not assumed) that Parquet's GZIP codec means the full RFC 1952 container (10-byte
+header, deflate stream, CRC-32 + ISIZE trailer), by writing a real GZIP-compressed file with
+pyarrow itself and checking the page bytes open with the `1f8b` gzip magic and read cleanly via
+Python's stdlib `gzip` reader -- not the bare RFC 1950 zlib framing a different codec would use.
+
+**LZ77 matching**, the part that actually earns compression ratio, needed two ideas to avoid
+O(n^2) behavior without writing (and likely getting subtly wrong) a real hash-chain data
+structure:
+
+- **Candidate-finding as a SQL self-join, not a hand-rolled chain.** A rolling 3-byte hash per
+  position, indexed, then `... JOIN LATERAL (SELECT ... ORDER BY pos DESC LIMIT 1) ...` to find
+  the nearest prior position sharing that hash within the 32KB window. An earlier version used
+  an unbounded `GROUP BY pos, MAX(candidate)`, which blew up to 35s on 170KB of *exactly the
+  highly-repetitive input compression matters most for* (every position shares a hash with
+  thousands of others); the `LATERAL ... LIMIT 1` form lets the planner use a backward
+  index-only scan and stop at the first hit, regardless of how repetitive the data is.
+- **Match-length extension via binary search, not a byte-by-byte loop.** `substr(data,a,k) =
+  substr(data,b,k)` is a single native comparison regardless of `k`; bisecting on `k` finds the
+  true match length in O(log match_length) comparisons instead of O(match_length).
+- **Lazy evaluation, driven by the greedy parse.** Only look up a candidate at positions the
+  parse actually visits -- a position consumed by a preceding match is never queried at all.
+  For highly compressible input this cut lookups from ~1M to ~4,800 for a 1MB payload (parse
+  time 4.3s -> 40ms); for near-incompressible input the reduction is smaller but still real
+  (~2x). The first version of this used `EXECUTE format(...)` so the lookup query could take a
+  table name parameter; that alone cost ~2.5x versus a plain hardcoded-table-name query, once
+  isolated from a *second* confound (the correctness-verification reconstruction step has its
+  own unrelated O(n^2) cost that was swamping the actual measurement) -- both had to be
+  untangled before the real number was visible.
+
+**Huffman/bit-packing** surfaced a third instance of the same general lesson (small per-call
+overhead dominating simple work, once multiplied by enough calls): the length/distance code
+lookups were originally separate PL/pgSQL functions with `OUT` parameters, invoked via `SELECT
+... FROM f(...)` once per LZ77 match. That calling convention alone cost more than the entire
+LZ77 tokenizer for a 1MB near-incompressible payload (~1.9s vs ~1.6s) -- more than the bit-level
+work it was computing inputs for. Inlining those lookups as `CASE` expressions directly in the
+hot loop, combined with merging a whole Huffman code into a wide accumulator via one shift+OR
+(bit-reversing the code once per *token*, not once per output *bit* -- Huffman codes are
+MSB-first on the wire, but the byte stream itself packs LSB-first, an easy inversion to make by
+accident) took a 1MB near-incompressible payload from 4.56s to 2.64s.
+
+Verified two ways for every case, matching the project's verification bar: the raw DEFLATE
+stream via `zlib.decompress(data, wbits=-15)`, and the full GZIP container via stdlib `gzip`
+(which verifies its own CRC-32 internally, a check with zero code in common with this encoder).
+Then, separately, real Parquet files built end-to-end by `pq.to_parquet`/`to_parquet_range`
+with `p_compress => true`, read back by both pyarrow (confirming `codec: GZIP`) and DuckDB, and
+checked row-for-row against the live source table -- covering plain columns, nullable columns
+(the definition-levels bitmap and the values are compressed together as one page), an empty
+table, and a cross-partition range spanning two children.
+
 ## Layout
 
 `parquet_writer.sql` implements, bottom-up:
@@ -114,6 +170,11 @@ docker-compose --profile pg17 up -d
    since two separate `array_agg` calls have no order guarantee otherwise;
    `array_agg` preserves `NULL`s in position, so this is one pass either
    way), and assembles the final file.
+6. A from-scratch DEFLATE/GZIP compressor (`pq._gzip_compress`, see "GZIP
+   compression" below): LZ77 matching (SQL self-join for candidates, binary
+   search for match length, lazy evaluation driven by the greedy parse) plus
+   fixed-Huffman bit-packing and a CRC-32 trailer. Optional, via
+   `p_compress` on `pq.to_parquet`/`to_parquet_range`.
 
 ## Verification
 
@@ -132,7 +193,12 @@ unsupported type, and a run of nullable-column cases: mixed nulls crossing
 a definition-levels byte boundary, an all-null column, a nullable column
 declared but with no actual nulls, an empty table with a nullable column,
 `NULL` staying distinct from `''` in a nullable text column, a nullable
-boolean, and a table mixing `NOT NULL` and nullable columns together.
+boolean, and a table mixing `NOT NULL` and nullable columns together. Plus
+four `p_compress => true` cases: repetitive text (real LZ77 matches, checked
+smaller than the uncompressed version and `codec: GZIP` via pyarrow),
+nullable columns compressed, low-entropy hex text (near-worst-case for
+LZ77 -- correctness under a bad ratio, not the ratio itself), and an empty
+table.
 
 Note on the DuckDB side of `read_with_both_readers()`: it fetches raw
 tuples, not `.fetchdf()` (pandas). Pandas represents SQL `NULL` as `NaN`,
@@ -146,4 +212,4 @@ python3 -m venv .venv && ./.venv/bin/pip install pyarrow psycopg2-binary duckdb 
 ./.venv/bin/python verify.py
 ```
 
-All 20 cases pass against a live PG17 container as of this writing.
+All 24 cases pass against a live PG17 container as of this writing.

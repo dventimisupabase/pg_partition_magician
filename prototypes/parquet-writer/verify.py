@@ -39,6 +39,21 @@ def to_parquet_bytes(conn, table):
     return bytes(rows[0][0])
 
 
+def to_parquet_bytes_compressed(conn, table):
+    rows = run(conn, f"select pq.to_parquet('{table}'::regclass, true)")
+    return bytes(rows[0][0])
+
+
+def codec_of(raw):
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        return str(pq.ParquetFile(path).metadata.row_group(0).column(0).compression)
+    finally:
+        os.unlink(path)
+
+
 def read_with_both_readers(raw):
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
         f.write(raw)
@@ -346,6 +361,61 @@ def test_mixed_required_and_optional_columns(conn):
     check("mixed NOT NULL (id) and nullable (note, score) columns", expected, arrow_rows, duck_rows)
 
 
+def test_compressed_repetitive_text(conn):
+    # a repeated phrase forces real LZ77 back-references, not just Huffman-coded literals --
+    # the case compression exists for.
+    make_table(conn, "t_gzip_rep", "id int4 not null, note text not null", None)
+    run(conn, "insert into t_gzip_rep (id, note) select g, repeat('the quick brown fox jumps over the lazy dog ', 4) || g::text from generate_series(1, 400) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed(conn, "t_gzip_rep")
+    uncompressed_raw = to_parquet_bytes(conn, "t_gzip_rep")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_gzip_rep", ["id", "note"])
+    ok = check("gzip-compressed: repetitive text (real LZ77 matches)", expected, arrow_rows, duck_rows)
+    if codec_of(raw) != "GZIP":
+        FAILURES.append(f"gzip codec: expected GZIP, got {codec_of(raw)}")
+        ok = False
+    if len(raw) >= len(uncompressed_raw):
+        FAILURES.append(f"gzip codec: compressed ({len(raw)}) not smaller than uncompressed ({len(uncompressed_raw)})")
+        ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: gzip codec + smaller-than-uncompressed "
+          f"({len(uncompressed_raw)} -> {len(raw)} bytes)")
+
+
+def test_compressed_nullable_mixed(conn):
+    make_table(conn, "t_gzip_null", "id int4 not null, note text, score float8", None)
+    run(conn, "insert into t_gzip_null (id, note, score) select g, "
+              "case when g % 3 = 0 then null else repeat('hello world ', 5) || g::text end, "
+              "case when g % 7 = 0 then null else g * 1.5 end "
+              "from generate_series(1, 300) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed(conn, "t_gzip_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_gzip_null", ["id", "note", "score"])
+    check("gzip-compressed: nullable columns (definition levels + values both compressed)",
+          expected, arrow_rows, duck_rows)
+
+
+def test_compressed_low_entropy_still_correct(conn):
+    # md5 hex text barely compresses (small alphabet gives short LZ77 matches everywhere, not
+    # long ones) -- the point is correctness under a near-worst-case input, not ratio.
+    make_table(conn, "t_gzip_hash", "id int4 not null, h text not null", None)
+    run(conn, "insert into t_gzip_hash (id, h) select g, md5(g::text) from generate_series(1, 500) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed(conn, "t_gzip_hash")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_gzip_hash", ["id", "h"])
+    check("gzip-compressed: low-entropy hex text (near-worst-case for LZ77)", expected, arrow_rows, duck_rows)
+
+
+def test_compressed_empty_table(conn):
+    make_table(conn, "t_gzip_empty", "id int4 not null, note text not null", None)
+    raw = to_parquet_bytes_compressed(conn, "t_gzip_empty")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_gzip_empty", ["id", "note"])
+    check("gzip-compressed: empty table (0 rows), still a valid Parquet file", expected, arrow_rows, duck_rows)
+
+
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
@@ -373,6 +443,10 @@ def main():
         test_nullable_text_with_empty_string,
         test_nullable_bool,
         test_mixed_required_and_optional_columns,
+        test_compressed_repetitive_text,
+        test_compressed_nullable_mixed,
+        test_compressed_low_entropy_still_correct,
+        test_compressed_empty_table,
     ]
     for t in tests:
         try:

@@ -37,8 +37,9 @@ def run(conn, sql, params=None):
         return None
 
 
-def to_parquet_range_bytes(conn, parent, control, lo, hi):
-    rows = run(conn, "select pq.to_parquet_range(%s::regclass, %s, %s, %s)", (parent, control, lo, hi))
+def to_parquet_range_bytes(conn, parent, control, lo, hi, compress=False):
+    rows = run(conn, "select pq.to_parquet_range(%s::regclass, %s, %s, %s, %s)",
+               (parent, control, lo, hi, compress))
     return bytes(rows[0][0])
 
 
@@ -364,6 +365,18 @@ def test_range_pruning_skips_untouched_partition(conn):
         FAILURES.append(f"partition pruning: unexpected plan:\n{plan_text}")
 
 
+def test_range_compressed_across_children(conn):
+    # gzip compression through the SAME cross-partition range path (spans p1+p2), not just
+    # pq.to_parquet's single-relation path -- the two entry points share _gzip_compress, but
+    # each wires it into its own page-building loop independently, so each needs its own check.
+    make_events_fixture(conn)
+    raw = to_parquet_range_bytes(conn, "t_range_events", "ts", "2026-01-01", "2026-03-01", compress=True)
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = expected_rows(conn, "t_range_events", "ts", "2026-01-01", "2026-03-01",
+                              ["ts", "id"], ["id", "ts", "val"])
+    check("gzip-compressed range spanning p1+p2", expected, arrow_rows, duck_rows)
+
+
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
@@ -382,6 +395,7 @@ def main():
         test_range_bare_unique_index_refused,
         test_range_keyless_refused,
         test_range_pruning_skips_untouched_partition,
+        test_range_compressed_across_children,
     ]
     for t in tests:
         try:
