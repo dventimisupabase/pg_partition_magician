@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+- **Docs: chunked, cross-partition Parquet archival (`docs/archive-chunked-parquet.md`).** A third
+  archival strategy alongside `archive-to-s3.md` and `archive-assistant.md`: decouples Parquet file
+  boundaries from partition boundaries entirely, so the vacuum-horizon hold is bounded by a chosen
+  target file size instead of emergent partition size (a busy month's partition can be far bigger
+  than a quiet one's under time-cut partitioning). Adds `archive.file_ledger` (an additive table
+  recording one row per archived file, `[lo, hi)` ranges always contiguous and gap-free from the
+  parent's grid anchor, the watermark derived as `max(hi)`), a cross-partition range-query variant
+  of the Parquet encoder (`archive._pq_to_parquet_range`, reading straight off the parent and
+  relying on Postgres's own partition pruning, ordering by `(control column, real key)` instead of
+  `ctid` since a range can span more than one child's heap and a time-kind control column routinely
+  repeats; key discovery mirrors `pgpm.regrain_step`'s own PK/unique-constraint contract exactly,
+  refusing keyless tables the same way), a two-part `archive.file_gate` (a derived-watermark fast
+  path plus a whole-file defense-in-depth recount), and `archive._chunk_one`/`archive.chunk_step`/
+  `archive.chunk_all` (the chunker itself, stopping each file at the smallest of a byte-budget
+  estimate, the frozen floor, and the retention horizon, mirroring `pgpm.regrain_step`/`regrain`'s
+  two driving modes).
+
+  Verification surfaced a real correctness gap beyond the original design: a naive gate that
+  recounts a file's live range against a *static* `rows_archived` misfires the moment two
+  partitions sharing a file are dropped in separate `retire()` calls (the ordinary case, since
+  `retain_batch` paces drops one at a time) -- partition A's legitimate drop makes the file's live
+  count permanently look "short" to partition B's later check, indistinguishable from a real stray.
+  The fix keeps `rows_archived` in lockstep by decrementing it (under `FOR UPDATE`) by exactly the
+  dropped partition's overlap with each file it touches, verified against the constructed failure
+  case directly. Verified end-to-end against a live MinIO instance through the real
+  `pgpm.retire()`/`retain()` path: a 1,000-row/20-day fixture chunked into 57 files, every one
+  fetched back and read by both pyarrow and DuckDB, the union exactly reconstructing the source
+  (zero dup, zero drop, contiguous ranges confirmed programmatically); the sequential-sibling-drop
+  fix proven against the exact adversarial sequence that breaks the naive version; a real stray
+  (a row deleted out of an already-archived partition) caught through the actual `retain()` path
+  and logged via the standard `retain_hook_fail` contract; single-writer confirmed under real
+  concurrency; and both driving modes (paced one-file-per-tick, and drain-the-backlog-now)
+  exercised. Prototype + its own from-scratch test suite (13 cases) live alongside the existing
+  whole-relation encoder in `prototypes/parquet-writer/`.
+
 - **The metaphor gets its cast sorted, and the archival examples leave `public`.** The drain is no
   longer called the magician's "assistant" anywhere: pgpm does its own drain work (it is all one big
   act), and **assistant** now names the archive-then-retire scanner (`docs/archive-janitor.md` is now
