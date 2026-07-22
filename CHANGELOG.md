@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+- **Permanent CI infrastructure for `pgpm_archive` (#222, 2 of a planned 2-3 PR sequence):
+  a `./test.sh archive` track, replacing the ad hoc Postgres 17 + `pgsql-http` + MinIO harness
+  #217-#221 and #222's first PR were hand-verified against.** The shared `Dockerfile` grows an
+  opt-in `WITH_PGSQL_HTTP` build arg (default `false`, so the existing pg15-18 matrix images are
+  byte-for-byte unaffected); `docker-compose.yml` grows a `minio` service and an `archive` PG17
+  service (own profile, excluded from `all`, matching the `timescale` service's own pattern).
+  `test.sh` gets a `run_archive` function modeled on `run_timescale`'s disposable-database-per-file
+  shape, not `run_observe`'s begin/rollback shape: `archive.tick()` and
+  `archive._encode_upload_ndjson_commits` commit internally, and PL/pgSQL only allows that when the
+  call chain traces to a top-level `CALL`, which rules out wrapping them in `begin`/`rollback` (or
+  in any pgTAP assertion function -- `lives_ok`/`throws_ok` are themselves functions, so a
+  commit-issuing procedure must be invoked as a bare top-level `CALL`, its success proven by
+  separate assertions afterward, not by the wrapper).
+
+  New `tests/archive/fixtures.sql`: a `vault.decrypted_secrets` stub (the module reads S3
+  credentials via Supabase Vault's public view; the test image is plain Postgres with no
+  pgsodium/Vault available) seeded with the test MinIO's root credentials, plus small
+  managed-table and `archive.config`-row builders wired to the harness's MinIO bucket/endpoint. Six
+  `tests/archive/db/*.sql` pgTAP files cover the worker end to end: the happy path via
+  `archive.tick()` (`gate_only`), a `self_driving` table dropping partitions in the same `tick()`
+  call that archived them, the `byte_budget` boundary rule chunking a span that does not align to
+  any partition, the `parquet` format plus the structurally separate synchronous
+  `archive.to_s3_parquet` hook, the forward-only guard on `archive.archive_partition`, and --
+  the highest-value regression -- the unconditional retire sweep fix from #222's first PR, proven
+  the same way it was live-verified there: a second `pre_drop` hook fails one partition's drop, a
+  first `tick()` leaves it stuck while archiving and retiring the other two, and a second `tick()`
+  -- with nothing new to archive -- still retries and drops it.
+
+  A standalone, path-filtered `.github/workflows/archive.yml` runs the new track on push/PR
+  touching `pgpm_archive/install.sql`, `pgpm_core/install.sql`, `tests/archive/**`, or the harness
+  itself, mirroring `observe.yml`'s non-gating model (not wired into `test.yml`/`release.yml`),
+  since archival is fully optional user-land and depends on external MinIO infrastructure that
+  should not gate releases. Verified locally end to end (`./test.sh archive`, all green) and that
+  `WITH_PGSQL_HTTP` defaulting to `false` is a true no-op for the existing matrix
+  (`./test.sh 17`, unaffected).
+
+  Next in this sequence: update the existing `docs/archive-*.md` pages to point at this module as
+  the installable source of truth, keeping their narrative, honest-limits, and live-verification
+  write-ups.
+
 - **New `pgpm_archive/install.sql`: the archival harmonization stack (#217-#221), packaged as a
   real, installable, optional add-on (#222, 1 of a planned 2-3 PR sequence).** Mirrors
   `pgpm_hypertable/`/`pgpm_observe/`'s existing shape (one `install.sql`, no config table of its

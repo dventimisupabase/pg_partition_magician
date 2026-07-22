@@ -21,6 +21,8 @@ psql, or other tooling needed on the host.
 ./test.sh timescale # the from_hypertable track: TimescaleDB 2.9.1 + 2.16.1 / PG15
                     # (the big fleet clusters), its own image, NOT in the default matrix
                     # (TS_VERSIONS='2.9.1' ./test.sh timescale runs just one)
+./test.sh archive   # the pgpm_archive track: PG17 + pgsql-http against a MinIO stand-in
+                    # for S3, its own image, NOT in the default matrix
 ```
 
 `test.sh` exercises all three install channels (`psql`, bundle, dbdev) against a
@@ -51,6 +53,7 @@ docker compose --profile pg15 down -v
 | `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `tests/timescale/` | The `from_hypertable` track: its own `Dockerfile` (TimescaleDB + pgTAP), `fixtures.sql`, and `db/*.sql` tests, run by `./test.sh timescale` (disposable-db per file) |
+| `tests/archive/` | The `pgpm_archive` track: `fixtures.sql` (a `vault.decrypted_secrets` stub + small managed-table/config builders) and `db/*.sql` tests against a real MinIO service, run by `./test.sh archive` (disposable-db per file, since `archive.tick()` commits internally) |
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
