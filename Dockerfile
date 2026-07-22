@@ -8,6 +8,13 @@ FROM postgres:${PG_VERSION}
 ARG PG_CRON_SHA=61d693be59f456dbc2e26f73bf5e81e4fed7d73c
 ARG PGTAP_REF=v1.3.4
 
+# Optional: pgsql-http, needed only by the archive track (pgpm_archive/, S3 uploads via the http
+# extension). Off by default so the default pg15-18 matrix images stay exactly as they were --
+# no extra build step, no extra installed packages. docker-compose.yml's `archive` service passes
+# WITH_PGSQL_HTTP=true.
+ARG WITH_PGSQL_HTTP=false
+ARG PGSQL_HTTP_REF=v1.6.2
+
 RUN apt-get update \
     && apt-get install -y \
         postgresql-server-dev-${PG_MAJOR} \
@@ -18,6 +25,12 @@ RUN apt-get update \
     && git clone --depth 1 --branch ${PGTAP_REF} https://github.com/theory/pgtap.git \
     && cd pgtap && make && make install && cd .. && rm -rf pgtap \
     && apt-get install -y libtap-parser-sourcehandler-pgtap-perl \
+    && if [ "$WITH_PGSQL_HTTP" = "true" ]; then \
+         apt-get install -y libcurl4-openssl-dev \
+         && apt-mark manual libcurl4 \
+         && git clone --depth 1 --branch ${PGSQL_HTTP_REF} https://github.com/pramsey/pgsql-http.git \
+         && cd pgsql-http && make && make install && cd .. && rm -rf pgsql-http; \
+       fi \
     && apt-get remove -y build-essential git \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

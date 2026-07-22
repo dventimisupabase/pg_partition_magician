@@ -67,3 +67,29 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     ports: ["5519:5432"]
+
+  # The archive track: PG17 + pgsql-http (S3 uploads via the http extension) + MinIO standing in
+  # for S3. Its own profile, excluded from "all" -- pgsql-http is only needed here, so the default
+  # pg15-18 matrix images stay exactly as they were. test.sh's own one-off `docker run --network`
+  # calls (for MinIO bucket setup via the mc client, which has no service of its own) rely on the
+  # network name pinned below rather than guessing Compose's auto-generated one.
+  minio:
+    profiles: ["archive"]
+    image: minio/minio
+    container_name: pgpm_test-archive-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data
+
+  archive:
+    <<: *pg-base
+    profiles: ["archive"]
+    build: { context: ., args: { PG_VERSION: 17, WITH_PGSQL_HTTP: "true" } }
+    image: pgpm_test:17-archive
+    container_name: pgpm_test-archive
+    ports: ["5520:5432"]
+
+networks:
+  default:
+    name: pgpm_test_net

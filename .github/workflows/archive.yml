@@ -1,0 +1,38 @@
+name: Archive track
+
+# The optional archival add-on (pgpm_archive): archives aged partitions to S3 before retention
+# drops them. Separate from the main matrix: it needs pgsql-http (built into its own PG17 image)
+# and MinIO standing in for S3, neither of which the default pg15-18 matrix images carry.
+# Path-filtered so it runs only when the module, its tests, or the harness change.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pgpm_archive/install.sql'
+      - 'pgpm_core/install.sql'
+      - 'tests/archive/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/archive.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pgpm_archive/install.sql'
+      - 'pgpm_core/install.sql'
+      - 'tests/archive/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/archive.yml'
+  workflow_dispatch:
+
+jobs:
+  archive:
+    name: pgpm_archive against MinIO / PG17 + pgsql-http
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Run the archive track
+        run: ./test.sh archive
