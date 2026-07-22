@@ -362,24 +362,85 @@ on a bucket lifecycle rule (`AbortIncompleteMultipartUpload`) as the final backs
 
 ## The scanner
 
+Picking which partition to archive next is its own step, `archive._next_range_partition_aligned`,
+factored out so [the chunker](archive-chunked-parquet.md#the-chunker)'s own boundary rule
+(`archive._next_range_byte_budget`) can sit alongside it with a matching shape (`(p_parent)` in,
+`(lo, hi, child_name)` or no rows out) -- nothing downstream of the range (the read-and-upload, the
+ledger write, the retire) depends on which rule picked it.
+
 ```sql
--- the scanner: one standing pg_cron job. Finds every retention-eligible partition of every
--- managed table, archives the unarchived (or stale) ones, and retires each through
+-- picks the assistant's next range: the first attached, retention-eligible partition (in lo
+-- order) whose ledger row is missing or stale (the live count no longer matches what was
+-- recorded). Returns no rows once every eligible partition already has a fresh ledger row --
+-- unlike the chunker's boundary rule, this one DOES revisit already-covered ranges, because a
+-- partition-aligned range can still be attached (and still mutable) long after it was archived,
+-- where a chunked file's range is retention-eligible-or-gone by the time it would be reconsidered.
+create or replace function archive._next_range_partition_aligned(p_parent regclass)
+returns table(lo text, hi text, child_name name)
+language plpgsql as $$
+declare
+  cfg pgpm.config; v_boundary text; v_ncast text; v_nsp name;
+  v_part record; v_rows bigint; v_live bigint;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._next_range_partition_aligned: % is not managed', p_parent; end if;
+  v_boundary := pgpm._retain_boundary(cfg);
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  for v_part in execute format(
+    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
+    p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast)
+  loop
+    select a.rows_archived into v_rows from archive.ledger a
+     where a.parent_table = p_parent and a.child_name = v_part.child_name;
+    execute format('select count(*) from %I.%I', v_nsp, v_part.child_name) into v_live;
+    if v_rows is null or v_rows is distinct from v_live then
+      lo := v_part.lo; hi := v_part.hi; child_name := v_part.child_name;
+      return next;
+      return;
+    end if;
+  end loop;
+end;
+$$;
+```
+
+```sql
+-- the scanner: one standing pg_cron job. Archives every retention-eligible partition of every
+-- managed table that needs it, then retires every retention-eligible partition through
 -- pgpm.retire() -- the claim-guarded sanctioned drop, which also runs the gate (defense in
--- depth: an assistant bug that reached retire() with a bad archive would still be vetoed).
+-- depth: an assistant bug that reached retire() with a bad archive would still be vetoed). Two
+-- passes, not interleaved per partition: archiving drains archive._next_range_partition_aligned
+-- until it has nothing left to report, THEN the retire sweep attempts every eligible partition --
+-- not just the ones archived just now, so a partition that was already correctly archived but
+-- didn't retire last cycle (its own drop deferred by something unrelated) still gets retried here,
+-- since the picker above would no longer surface it as needing (re-)archiving.
 create or replace procedure archive.scan()
 language plpgsql as $$
 declare
   cfg pgpm.config; v_boundary text; v_ncast text;
   v_work  record; v_targets jsonb := '[]';
-  v_rows bigint; v_live bigint; v_nsp name;
+  v_lo text; v_hi text; v_child name; v_iter int;
 begin
   -- session-level advisory lock: pg_cron happily overlaps runs of the same job, and a second
   -- scanner mid-upload would double-archive. Session locks survive the COMMITs below.
   if not pg_try_advisory_lock(hashtext('pgpm-archiver')) then return; end if;
 
-  -- materialize the work list first (loop-with-COMMIT over a live cursor is legal since PG11,
-  -- but a fixed list is simpler to reason about; eligibility is re-checked by retire() anyway)
+  for cfg in select * from pgpm.config where retain is not null loop
+    v_iter := 0;
+    loop
+      select t.lo, t.hi, t.child_name into v_lo, v_hi, v_child
+        from archive._next_range_partition_aligned(cfg.parent_table) t;
+      exit when v_child is null;
+      call archive.partition(cfg.parent_table, v_child);
+      commit;
+      v_iter := v_iter + 1;
+      if v_iter > 1000000 then raise exception 'archive.scan: safety limit'; end if;
+    end loop;
+  end loop;
+
+  -- materialize the retire-sweep work list (loop-with-COMMIT over a live cursor is legal since
+  -- PG11, but a fixed list is simpler to reason about; eligibility is re-checked by retire() anyway)
   for cfg in select * from pgpm.config where retain is not null loop
     v_boundary := pgpm._retain_boundary(cfg);
     v_ncast    := pgpm._native_type(cfg.control_kind);
@@ -395,15 +456,6 @@ begin
   for v_work in select (t->>'parent')::regclass as parent, (t->>'child')::name as child
                   from jsonb_array_elements(v_targets) t
   loop
-    -- archive when there is no fresh ledger row (missing, or stale: the live count moved)
-    select a.rows_archived into v_rows from archive.ledger a
-     where a.parent_table = v_work.parent and a.child_name = v_work.child;
-    select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = v_work.parent;
-    execute format('select count(*) from %I.%I', v_nsp, v_work.child) into v_live;
-    commit;
-    if v_rows is null or v_rows is distinct from v_live then
-      call archive.partition(v_work.parent, v_work.child);
-    end if;
     perform pgpm.retire(v_work.parent, v_work.child);
     commit;
   end loop;
@@ -486,6 +538,18 @@ legitimate re-archive of an already-ledgered partition), which is exactly the di
 `archive._chunk_one` already keeps by construction. The same out-of-order sequence was re-run
 against the fixed procedure and now fails fast with `archive.partition: ... is out of order`
 instead of silently corrupting the ledger's contiguity.
+
+Extracting `archive._next_range_partition_aligned` (#219) restructured `archive.scan()` into two
+passes -- archive everything that needs it, then retire everything eligible -- rather than the
+original single pass interleaving an archive-or-not decision with a retire attempt for each
+partition in turn. Re-verified against the same fixture set: a scan with several eligible
+partitions archived and retired all of them exactly as before; a partition archived directly (not
+through `archive.scan()`) and left un-retired, simulating a drop deferred on some earlier cycle for
+a reason unrelated to archiving, was correctly *not* re-archived (its ledger row was already fresh,
+so the picker no longer surfaces it) but still retired by the unchanged retire sweep -- the
+guarantee the two-pass split had to preserve, since the picker's job is now only "does this need a
+fresh archive," not "does this need a retire attempt." The stale-veto self-repair path and the
+forward-only guard were both re-run through the new picker-driven call path with identical results.
 
 ## Supabase ceilings, discovered the honest way
 

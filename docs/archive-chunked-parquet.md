@@ -261,7 +261,7 @@ Each file covers `[watermark(P), stop)`, where `stop` is the smallest of three b
   that window equal to the scan cadence, not calendar time, so the gate's recount is sufficient
   on its own without a separate repair operation.
 
-`archive._chunk_one` does exactly one file's worth of work -- compute the range, read, encode,
+`archive._chunk_one` does exactly one file's worth of work -- pick the range, read, encode,
 PUT, ledger, `commit` -- so the vacuum-horizon hold for that call is bounded by the byte budget,
 the same way the archive assistant bounds its hold by `c_part_bytes`, just without the assistant's
 per-part sub-splitting (a small enough file makes that unnecessary; see the design's positioning
@@ -271,37 +271,34 @@ progress (the operator's "do it now", mirroring `pgpm.regrain`'s shape). Both ta
 advisory lock distinct from the archive assistant's, so a chunker and a scanner never collide if
 both are ever run against the same database.
 
+Picking the range is its own step, `archive._next_range_byte_budget`, factored out so [the archive
+assistant](archive-assistant.md#the-archiver)'s own boundary rule
+(`archive._next_range_partition_aligned`) can sit alongside it with a matching shape (`(p_parent)`
+in, `(lo, hi)` or no rows out) -- nothing downstream of the range (the read, the encode, the
+upload, the ledger write) depends on which rule picked it.
+
 ```sql
-create or replace procedure archive._chunk_one(p_parent regclass)
+-- picks this chunker's next range: the derived watermark (or this table's own grid anchor on the
+-- very first call -- reusing pgpm.config's grid origin rather than inventing a second one) up to
+-- the smallest of the frozen floor, the retention horizon, and the byte-budget estimate, extended
+-- to the next distinct control value so a run of ties never splits across two files. Returns no
+-- rows if nothing is eligible to archive yet.
+create or replace function archive._next_range_byte_budget(p_parent regclass, c_byte_budget bigint default 8 * 1024 * 1024, c_probe_sample int default 1000)
+returns table(lo text, hi text)
 language plpgsql as $$
 declare
-  -- deployment constants: edit these six
-  c_bucket       text := 'my-archive-bucket';
-  c_region       text := 'us-east-1';
-  c_prefix       text := 'events/';
-  c_endpoint     text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
-  c_byte_budget  bigint := 8 * 1024 * 1024;   -- target file size: the horizon-hold bound
-  c_probe_sample int := 1000;
-  c_compress     boolean := true;     -- GZIP the Parquet page data; counts against the byte-budget
-                                       -- hold below (see "Honest limits")
-
   cfg pgpm.config; v_ncast text; v_nsp name; v_rel name;
   v_lo text; v_frontier text; v_floor text; v_retain_boundary text;
   v_avg numeric; v_batch int; v_batch_count int; v_probe_hi_col text; v_probe_hi text;
   v_next_distinct_col text; v_bytebudget_stop text;
   v_stop text; v_hi text;
-  v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
-  v_rows bigint; v_etag text; h http_header;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._chunk_one: % is not managed', p_parent; end if;
+  if not found then raise exception 'archive._next_range_byte_budget: % is not managed', p_parent; end if;
   v_ncast := pgpm._native_type(cfg.control_kind);
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  -- resume point: the derived watermark, or this table's own grid anchor on the very first
-  -- call (the "archival floor" the invariant refers to -- reusing pgpm.config's grid origin
-  -- rather than inventing a second one)
   v_lo := coalesce(archive._file_watermark(p_parent), cfg.partition_anchor);
 
   v_frontier := pgpm._frontier_native(p_parent);
@@ -353,6 +350,40 @@ begin
   v_hi := v_stop;
   if not pgpm._native_gt(cfg.control_kind, v_hi, v_lo) then
     return;   -- no progress possible this call
+  end if;
+
+  lo := v_lo; hi := v_hi;
+  return next;
+end;
+$$;
+
+create or replace procedure archive._chunk_one(p_parent regclass)
+language plpgsql as $$
+declare
+  -- deployment constants: edit these six
+  c_bucket       text := 'my-archive-bucket';
+  c_region       text := 'us-east-1';
+  c_prefix       text := 'events/';
+  c_endpoint     text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
+  c_byte_budget  bigint := 8 * 1024 * 1024;   -- target file size: the horizon-hold bound
+  c_probe_sample int := 1000;
+  c_compress     boolean := true;     -- GZIP the Parquet page data; counts against the byte-budget
+                                       -- hold below (see "Honest limits")
+
+  cfg pgpm.config; v_nsp name; v_rel name;
+  v_lo text; v_hi text;
+  v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
+  v_rows bigint; v_etag text; h http_header;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._chunk_one: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  select t.lo, t.hi into v_lo, v_hi
+    from archive._next_range_byte_budget(p_parent, c_byte_budget, c_probe_sample) t;
+  if v_lo is null then
+    return;   -- nothing eligible to archive right now
   end if;
 
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
@@ -485,6 +516,11 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   coexisted in the one table with no key collision, and `archive._file_watermark`/
   `archive.file_gate` correctly read and gated each table using only its own `[lo, hi)` ranges,
   with no cross-talk from the other table's rows sitting in the same ledger.
+- **Boundary-rule extraction (#219)**: after factoring the range computation out of
+  `archive._chunk_one` into `archive._next_range_byte_budget`, re-ran both fixtures above --
+  `archive.chunk_all` against a single-file table and against a small-byte-budget table forced to
+  334 files over 5,000 rows -- and got byte-identical results: same ranges, same row counts, same
+  `lag(hi)` gap-free contiguity.
 
 ## Honest limits
 
