@@ -186,15 +186,43 @@ $$;
 
 ## The archiver
 
+*How* a range becomes bytes and lands in S3 is its own pluggable step (#221), matching-shaped with
+[the chunker](archive-chunked-parquet.md#the-chunker)'s: `(p_parent, p_lo, p_hi, p_compress)` in,
+`(s3_key, etag, rows_archived)` out, whichever of the three ways below is configured. All three
+read straight off the *parent* (relying on Postgres's own partition pruning), not a named child --
+the same shift [the chunker's range reader](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
+already made, generalized here to NDJSON too.
+
+- **`archive._encode_upload_ndjson_single`**: one read, one `PUT` (optionally gzipped as a single
+  member). No internal commits, so the vacuum-horizon hold spans the whole range's read and
+  upload -- fine for a range already bounded by whichever boundary rule chose it.
+- **`archive._encode_upload_ndjson_commits`**: this page's original per-part-commit technique
+  (read a page, commit, `PUT` a part, commit, repeat, complete the multipart upload once done),
+  generalized past "always exactly one partition" to any range. This is the only one of the three
+  that can bound the vacuum-horizon hold below the whole range's read-and-upload time, because
+  NDJSON has no whole-file structure to finalize -- there is nothing stopping a `COMMIT` between
+  parts.
+- **`archive._encode_upload_parquet`**: a thin wrapper around [the chunker's range
+  encoder](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation),
+  `archive._pq_to_parquet_range`, plus a `PUT`. Deploy `docs/archive-chunked-parquet.md`'s encoder
+  section too if this page's `c_format` is ever set to `'parquet'` -- unlike the other two, this
+  one is not self-contained in `archive-to-s3.md` alone.
+
+**Parquet with internal commits is not a fourth option, and cannot become one**: a Parquet file's
+footer needs every row group's byte offset, known only once the whole file's bytes exist, so there
+is no way to `COMMIT` partway through building one. This is a structural fact about the format, not
+a gap in this project -- see [Archive partitions to S3](archive-to-s3.md#honest-limits-for-the-parquet-variant)
+and [#211](https://github.com/dventimisupabase/pg_partition_magician/issues/211).
+
+Generalizing the per-part-commit reader past one partition surfaced a real, previously-latent
+correctness gap in its ordering, not just a mechanical lift -- see "Failure semantics, verified"
+below for what it was and how it's fixed.
+
 ```sql
--- the work: archive ONE partition, holding the vacuum horizon for at most one part-window at a
--- time. A PROCEDURE, not a function: it COMMITs after every statement that held a snapshot (each
--- part's read, each network call), and procedure-local variables (the keyset cursor, the
--- UploadId, the ETag list) survive those commits. PL/pgSQL forbids transaction control inside a
--- block with an EXCEPTION clause, so this procedure has NO handler and cannot abort-on-exit;
--- instead it CLEANS UP ON ENTRY (aborting any stale in-flight upload for its key, which also
--- covers crashed runs) and relies on a bucket lifecycle rule as the final backstop.
-create or replace procedure archive.partition(p_parent regclass, p_child name)
+-- single read, single PUT (optionally one gzip member for the whole body). No pagination, so no
+-- tiebreak is needed: a plain `order by` with no LIMIT never splits a run of ties across pages.
+create or replace function archive._encode_upload_ndjson_single(p_parent regclass, p_lo text, p_hi text, p_compress boolean default false)
+returns table(s3_key text, etag text, rows_archived bigint)
 language plpgsql as $$
 declare
   -- deployment constants: edit these four
@@ -202,49 +230,117 @@ declare
   c_region   text := 'us-east-1';
   c_prefix   text := 'events/';
   c_endpoint text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
-                                  -- (e.g. 'https://<ref>.storage.supabase.co/storage/v1/s3')
 
-  c_part_bytes int := 8 * 1024 * 1024;   -- per-part size = the horizon-hold bound: one part's network time
-  c_fetch_rows int := 20000;
-  v_ctype text := 'application/x-ndjson';
-
-  v_key_id text; v_secret text; v_nsp name; v_control name; v_ctltype text; v_key text;
-  v_part_payload text; v_chunk text; v_cursor text; v_done boolean := false;
-  v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
-  v_rows bigint := 0; v_n bigint; v_stale text; v_lo text; v_hi text;
-  v_reledger boolean; v_expected_lo text;
-  v_resp http_response; h http_header;
+  cfg pgpm.config; v_nsp name; v_rel name; v_ctype text;
+  v_payload text; v_body bytea; v_key text;
+  v_key_id text; v_secret text; v_resp http_response; h http_header; v_etag text; v_rows bigint;
 begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._encode_upload_ndjson_single: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  execute format(
+    'select coalesce(string_agg(row_to_json(t)::text, e''\n'' order by t.%I), ''''), count(*)
+       from %I.%I t where t.%I >= %L and t.%I < %L',
+    cfg.control_column, v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo),
+    cfg.control_column, pgpm._encode(cfg.control_kind, p_hi))
+    into v_payload, v_rows;
+
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
   select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
   if v_key_id is null or v_secret is null then
-    raise exception 'archive.partition: credentials missing from vault';
-  end if;
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  select control_column into v_control from pgpm.config where parent_table = p_parent;
-  select lo, hi into v_lo, v_hi from pgpm.part where parent_table = p_parent and child_name = p_child;
-
-  -- forward-only guard: archive.file_gate's fast path trusts the ledger's watermark to mean
-  -- "everything below this is archived" -- true only if coverage is gap-free from wherever the
-  -- ledger starts. archive._chunk_one (docs/archive-chunked-parquet.md) enforces that by
-  -- construction, always extending the watermark forward; this procedure takes an arbitrary
-  -- child name, so it enforces the same contract explicitly. A re-archive of an already-ledgered
-  -- partition (the stale-veto self-repair path) is exempt -- it overwrites its own existing row,
-  -- not extending the frontier.
-  select exists(select 1 from archive.ledger where parent_table = p_parent and lo = v_lo) into v_reledger;
-  if not v_reledger then
-    select coalesce(archive._file_watermark(p_parent), (select min(lo) from pgpm.part where parent_table = p_parent))
-      into v_expected_lo;
-    if v_lo is distinct from v_expected_lo then
-      raise exception 'archive.partition: % [lo %] is out of order -- % is next expected to archive lo %; archive partitions in ascending lo order (archive.scan always does) so the shared ledger stays gap-free for archive.file_gate''s fast path',
-        p_child, v_lo, p_parent, coalesce(v_expected_lo, '<none>');
-    end if;
+    raise exception 'archive._encode_upload_ndjson_single: credentials missing from vault';
   end if;
 
-  select a.atttypid::regtype::text into v_ctltype
-    from pg_attribute a where a.attrelid = p_parent and a.attname = v_control;
-  v_key := c_prefix || p_child || '.ndjson';
-  commit;   -- nothing above needs to stay open
+  v_key := c_prefix || p_parent::text || '_' || regexp_replace(p_lo, '[^0-9]', '', 'g') || '.ndjson';
+  if p_compress then
+    v_key := v_key || '.gz';
+    v_body := archive._pq_gzip_compress(convert_to(v_payload, 'UTF8'));
+    v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                              'application/gzip', v_body, v_key_id, v_secret);
+  else
+    v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                       'application/x-ndjson', v_payload, v_key_id, v_secret);
+  end if;
+  if v_resp.status not between 200 and 299 then
+    raise exception 'archive._encode_upload_ndjson_single: PUT of % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
+  end if;
+  foreach h in array v_resp.headers loop
+    if lower(h.field) = 'etag' then v_etag := h.value; end if;
+  end loop;
+
+  s3_key := v_key; etag := v_etag; rows_archived := v_rows;
+  return next;
+end;
+$$;
+
+-- per-part-commit technique, generalized off any [p_lo, p_hi) range read from the parent. A
+-- PROCEDURE, not a function, for the same two reasons the original per-partition version was one:
+-- procedure-local variables survive COMMIT (the keyset cursor, the UploadId, the ETag list), and
+-- PL/pgSQL forbids transaction control inside a block with an EXCEPTION clause, so there is no
+-- handler and no abort-on-exit -- cleanup-on-entry (aborting any stale in-flight upload for this
+-- key) and a bucket lifecycle rule are the backstops instead.
+--
+-- Ordering is where "any range" differs from "one partition": a range read off the parent can
+-- span more than one child, and a time-kind control column routinely repeats (duplicate
+-- timestamps are the common case, not the exception), so ordering by the control column alone is
+-- not deterministic across a page boundary -- see "Failure semantics, verified" below for the
+-- exact silent-skip this caused in the original per-partition reader. Ordering (and resuming) on
+-- a `text[]` of (control column, real key columns) instead fixes it: Postgres compares arrays
+-- lexicographically, element by element, so this is a genuine composite tiebreak without
+-- dynamic-arity ROW() construction. Key discovery is `archive._key_columns`, the same helper
+-- [the chunker's range encoder](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
+-- uses.
+--
+-- Compression, if requested, gzips each part independently (`archive._pq_gzip_compress`) and lets
+-- S3 multipart's own byte-range concatenation produce the final object -- a valid *multi-member*
+-- gzip stream (RFC 1952 permits concatenating independent gzip members; standard decompressors
+-- read through all of them transparently), so no part needs the others' bytes to compress its own.
+create or replace procedure archive._encode_upload_ndjson_commits(
+  p_parent regclass, p_lo text, p_hi text, p_compress boolean default false,
+  inout p_s3_key text default null, inout p_etag text default null, inout p_rows bigint default 0)
+language plpgsql as $$
+declare
+  -- deployment constants: edit these four
+  c_bucket     text := 'my-archive-bucket';
+  c_region     text := 'us-east-1';
+  c_prefix     text := 'events/';
+  c_endpoint   text := null;
+  c_part_bytes int := 8 * 1024 * 1024;   -- per-part size = the horizon-hold bound
+  c_fetch_rows int := 20000;
+
+  cfg pgpm.config; v_nsp name; v_rel name; v_ctype text;
+  v_key_cols name[]; v_castlist text; v_key text;
+  v_key_id text; v_secret text;
+  v_part_payload text; v_chunk text; v_cursor text[]; v_done boolean := false;
+  v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
+  v_rows bigint := 0; v_n bigint; v_stale text; v_body bytea;
+  v_resp http_response; h http_header;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._encode_upload_ndjson_commits: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  v_key_cols := archive._key_columns(p_parent);
+  if v_key_cols is null then
+    raise exception 'archive._encode_upload_ndjson_commits: % has no primary key or predicate/expression-free unique constraint; a resumable range read cannot tiebreak ties on % without one',
+      p_parent, cfg.control_column;
+  end if;
+  select string_agg(format('%I::text', c), ', ' order by ord) into v_castlist
+    from unnest(array_prepend(cfg.control_column, v_key_cols)) with ordinality as t(c, ord);
+
+  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
+  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
+  if v_key_id is null or v_secret is null then
+    raise exception 'archive._encode_upload_ndjson_commits: credentials missing from vault';
+  end if;
+
+  v_key := c_prefix || p_parent::text || '_' || regexp_replace(p_lo, '[^0-9]', '', 'g') || '.ndjson'
+           || (case when p_compress then '.gz' else '' end);
+  v_ctype := case when p_compress then 'application/gzip' else 'application/x-ndjson' end;
+  commit;
 
   -- cleanup-on-entry: abort any in-flight multipart upload a failed or crashed prior run left
   -- behind for this key (invisible in listings, billed until aborted)
@@ -260,7 +356,7 @@ begin
   end loop;
   commit;
 
-  -- stream the partition: read one part (snapshot held for a disk-speed moment, then COMMITted
+  -- stream the range: read one part (snapshot held for a disk-speed moment, then COMMITted
   -- away), PUT it (snapshot held for one part's network time, then COMMITted away), repeat.
   v_part_payload := '';
   v_cursor := null;
@@ -268,11 +364,13 @@ begin
   loop
     while not v_done and octet_length(v_part_payload) < c_part_bytes loop
       execute format(
-        'select coalesce(string_agg(j, e''\n'' order by k), ''''), (array_agg(k order by k desc))[1]::text, count(*)
-           from (select row_to_json(t)::text as j, t.%I as k from %I.%I t
-                  where $1 is null or t.%I > $1::%s
-                  order by t.%I limit $2) s',
-        v_control, v_nsp, p_child, v_control, v_ctltype, v_control)
+        'select coalesce(string_agg(j, e''\n'' order by k), ''''), max(k), count(*)
+           from (select row_to_json(t)::text as j, array[%s] as k from %I.%I t
+                  where t.%I >= %L and t.%I < %L and ($1 is null or array[%s] > $1)
+                  order by array[%s] limit $2) s',
+        v_castlist, v_nsp, v_rel,
+        cfg.control_column, pgpm._encode(cfg.control_kind, p_lo), cfg.control_column, pgpm._encode(cfg.control_kind, p_hi),
+        v_castlist, v_castlist)
         into v_chunk, v_cursor, v_n using v_cursor, c_fetch_rows;
       if v_chunk = '' then v_done := true;
       else v_part_payload := v_part_payload || v_chunk || e'\n'; v_rows := v_rows + v_n;
@@ -281,13 +379,21 @@ begin
     end loop;
 
     exit parts when v_done and v_part > 0 and v_part_payload = '';
+    if p_compress and v_part_payload != '' then
+      v_body := archive._pq_gzip_compress(convert_to(v_part_payload, 'UTF8'));
+    end if;
 
     if v_part = 0 and v_done then
       -- everything fit in one part: plain single PUT, no multipart bookkeeping
-      v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key, '',
-                                         v_ctype, v_part_payload, v_key_id, v_secret);
+      if p_compress then
+        v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                                  v_ctype, v_body, v_key_id, v_secret);
+      else
+        v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                           v_ctype, v_part_payload, v_key_id, v_secret);
+      end if;
       if v_resp.status not between 200 and 299 then
-        raise exception 'archive.partition: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+        raise exception 'archive._encode_upload_ndjson_commits: PUT of % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
       end if;
       foreach h in array v_resp.headers loop
         if lower(h.field) = 'etag' then v_etag := h.value; end if;
@@ -299,18 +405,24 @@ begin
       v_resp := archive.s3_signed_request('POST', c_endpoint, c_bucket, c_region, v_key, 'uploads=',
                                          v_ctype, '', v_key_id, v_secret);
       if v_resp.status not between 200 and 299 then
-        raise exception 'archive.partition: initiate multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+        raise exception 'archive._encode_upload_ndjson_commits: initiate multipart for % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
       end if;
       v_upload_id := (xpath('//*[local-name()=''UploadId'']/text()', v_resp.content::xml))[1]::text;
       commit;
     end if;
 
     v_part := v_part + 1;
-    v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key,
-                                       'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
-                                       v_ctype, v_part_payload, v_key_id, v_secret);
+    if p_compress then
+      v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key,
+                                                'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
+                                                v_ctype, v_body, v_key_id, v_secret);
+    else
+      v_resp := archive.s3_signed_request('PUT', c_endpoint, c_bucket, c_region, v_key,
+                                         'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
+                                         v_ctype, v_part_payload, v_key_id, v_secret);
+    end if;
     if v_resp.status not between 200 and 299 then
-      raise exception 'archive.partition: part % of % failed: HTTP % %', v_part, p_child, v_resp.status, left(v_resp.content, 200);
+      raise exception 'archive._encode_upload_ndjson_commits: part % of % failed: HTTP % %', v_part, v_key, v_resp.status, left(v_resp.content, 200);
     end if;
     v_etag := null;
     foreach h in array v_resp.headers loop
@@ -329,21 +441,123 @@ begin
                                        '<CompleteMultipartUpload>' || v_parts_xml || '</CompleteMultipartUpload>',
                                        v_key_id, v_secret);
     if v_resp.status not between 200 and 299 or v_resp.content like '%<Error>%' then
-      raise exception 'archive.partition: complete multipart for % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
+      raise exception 'archive._encode_upload_ndjson_commits: complete multipart for % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
     end if;
     v_etag := null;
     v_etag := (xpath('//*[local-name()=''ETag'']/text()', v_resp.content::xml))[1]::text;
   end if;
 
+  p_s3_key := v_key; p_etag := v_etag; p_rows := v_rows;
+end;
+$$;
+
+-- thin wrapper around the chunker's own range encoder + a PUT. Requires
+-- docs/archive-chunked-parquet.md's encoder section deployed too -- see above.
+create or replace function archive._encode_upload_parquet(p_parent regclass, p_lo text, p_hi text, p_compress boolean default true)
+returns table(s3_key text, etag text, rows_archived bigint)
+language plpgsql as $$
+declare
+  -- deployment constants: edit these four
+  c_bucket   text := 'my-archive-bucket';
+  c_region   text := 'us-east-1';
+  c_prefix   text := 'events/';
+  c_endpoint text := null;
+
+  cfg pgpm.config; v_nsp name; v_rel name;
+  v_payload bytea; v_key text; v_key_id text; v_secret text;
+  v_resp http_response; h http_header; v_etag text; v_rows bigint;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._encode_upload_parquet: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  v_payload := archive._pq_to_parquet_range(p_parent, cfg.control_column,
+                                            pgpm._encode(cfg.control_kind, p_lo), pgpm._encode(cfg.control_kind, p_hi),
+                                            p_compress);
+  execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
+                 v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, p_hi))
+    into v_rows;
+
+  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
+  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
+  if v_key_id is null or v_secret is null then
+    raise exception 'archive._encode_upload_parquet: credentials missing from vault';
+  end if;
+
+  v_key := c_prefix || p_parent::text || '_' || regexp_replace(p_lo, '[^0-9]', '', 'g') || '.parquet';
+  v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key, '',
+                                            'application/vnd.apache.parquet', v_payload, v_key_id, v_secret);
+  if v_resp.status not between 200 and 299 then
+    raise exception 'archive._encode_upload_parquet: PUT of % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
+  end if;
+  foreach h in array v_resp.headers loop
+    if lower(h.field) = 'etag' then v_etag := h.value; end if;
+  end loop;
+
+  s3_key := v_key; etag := v_etag; rows_archived := v_rows;
+  return next;
+end;
+$$;
+
+-- the assistant's own archiver: pick a partition's bounds, guard against archiving out of order,
+-- dispatch to whichever encode/upload step is configured, ledger the result.
+create or replace procedure archive.partition(p_parent regclass, p_child name)
+language plpgsql as $$
+declare
+  -- deployment constants: edit these two
+  c_format   text := 'ndjson_commits';   -- 'ndjson_commits' (default, this page's original
+                                          -- technique) | 'ndjson_single' | 'parquet' (needs
+                                          -- docs/archive-chunked-parquet.md's encoder deployed too)
+  c_compress boolean := false;           -- NDJSON default-off here (matching this page's history);
+                                          -- the chunker defaults Parquet on -- flip this to true
+                                          -- too if switching c_format to 'parquet'
+
+  v_lo text; v_hi text; v_reledger boolean; v_expected_lo text;
+  v_s3_key text; v_etag text; v_rows bigint;
+begin
+  select lo, hi into v_lo, v_hi from pgpm.part where parent_table = p_parent and child_name = p_child;
+
+  -- forward-only guard: archive.file_gate's fast path trusts the ledger's watermark to mean
+  -- "everything below this is archived" -- true only if coverage is gap-free from wherever the
+  -- ledger starts. archive._chunk_one (docs/archive-chunked-parquet.md) enforces that by
+  -- construction, always extending the watermark forward; this procedure takes an arbitrary
+  -- child name, so it enforces the same contract explicitly. A re-archive of an already-ledgered
+  -- partition (the stale-veto self-repair path) is exempt -- it overwrites its own existing row,
+  -- not extending the frontier.
+  select exists(select 1 from archive.ledger where parent_table = p_parent and lo = v_lo) into v_reledger;
+  if not v_reledger then
+    select coalesce(archive._file_watermark(p_parent), (select min(lo) from pgpm.part where parent_table = p_parent))
+      into v_expected_lo;
+    if v_lo is distinct from v_expected_lo then
+      raise exception 'archive.partition: % [lo %] is out of order -- % is next expected to archive lo %; archive partitions in ascending lo order (archive.scan always does) so the shared ledger stays gap-free for archive.file_gate''s fast path',
+        p_child, v_lo, p_parent, coalesce(v_expected_lo, '<none>');
+    end if;
+  end if;
+  commit;   -- release this procedure's own read snapshot before the encode/upload step's work
+
+  if c_format = 'ndjson_commits' then
+    call archive._encode_upload_ndjson_commits(p_parent, v_lo, v_hi, c_compress, v_s3_key, v_etag, v_rows);
+  elsif c_format = 'ndjson_single' then
+    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+      from archive._encode_upload_ndjson_single(p_parent, v_lo, v_hi, c_compress) t;
+  elsif c_format = 'parquet' then
+    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+      from archive._encode_upload_parquet(p_parent, v_lo, v_hi, c_compress) t;
+  else
+    raise exception 'archive.partition: unknown c_format %; expected ndjson_commits, ndjson_single, or parquet', c_format;
+  end if;
+
   -- the ledger row: written only now, after the store confirmed the object. A crash between the
-  -- complete and this insert just re-archives next scan (a PUT to the same key overwrites; the
-  -- cleanup-on-entry finds nothing in flight because the upload completed). Keyed by the
-  -- partition's own lo (its native-grid [lo, hi) bounds), with child_name populated since this
-  -- range is exactly one partition -- the shared archive.ledger table (see "The ledger and the
-  -- gate" above) also serves docs/archive-chunked-parquet.md's cross-partition ranges, which have
-  -- no single child_name to record.
+  -- encode/upload step and this insert just re-archives next scan (a PUT to the same key
+  -- overwrites; cleanup-on-entry finds nothing in flight because the upload completed). Keyed by
+  -- the partition's own lo (its native-grid [lo, hi) bounds), with child_name populated since
+  -- this range is exactly one partition -- the shared archive.ledger table (see "The ledger and
+  -- the gate" above) also serves docs/archive-chunked-parquet.md's cross-partition ranges, which
+  -- have no single child_name to record.
   insert into archive.ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
-  values (p_parent, v_lo, v_hi, p_child, v_key, v_etag, v_rows)
+  values (p_parent, v_lo, v_hi, p_child, v_s3_key, v_etag, v_rows)
   on conflict (parent_table, lo)
     do update set hi = excluded.hi, child_name = excluded.child_name,
                   s3_key = excluded.s3_key, etag = excluded.etag,
@@ -353,12 +567,21 @@ end;
 $$;
 ```
 
-Two PL/pgSQL rules shape this procedure. Procedure-local variables **survive `COMMIT`**, which is
-what lets the keyset cursor, the UploadId, and the ETag list ride across the per-part commits with
-no staging table. And transaction control is **forbidden inside a block with an `EXCEPTION`
-clause**, so a committing procedure cannot abort-on-exit the way the synchronous hook does; instead
-it cleans up on entry (which also covers crashed runs, which no exit handler ever could) and leans
-on a bucket lifecycle rule (`AbortIncompleteMultipartUpload`) as the final backstop.
+Two PL/pgSQL rules shape `archive._encode_upload_ndjson_commits`. Procedure-local variables
+**survive `COMMIT`**, which is what lets the keyset cursor, the UploadId, and the ETag list ride
+across the per-part commits with no staging table. And transaction control is **forbidden inside a
+block with an `EXCEPTION` clause**, so a committing procedure cannot abort-on-exit the way the
+synchronous hook does; instead it cleans up on entry (which also covers crashed runs, which no exit
+handler ever could) and leans on a bucket lifecycle rule (`AbortIncompleteMultipartUpload`) as the
+final backstop. `archive.partition` itself no longer touches S3 directly, or Vault -- both moved
+into whichever encode/upload step it dispatches to -- so it only needs its own `commit` to release
+the guard check's read snapshot before that step's work begins.
+
+The S3 key naming changed with this generalization: every encode/upload step names its object from
+`(parent, lo)` (`events/<parent>_<lo-digits>.<ext>`), not `(child name)`
+(`events/<child>.ndjson`), because none of the three know a child name -- only a range. Existing
+objects already archived under the old per-child naming are unaffected (their ledger rows still
+match); only newly archived ranges use the new naming.
 
 ## The scanner
 
@@ -507,7 +730,9 @@ select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
 
 Unlike the synchronous hook, this needs **no `retain_batch`**: the gate is a count lookup, so even
 an unbounded `retain()` pass over an archived backlog is quick. The knob that matters here is
-`c_part_bytes`, the horizon-hold bound.
+`c_part_bytes`, the horizon-hold bound -- but only for the default `c_format := 'ndjson_commits'`;
+switch to `'ndjson_single'` or `'parquet'` (see "The archiver" above) and `c_part_bytes` no longer
+applies, since neither of those can bound its hold below the whole range's read-and-upload time.
 
 `archive.scan()`'s `c_self_driving` constant is `true` above -- the scanner retires what it
 archives, same as it always has. Set it to `false` for **gate-only** instead: the scanner becomes
@@ -595,6 +820,33 @@ the new chunk's watermark now fully covers. The restructured retire sweep (loopi
 directly and calling the shared, committing `archive._retire_covered` per table, rather than
 materializing every table's targets into one list first) was also re-run across two managed tables
 archived in the same `scan()` call, both correctly archived and retired with no cross-talk.
+
+The pluggable encode/upload step (#221) surfaced a real, previously-latent bug rather than being a
+purely mechanical lift, and it was caught the same way every other one in this stack was: live,
+not by inspection. The original per-partition `archive.partition` ordered its keyset pagination by
+the control column alone, with a strict `>` resume predicate between pages -- correct only if no
+two rows in the range share a control-column value across a page boundary. Constructed directly: a
+21-row, time-kind fixture (mostly 3-4 rows per distinct timestamp) read with a 5-row page size using
+that exact original query returned only **16 of 21 rows** -- 5 rows tied at a page boundary's exact
+cursor value were silently excluded by the next page's `> cursor` filter, never appearing in any
+page. The same fixture through the fixed reader (ordering and resuming on a `text[]` of `(control
+column, real key columns)`, comparing arrays lexicographically) returned all 21, verified by id.
+This was a real gap in a technique that had shipped and been "verified" before -- every prior test
+of `archive.partition` happened to use a unique id-kind control column, where the gap can never
+manifest.
+
+Beyond the fix itself: the happy path was re-verified with the new dispatch unchanged
+(`c_format := 'ndjson_commits'`, the default, archiving and retiring identically to before, just
+under the new `(parent, lo)`-based key naming); the two newly-possible combinations were verified
+end-to-end (`archive.partition` with `c_format := 'parquet'` -- valid Parquet magic bytes at both
+ends of the fetched object; [the chunker](archive-chunked-parquet.md#the-chunker) with
+`c_format := 'ndjson_single'` -- all 50,000 rows fetched back intact); and compression on
+`ndjson_commits` was verified against a 30,000-row, semi-random-payload fixture forced into several
+6MiB+ parts -- the resulting object, a genuine multi-member gzip stream (each part compressed
+independently, concatenated by S3 multipart's own byte-range join), decompressed with a stock
+`gunzip` into all 30,000 rows, no loss, no duplication. The forward-only guard (#218) and
+self-driving retire (#220) were both re-confirmed unaffected by the new dispatch layer sitting in
+front of them.
 
 ## Supabase ceilings, discovered the honest way
 

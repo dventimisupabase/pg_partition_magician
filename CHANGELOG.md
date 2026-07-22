@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+- **Docs: pluggable encode/upload step for the paced worker -- format x compression x commit
+  strategy (#221, closes #213, #214).** The last hardwired piece after #217-#220: *how* a range
+  becomes bytes and lands in S3. Adds three shared, matching-shaped steps -- `(p_parent, p_lo,
+  p_hi, p_compress)` in, `(s3_key, etag, rows_archived)` out -- defined once in
+  `docs/archive-assistant.md`'s "The archiver": `archive._encode_upload_ndjson_single` (one read,
+  one `PUT`, optionally one gzip member), `archive._encode_upload_ndjson_commits` (the per-part-
+  commit technique, generalized off any range instead of always exactly one partition), and
+  `archive._encode_upload_parquet` (a thin wrapper around the chunker's own range encoder). Both
+  `archive.partition` and `archive._chunk_one` get a `c_format` constant dispatching to whichever
+  step is configured (`'ndjson_commits'` / `'parquet'` respectively by default, unchanged); Parquet
+  with internal commits is named explicitly as impossible, not a gap -- its footer needs every row
+  group's byte offset, known only once the whole file exists.
+
+  Generalizing the per-part-commit reader past "always one partition" surfaced a real,
+  previously-latent bug, not just a mechanical lift: the original ordered its keyset pagination by
+  the control column alone with a strict `>` resume predicate, correct only if no two rows share a
+  control-column value across a page boundary. Reproduced directly -- a 21-row, time-kind fixture
+  (mostly 3-4 rows per timestamp) read page-by-page with the original query returned only 16 of 21
+  rows, 5 silently dropped at a page boundary tie. Every prior test of `archive.partition` had used
+  a unique id-kind control column, where this gap can never manifest. Fixed by ordering and
+  resuming on a `text[]` of `(control column, real key columns)` -- Postgres compares arrays
+  lexicographically, so this is a genuine composite tiebreak without dynamic-arity `ROW()`
+  construction -- using `archive._key_columns` (relocated from `archive-chunked-parquet.md` to
+  `archive-to-s3.md`, since both the Parquet and NDJSON range readers need the identical key
+  discovery now). The same fixture through the fixed reader returned all 21 rows, verified by id.
+
+  Compressing an NDJSON-with-commits range gzips each part independently and lets S3 multipart's
+  own byte-range concatenation produce the final object -- a valid multi-member gzip stream (RFC
+  1952 permits concatenating independent gzip members; standard decompressors read through all of
+  them transparently) -- verified against a 30,000-row fixture forced into several 6MiB+ parts,
+  decompressing cleanly with a stock `gunzip` into all 30,000 rows, no loss or duplication.
+
+  Live-verified end-to-end: the unchanged defaults for both pages; the two newly-possible
+  combinations (`archive.partition` with `c_format := 'parquet'`, `archive._chunk_one` with
+  `c_format := 'ndjson_single'`); the tie-break bug reproduced and then confirmed fixed;
+  compression on the commits variant; and the #218 forward-only guard and #220 self-driving retire
+  both unaffected by the new dispatch layer. The S3 key naming changed as a side effect of no
+  encode/upload step knowing a child name anymore: newly archived objects are now keyed by
+  `(parent, lo)` rather than `(child name)` -- already-archived objects and their ledger rows are
+  unaffected.
+
 - **Docs: add a drop-trigger toggle (gate-only vs self-driving) to the paced worker (#220).** Fills
   the two previously-unbuilt cells in `docs/archive-strategies-overview.md`'s boundary-rule x
   drop-trigger-rule table. Adds a shared `archive._retire_covered(p_parent, p_up_to)` procedure

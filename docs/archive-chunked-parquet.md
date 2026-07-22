@@ -9,10 +9,12 @@ encoder](archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson) and the 
 SigV4 signer from that page rather than duplicating them, and it reuses [the archive
 assistant](archive-assistant.md#the-ledger-and-the-gate)'s `archive.ledger` table, derived
 watermark, and gate (`archive.file_gate`, the one gate both pages now register) rather than
-declaring second, near-identical copies -- deploy that page's schema section first.
-`archive.partition` from the archive assistant is untouched and stays exactly as it is for anyone
-who does not need this; only the shared ledger/watermark/gate move with it. Everything here is
-user-land, like every hook and archival example in this project: pgpm ships none of it.
+declaring second, near-identical copies -- deploy that page's schema section first. As of #221,
+this page's own Parquet range encoder is in turn reused by the assistant (as an optional format
+choice on `archive.partition`), and this page's `archive._chunk_one` can equally choose either of
+the assistant's NDJSON encode/upload steps -- see [the archive
+assistant](archive-assistant.md#the-archiver) for what moved where. Everything here is user-land,
+like every hook and archival example in this project: pgpm ships none of it.
 
 ## Why partition size is the wrong unit to bound
 
@@ -69,12 +71,15 @@ timestamps are the common case, not the exception), so ordering by it alone is n
 deterministic -- and a resumable, budget-stopped read needs a boundary that can be described
 exactly as `[lo, hi)`, which is only possible if every row's sort position is unique and
 reproducible. So this orders by `(control column, real key columns)` instead, discovering the
-key the identical way `pgpm.regrain_step` already does (`pgpm_core/install.sql`): a PRIMARY KEY
-preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX unbacked
-by a constraint. A genuinely keyless relation is refused outright -- the same `'nokey'` contract
-`regrain()` already enforces, an inherited limitation, not a new gap. (On a partitioned parent,
-Postgres itself requires any unique constraint to include every partitioning column, so in
-practice the control column is always already one of the columns this discovers.)
+key via `archive._key_columns` -- [Archive partitions to
+S3](archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson)'s shared key-discovery helper,
+reused as-is here and by [the archive assistant](archive-assistant.md#the-archiver)'s
+NDJSON-with-commits range reader (#221): a PRIMARY KEY preferred, else a predicate/expression-free
+UNIQUE CONSTRAINT, never a bare UNIQUE INDEX unbacked by a constraint. A genuinely keyless relation
+is refused outright -- the same `'nokey'` contract `regrain()` already enforces, an inherited
+limitation, not a new gap. (On a partitioned parent, Postgres itself requires any unique constraint
+to include every partitioning column, so in practice the control column is always already one of
+the columns this discovers.)
 
 `archive._pq_encode_column_data` already takes the `p_order_by` parameter this range reader
 needs (default `'ctid'`, so `archive._pq_to_parquet`'s whole-relation callers are unaffected
@@ -87,27 +92,6 @@ ambiguous between the two (#209). Install `archive-to-s3.md`'s SQL first; everyt
 builds on it.
 
 ```sql
--- key discovery: identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery
-create or replace function archive._pq_key_columns(p_relation regclass) returns name[]
-language plpgsql as $$
-declare v_keyidx oid; v_cols name[];
-begin
-  select coalesce(
-           (select i.indexrelid from pg_index i where i.indrelid = p_relation and i.indisprimary limit 1),
-           (select con.conindid from pg_constraint con join pg_index i on i.indexrelid = con.conindid
-             where con.conrelid = p_relation and con.contype = 'u'
-               and i.indpred is null and i.indexprs is null limit 1))
-    into v_keyidx;
-  if v_keyidx is null then return null; end if;
-  select array_agg(a.attname order by k.ord) into v_cols
-    from pg_index i
-    cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
-    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
-   where i.indexrelid = v_keyidx;
-  return v_cols;
-end;
-$$;
-
 -- archive._pq_to_parquet_range: reads [p_lo, p_hi) of p_control off p_parent (typically a
 -- partitioned parent), relying on Postgres's own partition pruning. p_lo/p_hi are literals
 -- already typed for p_control's actual column type -- e.g. for a uuidv7-kind control column,
@@ -140,7 +124,7 @@ begin
     from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where c.oid = p_parent;
 
-  v_key_cols := archive._pq_key_columns(p_parent);
+  v_key_cols := archive._key_columns(p_parent);
   if v_key_cols is null then
     raise exception 'archive._pq_to_parquet_range: % has no primary key or predicate/expression-free unique constraint; a resumable cross-partition range read cannot tiebreak ties on % without one (the same refusal pgpm.regrain_step already makes for keyless tables)',
       p_parent, p_control;
@@ -261,12 +245,16 @@ Each file covers `[watermark(P), stop)`, where `stop` is the smallest of three b
   that window equal to the scan cadence, not calendar time, so the gate's recount is sufficient
   on its own without a separate repair operation.
 
-`archive._chunk_one` does exactly one file's worth of work -- pick the range, read, encode,
-PUT, ledger, `commit` -- so the vacuum-horizon hold for that call is bounded by the byte budget,
-the same way the archive assistant bounds its hold by `c_part_bytes`, just without the assistant's
-per-part sub-splitting (a small enough file makes that unnecessary; see the design's positioning
-below). `archive.chunk_step` is the paced, one-file-per-call entry point (a cron tick, mirroring
-how `archive.scan()` is driven); `archive.chunk_all` loops it in one call until there is no more
+`archive._chunk_one` does exactly one file's worth of work -- pick the range, dispatch to whichever
+encode/upload step `c_format` configures (`'parquet'` by default, this page's original;
+`'ndjson_single'` or `'ndjson_commits'` also available -- see [the archive
+assistant](archive-assistant.md#the-archiver) for what each one is and does), ledger, `commit` --
+so the vacuum-horizon hold for that call is bounded by the byte budget, the same way the archive
+assistant bounds its hold by `c_part_bytes`, just without the assistant's per-part sub-splitting
+by default (Parquet cannot sub-split at all; `'ndjson_commits'` can, if chosen here -- a small
+enough file makes it unnecessary either way; see the design's positioning below).
+`archive.chunk_step` is the paced, one-file-per-call entry point (a cron tick, mirroring how
+`archive.scan()` is driven); `archive.chunk_all` loops it in one call until there is no more
 progress (the operator's "do it now", mirroring `pgpm.regrain`'s shape). Both take a session
 advisory lock distinct from the archive assistant's, so a chunker and a scanner never collide if
 both are ever run against the same database.
@@ -371,62 +359,43 @@ $$;
 create or replace procedure archive._chunk_one(p_parent regclass)
 language plpgsql as $$
 declare
-  -- deployment constants: edit these seven
-  c_bucket       text := 'my-archive-bucket';
-  c_region       text := 'us-east-1';
-  c_prefix       text := 'events/';
-  c_endpoint     text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
+  -- deployment constants: edit these six
   c_byte_budget  bigint := 8 * 1024 * 1024;   -- target file size: the horizon-hold bound
   c_probe_sample int := 1000;
-  c_compress     boolean := true;     -- GZIP the Parquet page data; counts against the byte-budget
+  c_format       text := 'parquet';   -- 'parquet' (default, this page's original format) |
+                                       -- 'ndjson_single' | 'ndjson_commits' (needs
+                                       -- docs/archive-assistant.md's encoder section deployed too)
+  c_compress     boolean := true;     -- GZIP; Parquet defaults on here, NDJSON defaults off on
+                                       -- the assistant's page -- counts against the byte-budget
                                        -- hold below (see "Honest limits")
   c_self_driving boolean := false;    -- false (today's only mode, still the default): gate-only --
                                        -- retain()'s own schedule drives the drop, archive.file_gate
                                        -- vetoes anything not yet covered. true: retire, right here,
                                        -- any partition this chunk's new watermark now fully covers
 
-  cfg pgpm.config; v_nsp name; v_rel name;
   v_lo text; v_hi text; v_count int;
-  v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
-  v_rows bigint; v_etag text; h http_header;
+  v_s3_key text; v_etag text; v_rows bigint;
 begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._chunk_one: % is not managed', p_parent; end if;
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
   select t.lo, t.hi into v_lo, v_hi
     from archive._next_range_byte_budget(p_parent, c_byte_budget, c_probe_sample) t;
   if v_lo is null then
     return;   -- nothing eligible to archive right now
   end if;
 
-  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = 's3_archive_access_key_id';
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 's3_archive_secret_access_key';
-  if v_key_id is null or v_secret is null then
-    raise exception 'archive._chunk_one: credentials missing from vault';
+  if c_format = 'parquet' then
+    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+      from archive._encode_upload_parquet(p_parent, v_lo, v_hi, c_compress) t;
+  elsif c_format = 'ndjson_single' then
+    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+      from archive._encode_upload_ndjson_single(p_parent, v_lo, v_hi, c_compress) t;
+  elsif c_format = 'ndjson_commits' then
+    call archive._encode_upload_ndjson_commits(p_parent, v_lo, v_hi, c_compress, v_s3_key, v_etag, v_rows);
+  else
+    raise exception 'archive._chunk_one: unknown c_format %; expected parquet, ndjson_single, or ndjson_commits', c_format;
   end if;
-
-  v_payload := archive._pq_to_parquet_range(p_parent, cfg.control_column,
-                                            pgpm._encode(cfg.control_kind, v_lo), pgpm._encode(cfg.control_kind, v_hi),
-                                            c_compress);
-  execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                 v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, v_hi))
-    into v_rows;
-
-  v_key := c_prefix || p_parent::text || '_' || regexp_replace(v_lo, '[^0-9]', '', 'g') || '.parquet';
-  v_resp := archive.s3_signed_request_bytea('PUT', c_endpoint, c_bucket, c_region, v_key, '',
-                                            'application/vnd.apache.parquet', v_payload, v_key_id, v_secret);
-  if v_resp.status not between 200 and 299 then
-    raise exception 'archive._chunk_one: PUT of % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
-  end if;
-  foreach h in array v_resp.headers loop
-    if lower(h.field) = 'etag' then v_etag := h.value; end if;
-  end loop;
 
   insert into archive.ledger (parent_table, lo, hi, s3_key, etag, rows_archived)
-  values (p_parent, v_lo, v_hi, v_key, v_etag, v_rows);
+  values (p_parent, v_lo, v_hi, v_s3_key, v_etag, v_rows);
   commit;   -- the horizon-hold window ends here
 
   if c_self_driving then
@@ -567,18 +536,29 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   `regrain` swaps, with nothing to gate it (there is no partition-level `pre_drop` hook fired by
   a `regrain` swap, only by `retire`/`retain`). Run the chunker's backlog down with
   `archive.chunk_all` before regraining a coarse child that holds unarchived history.
-- **Same six types, same one-row-group shape as the whole-relation encoder**: `int4`, `int8`,
-  `float8`, `boolean`, `text`, `timestamp`/`timestamptz`; see [Archive partitions to
-  S3](archive-to-s3.md#honest-limits-for-the-parquet-variant) for the full list of what is out of
-  scope (dictionary encoding, statistics, nested schemas, and more). GZIP is on by default here too
-  (`archive._pq_to_parquet_range`'s `p_compress`, `archive._chunk_one`'s `c_compress`), and its
-  cost is not free against this section's byte budget: PR #205 measured real compression time from
-  ~50ms/MB on highly compressible data up to ~2.6s/MB on near-incompressible data, and that time is
-  now part of the horizon-hold for any file that compresses, on top of the read-and-upload time the
-  budget was already sized around. A `c_byte_budget` picked to bound the hold at N seconds under
-  the uncompressed assumption may run longer than N once compression is in the loop; set
+- **Same six types, same one-row-group shape as the whole-relation encoder, when `c_format` is
+  `'parquet'`**: `int4`, `int8`, `float8`, `boolean`, `text`, `timestamp`/`timestamptz`; see
+  [Archive partitions to S3](archive-to-s3.md#honest-limits-for-the-parquet-variant) for the full
+  list of what is out of scope (dictionary encoding, statistics, nested schemas, and more). NDJSON
+  (`'ndjson_single'`/`'ndjson_commits'`) has no such type restriction -- `row_to_json` round-trips
+  any column type -- at the cost of not being directly queryable by a columnar analytics engine.
+  GZIP is on by default for Parquet here (`archive._pq_to_parquet_range`'s `p_compress`,
+  `archive._chunk_one`'s `c_compress`), off by default for NDJSON (matching [the archive
+  assistant](archive-assistant.md#the-archiver)'s own default), and its cost is not free against
+  this section's byte budget either way: PR #205 measured real compression time from ~50ms/MB on
+  highly compressible data up to ~2.6s/MB on near-incompressible data, and that time is now part of
+  the horizon-hold for any file that compresses, on top of the read-and-upload time the budget was
+  already sized around. A `c_byte_budget` picked to bound the hold at N seconds under the
+  uncompressed assumption may run longer than N once compression is in the loop; set
   `c_compress := false` if the byte budget is tuned tightly enough that this matters more than the
   smaller files do.
+- **Parquet cannot use `'ndjson_commits'`'s per-part-commit technique, and never will.** A
+  Parquet file's footer needs every row group's byte offset, known only once the whole file's
+  bytes exist -- there is no way to `COMMIT` partway through building one. This is a structural
+  fact about the format (see [Archive partitions to
+  S3](archive-to-s3.md#honest-limits-for-the-parquet-variant) and
+  [#211](https://github.com/dventimisupabase/pg_partition_magician/issues/211)), not a gap;
+  `'parquet'` is always single-shot here regardless of `c_byte_budget`.
 - **The proactive alternative (archive as soon as data freezes, not gated on retention
   eligibility) is deliberately not built here.** It would need a periodic verification sweep plus
   a `repatch`-shaped repair operation to correct an already-archived file after a late-arriving
@@ -587,16 +567,17 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
 
 ## Positioning
 
-This is a parallel strategy, not a replacement for anything else on this project's archival
-pages. `archive.partition` (the per-partition, per-part-committing archive assistant) and the
-single-PUT `archive.to_s3_parquet` hook stay exactly as they are for anyone who does not need
+This is a parallel strategy, not a replacement for anything else on this project's archival pages.
+The single-PUT `archive.to_s3_parquet` hook stays exactly as it is for anyone who does not need
 cross-partition chunking -- most workloads with reasonably bounded partition sizes have no reason
-to reach for this. `archive.chunk_step` / `archive.chunk_all` are additive on top of the shared
-`archive.ledger` table and gate (`archive.file_gate`, registered by both pages' install
-instructions): none of the existing functions or hooks are touched, and everything here can
-coexist in the same database. Mixing the two *archivers* on one managed table -- calling both
-`archive.partition` and `archive._chunk_one` against the same parent -- is not something this page
-tests or recommends, even though the shared watermark and `archive.partition`'s forward-only guard
-(see [the archive assistant](archive-assistant.md#the-archiver)) would keep either one from
-silently corrupting the other's coverage: pick one strategy per managed table for a simpler
-operational story, one archiver and one schedule per table.
+to reach for this. `archive.partition` (the archive assistant's own archiver) no longer builds its
+NDJSON directly either, as of #221 -- both it and `archive._chunk_one` dispatch to the same three
+`archive._encode_upload_*` steps, defined once on [the archive
+assistant](archive-assistant.md#the-archiver)'s page. `archive.chunk_step` / `archive.chunk_all`
+are additive on top of the shared `archive.ledger` table and gate (`archive.file_gate`, registered
+by both pages' install instructions), and everything here can coexist in the same database. Mixing
+the two *archivers* on one managed table -- calling both `archive.partition` and
+`archive._chunk_one` against the same parent -- is not something this page tests or recommends,
+even though the shared watermark and `archive.partition`'s forward-only guard would keep either
+one from silently corrupting the other's coverage: pick one strategy per managed table for a
+simpler operational story, one archiver and one schedule per table.
