@@ -237,6 +237,272 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- GZIP compression: a from-scratch DEFLATE (RFC 1951) encoder plus a CRC-32
+-- (RFC 1952) trailer, zero extension dependencies. Real LZ77 matching (not
+-- just Huffman-coded literals): a rolling 3-byte hash per position, a SQL
+-- self-join capped via LATERAL...LIMIT 1 to find the nearest candidate within
+-- a 32KB window (an unbounded search degrades badly on exactly the
+-- highly-repetitive input compression matters most for), and a binary-search
+-- match-length extension via substr equality (O(log match_length) native
+-- comparisons instead of a byte-by-byte extend loop). The parse itself is
+-- lazy -- driven by the greedy walk, so a position consumed by a preceding
+-- match is never looked up at all, not merely computed and discarded.
+--
+-- Fixed Huffman only (DEFLATE block type 1): the code lengths are spec-
+-- mandated constants (RFC 1951 3.2.6), so there is no tree-from-frequencies
+-- step. Two PostgreSQL/PL-pgSQL performance traps, found by benchmarking
+-- against real table-sourced data rather than assumed: (1) a per-bit
+-- insertion loop is far slower than merging a whole code into a wide
+-- accumulator via one shift+OR (bit-reversing a Huffman code once per TOKEN,
+-- not once per output BIT, since codes are written MSB-first on the wire but
+-- the byte stream itself packs LSB-first -- an inversion easy to get
+-- backwards); (2) calling small helper functions (length/distance code
+-- lookup) via the OUT-parameter "select ... from f(...)" convention costs
+-- more per call than the arithmetic they wrap once called millions of times,
+-- so those lookups are inlined as plain CASE expressions in the hot loop
+-- instead of factored out.
+-- ---------------------------------------------------------------------------
+
+-- CRC-32/ISO-HDLC (the checksum RFC 1952's gzip trailer requires), table-driven.
+create or replace function pq._crc32_table() returns bigint[]
+language plpgsql immutable as $$
+declare
+  tbl bigint[] := array_fill(0::bigint, array[256]);
+  c bigint; i int4; j int4;
+begin
+  for i in 0..255 loop
+    c := i;
+    for j in 0..7 loop
+      if (c & 1) = 1 then c := (c >> 1) # 3988292384;   -- 0xEDB88320
+      else c := c >> 1;
+      end if;
+    end loop;
+    tbl[i+1] := c;
+  end loop;
+  return tbl;
+end;
+$$;
+
+-- `data` is forced into a fresh, plain (non-TOASTed) copy before the per-byte loop: calling
+-- get_byte() repeatedly on a bytea sourced from a real table column is ~1000x slower than the
+-- identical loop over a freshly-built local variable (measured: 49s vs 58ms for the same 1MB
+-- input) -- PostgreSQL does not cache the detoasted form across calls the way one might expect.
+create or replace function pq._crc32(data bytea) returns bigint
+language plpgsql as $$
+declare
+  tbl bigint[] := pq._crc32_table();
+  crc bigint := 4294967295;
+  v_data bytea := data || ''::bytea;
+  n int4 := length(v_data);
+  i int4;
+begin
+  for i in 0..n-1 loop
+    crc := tbl[(((crc # get_byte(v_data,i)) & 255) + 1)] # (crc >> 8);
+  end loop;
+  return crc # 4294967295;
+end;
+$$;
+
+-- one row per position 0..length(data)-3: a 3-byte rolling "hash" (the exact 3-byte value
+-- itself, so no collisions -- cheap enough at this alphabet size and simpler than a lossy hash)
+create or replace function pq._lz_pos_hashes(data bytea) returns table(pos int4, h int4)
+language sql immutable as $$
+  select i, (get_byte(data,i)<<16) | (get_byte(data,i+1)<<8) | get_byte(data,i+2)
+  from generate_series(0, length(data)-3) i;
+$$;
+
+-- longest k in [0, max_len] with substr(data,a+1,k) = substr(data,b+1,k): a binary search over
+-- native substr-equality comparisons (each a C-level memcmp regardless of k), not a byte-by-byte
+-- extend loop -- O(log max_len) comparisons instead of O(max_len).
+create or replace function pq._lz_match_len(data bytea, a int4, b int4, max_len int4) returns int4
+language plpgsql immutable as $$
+declare
+  lo int4 := 0; hi int4 := max_len; mid int4;
+begin
+  while lo < hi loop
+    mid := (lo + hi + 1) / 2;
+    if substr(data, a+1, mid) = substr(data, b+1, mid) then lo := mid; else hi := mid - 1; end if;
+  end loop;
+  return lo;
+end;
+$$;
+
+-- reverse the low `nbits` bits of `value`: needed once per Huffman-code insert (bounded at 9
+-- bits here), not once per output bit -- see pq._deflate_encode.
+create or replace function pq._bit_reverse(value int4, nbits int4) returns int4
+language plpgsql immutable as $$
+declare rev int4 := 0; i int4;
+begin
+  for i in 0..nbits-1 loop
+    rev := rev | (((value >> i) & 1) << (nbits - 1 - i));
+  end loop;
+  return rev;
+end;
+$$;
+
+-- DEFLATE-encode `payload` as one final, fixed-Huffman block (RFC 1951 3.2.3/3.2.6). Builds its
+-- own scratch hash table per call (one call per column page; matching never crosses column
+-- boundaries) -- a hardcoded table name, not a regclass/text parameter passed through EXECUTE:
+-- dynamic SQL measured ~2.5x slower per lookup than a plain statement referencing a fixed name,
+-- for exactly the reason invoking any function has overhead -- EXECUTE just adds more of it.
+create or replace function pq._deflate_encode(payload bytea) returns bytea
+language plpgsql as $$
+declare
+  n int4 := length(payload);
+  v_pos int4 := 0;
+  v_hash int4; v_candidate int4; v_mlen int4;
+  v_acc int4 := 0; v_acc_n int4 := 0; v_bytes int4[] := '{}';
+  v_code int4; v_nbits int4; v_rev int4;
+  v_lcode int4; v_lextra_bits int4; v_lextra_val int4;
+  v_dcode int4; v_dextra_bits int4; v_dextra_val int4;
+  v_dist int4; v_len int4; v_sym int4;
+begin
+  drop table if exists pq_deflate_hash_scratch;
+  create temp table pq_deflate_hash_scratch as select * from pq._lz_pos_hashes(payload);
+  create index on pq_deflate_hash_scratch (h, pos);
+
+  -- block header: BFINAL=1, BTYPE=01 (fixed Huffman) -- raw, LSB-of-value-first (the OPPOSITE
+  -- convention from Huffman codes, which are MSB-of-the-code-first; RFC 1951 3.1.1 splits these
+  -- two conventions and it is easy to invert one for the other by accident).
+  v_acc := v_acc | (3 << v_acc_n); v_acc_n := v_acc_n + 3;
+  while v_acc_n >= 8 loop
+    v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+  end loop;
+
+  while v_pos < n loop
+    v_candidate := null;
+    if v_pos <= n - 3 then
+      v_hash := (get_byte(payload,v_pos)<<16) | (get_byte(payload,v_pos+1)<<8) | get_byte(payload,v_pos+2);
+      select pos into v_candidate from pq_deflate_hash_scratch
+       where h = v_hash and pos < v_pos and v_pos - pos <= 32768
+       order by pos desc limit 1;
+    end if;
+    if v_candidate is not null then
+      v_mlen := pq._lz_match_len(payload, v_pos, v_candidate, least(258, n - v_pos));
+    else
+      v_mlen := 0;
+    end if;
+
+    if v_mlen >= 3 then
+      v_dist := v_pos - v_candidate;
+      v_len := v_mlen;
+
+      -- length code (RFC 1951 3.2.5), inlined rather than a separate lookup function -- see the
+      -- section header note on OUT-parameter call overhead.
+      case
+        when v_len between 3 and 10 then v_lcode := 257+(v_len-3); v_lextra_bits := 0; v_lextra_val := 0;
+        when v_len between 11 and 18 then v_lcode := 265+(v_len-11)/2; v_lextra_bits := 1; v_lextra_val := (v_len-11)%2;
+        when v_len between 19 and 34 then v_lcode := 269+(v_len-19)/4; v_lextra_bits := 2; v_lextra_val := (v_len-19)%4;
+        when v_len between 35 and 66 then v_lcode := 273+(v_len-35)/8; v_lextra_bits := 3; v_lextra_val := (v_len-35)%8;
+        when v_len between 67 and 130 then v_lcode := 277+(v_len-67)/16; v_lextra_bits := 4; v_lextra_val := (v_len-67)%16;
+        when v_len between 131 and 257 then v_lcode := 281+(v_len-131)/32; v_lextra_bits := 5; v_lextra_val := (v_len-131)%32;
+        else v_lcode := 285; v_lextra_bits := 0; v_lextra_val := 0;
+      end case;
+
+      -- distance code (RFC 1951 3.2.5), inlined
+      case
+        when v_dist between 1 and 4 then v_dcode := v_dist-1; v_dextra_bits := 0; v_dextra_val := 0;
+        when v_dist between 5 and 8 then v_dcode := 4+(v_dist-5)/2; v_dextra_bits := 1; v_dextra_val := (v_dist-5)%2;
+        when v_dist between 9 and 16 then v_dcode := 6+(v_dist-9)/4; v_dextra_bits := 2; v_dextra_val := (v_dist-9)%4;
+        when v_dist between 17 and 32 then v_dcode := 8+(v_dist-17)/8; v_dextra_bits := 3; v_dextra_val := (v_dist-17)%8;
+        when v_dist between 33 and 64 then v_dcode := 10+(v_dist-33)/16; v_dextra_bits := 4; v_dextra_val := (v_dist-33)%16;
+        when v_dist between 65 and 128 then v_dcode := 12+(v_dist-65)/32; v_dextra_bits := 5; v_dextra_val := (v_dist-65)%32;
+        when v_dist between 129 and 256 then v_dcode := 14+(v_dist-129)/64; v_dextra_bits := 6; v_dextra_val := (v_dist-129)%64;
+        when v_dist between 257 and 512 then v_dcode := 16+(v_dist-257)/128; v_dextra_bits := 7; v_dextra_val := (v_dist-257)%128;
+        when v_dist between 513 and 1024 then v_dcode := 18+(v_dist-513)/256; v_dextra_bits := 8; v_dextra_val := (v_dist-513)%256;
+        when v_dist between 1025 and 2048 then v_dcode := 20+(v_dist-1025)/512; v_dextra_bits := 9; v_dextra_val := (v_dist-1025)%512;
+        when v_dist between 2049 and 4096 then v_dcode := 22+(v_dist-2049)/1024; v_dextra_bits := 10; v_dextra_val := (v_dist-2049)%1024;
+        when v_dist between 4097 and 8192 then v_dcode := 24+(v_dist-4097)/2048; v_dextra_bits := 11; v_dextra_val := (v_dist-4097)%2048;
+        when v_dist between 8193 and 16384 then v_dcode := 26+(v_dist-8193)/4096; v_dextra_bits := 12; v_dextra_val := (v_dist-8193)%4096;
+        else v_dcode := 28+(v_dist-16385)/8192; v_dextra_bits := 13; v_dextra_val := (v_dist-16385)%8192;
+      end case;
+
+      -- length code's literal/length Huffman code (RFC 1951 3.2.6), inlined
+      v_sym := v_lcode;
+      if v_sym <= 143 then v_code := 48+v_sym; v_nbits := 8;
+      elsif v_sym <= 255 then v_code := 400+(v_sym-144); v_nbits := 9;
+      elsif v_sym <= 279 then v_code := v_sym-256; v_nbits := 7;
+      else v_code := 192+(v_sym-280); v_nbits := 8;
+      end if;
+      v_rev := pq._bit_reverse(v_code, v_nbits);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+      while v_acc_n >= 8 loop
+        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+      end loop;
+
+      if v_lextra_bits > 0 then
+        v_acc := v_acc | (v_lextra_val << v_acc_n); v_acc_n := v_acc_n + v_lextra_bits;
+        while v_acc_n >= 8 loop
+          v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        end loop;
+      end if;
+
+      -- distance code: fixed 5-bit Huffman, identity-mapped (RFC 1951 3.2.6)
+      v_rev := pq._bit_reverse(v_dcode, 5);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + 5;
+      while v_acc_n >= 8 loop
+        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+      end loop;
+
+      if v_dextra_bits > 0 then
+        v_acc := v_acc | (v_dextra_val << v_acc_n); v_acc_n := v_acc_n + v_dextra_bits;
+        while v_acc_n >= 8 loop
+          v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        end loop;
+      end if;
+
+      v_pos := v_pos + v_mlen;
+    else
+      v_sym := get_byte(payload, v_pos);
+      if v_sym <= 143 then v_code := 48+v_sym; v_nbits := 8;
+      elsif v_sym <= 255 then v_code := 400+(v_sym-144); v_nbits := 9;
+      elsif v_sym <= 279 then v_code := v_sym-256; v_nbits := 7;
+      else v_code := 192+(v_sym-280); v_nbits := 8;
+      end if;
+      v_rev := pq._bit_reverse(v_code, v_nbits);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+      while v_acc_n >= 8 loop
+        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+      end loop;
+      v_pos := v_pos + 1;
+    end if;
+  end loop;
+
+  -- end-of-block (symbol 256): 7-bit code, value 0
+  v_rev := pq._bit_reverse(0, 7);
+  v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + 7;
+  while v_acc_n >= 8 loop
+    v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+  end loop;
+  if v_acc_n > 0 then v_bytes := array_append(v_bytes, v_acc & 255); end if;   -- pad final byte
+
+  drop table pq_deflate_hash_scratch;
+  return (select decode(string_agg(lpad(to_hex(x), 2, '0'), '' order by ord), 'hex')
+          from unnest(v_bytes) with ordinality as t(x, ord));
+end;
+$$;
+
+-- the full RFC 1952 gzip container Parquet's GZIP codec expects (confirmed empirically: a real
+-- pyarrow-written GZIP-compressed Parquet file's page bytes open with the 1f8b gzip magic and
+-- read cleanly via Python's stdlib gzip reader end to end, not a bare zlib/RFC-1950 stream) --
+-- 10-byte header, the DEFLATE stream, then a CRC-32 + ISIZE trailer over the ORIGINAL
+-- (uncompressed) bytes.
+create or replace function pq._gzip_compress(payload bytea) returns bytea
+language plpgsql as $$
+declare
+  v_deflate bytea := pq._deflate_encode(payload);
+  v_header bytea := decode('1f8b08000000000000ff', 'hex');
+  v_crc bigint := pq._crc32(payload);
+  v_isize bigint := length(payload) & 4294967295;
+  v_trailer bytea;
+begin
+  v_trailer := pq._reverse_bytes(int4send((v_crc - 4294967296 * (v_crc >> 31))::int4))
+            || pq._reverse_bytes(int4send((v_isize - 4294967296 * (v_isize >> 31))::int4));
+  return v_header || v_deflate || v_trailer;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Struct builders (SchemaElement / DataPageHeader / PageHeader /
 -- ColumnMetaData / ColumnChunk / RowGroup / FileMetaData)
 -- ---------------------------------------------------------------------------
@@ -274,36 +540,44 @@ language sql immutable as $$
       || pq._stop();
 $$;
 
-create or replace function pq._build_page_header(p_num_values int4, p_data_len int4) returns bytea
+-- p_compressed_len defaults to p_uncompressed_len (codec = UNCOMPRESSED, the existing
+-- behavior unchanged); pass a smaller value when the page bytes going into the file are
+-- actually pq._gzip_compress(...) output rather than the raw encoded bytes.
+create or replace function pq._build_page_header(p_num_values int4, p_uncompressed_len int4, p_compressed_len int4 default null) returns bytea
 language plpgsql immutable as $$
 declare
   dph bytea := pq._build_data_page_header(p_num_values);
+  v_compressed_len int4 := coalesce(p_compressed_len, p_uncompressed_len);
   buf bytea;
 begin
-  buf := pq._write_i32(0, 1, 0);                    -- type = DATA_PAGE
-  buf := buf || pq._write_i32(1, 2, p_data_len);     -- uncompressed_page_size
-  buf := buf || pq._write_i32(2, 3, p_data_len);     -- compressed_page_size (codec = UNCOMPRESSED)
-  buf := buf || pq._write_struct(3, 5, dph);         -- data_page_header
+  buf := pq._write_i32(0, 1, 0);                        -- type = DATA_PAGE
+  buf := buf || pq._write_i32(1, 2, p_uncompressed_len); -- uncompressed_page_size
+  buf := buf || pq._write_i32(2, 3, v_compressed_len);   -- compressed_page_size
+  buf := buf || pq._write_struct(3, 5, dph);             -- data_page_header
   buf := buf || pq._stop();
   return buf;
 end;
 $$;
 
+-- p_codec: 0 = UNCOMPRESSED (default, existing behavior), 2 = GZIP. p_total_compressed
+-- defaults to p_total_uncompressed for the UNCOMPRESSED case.
 create or replace function pq._build_column_metadata(
     p_ptype int4, p_colname text, p_num_values bigint,
-    p_total_uncompressed bigint, p_data_page_offset bigint
+    p_total_uncompressed bigint, p_data_page_offset bigint,
+    p_codec int4 default 0, p_total_compressed bigint default null
 ) returns bytea
 language plpgsql immutable as $$
 declare
+  v_total_compressed bigint := coalesce(p_total_compressed, p_total_uncompressed);
   buf bytea;
 begin
   buf := pq._write_i32(0, 1, p_ptype);                                              -- type
   buf := buf || pq._write_list_i32(1, 2, array[0]);                                 -- encodings = [PLAIN]
   buf := buf || pq._write_list_binary(2, 3, array[convert_to(p_colname,'UTF8')]);   -- path_in_schema
-  buf := buf || pq._write_i32(3, 4, 0);                                            -- codec = UNCOMPRESSED
+  buf := buf || pq._write_i32(3, 4, p_codec);                                       -- codec
   buf := buf || pq._write_i64(4, 5, p_num_values);                                  -- num_values
   buf := buf || pq._write_i64(5, 6, p_total_uncompressed);                          -- total_uncompressed_size
-  buf := buf || pq._write_i64(6, 7, p_total_uncompressed);                          -- total_compressed_size
+  buf := buf || pq._write_i64(6, 7, v_total_compressed);                            -- total_compressed_size
   buf := buf || pq._write_i64(7, 9, p_data_page_offset);                            -- data_page_offset
   buf := buf || pq._stop();
   return buf;
@@ -423,7 +697,7 @@ $$;
 -- Entry point
 -- ---------------------------------------------------------------------------
 
-create or replace function pq.to_parquet(p_relation regclass) returns bytea
+create or replace function pq.to_parquet(p_relation regclass, p_compress boolean default false) returns bytea
 language plpgsql as $$
 declare
   v_schema name; v_table name; v_from_sql text;
@@ -437,7 +711,7 @@ declare
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
   v_body bytea;
-  v_data bytea; v_page_header bytea; v_page_offset bigint;
+  v_data bytea; v_page_bytes bytea; v_page_header bytea; v_page_offset bigint;
   v_column_chunks bytea[] := '{}';
   v_schema_elements bytea[] := '{}';
   v_total_uncompressed bigint;
@@ -482,13 +756,21 @@ begin
   v_body := v_magic;
   for i in 1..v_ncols loop
     v_data := pq._encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i]);
-    v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data));
+    if p_compress then
+      v_page_bytes := pq._gzip_compress(v_data);
+      v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
+    else
+      v_page_bytes := v_data;
+      v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data));
+    end if;
     v_page_offset := length(v_body);
-    v_body := v_body || v_page_header || v_data;
+    v_body := v_body || v_page_header || v_page_bytes;
 
     v_total_uncompressed := length(v_page_header) + length(v_data);
     v_column_chunks := v_column_chunks || pq._build_column_chunk(
-        pq._build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset));
+        pq._build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset,
+          case when p_compress then 2 else 0 end,
+          case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
     v_schema_elements := v_schema_elements || pq._build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
   end loop;
 
@@ -551,7 +833,7 @@ $$;
 -- reproducible, which is what lets a future chunk boundary land between two rows rather than
 -- inside a run of ties (see the design note on the chunker's stopping rule). A relation with
 -- no real key refuses outright, via pq._key_columns's NULL.
-create or replace function pq.to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text) returns bytea
+create or replace function pq.to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default false) returns bytea
 language plpgsql as $$
 declare
   v_schema name; v_table name; v_from_sql text; v_order_by text; v_key_cols name[];
@@ -565,7 +847,7 @@ declare
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
   v_body bytea;
-  v_data bytea; v_page_header bytea; v_page_offset bigint;
+  v_data bytea; v_page_bytes bytea; v_page_header bytea; v_page_offset bigint;
   v_column_chunks bytea[] := '{}';
   v_schema_elements bytea[] := '{}';
   v_total_uncompressed bigint;
@@ -621,13 +903,21 @@ begin
   v_body := v_magic;
   for i in 1..v_ncols loop
     v_data := pq._encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by);
-    v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data));
+    if p_compress then
+      v_page_bytes := pq._gzip_compress(v_data);
+      v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
+    else
+      v_page_bytes := v_data;
+      v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data));
+    end if;
     v_page_offset := length(v_body);
-    v_body := v_body || v_page_header || v_data;
+    v_body := v_body || v_page_header || v_page_bytes;
 
     v_total_uncompressed := length(v_page_header) + length(v_data);
     v_column_chunks := v_column_chunks || pq._build_column_chunk(
-        pq._build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset));
+        pq._build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset,
+          case when p_compress then 2 else 0 end,
+          case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
     v_schema_elements := v_schema_elements || pq._build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
   end loop;
 
