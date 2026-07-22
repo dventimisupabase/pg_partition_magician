@@ -129,7 +129,7 @@ $$;
 -- already typed for p_control's actual column type -- e.g. for a uuidv7-kind control column,
 -- translate a pgpm native-grid (timestamptz) value via pgpm._encode first, the same way
 -- pgpm.regrain_step builds its own v_lo_lit/v_hi_lit before using them.
-create or replace function archive._pq_to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text) returns bytea
+create or replace function archive._pq_to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default true) returns bytea
 language plpgsql as $$
 declare
   v_schema name; v_table name; v_from_sql text; v_order_by text; v_key_cols name[];
@@ -143,7 +143,7 @@ declare
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
   v_body bytea;
-  v_data bytea; v_page_header bytea; v_page_offset bigint;
+  v_data bytea; v_page_bytes bytea; v_page_header bytea; v_page_offset bigint;
   v_column_chunks bytea[] := '{}';
   v_schema_elements bytea[] := '{}';
   v_total_uncompressed bigint;
@@ -199,13 +199,21 @@ begin
   v_body := v_magic;
   for i in 1..v_ncols loop
     v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by);
-    v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data));
+    if p_compress then
+      v_page_bytes := archive._pq_gzip_compress(v_data);
+      v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
+    else
+      v_page_bytes := v_data;
+      v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data));
+    end if;
     v_page_offset := length(v_body);
-    v_body := v_body || v_page_header || v_data;
+    v_body := v_body || v_page_header || v_page_bytes;
 
     v_total_uncompressed := length(v_page_header) + length(v_data);
     v_column_chunks := v_column_chunks || archive._pq_build_column_chunk(
-        archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset));
+        archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset,
+          case when p_compress then 2 else 0 end,
+          case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
     v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
   end loop;
 
@@ -354,13 +362,15 @@ both are ever run against the same database.
 create or replace procedure archive._chunk_one(p_parent regclass)
 language plpgsql as $$
 declare
-  -- deployment constants: edit these five
+  -- deployment constants: edit these six
   c_bucket       text := 'my-archive-bucket';
   c_region       text := 'us-east-1';
   c_prefix       text := 'events/';
   c_endpoint     text := null;        -- null = AWS S3; an URL for S3-compatible, path prefix and all
   c_byte_budget  bigint := 8 * 1024 * 1024;   -- target file size: the horizon-hold bound
   c_probe_sample int := 1000;
+  c_compress     boolean := true;     -- GZIP the Parquet page data; counts against the byte-budget
+                                       -- hold below (see "Honest limits")
 
   cfg pgpm.config; v_ncast text; v_nsp name; v_rel name;
   v_lo text; v_frontier text; v_floor text; v_retain_boundary text;
@@ -439,7 +449,8 @@ begin
   end if;
 
   v_payload := archive._pq_to_parquet_range(p_parent, cfg.control_column,
-                                            pgpm._encode(cfg.control_kind, v_lo), pgpm._encode(cfg.control_kind, v_hi));
+                                            pgpm._encode(cfg.control_kind, v_lo), pgpm._encode(cfg.control_kind, v_hi),
+                                            c_compress);
   execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
                  v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
                  cfg.control_column, pgpm._encode(cfg.control_kind, v_hi))
@@ -546,6 +557,13 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
 - **Real drops through `pgpm.retain()`**, not simulated: with `archive.file_gate` registered as
   an ordinary `pre_drop` hook, retention-eligible partitions archived by the chunker were
   dropped cleanly through the standard `retain()` path, gate passing each time.
+- **GZIP on, through the same real path**: a 5,000-row table (all six types including a nullable
+  column) chunked with `c_compress := true` and a byte budget small enough to force many files
+  produced 112 files, gap-free and contiguous by the same `lag(hi)` check above. Every column's
+  page in every one of the 112 fetched objects carried Thrift `codec = GZIP`; the union of all
+  112, read independently by pyarrow and DuckDB, matched the source rows exactly. `retain()`
+  through the real `archive.file_gate` hook dropped the fully-covered partition cleanly and
+  correctly deferred the partition its data hadn't reached the file-ledger watermark for yet.
 
 ## Honest limits
 
@@ -565,10 +583,18 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   `regrain` swaps, with nothing to gate it (there is no partition-level `pre_drop` hook fired by
   a `regrain` swap, only by `retire`/`retain`). Run the chunker's backlog down with
   `archive.chunk_all` before regraining a coarse child that holds unarchived history.
-- **Same six types, same one-row-group, no-compression shape as the whole-relation encoder**:
-  `int4`, `int8`, `float8`, `boolean`, `text`, `timestamp`/`timestamptz`; see [Archive partitions
-  to S3](archive-to-s3.md#honest-limits-for-the-parquet-variant) for the full list of what is out
-  of scope (dictionary encoding, compression, nested schemas, and more).
+- **Same six types, same one-row-group shape as the whole-relation encoder**: `int4`, `int8`,
+  `float8`, `boolean`, `text`, `timestamp`/`timestamptz`; see [Archive partitions to
+  S3](archive-to-s3.md#honest-limits-for-the-parquet-variant) for the full list of what is out of
+  scope (dictionary encoding, statistics, nested schemas, and more). GZIP is on by default here too
+  (`archive._pq_to_parquet_range`'s `p_compress`, `archive._chunk_one`'s `c_compress`), and its
+  cost is not free against this section's byte budget: PR #205 measured real compression time from
+  ~50ms/MB on highly compressible data up to ~2.6s/MB on near-incompressible data, and that time is
+  now part of the horizon-hold for any file that compresses, on top of the read-and-upload time the
+  budget was already sized around. A `c_byte_budget` picked to bound the hold at N seconds under
+  the uncompressed assumption may run longer than N once compression is in the loop; set
+  `c_compress := false` if the byte budget is tuned tightly enough that this matters more than the
+  smaller files do.
 - **The proactive alternative (archive as soon as data freezes, not gated on retention
   eligibility) is deliberately not built here.** It would need a periodic verification sweep plus
   a `repatch`-shaped repair operation to correct an already-archived file after a late-arriving
