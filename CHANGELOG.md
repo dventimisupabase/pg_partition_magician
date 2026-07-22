@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **Point `docs/archive-*.md` at `pgpm_archive/install.sql` as the installable source of truth
+  (#222, 3 of 3 -- closes the six-issue archive harmonization stack, #217-#222).** The three
+  implementation pages (`archive-to-s3.md`, `archive-assistant.md`, `archive-chunked-parquet.md`)
+  and the overview (`archive-strategies-overview.md`) keep every line of hand-rolled SQL, their
+  original names, and everything they verified exactly as written -- they remain the design
+  rationale, the honest limits, and the live-verification story. Each of the three implementation
+  pages gets a short callout near its top plus an updated "Install"/"Register and pace it" section
+  showing the module-based path (install `pgpm_archive/install.sql`, configure one `archive.config`
+  row per table) as the recommended way to deploy, with the original hand-rolled instructions kept
+  as the alternative. `archive-strategies-overview.md` gets a new "Installing the module" section
+  with the full name-mapping table (`archive.partition` -> `archive.archive_partition`,
+  `archive.scan()` -> `archive.tick()`, `archive._chunk_one` -> `archive._tick_one`,
+  `archive.chunk_all` -> `archive.run_all`, `c_self_driving`/`c_format`/`c_compress`/... ->
+  `archive.config` columns), and its "Positioning" section now reflects that #222 actually closed
+  the "two entry points remain unmerged" gap that section used to flag as still open.
+
 - **Permanent CI infrastructure for `pgpm_archive` (#222, 2 of a planned 2-3 PR sequence):
   a `./test.sh archive` track, replacing the ad hoc Postgres 17 + `pgsql-http` + MinIO harness
   #217-#221 and #222's first PR were hand-verified against.** The shared `Dockerfile` grows an

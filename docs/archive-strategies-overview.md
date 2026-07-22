@@ -12,6 +12,15 @@ the same small space. All four are built today (see the table below) -- this pag
 you pick an architecture and a configuration before diving into any one page's mechanics, and it
 still does not replace those pages or introduce a new mechanism of its own.
 
+**As of #222, all of it also ships as one installable module**, `pgpm_archive/install.sql`:
+install it on top of `pgpm_core`, then configure one row per managed table in `archive.config`
+(`boundary_rule`, `drop_trigger`, `format`, `compress`, plus connection settings) instead of
+hand-copying SQL from these pages and editing constants. The three pages keep their original
+hand-rolled names and code exactly as written below -- they remain the design rationale, the
+honest limits, and the live-verification story -- but the module is the maintained, installable
+source of truth to actually deploy. See ["Installing the module"](#installing-the-module) below
+for how each page's names map onto it.
+
 ## The synchronous hook
 
 [`pgpm.retain`](reference.md#retain) (or a direct [`pgpm.retire`](reference.md#retire) call)
@@ -158,19 +167,67 @@ guidance](archive-chunked-parquet.md#the-chunker) for measured numbers -- but no
 beyond that), and multipart transport only matters for the synchronous hook, and only really helps
 NDJSON.
 
+## Installing the module
+
+Everything above is a map of the *design space*, not an installation guide -- `pgpm_archive/
+install.sql` is. It ships every function/procedure named on this page and its three siblings,
+verbatim where the code is unchanged, plus one real addition: `archive.config`, one row per
+managed table, replacing every "deployment constants: edit these N" block below with columns you
+`insert`/`update` instead of hand-editing SQL. Install it on top of `pgpm_core`:
+
+```sql
+\i pgpm_core/install.sql
+\i pgpm_archive/install.sql
+
+insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
+values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
+        'partition_aligned',   -- or 'byte_budget'
+        'self_driving',        -- or 'gate_only'
+        'ndjson_commits',      -- or 'ndjson_single' / 'parquet'
+        false);
+
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
+select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one standing job, every configured table
+```
+
+The three implementation pages below kept their original hand-rolled names and `c_`-prefixed
+"deployment constants" throughout -- they remain the design rationale, the honest limits, and the
+live-verification write-ups those names were verified under. The module renamed a few things while
+unifying them; this table is the map from what a page says to what the module actually ships:
+
+| This page says | The module ships | Notes |
+|---|---|---|
+| `archive.partition(parent, child)` | `archive.archive_partition(parent, child)` | same forward-only guard; now dispatches through `archive.archive_range` |
+| `archive.scan()` | `archive.tick()` | the one standing worker, loops every `archive.config` row of either boundary rule |
+| `archive._chunk_one(parent)` | `archive._tick_one(parent)` | picks the next range per `boundary_rule`, then calls `archive.archive_partition` or `archive.archive_range` |
+| `archive.chunk_step(parent)` | folded into `archive.tick()` | no longer a separate per-table cron entry -- one job covers every configured table |
+| `archive.chunk_all(parent)` | `archive.run_all(parent)` | the operator's "do it now", either boundary rule |
+| `c_self_driving` | `archive.config.drop_trigger` | `'self_driving'` \| `'gate_only'` |
+| `c_format` | `archive.config.format` | `'ndjson_single'` \| `'ndjson_commits'` \| `'parquet'` |
+| `c_compress` | `archive.config.compress` | boolean |
+| `c_byte_budget` / `c_probe_sample` | `archive.config.byte_budget` / `archive.config.probe_sample` | byte-budget rule only |
+| `c_part_bytes` / `c_fetch_rows` | `archive.config.part_bytes` / `archive.config.fetch_rows` | `ndjson_commits` format only |
+| `c_bucket` / `c_region` / `c_prefix` / `c_endpoint` | `archive.config.bucket` / `region` / `prefix` / `endpoint` | one connection per managed table, not per function |
+| hardcoded `'s3_archive_access_key_id'` / `'s3_archive_secret_access_key'` | `archive.config.vault_key_id` / `vault_secret` | same defaults, now configurable per table |
+| `archive.to_s3` / `archive.to_s3_parquet` | same names | unchanged architecture (still the synchronous hook), now reading connection settings from `archive.config` too |
+
 ## Positioning
 
-This page is a map, not a fourth mechanism. `archive.to_s3`, `archive.to_s3_parquet`,
-`archive.partition`/`archive.scan`, and `archive._chunk_one`/`chunk_step`/`chunk_all` all continue
-to exist exactly as their own pages describe; nothing here changes their behavior or supersedes
-their own "Honest limits" sections. The reframing above (one fixed architecture, one two-knobbed
-architecture, all four configurations built) is a way of reading what's already there, not a
-proposal to merge `archive-assistant.md` and `archive-chunked-parquet.md`'s actual code. Since #221
-landed, the ledger, the gate, the boundary-rule dispatch, the drop-trigger step, *and* the
-encode/upload step are all shared machinery (`archive.ledger`, `archive.file_gate`,
+This page is a map, not a fourth mechanism. `archive.to_s3`, `archive.to_s3_parquet`, and the
+paced worker's two boundary rules all continue to work exactly as their own pages describe;
+nothing here changes their behavior or supersedes their own "Honest limits" sections. The
+reframing above (one fixed architecture, one two-knobbed architecture, all four configurations
+built) is a way of reading what's already there. Since #221, the ledger, the gate, the
+boundary-rule dispatch, the drop-trigger step, *and* the encode/upload step were already shared
+machinery (`archive.ledger`, `archive.file_gate`,
 `archive._next_range_partition_aligned`/`archive._next_range_byte_budget`,
-`archive._retire_covered`, `archive._encode_upload_ndjson_single`/`_ndjson_commits`/`_parquet`).
-What is left unmerged is just the two entry points themselves, `archive.partition` (told which
-partition by its caller) and `archive._chunk_one` (picks its own range) -- both now thin dispatch
-shells over entirely shared steps, tracked by whichever future issue decides that gap is worth
-closing (#222's `contrib/` graduation is the next, and last, planned step in this stack).
+`archive._retire_covered`, `archive._encode_upload_ndjson_single`/`_ndjson_commits`/`_parquet`);
+what was left unmerged was just the two entry points themselves, `archive.partition` (told which
+partition by its caller) and `archive._chunk_one` (picks its own range). #222 closed that last
+gap and packaged the result as `pgpm_archive/install.sql` (see ["Installing the
+module"](#installing-the-module) above): `archive.archive_partition`/`archive.archive_range` (the
+archiver), `archive._tick_one` (picks a range per `boundary_rule`), and
+`archive.tick()`/`archive.run_all(parent)` (the standing and do-it-now entry points) are one
+config-driven worker, the same code path regardless of which knobs a table uses. The three
+implementation pages below are unaffected by that packaging -- they describe the same mechanisms
+under their original names, and remain the place to read *why* each piece works the way it does.

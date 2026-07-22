@@ -16,6 +16,15 @@ error captured verbatim in the `retain_hook_fail` log, and the drop deferred). S
 carries a path prefix (`/storage/v1/s3`), which is why the path-style branch below splits the host and
 the URI prefix apart instead of assuming a bare host.
 
+> **As of #222, `archive.to_s3`/`archive.to_s3_parquet` also ship as part of an installable
+> module**: `pgpm_archive/install.sql`, reading connection settings (bucket/region/endpoint/prefix/
+> vault secret names) from a per-table `archive.config` row instead of the `c_`-prefixed constants
+> below. This page's worked-example framing, its SQL, and everything it verified are all unchanged
+> and kept below; see [Choosing an archival strategy's name
+> mapping](archive-strategies-overview.md#installing-the-module) for the full picture (including
+> the paced-worker pages' renames), and this page's own ["Register and pace
+> it"](#register-and-pace-it) section for the module-based registration path.
+
 ## The moving parts
 
 - **The [`http` extension](https://github.com/pramsey/pgsql-http)** (on Supabase: `http`, "RESTful
@@ -153,6 +162,19 @@ but failed to report (or a partition retried after a partial outage) never dupli
 archive.
 
 ## Register and pace it
+
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`), configure this table via
+`archive.config` instead of editing the constants above, then register:
+
+```sql
+insert into archive.config (parent_table, bucket, region, endpoint, prefix)
+values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/');
+
+select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
+update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
+```
+
+Or, register the hand-rolled function above directly -- same registration either way:
 
 ```sql
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
@@ -1399,7 +1421,8 @@ $$;
 
 ## Register the Parquet hook
 
-Same shape as the hooks above; only the function name changes:
+Same shape as the hooks above; only the function name changes (and, on `pgpm_archive`, the same
+`archive.config` row already covers this hook too -- no separate configuration needed):
 
 ```sql
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3_parquet(regclass,name,text,text)');
