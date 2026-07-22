@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **Docs: add a drop-trigger toggle (gate-only vs self-driving) to the paced worker (#220).** Fills
+  the two previously-unbuilt cells in `docs/archive-strategies-overview.md`'s boundary-rule x
+  drop-trigger-rule table. Adds a shared `archive._retire_covered(p_parent, p_up_to)` procedure
+  (kind-aware, claim-guarded via `pgpm.retire()`, one `commit` per drop) that retires every
+  attached partition whose bounds fit inside `p_up_to`. Both `archive.scan()` and
+  `archive._chunk_one` get a `c_self_driving` deployment constant: `archive.scan()` defaults to
+  `true` (unchanged, self-driving) and can be set `false` for gate-only, becoming a pure archiver
+  that leaves drop timing to `retain()`'s own schedule; `archive._chunk_one` defaults to `false`
+  (unchanged, gate-only) and can be set `true` to call `archive._retire_covered` with the chunk's
+  own newly-advanced watermark right after its ledger row commits -- the byte-budget-aligned,
+  self-driving configuration [#212](https://github.com/dventimisupabase/pg_partition_magician/issues/212)
+  asked about, generalized to both boundary rules at once. `archive.scan()`'s retire sweep was
+  also simplified in the same change: it now loops managed tables directly and calls the shared,
+  committing `archive._retire_covered` per table, rather than materializing every table's targets
+  into one list first (a live cursor calling a committing procedure per iteration is exactly the
+  pattern PG11 added transaction control in procedures to support). Live-verified all four
+  boundary-rule x drop-trigger-rule combinations: the assistant self-driving (unchanged) and
+  gate-only (new, archives without retiring, `retain()`+`archive.file_gate` pick up the drop
+  later); the chunker gate-only (unchanged) and self-driving (new, retires three partitions in one
+  call right after a chunk that happened to span all three); and the restructured retire sweep
+  across two managed tables in one `archive.scan()` call.
+
 - **Docs: extract the paced worker's boundary rule as a pluggable step (#219).** Factors "pick the
   next range to archive" out of both archivers into two matching-shaped functions --
   `archive._next_range_partition_aligned(p_parent)` (the assistant's existing eligibility logic:

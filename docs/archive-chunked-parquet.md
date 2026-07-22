@@ -271,6 +271,17 @@ progress (the operator's "do it now", mirroring `pgpm.regrain`'s shape). Both ta
 advisory lock distinct from the archive assistant's, so a chunker and a scanner never collide if
 both are ever run against the same database.
 
+By default this chunker is **gate-only**: it never calls `retire()` itself, leaving drop timing
+entirely to `retain()`'s own schedule with `archive.file_gate` vetoing anything not yet covered.
+Setting `c_self_driving := true` makes it **self-driving** instead: right after a chunk's ledger
+row commits, it calls [the archive assistant](archive-assistant.md#the-scanner)'s
+`archive._retire_covered(p_parent, v_hi)` -- the same shared, claim-guarded retire sweep the
+assistant's own scanner uses, just handed this chunk's new watermark instead of the retention
+boundary -- retiring any partition (or partitions, if one chunk happens to span several) the new
+range now fully covers. `retain()`'s own schedule is still worth leaving in place even
+self-driving, exactly as the assistant recommends for itself: a further-out backstop in case the
+chunker wedges.
+
 Picking the range is its own step, `archive._next_range_byte_budget`, factored out so [the archive
 assistant](archive-assistant.md#the-archiver)'s own boundary rule
 (`archive._next_range_partition_aligned`) can sit alongside it with a matching shape (`(p_parent)`
@@ -360,7 +371,7 @@ $$;
 create or replace procedure archive._chunk_one(p_parent regclass)
 language plpgsql as $$
 declare
-  -- deployment constants: edit these six
+  -- deployment constants: edit these seven
   c_bucket       text := 'my-archive-bucket';
   c_region       text := 'us-east-1';
   c_prefix       text := 'events/';
@@ -369,9 +380,13 @@ declare
   c_probe_sample int := 1000;
   c_compress     boolean := true;     -- GZIP the Parquet page data; counts against the byte-budget
                                        -- hold below (see "Honest limits")
+  c_self_driving boolean := false;    -- false (today's only mode, still the default): gate-only --
+                                       -- retain()'s own schedule drives the drop, archive.file_gate
+                                       -- vetoes anything not yet covered. true: retire, right here,
+                                       -- any partition this chunk's new watermark now fully covers
 
   cfg pgpm.config; v_nsp name; v_rel name;
-  v_lo text; v_hi text;
+  v_lo text; v_hi text; v_count int;
   v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
   v_rows bigint; v_etag text; h http_header;
 begin
@@ -413,6 +428,11 @@ begin
   insert into archive.ledger (parent_table, lo, hi, s3_key, etag, rows_archived)
   values (p_parent, v_lo, v_hi, v_key, v_etag, v_rows);
   commit;   -- the horizon-hold window ends here
+
+  if c_self_driving then
+    v_count := 0;
+    call archive._retire_covered(p_parent, v_hi, v_count);
+  end if;
 end;
 $$;
 
@@ -521,6 +541,13 @@ own `Dockerfile` builds `pg_cron`, here for `pgsql-http`) and a real MinIO conta
   `archive.chunk_all` against a single-file table and against a small-byte-budget table forced to
   334 files over 5,000 rows -- and got byte-identical results: same ranges, same row counts, same
   `lag(hi)` gap-free contiguity.
+- **Self-driving mode (#220)**: with `c_self_driving := true`, one `archive.chunk_all` call
+  archived a range spanning three attached partitions and retired all three immediately -- through
+  the same shared `archive._retire_covered` [the archive
+  assistant](archive-assistant.md#the-scanner) uses for its own retire sweep, just handed this
+  chunk's watermark instead of the retention boundary. The unchanged gate-only default (`false`)
+  was re-confirmed archiving without ever retiring, `retain()` picking up the drop on its own
+  schedule exactly as before.
 
 ## Honest limits
 

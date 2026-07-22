@@ -405,22 +405,60 @@ end;
 $$;
 ```
 
+The other half of a paced worker is the **drop-trigger rule**: who decides when an archived
+partition actually drops. `archive._retire_covered` is the shared step both boundary rules can
+call when configured *self-driving* -- retire every attached partition whose bounds already fit
+inside `p_up_to` (kind-aware, the same comparison the gate's own fast path uses), claim-guarded via
+`pgpm.retire()`, one `commit` per drop so a later failure never rolls back an earlier one. Called
+with the retention boundary, it is the assistant's own retire sweep; called with a boundary-rule's
+own newly-advanced watermark (as [the chunker](archive-chunked-parquet.md#the-chunker) does), it
+turns a gate-only worker self-driving without duplicating the sweep logic a second time.
+
+```sql
+create or replace procedure archive._retire_covered(p_parent regclass, p_up_to text, inout p_count int default 0)
+language plpgsql as $$
+declare
+  cfg pgpm.config; v_ncast text; v_child record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'archive._retire_covered: % is not managed', p_parent; end if;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  for v_child in execute format(
+    'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
+    p_parent::text, v_ncast, p_up_to, v_ncast, v_ncast)
+  loop
+    if pgpm.retire(p_parent, v_child.child_name) then
+      p_count := p_count + 1;
+    end if;
+    commit;
+  end loop;
+end;
+$$;
+```
+
 ```sql
 -- the scanner: one standing pg_cron job. Archives every retention-eligible partition of every
--- managed table that needs it, then retires every retention-eligible partition through
--- pgpm.retire() -- the claim-guarded sanctioned drop, which also runs the gate (defense in
--- depth: an assistant bug that reached retire() with a bad archive would still be vetoed). Two
--- passes, not interleaved per partition: archiving drains archive._next_range_partition_aligned
--- until it has nothing left to report, THEN the retire sweep attempts every eligible partition --
--- not just the ones archived just now, so a partition that was already correctly archived but
--- didn't retire last cycle (its own drop deferred by something unrelated) still gets retried here,
--- since the picker above would no longer surface it as needing (re-)archiving.
+-- managed table that needs it; if c_self_driving, also retires every retention-eligible partition
+-- through archive._retire_covered -- the claim-guarded sanctioned drop, which also runs the gate
+-- (defense in depth: an assistant bug that reached retire() with a bad archive would still be
+-- vetoed). Two passes, not interleaved per partition: archiving drains
+-- archive._next_range_partition_aligned until it has nothing left to report, THEN (if
+-- self-driving) the retire sweep attempts every eligible partition -- not just the ones archived
+-- just now, so a partition that was already correctly archived but didn't retire last cycle (its
+-- own drop deferred by something unrelated) still gets retried here, since the picker above would
+-- no longer surface it as needing (re-)archiving.
 create or replace procedure archive.scan()
 language plpgsql as $$
 declare
-  cfg pgpm.config; v_boundary text; v_ncast text;
-  v_work  record; v_targets jsonb := '[]';
-  v_lo text; v_hi text; v_child name; v_iter int;
+  -- deployment constant: edit this one
+  c_self_driving boolean := true;   -- true (today's only mode, still the default): the scanner
+                                     -- retires what it archives, same cadence as archiving.
+                                     -- false: gate-only -- archive ahead of retain()'s own
+                                     -- schedule and rely entirely on archive.file_gate to veto
+                                     -- an early drop; pgpm.schedule() becomes the sole drop timer
+
+  cfg pgpm.config; v_boundary text;
+  v_lo text; v_hi text; v_child name; v_iter int; v_count int;
 begin
   -- session-level advisory lock: pg_cron happily overlaps runs of the same job, and a second
   -- scanner mid-upload would double-archive. Session locks survive the COMMITs below.
@@ -439,26 +477,13 @@ begin
     end loop;
   end loop;
 
-  -- materialize the retire-sweep work list (loop-with-COMMIT over a live cursor is legal since
-  -- PG11, but a fixed list is simpler to reason about; eligibility is re-checked by retire() anyway)
-  for cfg in select * from pgpm.config where retain is not null loop
-    v_boundary := pgpm._retain_boundary(cfg);
-    v_ncast    := pgpm._native_type(cfg.control_kind);
-    for v_work in execute format(
-      'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
-      cfg.parent_table::text, v_ncast, v_boundary, v_ncast, v_ncast)
-    loop
-      v_targets := v_targets || jsonb_build_array(jsonb_build_object('parent', cfg.parent_table::text, 'child', v_work.child_name));
+  if c_self_driving then
+    for cfg in select * from pgpm.config where retain is not null loop
+      v_boundary := pgpm._retain_boundary(cfg);
+      v_count := 0;
+      call archive._retire_covered(cfg.parent_table, v_boundary, v_count);
     end loop;
-  end loop;
-  commit;
-
-  for v_work in select (t->>'parent')::regclass as parent, (t->>'child')::name as child
-                  from jsonb_array_elements(v_targets) t
-  loop
-    perform pgpm.retire(v_work.parent, v_work.child);
-    commit;
-  end loop;
+  end if;
 
   perform pg_advisory_unlock(hashtext('pgpm-archiver'));
 end;
@@ -483,6 +508,13 @@ select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
 Unlike the synchronous hook, this needs **no `retain_batch`**: the gate is a count lookup, so even
 an unbounded `retain()` pass over an archived backlog is quick. The knob that matters here is
 `c_part_bytes`, the horizon-hold bound.
+
+`archive.scan()`'s `c_self_driving` constant is `true` above -- the scanner retires what it
+archives, same as it always has. Set it to `false` for **gate-only** instead: the scanner becomes
+a pure archiver (it keeps the ledger ahead of `retain()`'s own schedule and no more), and
+`pgpm.schedule()` stops being a further-out backstop and becomes the *only* thing driving drops,
+with `archive.file_gate` doing all of the vetoing. Register the gate hook either way -- gate-only
+depends on it entirely; self-driving still wants it as defense in depth.
 
 ## Failure semantics, verified
 
@@ -550,6 +582,19 @@ so the picker no longer surfaces it) but still retired by the unchanged retire s
 guarantee the two-pass split had to preserve, since the picker's job is now only "does this need a
 fresh archive," not "does this need a retire attempt." The stale-veto self-repair path and the
 forward-only guard were both re-run through the new picker-driven call path with identical results.
+
+Adding the `c_self_driving` toggle (#220) was verified in all four combinations it makes possible
+across both archival pages: the assistant self-driving (`c_self_driving := true`, the unchanged
+default) still archives and retires every eligible partition in one `scan()` call; the assistant
+gate-only (`false`) archives every eligible partition but retires none, leaving all of them
+attached until a subsequent `pgpm.retain()` call (backed by `archive.file_gate`) drops them; [the
+chunker](archive-chunked-parquet.md#the-chunker) gate-only (its own unchanged default) still
+archives without ever retiring; and the chunker self-driving (`true`) retires, immediately after
+one `archive._chunk_one` call, every partition (three at once, in the fixture that exercised it)
+the new chunk's watermark now fully covers. The restructured retire sweep (looping managed tables
+directly and calling the shared, committing `archive._retire_covered` per table, rather than
+materializing every table's targets into one list first) was also re-run across two managed tables
+archived in the same `scan()` call, both correctly archived and retired with no cross-talk.
 
 ## Supabase ceilings, discovered the honest way
 
