@@ -826,18 +826,28 @@ language sql immutable as $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Column data extraction (server-side aggregation, ctid-ordered so every
--- column's array lines up on the same row order)
+-- Column data extraction (server-side aggregation, ctid-ordered by default so
+-- every column's array lines up on the same row order)
 -- ---------------------------------------------------------------------------
 
 -- p_nullable columns interleave nulls with real values (array_agg preserves NULLs in
--- position, so this is a single ctid-ordered pass either way); is_present[i] tracks which
+-- position, so this is a single ordered pass either way); is_present[i] tracks which
 -- rows had a value so the OPTIONAL path can prepend a definition-levels bitmap, while the
 -- values-only payload always contains just the non-null values, in row order. For a NOT
 -- NULL column every element is guaranteed non-null (Postgres enforces that at the table
 -- level), so this collapses to the old unconditional-encode behavior byte-for-byte; only
 -- p_nullable decides whether the definition-levels block gets prepended at all.
-create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text, p_nullable boolean) returns bytea
+--
+-- p_order_by defaults to 'ctid' (this function's original, whole-relation ordering,
+-- unchanged byte-for-byte); docs/archive-chunked-parquet.md's cross-partition range reader
+-- passes an explicit '(control column, key columns)' order-by instead, since ctid is not
+-- comparable once a read spans more than one child's heap. This one definition serves both
+-- callers -- it is deliberately NOT redeclared with a different parameter list anywhere
+-- else, since Postgres overload resolution is keyed on the parameter type list (not names or
+-- defaults): a second, differently-aritied "replacement" would coexist as a distinct
+-- overload rather than actually replacing this one, and a 4-arg call would become ambiguous
+-- between the two (see #209).
+create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid') returns bytea
 language plpgsql as $$
 declare
   values_payload bytea := ''::bytea;
@@ -847,28 +857,28 @@ declare
   i int4; n int4;
 begin
   if p_pgtype = 'int4' then
-    execute format('select array_agg(%I::int4 order by ctid) from %s', p_col, p_from_sql) into arr_i4;
+    execute format('select array_agg(%I::int4 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i4;
     n := coalesce(array_length(arr_i4,1),0);
     for i in 1..n loop
       is_present[i] := (arr_i4[i] is not null);
       if arr_i4[i] is not null then values_payload := values_payload || archive._pq_plain_int32(arr_i4[i]); end if;
     end loop;
   elsif p_pgtype = 'int8' then
-    execute format('select array_agg(%I::int8 order by ctid) from %s', p_col, p_from_sql) into arr_i8;
+    execute format('select array_agg(%I::int8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i8;
     n := coalesce(array_length(arr_i8,1),0);
     for i in 1..n loop
       is_present[i] := (arr_i8[i] is not null);
       if arr_i8[i] is not null then values_payload := values_payload || archive._pq_plain_int64(arr_i8[i]); end if;
     end loop;
   elsif p_pgtype = 'float8' then
-    execute format('select array_agg(%I::float8 order by ctid) from %s', p_col, p_from_sql) into arr_f8;
+    execute format('select array_agg(%I::float8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_f8;
     n := coalesce(array_length(arr_f8,1),0);
     for i in 1..n loop
       is_present[i] := (arr_f8[i] is not null);
       if arr_f8[i] is not null then values_payload := values_payload || archive._pq_plain_double(arr_f8[i]); end if;
     end loop;
   elsif p_pgtype = 'bool' then
-    execute format('select array_agg(%I::boolean order by ctid) from %s', p_col, p_from_sql) into arr_bool;
+    execute format('select array_agg(%I::boolean order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_bool;
     n := coalesce(array_length(arr_bool,1),0);
     for i in 1..n loop
       is_present[i] := (arr_bool[i] is not null);
@@ -876,14 +886,14 @@ begin
     end loop;
     values_payload := archive._pq_plain_boolean_array(present_bools);
   elsif p_pgtype = 'text' then
-    execute format('select array_agg(%I::text order by ctid) from %s', p_col, p_from_sql) into arr_text;
+    execute format('select array_agg(%I::text order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_text;
     n := coalesce(array_length(arr_text,1),0);
     for i in 1..n loop
       is_present[i] := (arr_text[i] is not null);
       if arr_text[i] is not null then values_payload := values_payload || archive._pq_plain_text(arr_text[i]); end if;
     end loop;
   elsif p_pgtype in ('timestamptz','timestamp') then
-    execute format('select array_agg(%I::timestamptz order by ctid) from %s', p_col, p_from_sql) into arr_ts;
+    execute format('select array_agg(%I::timestamptz order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_ts;
     n := coalesce(array_length(arr_ts,1),0);
     for i in 1..n loop
       is_present[i] := (arr_ts[i] is not null);

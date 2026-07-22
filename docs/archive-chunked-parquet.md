@@ -92,76 +92,17 @@ by a constraint. A genuinely keyless relation is refused outright -- the same `'
 Postgres itself requires any unique constraint to include every partitioning column, so in
 practice the control column is always already one of the columns this discovers.)
 
+`archive._pq_encode_column_data` already takes the `p_order_by` parameter this range reader
+needs (default `'ctid'`, so `archive._pq_to_parquet`'s whole-relation callers are unaffected
+byte-for-byte) -- see its definition in [Archive partitions to
+S3](archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson). It is deliberately not
+redeclared here: Postgres overload resolution is keyed on the parameter type list, not names or
+defaults, so a second definition with a different arity would coexist as a distinct overload
+rather than replace the original, and a 4-arg call from `archive._pq_to_parquet` would become
+ambiguous between the two (#209). Install `archive-to-s3.md`'s SQL first; everything below
+builds on it.
+
 ```sql
--- archive._pq_encode_column_data gains an optional order-by clause (default 'ctid', so
--- archive._pq_to_parquet's existing behavior is unchanged byte-for-byte). Replace the
--- version in docs/archive-to-s3.md with this one -- same function, one added parameter.
-create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid') returns bytea
-language plpgsql as $$
-declare
-  values_payload bytea := ''::bytea;
-  is_present boolean[] := '{}';
-  arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
-  present_bools boolean[] := '{}';
-  i int4; n int4;
-begin
-  if p_pgtype = 'int4' then
-    execute format('select array_agg(%I::int4 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i4;
-    n := coalesce(array_length(arr_i4,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i4[i] is not null);
-      if arr_i4[i] is not null then values_payload := values_payload || archive._pq_plain_int32(arr_i4[i]); end if;
-    end loop;
-  elsif p_pgtype = 'int8' then
-    execute format('select array_agg(%I::int8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i8;
-    n := coalesce(array_length(arr_i8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i8[i] is not null);
-      if arr_i8[i] is not null then values_payload := values_payload || archive._pq_plain_int64(arr_i8[i]); end if;
-    end loop;
-  elsif p_pgtype = 'float8' then
-    execute format('select array_agg(%I::float8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_f8;
-    n := coalesce(array_length(arr_f8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_f8[i] is not null);
-      if arr_f8[i] is not null then values_payload := values_payload || archive._pq_plain_double(arr_f8[i]); end if;
-    end loop;
-  elsif p_pgtype = 'bool' then
-    execute format('select array_agg(%I::boolean order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_bool;
-    n := coalesce(array_length(arr_bool,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_bool[i] is not null);
-      if arr_bool[i] is not null then present_bools := present_bools || arr_bool[i]; end if;
-    end loop;
-    values_payload := archive._pq_plain_boolean_array(present_bools);
-  elsif p_pgtype = 'text' then
-    execute format('select array_agg(%I::text order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_text;
-    n := coalesce(array_length(arr_text,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_text[i] is not null);
-      if arr_text[i] is not null then values_payload := values_payload || archive._pq_plain_text(arr_text[i]); end if;
-    end loop;
-  elsif p_pgtype in ('timestamptz','timestamp') then
-    execute format('select array_agg(%I::timestamptz order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_ts;
-    n := coalesce(array_length(arr_ts,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_ts[i] is not null);
-      if arr_ts[i] is not null then
-        values_payload := values_payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
-      end if;
-    end loop;
-  else
-    raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
-  end if;
-
-  if p_nullable then
-    return archive._pq_definition_levels(is_present) || values_payload;
-  else
-    return values_payload;
-  end if;
-end;
-$$;
-
 -- key discovery: identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery
 create or replace function archive._pq_key_columns(p_relation regclass) returns name[]
 language plpgsql as $$
