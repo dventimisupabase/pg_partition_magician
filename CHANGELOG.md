@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **Docs: extract the paced worker's boundary rule as a pluggable step (#219).** Factors "pick the
+  next range to archive" out of both archivers into two matching-shaped functions --
+  `archive._next_range_partition_aligned(p_parent)` (the assistant's existing eligibility logic:
+  the first attached, retention-eligible partition whose ledger row is missing or stale) and
+  `archive._next_range_byte_budget(p_parent, c_byte_budget, c_probe_sample)` (`archive._chunk_one`'s
+  existing byte-budget computation, unchanged) -- both `(p_parent)` in, `(lo, hi)` or no rows out.
+  `archive._chunk_one` now calls the byte-budget picker instead of inlining its computation, with
+  byte-identical results (re-verified: single-file and 334-file/5,000-row fixtures, same ranges,
+  same counts, same gap-free contiguity). `archive.scan()` now calls the partition-aligned picker
+  in a loop until exhausted for the archiving half of its work, with one honest, deliberate
+  restructuring: archiving and retiring are no longer interleaved per partition -- the picker drains
+  first, then the existing retire sweep (unchanged) attempts every eligible partition, not just the
+  ones just archived. Re-verified this preserves the one guarantee that split had to keep: a
+  partition archived on an earlier cycle but left un-retired (a drop deferred for a reason unrelated
+  to archiving) is correctly *not* re-archived by the picker but still retried by the retire sweep.
+  Stale-veto self-repair and the #218 forward-only guard were both re-run through the new
+  picker-driven call path with identical results.
+
 - **Docs: unify `archive.gate` and `archive.file_gate` into one gate (#218).** `archive.file_gate`
   (`docs/archive-chunked-parquet.md`'s fast-path-watermark-plus-decrement veto) replaces the
   retired `archive.gate` (`docs/archive-assistant.md`'s simpler per-child recount) everywhere; both
