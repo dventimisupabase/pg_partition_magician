@@ -127,6 +127,8 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
   troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
+- **[Choosing an archival strategy](docs/archive-strategies-overview.md)**: start here -- the
+  three drop-ownership patterns across the archival pages below, and which one fits your case.
 - **[Archive to S3](docs/archive-to-s3.md)**: a worked `pre_drop` hook that copies partitions to S3
   before retention drops them.
 - **[Archive assistant](docs/archive-assistant.md)**: the scanner variant with bounded vacuum-horizon
