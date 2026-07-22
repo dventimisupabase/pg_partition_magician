@@ -127,15 +127,6 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
   troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
-- **[Choosing an archival strategy](docs/archive-strategies-overview.md)**: start here -- the
-  three drop-ownership patterns across the archival pages below, and which one fits your case.
-- **[Archive to S3](docs/archive-to-s3.md)**: a worked `pre_drop` hook that copies partitions to S3
-  before retention drops them.
-- **[Archive assistant](docs/archive-assistant.md)**: the scanner variant with bounded vacuum-horizon
-  holds and assistant-owned drops via `pgpm.retire`.
-- **[Chunked, cross-partition Parquet archival](docs/archive-chunked-parquet.md)**: decouples Parquet
-  file boundaries from partition boundaries, bounding the vacuum-horizon hold by a target file size
-  instead of emergent partition size.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
 

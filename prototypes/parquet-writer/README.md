@@ -7,7 +7,7 @@ not shipped code, not wired into pgpm_core.
 
 **This encoder is now also wired into a real `pre_drop` hook**, verified
 end-to-end through `pgpm.retire()` against MinIO: see
-[`docs/archive-to-s3.md`](../../docs/archive-to-s3.md#a-columnar-variant-parquet-instead-of-ndjson).
+[`pgpm_archive/docs/to-s3.md`](../../pgpm_archive/docs/to-s3.md#a-columnar-variant-parquet-instead-of-ndjson).
 That version renames the `pq.*` functions here into the `archive` schema and
 adds a bytea-native SigV4 signer (`archive.s3_signed_request_bytea`), since
 the existing text-based signer's `convert_to(payload, 'UTF8')` call rejects
@@ -45,7 +45,7 @@ neither of which reduces to a single PL/pgSQL function.
 reads a `[p_lo, p_hi)` range of a control column off a relation -- typically a
 partitioned parent -- instead of one whole relation, relying on Postgres's own
 partition pruning to span whichever children the range touches. It exists for
-[the chunked, cross-partition archival design](../../archive-chunked-parquet-design.md):
+[the chunked, cross-partition archival design](../../pgpm_archive/docs/chunked-parquet.md):
 decoupling a Parquet file's boundaries from partition boundaries means a file
 can cover part of a partition, one whole partition, or several, so the encoder
 needs a query shape that isn't "select every row of this one child."

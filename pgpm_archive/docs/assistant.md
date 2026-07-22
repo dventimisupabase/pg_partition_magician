@@ -2,8 +2,8 @@
 
 A standing scanner that archives aged partitions to S3 **with per-part commits**, so the vacuum
 horizon is held for at most one part's network time instead of a whole partition's upload, and then
-drops each partition itself through [`pgpm.retire`](reference.md#retire). This is the variant of
-[Archive partitions to S3](archive-to-s3.md) for when that page's synchronous hook holds its
+drops each partition itself through [`pgpm.retire`](../../docs/reference.md#retire). This is the variant of
+[Archive partitions to S3](to-s3.md) for when that page's synchronous hook holds its
 transaction open longer than you like -- big partitions, slow links, or a database whose vacuum you
 will not gamble with. It reuses that page's `archive.s3_url_encode` and `archive.s3_signed_request` functions
 (deploy the multipart section's SQL first); everything here is user-land, like every hook: pgpm
@@ -14,7 +14,7 @@ ships none of it.
 > below. This page's SQL, its names (`archive.partition`, `archive.scan()`, `c_self_driving`,
 > `c_format`, ...), and everything it verified are all unchanged and kept below as the design
 > rationale; see [Choosing an archival strategy's name
-> mapping](archive-strategies-overview.md#installing-the-module) for how each maps onto the
+> mapping](strategies-overview.md#installing-the-module) for how each maps onto the
 > module, and this page's own ["Install"](#install) section for the module-based install path.
 
 ## Why: statements hold snapshots
@@ -62,7 +62,7 @@ create schema if not exists archive;
 -- the ledger: one row per archived range, written by the archiver at the moment it verified the
 -- upload. The drop gate consults THIS, never job history. A partition's own bounds are already a
 -- native-grid [lo, hi) range -- the same shape a cross-partition, byte-budget-aligned archiver
--- (docs/archive-chunked-parquet.md) needs for a range that spans part of one partition or several
+-- (docs/chunked-parquet.md) needs for a range that spans part of one partition or several
 -- -- so this table is shared by both: `lo` is the primary key (ranges never overlap, by either
 -- archiver's own invariant), and `child_name` is an optional convenience column, populated only
 -- when the archived range happens to equal exactly one partition's bounds, so a name-based lookup
@@ -195,10 +195,10 @@ $$;
 ## The archiver
 
 *How* a range becomes bytes and lands in S3 is its own pluggable step (#221), matching-shaped with
-[the chunker](archive-chunked-parquet.md#the-chunker)'s: `(p_parent, p_lo, p_hi, p_compress)` in,
+[the chunker](chunked-parquet.md#the-chunker)'s: `(p_parent, p_lo, p_hi, p_compress)` in,
 `(s3_key, etag, rows_archived)` out, whichever of the three ways below is configured. All three
 read straight off the *parent* (relying on Postgres's own partition pruning), not a named child --
-the same shift [the chunker's range reader](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
+the same shift [the chunker's range reader](chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
 already made, generalized here to NDJSON too.
 
 - **`archive._encode_upload_ndjson_single`**: one read, one `PUT` (optionally gzipped as a single
@@ -211,15 +211,15 @@ already made, generalized here to NDJSON too.
   NDJSON has no whole-file structure to finalize -- there is nothing stopping a `COMMIT` between
   parts.
 - **`archive._encode_upload_parquet`**: a thin wrapper around [the chunker's range
-  encoder](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation),
-  `archive._pq_to_parquet_range`, plus a `PUT`. Deploy `docs/archive-chunked-parquet.md`'s encoder
+  encoder](chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation),
+  `archive._pq_to_parquet_range`, plus a `PUT`. Deploy `docs/chunked-parquet.md`'s encoder
   section too if this page's `c_format` is ever set to `'parquet'` -- unlike the other two, this
-  one is not self-contained in `archive-to-s3.md` alone.
+  one is not self-contained in `to-s3.md` alone.
 
 **Parquet with internal commits is not a fourth option, and cannot become one**: a Parquet file's
 footer needs every row group's byte offset, known only once the whole file's bytes exist, so there
 is no way to `COMMIT` partway through building one. This is a structural fact about the format, not
-a gap in this project -- see [Archive partitions to S3](archive-to-s3.md#honest-limits-for-the-parquet-variant)
+a gap in this project -- see [Archive partitions to S3](to-s3.md#honest-limits-for-the-parquet-variant)
 and [#211](https://github.com/dventimisupabase/pg_partition_magician/issues/211).
 
 Generalizing the per-part-commit reader past one partition surfaced a real, previously-latent
@@ -298,7 +298,7 @@ $$;
 -- a `text[]` of (control column, real key columns) instead fixes it: Postgres compares arrays
 -- lexicographically, element by element, so this is a genuine composite tiebreak without
 -- dynamic-arity ROW() construction. Key discovery is `archive._key_columns`, the same helper
--- [the chunker's range encoder](archive-chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
+-- [the chunker's range encoder](chunked-parquet.md#the-encoder-reading-a-range-instead-of-a-relation)
 -- uses.
 --
 -- Compression, if requested, gzips each part independently (`archive._pq_gzip_compress`) and lets
@@ -460,7 +460,7 @@ end;
 $$;
 
 -- thin wrapper around the chunker's own range encoder + a PUT. Requires
--- docs/archive-chunked-parquet.md's encoder section deployed too -- see above.
+-- docs/chunked-parquet.md's encoder section deployed too -- see above.
 create or replace function archive._encode_upload_parquet(p_parent regclass, p_lo text, p_hi text, p_compress boolean default true)
 returns table(s3_key text, etag text, rows_archived bigint)
 language plpgsql as $$
@@ -517,7 +517,7 @@ declare
   -- deployment constants: edit these two
   c_format   text := 'ndjson_commits';   -- 'ndjson_commits' (default, this page's original
                                           -- technique) | 'ndjson_single' | 'parquet' (needs
-                                          -- docs/archive-chunked-parquet.md's encoder deployed too)
+                                          -- docs/chunked-parquet.md's encoder deployed too)
   c_compress boolean := false;           -- NDJSON default-off here (matching this page's history);
                                           -- the chunker defaults Parquet on -- flip this to true
                                           -- too if switching c_format to 'parquet'
@@ -529,7 +529,7 @@ begin
 
   -- forward-only guard: archive.file_gate's fast path trusts the ledger's watermark to mean
   -- "everything below this is archived" -- true only if coverage is gap-free from wherever the
-  -- ledger starts. archive._chunk_one (docs/archive-chunked-parquet.md) enforces that by
+  -- ledger starts. archive._chunk_one (docs/chunked-parquet.md) enforces that by
   -- construction, always extending the watermark forward; this procedure takes an arbitrary
   -- child name, so it enforces the same contract explicitly. A re-archive of an already-ledgered
   -- partition (the stale-veto self-repair path) is exempt -- it overwrites its own existing row,
@@ -562,7 +562,7 @@ begin
   -- overwrites; cleanup-on-entry finds nothing in flight because the upload completed). Keyed by
   -- the partition's own lo (its native-grid [lo, hi) bounds), with child_name populated since
   -- this range is exactly one partition -- the shared archive.ledger table (see "The ledger and
-  -- the gate" above) also serves docs/archive-chunked-parquet.md's cross-partition ranges, which
+  -- the gate" above) also serves docs/chunked-parquet.md's cross-partition ranges, which
   -- have no single child_name to record.
   insert into archive.ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
   values (p_parent, v_lo, v_hi, p_child, v_s3_key, v_etag, v_rows)
@@ -594,7 +594,7 @@ match); only newly archived ranges use the new naming.
 ## The scanner
 
 Picking which partition to archive next is its own step, `archive._next_range_partition_aligned`,
-factored out so [the chunker](archive-chunked-parquet.md#the-chunker)'s own boundary rule
+factored out so [the chunker](chunked-parquet.md#the-chunker)'s own boundary rule
 (`archive._next_range_byte_budget`) can sit alongside it with a matching shape (`(p_parent)` in,
 `(lo, hi, child_name)` or no rows out) -- nothing downstream of the range (the read-and-upload, the
 ledger write, the retire) depends on which rule picked it.
@@ -642,7 +642,7 @@ call when configured *self-driving* -- retire every attached partition whose bou
 inside `p_up_to` (kind-aware, the same comparison the gate's own fast path uses), claim-guarded via
 `pgpm.retire()`, one `commit` per drop so a later failure never rolls back an earlier one. Called
 with the retention boundary, it is the assistant's own retire sweep; called with a boundary-rule's
-own newly-advanced watermark (as [the chunker](archive-chunked-parquet.md#the-chunker) does), it
+own newly-advanced watermark (as [the chunker](chunked-parquet.md#the-chunker) does), it
 turns a gate-only worker self-driving without duplicating the sweep logic a second time.
 
 ```sql
@@ -745,7 +745,7 @@ select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
 
 Or, build it directly from this page's SQL above (`archive.partition`/`archive.scan()`, not the
 module's `archive.archive_partition`/`archive.tick()` -- see the [name
-mapping](archive-strategies-overview.md#installing-the-module) if you're cross-referencing both):
+mapping](strategies-overview.md#installing-the-module) if you're cross-referencing both):
 
 ```sql
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
@@ -803,7 +803,7 @@ The happy path, backstop veto, and stale veto + self-repair above were all re-ve
 unified `archive.ledger` table and shared `archive.file_gate` (#217, #218): `archive.partition`
 resolves its partition's own `[lo, hi)` from `pgpm.part`, the forward-only guard passes silently on
 in-order archiving and on re-archiving an already-ledgered (stale) partition, and a second managed
-table archived concurrently through [the chunker](archive-chunked-parquet.md) produced no key
+table archived concurrently through [the chunker](chunked-parquet.md) produced no key
 collisions or lookup cross-talk between the two tables' rows in the same ledger.
 
 `archive.file_gate` was not a safe drop-in for the retired `archive.gate` on the first attempt,
@@ -840,7 +840,7 @@ across both archival pages: the assistant self-driving (`c_self_driving := true`
 default) still archives and retires every eligible partition in one `scan()` call; the assistant
 gate-only (`false`) archives every eligible partition but retires none, leaving all of them
 attached until a subsequent `pgpm.retain()` call (backed by `archive.file_gate`) drops them; [the
-chunker](archive-chunked-parquet.md#the-chunker) gate-only (its own unchanged default) still
+chunker](chunked-parquet.md#the-chunker) gate-only (its own unchanged default) still
 archives without ever retiring; and the chunker self-driving (`true`) retires, immediately after
 one `archive._chunk_one` call, every partition (three at once, in the fixture that exercised it)
 the new chunk's watermark now fully covers. The restructured retire sweep (looping managed tables
@@ -866,7 +866,7 @@ Beyond the fix itself: the happy path was re-verified with the new dispatch unch
 (`c_format := 'ndjson_commits'`, the default, archiving and retiring identically to before, just
 under the new `(parent, lo)`-based key naming); the two newly-possible combinations were verified
 end-to-end (`archive.partition` with `c_format := 'parquet'` -- valid Parquet magic bytes at both
-ends of the fetched object; [the chunker](archive-chunked-parquet.md#the-chunker) with
+ends of the fetched object; [the chunker](chunked-parquet.md#the-chunker) with
 `c_format := 'ndjson_single'` -- all 50,000 rows fetched back intact); and compression on
 `ndjson_commits` was verified against a 30,000-row, semi-random-payload fixture forced into several
 6MiB+ parts -- the resulting object, a genuine multi-member gzip stream (each part compressed

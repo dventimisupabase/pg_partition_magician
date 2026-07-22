@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Move the archive docs under `pgpm_archive/` and stop referencing archival from the root
+  `README.md`.** Archiving to S3 is a downstream concern from partition lifecycle management, not
+  part of `pg_partition_magician` core -- it started as worked examples embedded in markdown and
+  later graduated into an installable module, but the root README had kept linking to it as though
+  it were a core feature. Fixed: the four archive docs (`archive-strategies-overview.md`,
+  `archive-to-s3.md`, `archive-assistant.md`, `archive-chunked-parquet.md`) moved from `docs/` to
+  `pgpm_archive/docs/` (`strategies-overview.md`, `to-s3.md`, `assistant.md`, `chunked-parquet.md`),
+  every cross-reference among them and from `docs/guide.md`/`docs/reference.md`/
+  `prototypes/parquet-writer/README.md`/`pgpm_archive/install.sql` updated to match; the root
+  `README.md`'s "Documentation" section no longer mentions archiving at all. In their place,
+  `pgpm_archive/README.md` is a new front door -- what the module is, why it's separate from core,
+  install + configure + register in one place, the two-architecture picture, and links into its own
+  `docs/`. Together, these leave `pgpm_archive/` reorganizable into its own repo with near-zero
+  further effort, which was the whole point.
+
 - **Point `docs/archive-*.md` at `pgpm_archive/install.sql` as the installable source of truth
   (#222, 3 of 3 -- closes the six-issue archive harmonization stack, #217-#222).** The three
   implementation pages (`archive-to-s3.md`, `archive-assistant.md`, `archive-chunked-parquet.md`)
