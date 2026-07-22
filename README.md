@@ -131,6 +131,9 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
   before retention drops them.
 - **[Archive assistant](docs/archive-assistant.md)**: the scanner variant with bounded vacuum-horizon
   holds and assistant-owned drops via `pgpm.retire`.
+- **[Chunked, cross-partition Parquet archival](docs/archive-chunked-parquet.md)**: decouples Parquet
+  file boundaries from partition boundaries, bounding the vacuum-horizon hold by a target file size
+  instead of emergent partition size.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
 

@@ -39,6 +39,55 @@ statistics, nested/repeated schemas) is out of scope. So is Iceberg: it needs
 a second binary format (Avro, for manifests) plus a catalog commit protocol,
 neither of which reduces to a single PL/pgSQL function.
 
+## The cross-partition range variant
+
+`pq.to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text)`
+reads a `[p_lo, p_hi)` range of a control column off a relation -- typically a
+partitioned parent -- instead of one whole relation, relying on Postgres's own
+partition pruning to span whichever children the range touches. It exists for
+[the chunked, cross-partition archival design](../../archive-chunked-parquet-design.md):
+decoupling a Parquet file's boundaries from partition boundaries means a file
+can cover part of a partition, one whole partition, or several, so the encoder
+needs a query shape that isn't "select every row of this one child."
+
+Two things `pq.to_parquet` doesn't need come along with that:
+
+- **A real key, not `ctid`.** `ctid` identifies a row's physical location within
+  *one* heap; it isn't comparable once a range spans more than one child's heap.
+  `pq._key_columns()` discovers a resumable-read key the same way
+  `pgpm.regrain_step` already does (`pgpm_core/install.sql`): prefer a PRIMARY
+  KEY, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE
+  INDEX unbacked by a constraint. A genuinely keyless relation is refused
+  outright, the same `'nokey'` contract `regrain()` already enforces -- an
+  inherited limitation, not a new gap.
+- **A composite sort, not just the control column.** A time-kind control column
+  routinely repeats (duplicate timestamps are common), so ordering by it alone
+  is not deterministic. The encoder orders by `(control column, key columns...)`
+  instead, so every row's position is unique and reproducible -- a property a
+  future chunk boundary needs (see the design note on the chunker's stopping
+  rule; not built in this rung, only enabled by it).
+
+`p_lo`/`p_hi` are literals already typed for the control column's actual SQL
+type; a caller translating a pgpm native-grid value (e.g. for a `uuidv7`-kind
+column, whose native grid is `timestamptz` but whose column type is `uuid`)
+does that translation itself first, the same way `regrain_step` builds its own
+`v_lo_lit`/`v_hi_lit` before it.
+
+`verify_range.py` covers: a range spanning two and three children, a sub-range
+confined to one child, five rows tied on the same control-column value ordered
+correctly by the real key (not insertion order), the exclusive-`hi` boundary
+landing exactly on both a data tie and a partition boundary simultaneously, an
+empty range, a three-column composite key, the UNIQUE CONSTRAINT fallback (no
+primary key present), a bare UNIQUE INDEX correctly refused, a genuinely
+keyless table correctly refused, and an `EXPLAIN`-verified check that
+partition pruning actually excludes untouched children rather than just being
+assumed.
+
+```bash
+docker-compose --profile pg17 up -d
+./.venv/bin/python verify_range.py
+```
+
 ## Layout
 
 `parquet_writer.sql` implements, bottom-up:

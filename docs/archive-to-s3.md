@@ -1137,3 +1137,8 @@ same sanctioned drop path `retain()` uses), not a standalone call to the encoder
   readable by every reader tested, none of it as compact as a tuned writer would produce. This is
   the minimal-viable rung, not the ambitious one; see #199 for pg_parquet/Iceberg as the extension-
   dependent alternative if that tradeoff matters more than the zero-dependency property does.
+- **This hook's horizon-hold is bounded by partition size, which is emergent, not by a chosen
+  file size.** If partitions grow large enough (or unevenly enough) that this matters, see
+  [Chunked, cross-partition Parquet archival](archive-chunked-parquet.md), which decouples
+  Parquet file boundaries from partition boundaries entirely so the hold is bounded by a target
+  file size instead.
