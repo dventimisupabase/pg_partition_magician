@@ -172,22 +172,22 @@ NDJSON.
 Everything above is a map of the *design space*, not an installation guide -- `pgpm_archive/
 install.sql` is. It ships every function/procedure named on this page and its three siblings,
 verbatim where the code is unchanged, plus one real addition: `archive.config`, one row per
-managed table, replacing every "deployment constants: edit these N" block below with columns you
-`insert`/`update` instead of hand-editing SQL. Install it on top of `pgpm_core`:
+managed table, replacing every "deployment constants: edit these N" block below with an operator
+interface (`archive.configure`/`archive.schedule`, no hand-editing SQL, no raw `insert`/`update`
+against the catalog). Install it on top of `pgpm_core`:
 
 ```sql
 \i pgpm_core/install.sql
 \i pgpm_archive/install.sql
 
-insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
-values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
-        'partition_aligned',   -- or 'byte_budget'
-        'self_driving',        -- or 'gate_only'
-        'ndjson_commits',      -- or 'ndjson_single' / 'parquet'
-        false);
+select archive.configure('public.events', 'my-archive-bucket',
+  p_region        => 'us-east-1',
+  p_boundary_rule => 'partition_aligned',   -- or 'byte_budget'
+  p_drop_trigger  => 'self_driving',        -- or 'gate_only'
+  p_format        => 'ndjson_commits');     -- or 'ndjson_single' / 'parquet'
 
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one standing job, every configured table
+select archive.schedule();   -- one standing job, every configured table
 ```
 
 The three implementation pages below kept their original hand-rolled names and `c_`-prefixed
@@ -210,6 +210,8 @@ unifying them; this table is the map from what a page says to what the module ac
 | `c_bucket` / `c_region` / `c_prefix` / `c_endpoint` | `archive.config.bucket` / `region` / `prefix` / `endpoint` | one connection per managed table, not per function |
 | hardcoded `'s3_archive_access_key_id'` / `'s3_archive_secret_access_key'` | `archive.config.vault_key_id` / `vault_secret` | same defaults, now configurable per table |
 | `archive.to_s3` / `archive.to_s3_parquet` | same names | unchanged architecture (still the synchronous hook), now reading connection settings from `archive.config` too |
+| a raw `insert`/`update` on `archive.config` | `archive.configure(parent, bucket, ...)` | one function, an upsert; never hand-edit the catalog directly |
+| a raw `cron.schedule(...)` call | `archive.schedule([interval])` / `archive.unschedule()` | same shape as `pgpm.schedule()`/`pgpm.unschedule()` |
 
 ## Positioning
 

@@ -448,16 +448,15 @@ produces a real `SignatureDoesNotMatch` against S3-compatible stores, caught by 
 
 ## Install
 
-Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and configure this table
-via `archive.config` instead of hand-editing the constants below:
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and call `archive.configure`
+instead of hand-editing the constants below:
 
 ```sql
-insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
-values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
-        'byte_budget', 'gate_only', 'parquet', true);
+select archive.configure('public.events', 'my-archive-bucket',
+  p_boundary_rule => 'byte_budget', p_drop_trigger => 'gate_only', p_format => 'parquet', p_compress => true);
 
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one job, every configured table
+select archive.schedule();   -- one job, every configured table
 -- or, the operator's "do it now" for just this table:
 call archive.run_all('public.events'::regclass);
 ```

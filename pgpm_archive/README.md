@@ -19,18 +19,18 @@ psql "$DATABASE_URL" -f pgpm_core/install.sql
 psql "$DATABASE_URL" -f pgpm_archive/install.sql
 ```
 
-Then configure one row per managed table in `archive.config` and register the gate hook:
+Then configure the table, register the gate hook, and schedule the standing job -- three function
+calls, never a raw `insert`/`update` into `archive.config` or a raw `cron.schedule`:
 
 ```sql
-insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
-values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
-        'partition_aligned',   -- or 'byte_budget'
-        'self_driving',        -- or 'gate_only'
-        'ndjson_commits',      -- or 'ndjson_single' / 'parquet'
-        false);
+select archive.configure('public.events', 'my-archive-bucket',
+  p_region        => 'us-east-1',
+  p_boundary_rule => 'partition_aligned',   -- or 'byte_budget'
+  p_drop_trigger  => 'self_driving',        -- or 'gate_only'
+  p_format        => 'ndjson_commits');     -- or 'ndjson_single' / 'parquet'
 
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one job, every configured table
+select archive.schedule();   -- one job, every configured table
 ```
 
 `archive.config`'s `vault_key_id`/`vault_secret` columns (defaults:

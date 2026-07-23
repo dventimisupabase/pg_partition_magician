@@ -34,19 +34,26 @@ end;
 $$;
 
 -- an archive.config row wired to the test MinIO bucket/endpoint (test.sh creates
--- archive-test-bucket via `mc mb` before any test file runs); overrides only the
--- columns a caller passes, everything else keeps the table's own default.
+-- archive-test-bucket via `mc mb` before any test file runs), via the real operator
+-- interface (archive.configure) rather than a raw insert -- overrides only the
+-- columns a caller passes, everything else keeps archive.configure's own default.
 create or replace function mk_archive_config(
   p_name text, p_boundary_rule text default 'partition_aligned', p_drop_trigger text default 'self_driving',
   p_format text default 'ndjson_single', p_compress boolean default false,
   p_byte_budget bigint default 8 * 1024 * 1024, p_part_bytes bigint default 8 * 1024 * 1024
 ) returns void language plpgsql as $$
 begin
-  insert into archive.config (parent_table, bucket, endpoint, prefix, boundary_rule, drop_trigger, format, compress, byte_budget, part_bytes)
-  values ('public.' || p_name, 'archive-test-bucket', 'http://minio:9000', p_name || '/',
-          p_boundary_rule, p_drop_trigger, p_format, p_compress, p_byte_budget, p_part_bytes)
-  on conflict (parent_table) do update set
-    boundary_rule = excluded.boundary_rule, drop_trigger = excluded.drop_trigger, format = excluded.format,
-    compress = excluded.compress, byte_budget = excluded.byte_budget, part_bytes = excluded.part_bytes;
+  perform archive.configure(
+    p_parent        => ('public.' || p_name)::regclass,
+    p_bucket        => 'archive-test-bucket',
+    p_endpoint      => 'http://minio:9000',
+    p_prefix        => p_name || '/',
+    p_boundary_rule => p_boundary_rule,
+    p_drop_trigger  => p_drop_trigger,
+    p_format        => p_format,
+    p_compress      => p_compress,
+    p_byte_budget   => p_byte_budget,
+    p_part_bytes    => p_part_bytes
+  );
 end;
 $$;

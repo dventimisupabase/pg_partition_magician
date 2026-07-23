@@ -2002,3 +2002,95 @@ begin
   end if;
 end;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- The operator interface: configure, register a hook, schedule. Nothing above
+-- this is meant to be hand-edited or hand-inserted for normal operation -- a
+-- raw insert/update into archive.config, or a raw cron.schedule call, is
+-- never the interface.
+-- ---------------------------------------------------------------------------
+
+-- wires up (or re-wires) archival's connection settings and knobs for one managed table. Call
+-- again to change any setting -- an upsert, not an error, on a table already configured. Does NOT
+-- register any pre_drop hook: which one to register (archive.file_gate for the paced worker,
+-- archive.to_s3/archive.to_s3_parquet for the synchronous hook) depends on which architecture the
+-- table uses, so that stays its own explicit pgpm.hook_register call.
+create or replace function archive.configure(
+  p_parent        regclass,
+  p_bucket        text,
+  p_region        text default 'us-east-1',
+  p_endpoint      text default null,
+  p_prefix        text default 'events/',
+  p_boundary_rule text default 'partition_aligned',   -- or 'byte_budget'
+  p_drop_trigger  text default 'self_driving',        -- or 'gate_only'
+  p_format        text default 'ndjson_commits',      -- or 'ndjson_single' / 'parquet'
+  p_compress      boolean default false,
+  p_byte_budget   bigint default 8 * 1024 * 1024,      -- byte_budget rule only
+  p_probe_sample  int default 1000,                    -- byte_budget rule only
+  p_part_bytes    bigint default 8 * 1024 * 1024,      -- ndjson_commits format only
+  p_fetch_rows    int default 20000,                   -- ndjson_commits format only
+  p_vault_key_id  text default 's3_archive_access_key_id',
+  p_vault_secret  text default 's3_archive_secret_access_key'
+) returns void language plpgsql as $$
+begin
+  if not exists (select 1 from pgpm.config where parent_table = p_parent) then
+    raise exception 'archive.configure: % is not managed by pgpm; transmute() it first', p_parent;
+  end if;
+
+  insert into archive.config (
+    parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress,
+    byte_budget, probe_sample, part_bytes, fetch_rows, vault_key_id, vault_secret)
+  values (
+    p_parent, p_bucket, p_region, p_endpoint, p_prefix, p_boundary_rule, p_drop_trigger, p_format, p_compress,
+    p_byte_budget, p_probe_sample, p_part_bytes, p_fetch_rows, p_vault_key_id, p_vault_secret)
+  on conflict (parent_table) do update set
+    bucket = excluded.bucket, region = excluded.region, endpoint = excluded.endpoint, prefix = excluded.prefix,
+    boundary_rule = excluded.boundary_rule, drop_trigger = excluded.drop_trigger,
+    format = excluded.format, compress = excluded.compress,
+    byte_budget = excluded.byte_budget, probe_sample = excluded.probe_sample,
+    part_bytes = excluded.part_bytes, fetch_rows = excluded.fetch_rows,
+    vault_key_id = excluded.vault_key_id, vault_secret = excluded.vault_secret;
+end;
+$$;
+
+-- the reverse of archive.configure: drops the config row (idempotent -- a no-op if there wasn't
+-- one). The ledger is untouched -- it is a record of what was actually archived, not
+-- configuration -- and any registered pre_drop hook is untouched too, for the same reason
+-- archive.configure never registered one: this function doesn't know which hook(s) this table
+-- was using, so it doesn't guess. Unregister explicitly via pgpm.hook_unregister first if wanted.
+create or replace function archive.unconfigure(p_parent regclass) returns void language plpgsql as $$
+begin
+  delete from archive.config where parent_table = p_parent;
+end;
+$$;
+
+-- the one standing job, same shape as pgpm.schedule(): one call, every archive.config row, paced
+-- by archive.tick(). p_every is a pg_cron schedule (standard 5-field cron, or pg_cron's seconds
+-- interval). cron.schedule_in_database (not bare cron.schedule) pins the job to the CURRENT
+-- database explicitly, the same way pgpm.schedule() does, since pg_cron's own scheduler process
+-- can serve more than one database.
+create or replace function archive.schedule(p_every text default '* * * * *')
+returns bigint language plpgsql as $$
+declare v_jobid bigint;
+begin
+  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+    raise exception 'archive.schedule: pg_cron is not installed in this database; enable it (create extension pg_cron) to schedule the archiver, or call archive.tick() by hand';
+  end if;
+  execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
+                 'pgpm-archiver', p_every, 'call archive.tick()', current_database())
+    into v_jobid;
+  return v_jobid;
+end;
+$$;
+
+create or replace function archive.unschedule() returns int language plpgsql as $$
+declare v_n int := 0;
+begin
+  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+    return 0;   -- nothing scheduled if pg_cron is not here
+  end if;
+  execute 'select count(*)::int from (select cron.unschedule(jobid) from cron.job '
+       || 'where jobname = ''pgpm-archiver'' and database = current_database()) s' into v_n;
+  return v_n;
+end;
+$$;

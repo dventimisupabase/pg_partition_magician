@@ -163,12 +163,11 @@ archive.
 
 ## Register and pace it
 
-Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`), configure this table via
-`archive.config` instead of editing the constants above, then register:
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`), call `archive.configure`
+instead of editing the constants above, then register:
 
 ```sql
-insert into archive.config (parent_table, bucket, region, endpoint, prefix)
-values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/');
+select archive.configure('public.events', 'my-archive-bucket');
 
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
 update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
