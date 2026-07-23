@@ -2004,10 +2004,8 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- The operator interface: configure, register a hook, schedule. Nothing above
--- this is meant to be hand-edited or hand-inserted for normal operation -- a
--- raw insert/update into archive.config, or a raw cron.schedule call, is
--- never the interface.
+-- The operator interface: configure a table, register a hook, schedule the
+-- standing job.
 -- ---------------------------------------------------------------------------
 
 -- wires up (or re-wires) archival's connection settings and knobs for one managed table. Call

@@ -172,9 +172,9 @@ NDJSON.
 Everything above is a map of the *design space*, not an installation guide -- `pgpm_archive/
 install.sql` is. It ships every function/procedure named on this page and its three siblings,
 verbatim where the code is unchanged, plus one real addition: `archive.config`, one row per
-managed table, replacing every "deployment constants: edit these N" block below with an operator
-interface (`archive.configure`/`archive.schedule`, no hand-editing SQL, no raw `insert`/`update`
-against the catalog). Install it on top of `pgpm_core`:
+managed table, replacing every "deployment constants: edit these N" block below. Configure it via
+`archive.configure`, and schedule the standing job via `archive.schedule`. Install it on top of
+`pgpm_core`:
 
 ```sql
 \i pgpm_core/install.sql
@@ -210,8 +210,6 @@ unifying them; this table is the map from what a page says to what the module ac
 | `c_bucket` / `c_region` / `c_prefix` / `c_endpoint` | `archive.config.bucket` / `region` / `prefix` / `endpoint` | one connection per managed table, not per function |
 | hardcoded `'s3_archive_access_key_id'` / `'s3_archive_secret_access_key'` | `archive.config.vault_key_id` / `vault_secret` | same defaults, now configurable per table |
 | `archive.to_s3` / `archive.to_s3_parquet` | same names | unchanged architecture (still the synchronous hook), now reading connection settings from `archive.config` too |
-| a raw `insert`/`update` on `archive.config` | `archive.configure(parent, bucket, ...)` | one function, an upsert; never hand-edit the catalog directly |
-| a raw `cron.schedule(...)` call | `archive.schedule([interval])` / `archive.unschedule()` | same shape as `pgpm.schedule()`/`pgpm.unschedule()` |
 
 ## Positioning
 

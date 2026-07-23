@@ -34,9 +34,9 @@ end;
 $$;
 
 -- an archive.config row wired to the test MinIO bucket/endpoint (test.sh creates
--- archive-test-bucket via `mc mb` before any test file runs), via the real operator
--- interface (archive.configure) rather than a raw insert -- overrides only the
--- columns a caller passes, everything else keeps archive.configure's own default.
+-- archive-test-bucket via `mc mb` before any test file runs), via archive.configure --
+-- overrides only the columns a caller passes, everything else keeps archive.configure's
+-- own default.
 create or replace function mk_archive_config(
   p_name text, p_boundary_rule text default 'partition_aligned', p_drop_trigger text default 'self_driving',
   p_format text default 'ndjson_single', p_compress boolean default false,
