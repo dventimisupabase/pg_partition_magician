@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **`archive.configure`/`archive.unconfigure`/`archive.schedule`/`archive.unschedule`: a real
+  operator interface for `pgpm_archive`, replacing raw SQL against `archive.config` and a bare
+  `cron.schedule` call.** Normal operation should never need a hand-written `insert`/`update`
+  against a catalog table -- `archive.configure(parent, bucket, ...)` upserts a table's connection
+  settings and knobs (an idempotent, re-callable setup, same shape as `pgpm.transmute`'s
+  many-named-parameters-with-defaults style), `archive.unconfigure(parent)` removes them, and
+  `archive.schedule`/`unschedule` wrap `cron.schedule_in_database` exactly the way
+  `pgpm.schedule`/`unschedule` already do (same guard when `pg_cron` isn't installed, same
+  idempotent re-scheduling). Deliberately does *not* also register a `pre_drop` hook: which one
+  (`archive.file_gate` for the paced worker, `archive.to_s3`/`archive.to_s3_parquet` for the
+  synchronous hook) depends on which architecture a table uses, so that stays its own explicit
+  `pgpm.hook_register` call. New `tests/archive/db/07_configure_and_schedule_test.sql` (13
+  assertions); `tests/archive/fixtures.sql`'s `mk_archive_config` now calls `archive.configure`
+  instead of its own raw insert, and every doc/`README.md` snippet showing the old
+  `insert into archive.config` pattern was updated to match.
+
 - **Move the archive docs under `pgpm_archive/` and stop referencing archival from the root
   `README.md`.** Archiving to S3 is a downstream concern from partition lifecycle management, not
   part of `pg_partition_magician` core -- it started as worked examples embedded in markdown and

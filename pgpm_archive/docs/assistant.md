@@ -730,17 +730,16 @@ double-*archive* (wasted work, safe: a PUT to the same key overwrites) but never
 
 ## Install
 
-Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and configure this table
-via `archive.config` instead of hand-editing the constants below:
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and call `archive.configure`
+instead of hand-editing the constants below:
 
 ```sql
-insert into archive.config (parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress)
-values ('public.events', 'my-archive-bucket', 'us-east-1', null, 'events/',
-        'partition_aligned', 'self_driving', 'ndjson_commits', false);
+select archive.configure('public.events', 'my-archive-bucket',
+  p_boundary_rule => 'partition_aligned', p_drop_trigger => 'self_driving', p_format => 'ndjson_commits');
 
 select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select cron.schedule('pgpm-archiver', '* * * * *', 'call archive.tick()');   -- one job, every configured table
-select pgpm.schedule();   -- the usual maintenance, now the further-out backstop
+select archive.schedule();   -- one job, every configured table
+select pgpm.schedule();      -- the usual maintenance, now the further-out backstop
 ```
 
 Or, build it directly from this page's SQL above (`archive.partition`/`archive.scan()`, not the
