@@ -1,6 +1,5 @@
 -- archive.configure()/archive.unconfigure()/archive.schedule()/archive.unschedule(): the
--- operator interface wrapping archive.config and pg_cron, so normal operation never needs a raw
--- insert/update into archive.config or a raw cron.schedule call. archive.schedule()/unschedule()
+-- operator interface wrapping archive.config and pg_cron. archive.schedule()/unschedule()
 -- reuse pgpm.schedule()/unschedule()'s own cron.schedule_in_database mechanics verbatim (proven
 -- happy-path coverage against a real job in tests/31_schedule_test.sql, run against the 'postgres'
 -- database where pg_cron's own cron.database_name is pinned); this disposable-db-per-file track

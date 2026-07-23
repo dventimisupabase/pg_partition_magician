@@ -19,8 +19,7 @@ psql "$DATABASE_URL" -f pgpm_core/install.sql
 psql "$DATABASE_URL" -f pgpm_archive/install.sql
 ```
 
-Then configure the table, register the gate hook, and schedule the standing job -- three function
-calls, never a raw `insert`/`update` into `archive.config` or a raw `cron.schedule`:
+Then configure the table, register the gate hook, and schedule the standing job:
 
 ```sql
 select archive.configure('public.events', 'my-archive-bucket',
