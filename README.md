@@ -129,6 +129,8 @@ psql "$DATABASE_URL" -f pgpm_observe/install.sql
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
+- **[Retention write-block and the retention/archiving merge](docs/retention-write-block-and-merge.md)**:
+  positioning doc for an in-progress design merge (docs only so far).
 
 ## Tests
 
