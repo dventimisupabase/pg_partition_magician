@@ -27,7 +27,14 @@
 --     archive.file_gate (a pre_drop hook) is the backstop either way: it defers
 --     a drop until the ledger shows the range fully, correctly archived.
 --
--- Surface (all in the archive schema):
+-- A third path is landing alongside these two (docs/retention-write-block-and-merge.md,
+-- #242): pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet below adapt the same
+-- transport onto pgpm_core's own pgpm.config.archive_fn contract, so a table rides
+-- pgpm.maintain()'s built-in byte-budget chunking (#237) instead of archive.config's
+-- boundary_rule/drop_trigger knobs. The two hooks and the paced worker above are
+-- untouched and keep working exactly as described until that path replaces them (#240).
+--
+-- Surface (all in the archive schema, except the archive_fn strategies noted below):
 --   archive.config                 per-table settings (see above); one row per
 --                                  managed table using either architecture.
 --   archive.ledger                 one row per archived [lo, hi) range.
@@ -38,6 +45,10 @@
 --   archive.run_all(parent)        the operator's "do it now" for one table.
 --   archive.archive_partition(parent, child)  manual, one partition, right now.
 --   archive.to_s3 / archive.to_s3_parquet     the synchronous pre_drop hooks.
+--   pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet   archive_fn strategies for
+--                                  pgpm.config.archive_fn (in the pgpm schema, not
+--                                  archive -- they are pgpm_core contract implementations
+--                                  that happen to live in this optional module).
 -- =============================================================================
 
 create extension if not exists http;
@@ -2000,6 +2011,75 @@ begin
   if v_resp.status not between 200 and 299 then
     raise exception 'archive.to_s3_parquet: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
   end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- archive_fn-conforming S3 strategies (issue #239): the same transport as the
+-- synchronous hooks above (archive._encode_upload_ndjson_single /
+-- archive._encode_upload_parquet -- the pluggable encode/upload step #221 already built for
+-- the paced worker, reused here as-is), adapted to pgpm.config.archive_fn's calling contract
+-- -- (p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result -- so a table can set
+-- archive_fn directly and ride pgpm.maintain()'s own byte-budget chunking
+-- (pgpm._next_archive_chunk/_archive_step, #237) instead of archive.config's separate
+-- boundary_rule/drop_trigger machinery. Connection settings (bucket/region/endpoint/prefix/
+-- vault key names/compress) still come from archive.config -- one config surface, not two
+-- (docs/retention-write-block-and-merge.md, #242).
+--
+-- archive._encode_upload_ndjson_commits (the third format, with internal COMMITs to bound an
+-- otherwise-unbounded single read) is deliberately NOT wired in here: archive_fn is a plain
+-- FUNCTION, and PL/pgSQL forbids transaction control inside a function regardless of call
+-- context, so it could never call a COMMIT-ing procedure anyway. It also doesn't need to --
+-- pgpm._next_archive_chunk already bounds every call's own [lo, hi) to
+-- config.archive_byte_budget before archive_fn ever runs, so the vacuum-horizon hold this
+-- call needs to bound is already small by construction, the same goal ndjson_commits'
+-- internal commits exist to reach a different way.
+--
+-- p_child is part of the archive_fn contract's required shape but unused here:
+-- archive._encode_upload_ndjson_single/_encode_upload_parquet already scope their read to
+-- [p_lo, p_hi) off p_parent directly, which pgpm._next_archive_chunk guarantees never spans
+-- more than p_child's own bounds.
+--
+-- archive.to_s3/archive.to_s3_parquet (the synchronous hooks above) and the paced worker
+-- (archive.tick et al) are untouched and keep working exactly as before; they are deleted
+-- only once this path is proven out (#240).
+create or replace function pgpm.archive_to_s3_ndjson(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare
+  cfg archive.config; v_result pgpm.archive_result;
+  v_s3_key text; v_etag text; v_rows bigint;
+begin
+  select * into cfg from archive.config where parent_table = p_parent;
+  if not found then raise exception 'pgpm.archive_to_s3_ndjson: % has no archive.config row', p_parent; end if;
+
+  select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+    from archive._encode_upload_ndjson_single(p_parent, p_lo, p_hi, cfg.compress) t;
+
+  v_result.covered_hi := p_hi;
+  v_result.rows_archived := v_rows;
+  v_result.s3_key := v_s3_key;
+  v_result.etag := v_etag;
+  return v_result;
+end;
+$$;
+
+create or replace function pgpm.archive_to_s3_parquet(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare
+  cfg archive.config; v_result pgpm.archive_result;
+  v_s3_key text; v_etag text; v_rows bigint;
+begin
+  select * into cfg from archive.config where parent_table = p_parent;
+  if not found then raise exception 'pgpm.archive_to_s3_parquet: % has no archive.config row', p_parent; end if;
+
+  select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
+    from archive._encode_upload_parquet(p_parent, p_lo, p_hi, cfg.compress) t;
+
+  v_result.covered_hi := p_hi;
+  v_result.rows_archived := v_rows;
+  v_result.s3_key := v_s3_key;
+  v_result.etag := v_etag;
+  return v_result;
 end;
 $$;
 

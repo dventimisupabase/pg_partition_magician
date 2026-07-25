@@ -578,13 +578,16 @@ signature right away, not later when a maintenance tick tries to call it -- the 
 `hook_register`'s `p_hook` parameter already uses.
 
 The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns
-pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint)`.
-`archive_fn` is expected to be **resumable**: called once per maintenance tick against the same
-child, making bounded incremental progress and reporting how much of `[p_lo, p_hi)` is now durably
-archived (`covered_hi`, which may be short of `p_hi`) and how many rows this one call archived
-(`rows_archived`, `null` when nothing was actually archived) -- not to archive the whole range in a
-single call. This is the contract the byte-budget chunked archiver and the real S3 upload functions
-implement (see `docs/retention-write-block-and-merge.md`, #242).
+pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint, s3_key
+text, etag text)`. `archive_fn` is expected to be **resumable**: called once per maintenance tick
+against the same child, making bounded incremental progress and reporting how much of `[p_lo, p_hi)`
+is now durably archived (`covered_hi`, which may be short of `p_hi`) and how many rows this one call
+archived (`rows_archived`, `null` when nothing was actually archived) -- not to archive the whole
+range in a single call. `s3_key`/`etag` are optional: a transport strategy that has an object-store
+identifier to report (issue #239's `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) sets
+them; a strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none`
+strategy) leaves them `null`. This is the contract the byte-budget chunked archiver and the real S3
+upload functions implement (see `docs/retention-write-block-and-merge.md`, #242).
 
 `pgpm._run_archive_strategy(p_parent, p_child, p_lo, p_hi)` is the dispatch stub: it looks up
 `config.archive_fn` and calls it, or, for a `null` (`none`) strategy, returns `(p_hi, null)` directly
@@ -609,8 +612,9 @@ archive a whole large partition as one giant operation, chunk it instead.
   budget via a sampled average row width.
 - `pgpm.archive_ledger` (successor to `pgpm_archive`'s `archive.ledger`, same shape:
   `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`, `rows_archived`, `archived_at`) records
-  one row per chunk. `s3_key`/`etag` stay `null` until a real transport strategy (#239) has
-  something to put there -- the `archive_fn` contract does not carry them yet.
+  one row per chunk. `s3_key`/`etag` come straight from the `archive_fn` call's own
+  `pgpm.archive_result` -- populated for a real transport strategy (#239), still `null` for a
+  strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none` strategy).
 - `pgpm._next_archive_chunk(p_parent, p_child)` picks the next chunk **within one child's own
   `[lo, hi)`** -- resuming from wherever that child's ledger coverage left off, extended to the next
   distinct control value so a run of ties never splits across two chunks. Unlike the original
@@ -629,6 +633,30 @@ archive a whole large partition as one giant operation, chunk it instead.
 `pgpm_archive`'s own `archive.ledger`/`archive._next_range_byte_budget`/`archive.tick` are untouched
 by any of this and keep working exactly as their own docs describe; they are retired only once this
 path replaces them (#240).
+
+### Real S3 archive strategies
+
+`pgpm_archive` (the optional module, `pgpm_archive/install.sql`) ships two `archive_fn`-conforming
+strategies, issue #239: `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet` (both in the
+`pgpm` schema, not `archive` -- they are `pgpm_core` contract implementations that happen to live in
+this optional module). Set either directly:
+
+```sql
+update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;
+```
+
+Both delegate to the same transport `pgpm_archive`'s paced worker already uses --
+`archive._encode_upload_ndjson_single` / `archive._encode_upload_parquet` -- so the encoded bytes and
+S3 semantics are identical to `archive.to_s3`/`archive.to_s3_parquet`, the synchronous pre_drop hooks;
+only the calling contract differs. Connection settings (bucket, region, endpoint, prefix, vault key
+names, compression) still come from `archive.config`, the same one config surface the paced worker
+and the synchronous hooks already use -- setting `archive_fn` this way needs no second, independently
+configured surface. `archive._encode_upload_ndjson_commits` (the third format, with internal `COMMIT`s
+to bound an otherwise-unbounded single read) has no `archive_fn` counterpart: a `archive_fn` is a
+plain function and PL/pgSQL forbids transaction control inside one regardless of call context, and it
+doesn't need one anyway -- `pgpm._next_archive_chunk` already bounds every call to
+`config.archive_byte_budget` before `archive_fn` ever runs.
 
 ## Scheduling
 
@@ -1001,8 +1029,8 @@ One row per archived chunk (issue #237). See [Byte-budget chunked archiving](#by
 | `lo` | `text` | native-grid start of this chunk |
 | `hi` | `text` | native-grid end of this chunk |
 | `child_name` | `name` | the child this chunk belongs to |
-| `s3_key` | `text` | null until a real transport strategy (#239) populates it |
-| `etag` | `text` | null until a real transport strategy (#239) populates it |
+| `s3_key` | `text` | set by a real transport strategy (#239); null for a strategy with nothing object-store-shaped to name |
+| `etag` | `text` | set by a real transport strategy (#239); null for a strategy with nothing object-store-shaped to name |
 | `rows_archived` | `bigint` | rows this chunk archived; null if the strategy reported no progress |
 | `archived_at` | `timestamptz` | when this chunk was recorded |
 

@@ -886,13 +886,17 @@ $$;
 -- may be less than hi, since a real strategy is expected to be resumable (called again next tick to
 -- make further bounded progress, not to finish the whole range at once). rows_archived is how many
 -- rows this call actually archived; null when nothing was actually archived (the 'none' strategy,
--- or a strategy that made no progress this tick). No CREATE OR REPLACE TYPE exists in PostgreSQL, so
--- guard creation the same way the rest of this file guards idempotent DDL.
+-- or a strategy that made no progress this tick). s3_key/etag are optional identifiers a transport
+-- strategy (e.g. pgpm_archive's pgpm.archive_to_s3_ndjson/archive_to_s3_parquet, issue #239) can
+-- report back for the ledger row; null for a strategy with nothing object-store-shaped to name (the
+-- 'none' strategy, pgpm._archive_noop, a user-authored strategy that doesn't use S3). No CREATE OR
+-- REPLACE TYPE exists in PostgreSQL, so guard creation the same way the rest of this file guards
+-- idempotent DDL.
 do $$ begin
   if not exists (
     select 1 from pg_type where typname = 'archive_result' and typnamespace = 'pgpm'::regnamespace
   ) then
-    create type pgpm.archive_result as (covered_hi text, rows_archived bigint);
+    create type pgpm.archive_result as (covered_hi text, rows_archived bigint, s3_key text, etag text);
   end if;
 end $$;
 
@@ -956,10 +960,12 @@ $$;
 
 -- successor to archive.ledger, same shape (parent_table, lo, hi, child_name nullable, s3_key, etag,
 -- rows_archived, archived_at), primary key (parent_table, lo) since a chunk always belongs to
--- exactly one child and one parent's chunks never overlap. s3_key/etag stay null until a real
--- strategy (#239) has something to put there -- the archive_fn contract (#236) does not carry them
--- yet. rows_archived is nullable (unlike the original's not null): the contract explicitly allows a
--- strategy to report no progress on a given call.
+-- exactly one child and one parent's chunks never overlap. s3_key/etag come straight from
+-- pgpm.archive_result (issue #239 widened the contract to carry them) -- populated for a real
+-- transport strategy (e.g. pgpm_archive's pgpm.archive_to_s3_ndjson/archive_to_s3_parquet), still
+-- null for a strategy with nothing object-store-shaped to name (pgpm._archive_noop, the 'none'
+-- strategy). rows_archived is nullable (unlike the original's not null): the contract explicitly
+-- allows a strategy to report no progress on a given call.
 create table if not exists pgpm.archive_ledger (
   parent_table  regclass    not null,
   lo            text        not null,
@@ -1110,8 +1116,8 @@ begin
 
     v_result := pgpm._run_archive_strategy(p_parent, r.child_name, v_range.lo, v_range.hi);
 
-    insert into pgpm.archive_ledger (parent_table, lo, hi, child_name, rows_archived)
-    values (p_parent, v_range.lo, v_result.covered_hi, r.child_name, v_result.rows_archived);
+    insert into pgpm.archive_ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
+    values (p_parent, v_range.lo, v_result.covered_hi, r.child_name, v_result.s3_key, v_result.etag, v_result.rows_archived);
     v_count := v_count + 1;
   end loop;
   return v_count;
