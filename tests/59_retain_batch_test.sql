@@ -8,10 +8,10 @@
 --     paced backlog drains tick over tick, OR while chunked archiving is still catching up on a
 --     write-blocked child (issue #238) -- neither is a failure.
 --
--- As of #238, a not-yet-archive-covered child at the head of the backlog produces the SAME kind of
--- flat-backlog wedge a failing pre_drop hook used to (tests/58's old scenario, before retire()
--- stopped consulting pgpm.hook): retain() just returns false and moves on, consuming its batch slot
--- without dropping. The one thing that's genuinely different: this is NOT a failure.
+-- As of #238, a not-yet-archive-covered child at the head of the backlog produces a flat-backlog
+-- wedge shape: retain() just returns false and moves on, consuming its batch slot without dropping.
+-- The one thing that's genuinely different from a real wedge (a repeatedly failing drop): this is
+-- NOT a failure.
 -- status().retain_drop_failures stays at zero throughout -- archiving still catching up is an
 -- expected, retryable state, not a wedge to alert on.
 create extension if not exists pgtap;

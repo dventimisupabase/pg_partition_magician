@@ -1,60 +1,33 @@
--- format = parquet, plus the module's OTHER, structurally separate architecture: the
--- synchronous archive.to_s3_parquet pre_drop hook, which archives a partition INLINE
--- inside retain()'s own drop transaction (no ledger, no gate, no archive.config.
--- boundary_rule/drop_trigger involvement -- just the connection settings).
-select plan(7);
+-- archive.to_s3_parquet, one of the synchronous functions (issue #240: "hook" is no longer the
+-- right word for these -- pgpm.hook itself is gone entirely, so this is just a plain function an
+-- operator calls directly, INLINE, before dropping a partition another way; no ledger, no
+-- automatic scheduling, no archive_fn involvement). Proves it still works standalone, with no hook
+-- mechanism at all: called directly against two real partitions, each PUT succeeding (the function
+-- itself raises on any HTTP failure), then both drop normally via pgpm.retain() -- archive_fn stays
+-- unset for this table, so the drop precondition never depended on this function having been
+-- called; archiving first is purely the operator's own manual discipline, same as always.
+select plan(3);
 
--- --- Part A: the paced worker, dispatched to the parquet encode/upload step -------------
+select mk_archive_table('a4', 60, 10, 20, p_paused => false);   -- monolith [0, 70), premakes 4 ahead
+insert into public.a4 (id, payload) values (71, 'y');    -- into [70,80)
+insert into public.a4 (id, payload) values (109, 'frontier');   -- advances the frontier to 109
 
-select mk_archive_table('a4', 5000, 1000, 3000);   -- monolith [0, 6000), premakes 4 ahead
-insert into public.a4 (id, payload) select g, 'y' from generate_series(6001, 6005) g;   -- into [6000,7000)
-insert into public.a4 (id, payload) select g, 'z' from generate_series(7001, 7005) g;   -- into [7000,8000)
-insert into public.a4 (id, payload) values (11000, 'frontier');   -- advances the frontier to 11000
-
-select pgpm.hook_register('public.a4', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select mk_archive_config('a4', 'partition_aligned', 'gate_only', 'parquet', false);
-
--- boundary = grid_floor(11000 - 3000, 1000) = 8000: eligible = monolith [0,6000),
--- [6000,7000), [7000,8000), same shape as 01/02 scaled down by 10.
--- archive.tick() is a PROCEDURE that commits internally, so it must be a bare top-level
--- CALL (see 01's own note); its success is proven by the assertions below.
-call archive.tick();
-
-select is(
-  (select count(*)::int from archive.ledger where parent_table = 'public.a4'::regclass),
-  3, 'tick wrote one ledger row per eligible range');
-
-select is(
-  (select coalesce(sum(rows_archived), 0)::bigint from archive.ledger where parent_table = 'public.a4'::regclass),
-  5010::bigint, 'rows_archived sums to the monolith (5000) plus the two live inserts (5 + 5)');
-
-select is(
-  (select count(*)::int from archive.ledger where parent_table = 'public.a4'::regclass and s3_key like '%.parquet'),
-  3, 'every uploaded object key carries the parquet extension -- proof format dispatch actually took effect');
-
-select is(pgpm.retain('public.a4'), 3,
-  'the gate allows all 3 drops since the ledger fully covers them');
-
--- --- Part B: the synchronous hook, independent of the paced worker entirely -------------
-
-select mk_archive_table('a4b', 60, 10, 20);   -- monolith [0, 70), premakes 4 ahead
-insert into public.a4b (id, payload) values (71, 'y');    -- into [70,80)
-insert into public.a4b (id, payload) values (109, 'frontier');   -- advances the frontier to 109
-
-select pgpm.hook_register('public.a4b', 'pre_drop', 'archive.to_s3_parquet(regclass,name,text,text)');
-select mk_archive_config('a4b', 'partition_aligned', 'gate_only', 'parquet', false);
+select mk_archive_config('a4', false);
 
 -- boundary = grid_floor(109 - 20, 10) = 80: eligible = monolith [0,70), [70,80).
-select is(pgpm.retain('public.a4b'), 2,
-  'the synchronous hook archives each eligible partition inline, inside retain()''s own drop transaction');
+select child_name as child_0,  lo as lo_0,  hi as hi_0  from pgpm.part where parent_table = 'public.a4'::regclass and lo = '0' \gset
+select child_name as child_70, lo as lo_70, hi as hi_70 from pgpm.part where parent_table = 'public.a4'::regclass and lo = '70' \gset
 
-select is(
-  (select count(*)::int from pgpm.part where parent_table = 'public.a4b'::regclass and attached and hi::bigint <= 80),
-  0, 'both eligible partitions actually dropped');
+select lives_ok(
+  format($$ select archive.to_s3_parquet('public.a4', %L, %L, %L) $$, :'child_0', :'lo_0', :'hi_0'),
+  'archive.to_s3_parquet runs as a plain function call against the monolith -- no hook registration needed');
 
-select is(
-  (select count(*)::int from archive.ledger where parent_table = 'public.a4b'::regclass),
-  0, 'the synchronous architecture writes no ledger row -- structurally separate from the paced worker');
+select lives_ok(
+  format($$ select archive.to_s3_parquet('public.a4', %L, %L, %L) $$, :'child_70', :'lo_70', :'hi_70'),
+  'and again against the second eligible partition');
+
+select is(pgpm.retain('public.a4'), 2,
+  'both partitions drop normally afterward -- archiving first is the operator''s own manual step, not tied to the drop precondition');
 
 select * from finish();
 -- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).

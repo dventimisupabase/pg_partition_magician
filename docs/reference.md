@@ -443,8 +443,8 @@ the partition is write-blocked but not yet `pgpm._archive_fully_covered` -- chun
 issue #237) simply hasn't caught up yet. Only a genuinely unexpected failure in the `DROP` itself is
 logged (`retain_drop_fail`) and returns `false`.
 
-As of issue #238, `pgpm.hook`'s `pre_drop` registry is **not** consulted here at all -- see
-[`hook_register`](#hook_register) below for why the table and functions still exist, unused, for now.
+The old `pgpm.hook` `pre_drop` registry this used to consult is gone entirely (issue #240) --
+archive coverage via `config.archive_fn` is the only drop-precondition gate now.
 
 ### `regrain`
 
@@ -511,14 +511,14 @@ Write-blocking (issue #235): a child whose whole range sits at/below the retenti
 trigger the moment it becomes eligible, independent of whether or how it is archived -- a backdated
 write into an eligible-but-not-yet-dropped range (including one a chunked archiver already covered)
 is rejected rather than silently diverging the archive from what is live. Loosening `config.retain`
-removes the trigger from a partition that becomes ineligible again. Not yet a `retire()` drop
-precondition -- a write-blocked partition drops exactly as before.
+removes the trigger from a partition that becomes ineligible again. Write-blocked is one of
+`retire()`'s drop preconditions (issue #238; see [`retire`](#retire)).
 
 Chunked archiving (issue #237): `archived=N` counts how many chunks this tick recorded via
 `pgpm._archive_step` -- see [Archive strategy contract](#archive-strategy-contract) for the
 mechanism. It only ever considers a child the write-block step above has already protected, so it
-always runs after write-blocking within the same tick, and (like write-blocking) it is not yet a
-`retire()` drop precondition either.
+always runs after write-blocking within the same tick. Archive coverage is `retire()`'s other drop
+precondition (issue #238).
 
 ### `maintain_all`
 
@@ -528,45 +528,12 @@ call pgpm.maintain_all()
 
 A procedure that calls `maintain` for every managed table. This is what the scheduled job runs.
 
-## Lifecycle hooks
-
-> **As of issue #238, this registry is inert.** [`retire`](#retire) no longer calls anything
-> registered here, for any event. `pgpm.hook`/`hook_register`/`hook_unregister` are kept, unchanged,
-> only because `pgpm_archive`'s existing gate-only architecture still registers `archive.file_gate`
-> through them; removing them now would break that before `pgpm_archive` migrates onto the pluggable
-> `archive_fn` contract (see [Archive strategy contract](#archive-strategy-contract) and
-> `docs/retention-write-block-and-merge.md`, #242). Do not register a `pre_drop` hook expecting it to
-> run -- it will not. This section is kept for reference until `pgpm.hook` is removed entirely
-> (planned for #240).
-
-### `hook_register`
-
-```sql
-pgpm.hook_register(
-  p_parent regclass, p_event text, p_hook regprocedure, p_enabled boolean default true
-) returns void
-```
-
-Registers a user function against a lifecycle event. `pre_drop` is the only event that has ever
-existed, and (as of #238) nothing calls it anymore. `p_hook` is `regprocedure` (e.g.
-`'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a signature that
-doesn't match the event's contract is refused at registration -- this validation is unchanged and
-still works. A `pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi
-text) returns void`. Re-registering the same `(parent, event, hook)` just updates `enabled`.
-
-### `hook_unregister`
-
-```sql
-pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure) returns void
-```
-
-Removes a hook registration.
-
 ## Archive strategy contract
 
-`config.archive_fn` (issue #236) narrows `pgpm.hook`'s generic `pre_drop` registry to the one thing
-it has ever really been used for: one archive strategy per managed table. `null` (the default)
-means strategy `none` -- no archiving, a partition is immediately drop-ready. Set it directly:
+`config.archive_fn` (issue #236) is one archive strategy per managed table, superseding the old
+`pgpm.hook` generic `pre_drop` registry (removed entirely, issue #240) -- archiving before a drop
+was its only real use. `null` (the default) means strategy `none` -- no archiving, a partition is
+immediately drop-ready. Set it directly:
 
 ```sql
 update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
@@ -574,8 +541,7 @@ update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,tex
 ```
 
 Casting the reference to `regprocedure` validates that the function exists with exactly this
-signature right away, not later when a maintenance tick tries to call it -- the same reasoning
-`hook_register`'s `p_hook` parameter already uses.
+signature right away, not later when a maintenance tick tries to call it.
 
 The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns
 pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint, s3_key
@@ -596,9 +562,9 @@ protect against a drop. `pgpm._archive_noop` is a trivial built-in strategy (alw
 whole requested range archived immediately, having actually counted the rows in it) that exists only
 to exercise real dispatch in tests.
 
-This issue is schema and contract only: nothing yet calls `_run_archive_strategy` from
-`retire()`/`retain()`, and `pgpm.hook` is completely untouched -- both continue to work exactly as
-above. A written archive strategy is inert until a later issue wires the drop path to consult it.
+`retire()`'s drop precondition consults `pgpm._archive_fully_covered` (issue #238; see
+[`retire`](#retire)), which in turn is driven by `_run_archive_strategy` via `pgpm._archive_step`
+below.
 
 ### Byte-budget chunked archiving
 
@@ -622,17 +588,16 @@ archive a whole large partition as one giant operation, chunk it instead.
   directly), this is scoped to a single already-write-blocked child, because that gating is now the
   write-block trigger's job (#235).
 - `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
-  that child reach its own `hi` (or the strategy is `none`) -- the intended `retire()` drop
-  precondition once #238 wires it in. Not consulted by anything yet.
+  that child reach its own `hi` (or the strategy is `none`) -- `retire()`'s archive-coverage drop
+  precondition (issue #238; see [`retire`](#retire)).
 - `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: for every
   attached child that **already has the write-block trigger installed** (checked directly, not
   re-derived from the boundary formula) and is not yet fully covered, it picks the next chunk, runs
   `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
   trigger yet is never touched, however far past the byte budget's reach it sits.
 
-`pgpm_archive`'s own `archive.ledger`/`archive._next_range_byte_budget`/`archive.tick` are untouched
-by any of this and keep working exactly as their own docs describe; they are retired only once this
-path replaces them (#240).
+`pgpm_archive`'s own old `archive.ledger`/`archive._next_range_byte_budget`/`archive.tick` -- the
+paced worker this path replaced -- are deleted entirely (issue #240).
 
 ### Real S3 archive strategies
 
@@ -646,17 +611,17 @@ update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,tex
   where parent_table = 'public.events'::regclass;
 ```
 
-Both delegate to the same transport `pgpm_archive`'s paced worker already uses --
-`archive._encode_upload_ndjson_single` / `archive._encode_upload_parquet` -- so the encoded bytes and
-S3 semantics are identical to `archive.to_s3`/`archive.to_s3_parquet`, the synchronous pre_drop hooks;
-only the calling contract differs. Connection settings (bucket, region, endpoint, prefix, vault key
-names, compression) still come from `archive.config`, the same one config surface the paced worker
-and the synchronous hooks already use -- setting `archive_fn` this way needs no second, independently
-configured surface. `archive._encode_upload_ndjson_commits` (the third format, with internal `COMMIT`s
-to bound an otherwise-unbounded single read) has no `archive_fn` counterpart: a `archive_fn` is a
-plain function and PL/pgSQL forbids transaction control inside one regardless of call context, and it
-doesn't need one anyway -- `pgpm._next_archive_chunk` already bounds every call to
-`config.archive_byte_budget` before `archive_fn` ever runs.
+Both delegate to `archive._encode_upload_ndjson_single` / `archive._encode_upload_parquet` for the
+actual transport -- the same encode/upload steps `archive.to_s3`/`archive.to_s3_parquet` (the
+synchronous functions, called directly rather than through `archive_fn`) are built on, so the
+encoded bytes and S3 semantics are identical; only the calling contract differs. Connection settings
+(bucket, region, endpoint, prefix, vault key names, compression) still come from `archive.config`,
+the same one config surface the synchronous functions use -- setting `archive_fn` this way needs no
+second, independently configured surface. `archive._encode_upload_ndjson_commits` (a third format,
+with internal `COMMIT`s to bound an otherwise-unbounded single read) has no `archive_fn` counterpart
+and is gone (issue #240): `archive_fn` is a plain function and PL/pgSQL forbids transaction control
+inside one regardless of call context, and it doesn't need one anyway -- `pgpm._next_archive_chunk`
+already bounds every call to `config.archive_byte_budget` before `archive_fn` ever runs.
 
 ## Scheduling
 
@@ -985,24 +950,7 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `obtain_skip` / `retain_skip` / `drain_skip` / `regrain_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `restore_incoming_fk_failed` / `validate_incoming_fk_blocked` | a preserve-FK re-add failed / a validation was blocked by an orphan |
-| `retain_hook_fail` | a `pre_drop` hook raised; the partition was not dropped (`method` carries the hook's error) |
-
-### `pgpm.hook`
-
-The lifecycle hook registry (see [Lifecycle hooks](#lifecycle-hooks) -- inert as of issue #238,
-kept only for `pgpm_archive`'s sake until #240).
-
-| Column | Type | Meaning |
-|---|---|---|
-| `id` | `bigint` | identity, also the registration-order tiebreak when multiple hooks share an event |
-| `parent_table` | `regclass` | the managed table this hook applies to |
-| `event` | `text` | the lifecycle event (`pre_drop` today) |
-| `hook_fn` | `regprocedure` | the function to call, resolved at registration time |
-| `enabled` | `boolean` | disabled hooks are skipped without losing the registration |
-| `created_at` | `timestamptz` | when registered |
-
-Unique on `(parent_table, event, hook_fn)`; `hook_register` upserts this key, so re-registering the same
-function only ever flips `enabled`.
+| `retain_drop_fail` | an unexpected `DROP` failure; the partition was not dropped (`method` carries the error) |
 
 ### `pgpm.dropped_fk`
 

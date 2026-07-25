@@ -28,12 +28,13 @@
 # The `archive` track is also separate: it installs the OPTIONAL pgpm_archive module on top of the
 # core and exercises it against a real MinIO container standing in for S3 (tests/archive/). Its own
 # image (pgpm_test:17-archive) adds pgsql-http on top of the stock pg17 image. Like `timescale`
-# (and unlike `observe`), each tests/archive/db/*.sql runs against a fresh throwaway database:
-# archive.tick()/archive._encode_upload_ndjson_commits commit internally as part of normal
-# operation (bounding the vacuum-horizon hold is the whole point), so a test wrapped in
-# BEGIN/ROLLBACK would not actually leave no state -- the internal commits make it durable
-# regardless of a trailing ROLLBACK. It is a standalone, path-filtered CI workflow (like
-# `observe`'s), not wired into the default Test Suite or the release gate.
+# (and unlike `observe`), each tests/archive/db/*.sql runs against a fresh throwaway database --
+# historically because the old paced worker's archive.tick()/archive._encode_upload_ndjson_commits
+# committed internally as part of normal operation, which a BEGIN/ROLLBACK-wrapped test would not
+# actually undo. That apparatus is gone (issue #240; nothing left in this track commits
+# internally), but the harness itself is unchanged for now -- updating it to match is #241's job.
+# It is a standalone, path-filtered CI workflow (like `observe`'s), not wired into the default Test
+# Suite or the release gate.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -257,11 +258,10 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
 
 # The pgpm_archive track: PG17 + pgsql-http against a real MinIO container standing in for S3.
 # Each tests/archive/db/*.sql runs against a fresh throwaway database (disposable-db, like
-# timescale, unlike observe): archive.tick() and archive._encode_upload_ndjson_commits COMMIT
-# internally as part of normal operation, so a test wrapped in BEGIN/ROLLBACK would not actually
-# leave no state behind. MinIO has no docker-compose service of its own for the `mc` client, so
-# bucket setup runs as a one-off `docker run` against the network name pinned in
-# docker-compose.yml (pgpm_test_net) rather than a compose-managed service.
+# timescale, unlike observe) -- see the comment at this file's top for why (historical, #240
+# deleted the internally-committing apparatus that made it necessary). MinIO has no docker-compose
+# service of its own for the `mc` client, so bucket setup runs as a one-off `docker run` against the
+# network name pinned in docker-compose.yml (pgpm_test_net) rather than a compose-managed service.
 run_archive() {
   local prof="archive" svc="archive" fail=0 f db out
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )

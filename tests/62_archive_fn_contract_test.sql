@@ -1,18 +1,15 @@
 -- Pluggable archive_fn contract (issue #236; see docs/retention-write-block-and-merge.md, #242).
--- pgpm.hook's pre_drop registry is generic (any event, any number of hooks) but has only ever had
--- one real use: archiving before a drop. This narrows that to one archive STRATEGY per managed
--- table (config.archive_fn, nullable regprocedure -- null = strategy 'none', immediately
--- drop-ready) and defines the calling contract a real strategy (#237's chunked port, #239's real S3
--- functions) will implement: archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text)
--- returns pgpm.archive_result, called once per tick, expected to make bounded incremental progress
--- and report how much of [lo, hi) is now durably archived (covered_hi), not to finish the whole
--- range in one call. Schema and contract only: pgpm._run_archive_strategy dispatches, but nothing
--- calls it from retire()/retain() yet (#238), and pgpm.hook is completely untouched (#238 removes
--- it, not this issue).
+-- Narrowed pgpm.hook's old generic pre_drop registry (removed entirely, issue #240) to one archive
+-- STRATEGY per managed table (config.archive_fn, nullable regprocedure -- null = strategy 'none',
+-- immediately drop-ready) and defines the calling contract a real strategy (#237's chunked port,
+-- #239's real S3 functions) implements: archive_fn(p_parent regclass, p_child name, p_lo text,
+-- p_hi text) returns pgpm.archive_result, called once per tick, expected to make bounded
+-- incremental progress and report how much of [lo, hi) is now durably archived (covered_hi), not to
+-- finish the whole range in one call.
 create extension if not exists pgtap;
 
 begin;
-select plan(10);
+select plan(8);
 
 create schema pgpm_test62;
 
@@ -92,20 +89,6 @@ select throws_like(
   $$ select pgpm._run_archive_strategy('pgpm_test62.bounds', 'whatever', '0', '10') $$,
   '%is not managed%',
   '_run_archive_strategy refuses an unmanaged relation, the same convention as every other pgpm entry point');
-
--- pgpm.hook is completely untouched by any of the above: a pre_drop hook still registers and
--- coexists with archive_fn on the same table.
-create function pgpm_test62.harmless_hook(p_parent regclass, p_child name, p_lo text, p_hi text)
-returns void language plpgsql as $$ begin end; $$;
-
-select lives_ok(
-  $$ select pgpm.hook_register('public.af62', 'pre_drop', 'pgpm_test62.harmless_hook(regclass,name,text,text)') $$,
-  'pgpm.hook still works unchanged -- a pre_drop hook registers fine on a table that also has archive_fn set');
-
-select ok(
-  exists (select 1 from pgpm.hook where parent_table = 'public.af62'::regclass and event = 'pre_drop')
-    and (select archive_fn is not null from pgpm.config where parent_table = 'public.af62'::regclass),
-  'pgpm.hook and config.archive_fn coexist on the same table without conflict (issue #236 does not touch pgpm.hook -- that''s #238)');
 
 select * from finish();
 rollback;
