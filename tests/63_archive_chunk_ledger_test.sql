@@ -6,10 +6,10 @@
 -- child the write-block trigger has ALREADY been installed on, chunks it via
 -- pgpm._next_archive_chunk (same avg-row-width/probe-sample estimate as the original, now scoped to
 -- one child's own [lo, hi) instead of spanning the whole table), and records progress in
--- pgpm.archive_ledger. pgpm._archive_fully_covered is the drop precondition #238 will consult --
--- not wired to anything yet here. archive.ledger/archive.tick in pgpm_archive are untouched (#240
--- deletes them, not this issue); pgpm._archive_noop (#236) is enough to exercise the whole path
--- end to end without any real S3 code (#239).
+-- pgpm.archive_ledger. pgpm._archive_fully_covered is retire()'s drop precondition (#238).
+-- pgpm_archive's old archive.ledger/archive.tick, the paced worker this superseded, are deleted
+-- entirely (#240); pgpm._archive_noop (#236) is enough to exercise the whole path end to end
+-- without any real S3 code (#239).
 create extension if not exists pgtap;
 
 begin;

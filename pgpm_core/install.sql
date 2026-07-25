@@ -130,11 +130,11 @@ alter table pgpm.config add column if not exists regrain_cursor text;
 alter table pgpm.config add column if not exists retain_batch int;
 -- the pluggable archive strategy (issue #236): null = strategy 'none' (no archiving, drop as soon as
 -- write-blocked). regprocedure (not text/regproc) so a bad reference is refused right here at
--- assignment, not discovered later when a maintenance tick tries to call it -- the same reasoning
--- pgpm.hook.hook_fn already uses. Contract: archive_fn(p_parent regclass, p_child name, p_lo text,
--- p_hi text) returns pgpm.archive_result, called once per tick, expected to make bounded
--- incremental progress and report how much of [lo, hi) is now durably archived (not to finish the
--- whole range in one call). Not yet consulted by retire()/retain() (#238) -- see
+-- assignment, not discovered later when a maintenance tick tries to call it. Contract:
+-- archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns pgpm.archive_result,
+-- called once per tick, expected to make bounded incremental progress and report how much of
+-- [lo, hi) is now durably archived (not to finish the whole range in one call). retire()'s drop
+-- precondition consults this via pgpm._archive_fully_covered (#238) -- see
 -- pgpm._run_archive_strategy and pgpm._archive_noop below.
 alter table pgpm.config add column if not exists archive_fn regprocedure;
 -- byte-budget chunking knobs (issue #237, porting archive._next_range_byte_budget's own
@@ -208,26 +208,13 @@ update pgpm.dropped_fk d set validated_at = d.restored_at
                 where c.conrelid = d.referencing_table and c.conname = d.constraint_name
                   and c.contype = 'f' and c.convalidated);
 
--- lifecycle hook registry: user functions pgpm invokes at specific points in a parent's lifecycle.
--- 'pre_drop' was the first (and, as of issue #236, only real) use: archiving before a drop, now
--- superseded by config.archive_fn. hook_fn is regprocedure, not text/regproc, so pgpm.hook_register
--- validates the function exists with the exact expected signature up front, instead of discovering a
--- bad reference later.
---
--- As of issue #238, retire() no longer calls anything registered here -- pre_drop hooks are inert.
--- This table and hook_register/hook_unregister are kept, unchanged, ONLY because pgpm_archive's
--- existing gate-only architecture still registers archive.file_gate through them; removing it now
--- would silently disable that gate's drop-veto before #239/#240 migrate pgpm_archive onto the
--- archive_fn contract. Do not register a new pre_drop hook expecting it to run -- it will not.
-create table if not exists pgpm.hook (
-  id           bigint generated always as identity primary key,
-  parent_table regclass     not null,
-  event        text         not null check (event in ('pre_drop')),
-  hook_fn      regprocedure not null,
-  enabled      boolean      not null default true,
-  created_at   timestamptz  not null default now(),
-  unique (parent_table, event, hook_fn)
-);
+-- the lifecycle hook registry (issue #236's pre_drop event, superseded by config.archive_fn) is
+-- fully retired (issue #240): retire() stopped consulting it at all in #238, and #239 gave
+-- pgpm_archive's gate-only architecture (archive.file_gate, the registry's last real registrant) a
+-- replacement on the archive_fn contract. Nothing depends on it anymore.
+drop function if exists pgpm.hook_register(regclass, text, regprocedure, boolean);
+drop function if exists pgpm.hook_unregister(regclass, text, regprocedure);
+drop table if exists pgpm.hook;
 
 -- =============================== adapter layer ===============================
 
@@ -648,25 +635,6 @@ begin
 end;
 $$;
 
--- register/unregister a lifecycle hook. Upsert on (parent_table, event, hook_fn): re-registering the same
--- function just flips enabled, so toggling a hook off and back on does not lose its created_at history.
-create or replace function pgpm.hook_register(
-  p_parent regclass, p_event text, p_hook regprocedure, p_enabled boolean default true
-)
-returns void language plpgsql as $$
-begin
-  insert into pgpm.hook (parent_table, event, hook_fn, enabled) values (p_parent, p_event, p_hook, p_enabled)
-  on conflict (parent_table, event, hook_fn) do update set enabled = excluded.enabled;
-end;
-$$;
-
-create or replace function pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure)
-returns void language plpgsql as $$
-begin
-  delete from pgpm.hook where parent_table = p_parent and event = p_event and hook_fn = p_hook;
-end;
-$$;
-
 -- the retention horizon on the native grid: the grid-floored boundary at/below which a partition's
 -- whole range has aged out. null = no retention policy. Shared by retain() (what to drop now) and
 -- status() (retain_backlog: what is eligible but not yet dropped).
@@ -702,12 +670,9 @@ $$;
 -- it already does for a concurrently-claimed partition, so retain()'s batch loop skips it this cycle
 -- without logging anything.
 --
--- pgpm.hook's pre_drop registry is no longer consulted here at all (previously: hooks ran in
--- registration order immediately before the DROP). pgpm.hook/hook_register/hook_unregister are
--- NOT removed by this issue -- pgpm_archive's existing gate-only architecture still registers
--- archive.file_gate through them, and dropping the table/functions outright would break that
--- before #239/#240 migrate it onto the archive_fn contract. Any hook registered today simply never
--- runs anymore; full removal is #240's job, once nothing still depends on it.
+-- The pgpm.hook pre_drop registry this used to consult (hooks ran in registration order
+-- immediately before the DROP) is gone entirely as of issue #240 -- archive coverage via
+-- config.archive_fn is the only gate a drop precondition has now.
 --
 -- Returns false, without side effects, when the pgpm.part row is absent (already retired by another
 -- actor) or claimed by a concurrent transaction: FOR UPDATE SKIP LOCKED (issue #188) gives each
@@ -876,10 +841,10 @@ end;
 $$;
 
 -- ===================== pluggable archive strategy (issue #236) =====================
--- Narrows pgpm.hook's generic pre_drop registry to the one thing it was ever really used for:
--- one archive strategy per managed table (config.archive_fn). Schema and contract only here --
--- nothing calls this yet (that's #238, once #237/#239 give it something real to dispatch to), and
--- pgpm.hook is untouched.
+-- One archive strategy per managed table (config.archive_fn), superseding the old generic
+-- pgpm.hook pre_drop registry (removed entirely, issue #240) -- archiving before a drop was its
+-- only real use. pgpm._archive_step (below) drives this every maintain() tick, and retire()'s drop
+-- precondition gates on pgpm._archive_fully_covered.
 
 -- archive_fn's return shape: how much of a requested [lo, hi) a single call durably archived.
 -- covered_hi is the native-grid value up to which [lo, ...) is now durably archived by THIS call --
@@ -2233,7 +2198,8 @@ begin
 
   -- Write-block on retain-eligibility (issue #235), ahead of retain()'s own drop logic: a partition
   -- is blocked from writes the instant it crosses the boundary, whether or not (or how far along)
-  -- it is being archived -- not yet gated on by retire()'s drop precondition itself (#238).
+  -- it is being archived. One of retire()'s two drop preconditions (#238; the other is archive
+  -- coverage, below).
   begin
     perform pgpm._enforce_write_blocks(p_parent);
   exception when others then
@@ -2243,8 +2209,8 @@ begin
 
   -- Byte-budget chunked archiving (issue #237), one tick's worth per write-blocked, not-yet-covered
   -- child: only ever runs after the write-block step above, on children that step has already
-  -- protected. Not a retire()/retain() drop precondition yet (#238) -- archiving here only records
-  -- progress, it never causes anything to be dropped.
+  -- protected. retire()'s other drop precondition (#238) -- a child only drops once this has fully
+  -- covered it.
   begin
     v_archived := pgpm._archive_step(p_parent);
   exception when others then

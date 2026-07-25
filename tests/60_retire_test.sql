@@ -14,8 +14,8 @@
 --     of whether it ends up dropping it, and GATES the actual drop on pgpm._archive_fully_covered --
 --     a not-yet-covered child makes retire() return false, log NOTHING (a normal, retryable state,
 --     not a failure), and keep the partition, until a later call finds it covered;
---   * pgpm.hook is no longer consulted at all here -- see tests/58 for that contract;
---   * retain() is now a loop over retire() and behaves as before (tests/07/34/40/58/59).
+--   * pgpm.hook, the old pre_drop registry this superseded, is gone entirely (issue #240);
+--   * retain() is now a loop over retire() and behaves as before (tests/07/34/40/59).
 --
 -- NOTE: this file does NOT use the usual begin/rollback isolation. The concurrency assertions need
 -- a second session (dblink) to see and lock the fixture's pgpm.part rows, which requires the

@@ -1,6 +1,6 @@
 -- Full lifecycle test for issue #238 (see docs/retention-write-block-and-merge.md, #242):
 -- pgpm.retire()'s drop precondition is now write-blocked + pgpm._archive_fully_covered, not a
--- pre_drop hook (tests/58 covers that pgpm.hook is now inert). This is the issue's own test plan:
+-- pre_drop hook (pgpm.hook itself is gone entirely, issue #240). This is the issue's own test plan:
 -- a child crosses the retention boundary, becomes write-blocked immediately, but stays UNDROPPED
 -- while chunked archiving is still catching up, and drops on the very first maintain() tick once
 -- coverage completes; a none-strategy child (no archiving configured at all -- the common case)

@@ -3,62 +3,45 @@
 -- partitions to S3 before retention drops them, config-driven.
 --
 -- OPTIONAL add-on, loaded ON TOP of the core (pgpm_core/install.sql). See
--- README.md in this directory for the front door. Graduates
--- docs/to-s3.md, docs/assistant.md, and
--- docs/chunked-parquet.md's embedded SQL into one installable module
--- (the harmonization stack, #217-#221, unified the ledger/gate/boundary-rule/
--- drop-trigger/encode-upload machinery those pages hand-built separately; this
--- module is what actually ships it). Those three pages remain the narrative:
--- motivation, honest limits, and the live-verification write-ups this module's
--- design rests on. pgpm's own core has zero dependency on this schema; nothing
--- here is required for ordinary partitioning.
+-- README.md in this directory for the front door. pgpm's own core has zero
+-- dependency on this schema; nothing here is required for ordinary
+-- partitioning.
 --
--- Two independent architectures, same as the docs describe:
---   - The synchronous hook (archive.to_s3 / archive.to_s3_parquet): archives a
---     partition INLINE, inside retain()'s own drop transaction. Simplest model,
---     but holds the vacuum horizon for the whole read-and-upload.
---   - The paced worker (everything else here): an independently-paced procedure
---     (archive.tick(), driven by pg_cron) that archives ahead of any drop,
---     bounding the vacuum-horizon hold by committing between chunks of work.
---     Configured per managed table via archive.config, not hardcoded constants:
---       boundary_rule  'partition_aligned' | 'byte_budget'   -- which unit to archive
---       drop_trigger   'self_driving' | 'gate_only'          -- who drops it
---       format         'ndjson_single' | 'ndjson_commits' | 'parquet'
---     archive.file_gate (a pre_drop hook) is the backstop either way: it defers
---     a drop until the ledger shows the range fully, correctly archived.
+-- Two ways to use it, both reading connection settings (bucket/region/
+-- endpoint/prefix/vault key names/compress) from archive.config, the one
+-- config surface both share:
+--   - The archive_fn strategies (pgpm.archive_to_s3_ndjson / archive_to_s3_parquet,
+--     in the pgpm schema, not archive -- they are pgpm_core contract implementations
+--     that happen to live in this optional module): set pgpm.config.archive_fn to
+--     one of them and pgpm.maintain()'s own byte-budget chunking (pgpm._archive_step,
+--     pgpm.archive_ledger) drives archiving automatically, ahead of every drop.
+--     This is the normal way to use this module.
+--   - The synchronous functions (archive.to_s3 / archive.to_s3_parquet): archive a
+--     partition INLINE, called directly, holding the vacuum horizon for the whole
+--     read-and-upload. No ledger, no automatic scheduling -- call one yourself
+--     before dropping a partition another way.
 --
--- A third path is landing alongside these two (docs/retention-write-block-and-merge.md,
--- #242): pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet below adapt the same
--- transport onto pgpm_core's own pgpm.config.archive_fn contract, so a table rides
--- pgpm.maintain()'s built-in byte-budget chunking (#237) instead of archive.config's
--- boundary_rule/drop_trigger knobs. The two hooks and the paced worker above are
--- untouched and keep working exactly as described until that path replaces them (#240).
+-- The old paced worker (archive.tick(), archive.config's boundary_rule/drop_trigger/
+-- format knobs, archive.file_gate, the archive.configure/schedule operator interface,
+-- and pgpm.hook, the pre_drop registry it and the synchronous functions used to
+-- register through) existed to do by hand what pgpm.maintain()'s archive_fn path now
+-- does natively; it was deleted once that path was proven out (issue #240; see
+-- docs/retention-write-block-and-merge.md, #242).
 --
 -- Surface (all in the archive schema, except the archive_fn strategies noted below):
---   archive.config                 per-table settings (see above); one row per
---                                  managed table using either architecture.
---   archive.ledger                 one row per archived [lo, hi) range.
---   archive.file_gate              the pre_drop hook (register on every table
---                                  using the paced worker).
---   archive.tick()                 the standing worker: one pg_cron job, all
---                                  archive.config rows, paced.
---   archive.run_all(parent)        the operator's "do it now" for one table.
---   archive.archive_partition(parent, child)  manual, one partition, right now.
---   archive.to_s3 / archive.to_s3_parquet     the synchronous pre_drop hooks.
---   pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet   archive_fn strategies for
---                                  pgpm.config.archive_fn (in the pgpm schema, not
---                                  archive -- they are pgpm_core contract implementations
---                                  that happen to live in this optional module).
+--   archive.config                 per-table connection settings; one row per
+--                                  managed table using either path above.
+--   archive.to_s3 / archive.to_s3_parquet     the synchronous functions.
+--   pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet   the archive_fn strategies.
 -- =============================================================================
 
 create extension if not exists http;
 create extension if not exists pgcrypto;
 create schema if not exists archive;
 
--- per-table configuration, replacing the docs' "deployment constants: edit
--- these N" pattern with one real row per managed table. `create table if not
--- exists` + `alter table ... add column if not exists` below, mirroring
--- pgpm.config's own idempotent-upgrade shape, so re-running this file is safe.
+-- per-table configuration: one real row per managed table, connection settings only. `create
+-- table if not exists` below, mirroring pgpm.config's own idempotent-upgrade shape, so re-running
+-- this file is safe.
 create table if not exists archive.config (
   parent_table    regclass    primary key,
 
@@ -72,58 +55,37 @@ create table if not exists archive.config (
   prefix          text        not null default 'events/',
   vault_key_id    text        not null default 's3_archive_access_key_id',
   vault_secret    text        not null default 's3_archive_secret_access_key',
-
-  -- the paced worker's two independent knobs (see docs/strategies-overview.md)
-  boundary_rule   text        not null default 'partition_aligned'
-                  check (boundary_rule in ('partition_aligned', 'byte_budget')),
-  drop_trigger    text        not null default 'self_driving'
-                  check (drop_trigger in ('self_driving', 'gate_only')),
-
-  -- the pluggable encode/upload step
-  format          text        not null default 'ndjson_commits'
-                  check (format in ('ndjson_single', 'ndjson_commits', 'parquet')),
   compress        boolean     not null default false,
 
-  -- boundary-rule-specific tuning (unused columns for the other rule are simply ignored)
-  byte_budget     bigint      not null default 8 * 1024 * 1024,   -- byte_budget rule
-  probe_sample    int         not null default 1000,              -- byte_budget rule
-
-  -- encode/upload-specific tuning (ndjson_commits only; ignored otherwise)
+  -- archive.to_s3's own multipart PUT chunking (the archive_fn strategies don't need this --
+  -- pgpm._next_archive_chunk already bounds their read size before they ever run)
   part_bytes      bigint      not null default 8 * 1024 * 1024,
   fetch_rows      int         not null default 20000,
 
   created_at      timestamptz not null default now()
 );
+-- the paced worker's knobs and the old archive.ledger's own connection-settings columns are gone
+-- (issue #240): boundary_rule/drop_trigger picked which unit to archive and who dropped it,
+-- format/byte_budget/probe_sample configured the deleted archive._next_range_byte_budget/
+-- archive.archive_range/archive._encode_upload_ndjson_commits. Nothing reads them anymore.
+alter table archive.config drop column if exists boundary_rule;
+alter table archive.config drop column if exists drop_trigger;
+alter table archive.config drop column if exists format;
+alter table archive.config drop column if exists byte_budget;
+alter table archive.config drop column if exists probe_sample;
 
--- the ledger: one row per archived range, written by the archiver at the moment it verified the
--- upload. The drop gate consults THIS, never job history. A partition's own bounds are already a
--- native-grid [lo, hi) range -- the same shape a cross-partition, byte-budget-aligned archiver
--- needs for a range that spans part of one partition or several -- so this table is shared by
--- both boundary rules: `lo` is the primary key (ranges never overlap, by either rule's own
--- invariant), and `child_name` is an optional convenience column, populated only when the
--- archived range happens to equal exactly one partition's bounds, so a name-based lookup stays a
--- cheap equality check instead of a bounds-membership query.
-create table if not exists archive.ledger (
-  parent_table  regclass    not null,
-  lo            text        not null,   -- native-grid text, same convention as pgpm.config lo/hi
-  hi            text        not null,
-  child_name    name,                   -- populated iff [lo, hi) is exactly one partition's bounds
-  s3_key        text        not null,
-  etag          text,
-  rows_archived bigint      not null,
-  archived_at   timestamptz not null default now(),
-  primary key (parent_table, lo)
-);
-create index if not exists ledger_parent_table_hi_idx on archive.ledger (parent_table, hi desc);   -- cheap max(hi) for range-based readers
+-- the old ledger (one row per archived range, written by the paced worker) is gone entirely
+-- (issue #240): pgpm.archive_ledger, populated by the archive_fn strategies below via
+-- pgpm._archive_step, is its successor.
+drop table if exists archive.ledger;
 
 -- ---------------------------------------------------------------------------
 -- Key discovery and S3 transport primitives
 -- ---------------------------------------------------------------------------
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
--- heap (where ctid is no longer comparable): docs/chunked-parquet.md's Parquet range
--- reader and docs/assistant.md's NDJSON-with-commits range reader (#221) both call this.
--- Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
+-- heap (where ctid is no longer comparable): archive._pq_to_parquet_range, the Parquet range
+-- reader, calls this. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
 -- contract regrain() already enforces, an inherited limitation, not a new gap. (On a partitioned
@@ -1168,235 +1130,24 @@ begin
 end;
 $$;
 
--- the derived watermark: kind-aware (numeric for id, timestamptz otherwise, matching
--- pgpm.config.control_kind), so a plain lexicographic max on the stored text never runs.
-create or replace function archive._file_watermark(p_parent regclass) returns text
-language plpgsql as $$
-declare cfg pgpm.config; v_ncast text; v_wm text;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._file_watermark: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  execute format('select max(hi::%s)::text from archive.ledger where parent_table = %L::regclass',
-                 v_ncast, p_parent::text) into v_wm;
-  return v_wm;
-end;
-$$;
-
-create or replace function archive.file_gate(p_parent regclass, p_child name, p_lo text, p_hi text)
-returns void language plpgsql as $$
-declare
-  cfg pgpm.config; v_ncast text; v_wm text; v_nsp name; v_rel name;
-  r record; v_overlap_live bigint; v_ov_lo text; v_ov_hi text; v_child_overlap bigint;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive.file_gate: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-
-  -- fast path: derived, no scan
-  v_wm := archive._file_watermark(p_parent);
-  if v_wm is null or pgpm._native_gt(cfg.control_kind, p_hi, v_wm) then
-    raise exception 'archive.file_gate: % (hi %) is not yet fully covered by the ledger watermark (%); deferring the drop',
-      p_child, p_hi, coalesce(v_wm, '<none>');
-  end if;
-
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
-  -- defense in depth: every ledger row overlapping [p_lo, p_hi), whole-range recounted
-  for r in
-    execute format(
-      'select lo, hi, rows_archived from archive.ledger
-        where parent_table = %L::regclass and hi::%s > %L::%s and lo::%s < %L::%s
-        for update',
-      p_parent::text, v_ncast, p_lo, v_ncast, v_ncast, p_hi, v_ncast)
-  loop
-    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, r.lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, r.hi))
-      into v_overlap_live;
-    if v_overlap_live is distinct from r.rows_archived then
-      raise exception 'archive.file_gate: file % [%, %) changed since it was archived (% rows live, % archived); deferring for re-archive',
-        (select s3_key from archive.ledger where parent_table = p_parent and lo = r.lo),
-        r.lo, r.hi, v_overlap_live, r.rows_archived;
-    end if;
-
-    -- keep rows_archived in lockstep: subtract exactly the overlap between the partition about
-    -- to be dropped and this row's range (a partition can span more than one row; each gets only
-    -- its own slice subtracted).
-    v_ov_lo := case when pgpm._native_gt(cfg.control_kind, p_lo, r.lo) then p_lo else r.lo end;
-    v_ov_hi := case when pgpm._native_gt(cfg.control_kind, r.hi, p_hi) then p_hi else r.hi end;
-    execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                   v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_lo),
-                   cfg.control_column, pgpm._encode(cfg.control_kind, v_ov_hi))
-      into v_child_overlap;
-    update archive.ledger set rows_archived = rows_archived - v_child_overlap
-      where parent_table = p_parent and lo = r.lo;
-  end loop;
-end;
-$$;
-
+-- pgpm_archive's old range-picking, drop-gating, and self-driving-retire-sweep apparatus
+-- (archive._file_watermark, archive.file_gate, archive._next_range_partition_aligned,
+-- archive._next_range_byte_budget, archive._retire_covered) is gone entirely (issue #240):
+-- pgpm._next_archive_chunk/_archive_fully_covered/_archive_step in pgpm_core replaced it.
 
 -- ---------------------------------------------------------------------------
--- Boundary rule: which range to archive next. Matching shapes -- (p_parent)
--- in, (lo, hi[, child_name]) or no rows out -- dispatched by archive.config's
--- boundary_rule column.
--- ---------------------------------------------------------------------------
-
--- picks the assistant's next range: the first attached, retention-eligible partition (in lo
--- order) whose ledger row is missing or stale (the live count no longer matches what was
--- recorded). Returns no rows once every eligible partition already has a fresh ledger row --
--- unlike the chunker's boundary rule, this one DOES revisit already-covered ranges, because a
--- partition-aligned range can still be attached (and still mutable) long after it was archived,
--- where a chunked file's range is retention-eligible-or-gone by the time it would be reconsidered.
-create or replace function archive._next_range_partition_aligned(p_parent regclass)
-returns table(lo text, hi text, child_name name)
-language plpgsql as $$
-declare
-  cfg pgpm.config; v_boundary text; v_ncast text; v_nsp name;
-  v_part record; v_rows bigint; v_live bigint;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._next_range_partition_aligned: % is not managed', p_parent; end if;
-  v_boundary := pgpm._retain_boundary(cfg);
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
-  for v_part in execute format(
-    'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
-    p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast)
-  loop
-    select a.rows_archived into v_rows from archive.ledger a
-     where a.parent_table = p_parent and a.child_name = v_part.child_name;
-    execute format('select count(*) from %I.%I', v_nsp, v_part.child_name) into v_live;
-    if v_rows is null or v_rows is distinct from v_live then
-      lo := v_part.lo; hi := v_part.hi; child_name := v_part.child_name;
-      return next;
-      return;
-    end if;
-  end loop;
-end;
-$$;
-
--- picks this chunker's next range: the derived watermark (or this table's own grid anchor on the
--- very first call -- reusing pgpm.config's grid origin rather than inventing a second one) up to
--- the smallest of the frozen floor, the retention horizon, and the byte-budget estimate, extended
--- to the next distinct control value so a run of ties never splits across two files. Returns no
--- rows if nothing is eligible to archive yet.
-create or replace function archive._next_range_byte_budget(p_parent regclass, c_byte_budget bigint default 8 * 1024 * 1024, c_probe_sample int default 1000)
-returns table(lo text, hi text)
-language plpgsql as $$
-declare
-  cfg pgpm.config; v_ncast text; v_nsp name; v_rel name;
-  v_lo text; v_frontier text; v_floor text; v_retain_boundary text;
-  v_avg numeric; v_batch int; v_batch_count int; v_probe_hi_col text; v_probe_hi text;
-  v_next_distinct_col text; v_bytebudget_stop text;
-  v_stop text; v_hi text;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._next_range_byte_budget: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
-  v_lo := coalesce(archive._file_watermark(p_parent), cfg.partition_anchor);
-
-  v_frontier := pgpm._frontier_native(p_parent);
-  v_floor := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
-  if not pgpm._native_gt(cfg.control_kind, v_floor, v_lo) then
-    return;   -- nothing has frozen past the watermark yet
-  end if;
-
-  v_retain_boundary := pgpm._retain_boundary(cfg);
-  if v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_retain_boundary, v_lo) then
-    return;   -- nothing retention-eligible past the watermark yet
-  end if;
-  v_stop := v_floor;
-  if v_retain_boundary is not null and pgpm._native_gt(cfg.control_kind, v_stop, v_retain_boundary) then
-    v_stop := v_retain_boundary;
-  end if;
-
-  -- byte budget -> row-count estimate, via a sampled average row width
-  execute format(
-    'select avg(pg_column_size(t.*))::numeric from (select * from %I.%I t where t.%I >= %L order by t.%I limit %s) t',
-    v_nsp, v_rel, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo), cfg.control_column, c_probe_sample)
-    into v_avg;
-  if coalesce(v_avg, 0) <= 0 then
-    return;   -- nothing at/after the watermark yet
-  end if;
-  v_batch := greatest(1, floor(c_byte_budget::numeric / v_avg))::int;
-
-  execute format(
-    'select count(*), max(%I)::text from (select %I from %I.%I t where t.%I >= %L order by t.%I limit %s) s',
-    cfg.control_column, cfg.control_column, v_nsp, v_rel, cfg.control_column,
-    pgpm._encode(cfg.control_kind, v_lo), cfg.control_column, v_batch)
-    into v_batch_count, v_probe_hi_col;
-
-  if v_batch_count < v_batch then
-    v_bytebudget_stop := null;   -- reached the live end of the table: this bound does not apply
-  else
-    v_probe_hi := pgpm._decode(cfg.control_kind, v_probe_hi_col);
-    -- extend to the next distinct value past the boundary, so hi never splits a run of ties
-    execute format('select min(%I)::text from %I.%I t where t.%I > %L',
-                   cfg.control_column, v_nsp, v_rel, cfg.control_column, v_probe_hi_col)
-      into v_next_distinct_col;
-    v_bytebudget_stop := case when v_next_distinct_col is null then null
-                              else pgpm._decode(cfg.control_kind, v_next_distinct_col) end;
-  end if;
-
-  if v_bytebudget_stop is not null and pgpm._native_gt(cfg.control_kind, v_stop, v_bytebudget_stop) then
-    v_stop := v_bytebudget_stop;
-  end if;
-  v_hi := v_stop;
-  if not pgpm._native_gt(cfg.control_kind, v_hi, v_lo) then
-    return;   -- no progress possible this call
-  end if;
-
-  lo := v_lo; hi := v_hi;
-  return next;
-end;
-$$;
-
-
--- ---------------------------------------------------------------------------
--- Drop-trigger rule: archive.config.drop_trigger dispatches to this shared
--- retire sweep for 'self_driving' tables.
--- ---------------------------------------------------------------------------
-
-create or replace procedure archive._retire_covered(p_parent regclass, p_up_to text, inout p_count int default 0)
-language plpgsql as $$
-declare
-  cfg pgpm.config; v_ncast text; v_child record;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._retire_covered: % is not managed', p_parent; end if;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  for v_child in execute format(
-    'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s',
-    p_parent::text, v_ncast, p_up_to, v_ncast, v_ncast)
-  loop
-    if pgpm.retire(p_parent, v_child.child_name) then
-      p_count := p_count + 1;
-    end if;
-    commit;
-  end loop;
-end;
-$$;
-
-
--- ---------------------------------------------------------------------------
--- The pluggable encode/upload step: given a [lo, hi) range, produce and PUT
--- the archived object, returning what the ledger insert needs. Matching
--- shapes -- (p_parent, p_lo, p_hi, p_compress) in, (s3_key, etag,
--- rows_archived) out -- dispatched by archive.config.format. Connection
--- settings (bucket/region/endpoint/prefix/vault key names) come from
--- archive.config, not local deployment constants.
+-- The encode/upload transport: given a [lo, hi) range, produce and PUT the
+-- archived object, returning what a ledger insert needs. Matching shapes --
+-- (p_parent, p_lo, p_hi, p_compress) in, (s3_key, etag, rows_archived) out --
+-- called directly by whichever pgpm.archive_to_s3_* strategy (below) a table's
+-- config.archive_fn names. Connection settings (bucket/region/endpoint/prefix/
+-- vault key names) come from archive.config, not local deployment constants.
 --
--- Parquet with internal commits is not a fourth option, and cannot become
--- one: a Parquet file's footer needs every row group's byte offset, known
--- only once the whole file's bytes exist, so there is no way to COMMIT
--- partway through building one -- a structural fact about the format, not a
--- gap (docs/to-s3.md#honest-limits-for-the-parquet-variant, #211).
+-- Parquet has no internal-commits variant, and cannot: a Parquet file's footer
+-- needs every row group's byte offset, known only once the whole file's bytes
+-- exist, so there is no way to COMMIT partway through building one -- a
+-- structural fact about the format, not a gap
+-- (docs/to-s3.md#honest-limits-for-the-parquet-variant, #211).
 -- ---------------------------------------------------------------------------
 
 -- single read, single PUT (optionally one gzip member for the whole body). No pagination, so no
@@ -1451,177 +1202,13 @@ begin
 end;
 $$;
 
--- per-part-commit technique: reads a [lo, hi) range off the parent, keyset-paginated, committing
--- between a page's read and a part's PUT (each snapshot held for at most one of those, not both) --
--- so the vacuum-horizon hold is bounded by archive.config.part_bytes over bandwidth, not the whole
--- range's read-and-upload time. A PROCEDURE, not a function, for two reasons: procedure-local
--- variables survive COMMIT (the keyset cursor, the UploadId, the ETag list), and PL/pgSQL forbids
--- transaction control inside a block with an EXCEPTION clause, so there is no handler and no
--- abort-on-exit -- cleanup-on-entry (aborting any stale in-flight upload for this key) and a bucket
--- lifecycle rule are the backstops instead.
---
--- Ordering matters more than it looks: a range read off the parent can span more than one child,
--- and a time-kind control column routinely repeats (duplicate timestamps are the common case, not
--- the exception), so ordering by the control column alone is not deterministic across a keyset
--- page boundary -- a run of ties straddling one silently drops rows under a naive `>` resume
--- predicate (confirmed live: a 21-row fixture with repeated timestamps lost 5 rows this way).
--- Ordering and resuming on a `text[]` of (control column, real key columns) fixes it: Postgres
--- compares arrays lexicographically, element by element, so `max(k)` / `array[...] > cursor` is a
--- genuine composite tiebreak without dynamic-arity ROW() construction. Key discovery is
--- archive._key_columns, the same helper the Parquet range reader uses.
---
--- Compression, if requested, gzips each part independently (archive._pq_gzip_compress) and lets S3
--- multipart's own byte-range concatenation produce the final object -- a valid multi-member gzip
--- stream (RFC 1952 permits concatenating independent gzip members; standard decompressors read
--- through all of them transparently; verified against a 30,000-row fixture forced into several
--- 6MiB+ parts, decompressing cleanly with a stock gunzip into all 30,000 rows).
-create or replace procedure archive._encode_upload_ndjson_commits(
-  p_parent regclass, p_lo text, p_hi text, p_compress boolean default false,
-  inout p_s3_key text default null, inout p_etag text default null, inout p_rows bigint default 0)
-language plpgsql as $$
-declare
-  cfg archive.config; pcfg pgpm.config; v_nsp name; v_rel name; v_ctype text;
-  v_key_cols name[]; v_castlist text; v_key text;
-  v_key_id text; v_secret text;
-  v_part_payload text; v_chunk text; v_cursor text[]; v_done boolean := false;
-  v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
-  v_rows bigint := 0; v_n bigint; v_stale text; v_body bytea;
-  v_resp http_response; h http_header;
-begin
-  select * into cfg from archive.config where parent_table = p_parent;
-  if not found then raise exception 'archive._encode_upload_ndjson_commits: % has no archive.config row', p_parent; end if;
-  select * into pcfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'archive._encode_upload_ndjson_commits: % is not managed', p_parent; end if;
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-
-  v_key_cols := archive._key_columns(p_parent);
-  if v_key_cols is null then
-    raise exception 'archive._encode_upload_ndjson_commits: % has no primary key or predicate/expression-free unique constraint; a resumable range read cannot tiebreak ties on % without one',
-      p_parent, pcfg.control_column;
-  end if;
-  select string_agg(format('%I::text', c), ', ' order by ord) into v_castlist
-    from unnest(array_prepend(pcfg.control_column, v_key_cols)) with ordinality as t(c, ord);
-
-  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = cfg.vault_secret;
-  if v_key_id is null or v_secret is null then
-    raise exception 'archive._encode_upload_ndjson_commits: credentials missing from vault';
-  end if;
-
-  v_key := cfg.prefix || p_parent::text || '_' || regexp_replace(p_lo, '[^0-9]', '', 'g') || '.ndjson'
-           || (case when p_compress then '.gz' else '' end);
-  v_ctype := case when p_compress then 'application/gzip' else 'application/x-ndjson' end;
-  commit;
-
-  -- cleanup-on-entry: abort any in-flight multipart upload a failed or crashed prior run left
-  -- behind for this key (invisible in listings, billed until aborted)
-  v_resp := archive.s3_signed_request('GET', cfg.endpoint, cfg.bucket, cfg.region, '',
-                                     'prefix=' || archive.s3_url_encode(v_key) || '&uploads=',
-                                     'application/xml', '', v_key_id, v_secret);
-  for v_stale in
-    select unnest(xpath('//*[local-name()=''Upload'']/*[local-name()=''UploadId'']/text()', v_resp.content::xml))::text
-  loop
-    perform archive.s3_signed_request('DELETE', cfg.endpoint, cfg.bucket, cfg.region, v_key,
-                                     'uploadId=' || archive.s3_url_encode(v_stale),
-                                     'text/plain', '', v_key_id, v_secret);
-  end loop;
-  commit;
-
-  -- stream the range: read one part (snapshot held for a disk-speed moment, then COMMITted
-  -- away), PUT it (snapshot held for one part's network time, then COMMITted away), repeat.
-  v_part_payload := '';
-  v_cursor := null;
-  <<parts>>
-  loop
-    while not v_done and octet_length(v_part_payload) < cfg.part_bytes loop
-      execute format(
-        'select coalesce(string_agg(j, e''\n'' order by k), ''''), max(k), count(*)
-           from (select row_to_json(t)::text as j, array[%s] as k from %I.%I t
-                  where t.%I >= %L and t.%I < %L and ($1 is null or array[%s] > $1)
-                  order by array[%s] limit $2) s',
-        v_castlist, v_nsp, v_rel,
-        pcfg.control_column, pgpm._encode(pcfg.control_kind, p_lo), pcfg.control_column, pgpm._encode(pcfg.control_kind, p_hi),
-        v_castlist, v_castlist)
-        into v_chunk, v_cursor, v_n using v_cursor, cfg.fetch_rows;
-      if v_chunk = '' then v_done := true;
-      else v_part_payload := v_part_payload || v_chunk || e'\n'; v_rows := v_rows + v_n;
-      end if;
-      commit;   -- release the read snapshot before any network time
-    end loop;
-
-    exit parts when v_done and v_part > 0 and v_part_payload = '';
-    if p_compress and v_part_payload != '' then
-      v_body := archive._pq_gzip_compress(convert_to(v_part_payload, 'UTF8'));
-    end if;
-
-    if v_part = 0 and v_done then
-      -- everything fit in one part: plain single PUT, no multipart bookkeeping
-      if p_compress then
-        v_resp := archive.s3_signed_request_bytea('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key, '',
-                                                  v_ctype, v_body, v_key_id, v_secret);
-      else
-        v_resp := archive.s3_signed_request('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key, '',
-                                           v_ctype, v_part_payload, v_key_id, v_secret);
-      end if;
-      if v_resp.status not between 200 and 299 then
-        raise exception 'archive._encode_upload_ndjson_commits: PUT of % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
-      end if;
-      foreach h in array v_resp.headers loop
-        if lower(h.field) = 'etag' then v_etag := h.value; end if;
-      end loop;
-      exit parts;
-    end if;
-
-    if v_part = 0 then
-      v_resp := archive.s3_signed_request('POST', cfg.endpoint, cfg.bucket, cfg.region, v_key, 'uploads=',
-                                         v_ctype, '', v_key_id, v_secret);
-      if v_resp.status not between 200 and 299 then
-        raise exception 'archive._encode_upload_ndjson_commits: initiate multipart for % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
-      end if;
-      v_upload_id := (xpath('//*[local-name()=''UploadId'']/text()', v_resp.content::xml))[1]::text;
-      commit;
-    end if;
-
-    v_part := v_part + 1;
-    if p_compress then
-      v_resp := archive.s3_signed_request_bytea('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key,
-                                                'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
-                                                v_ctype, v_body, v_key_id, v_secret);
-    else
-      v_resp := archive.s3_signed_request('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key,
-                                         'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
-                                         v_ctype, v_part_payload, v_key_id, v_secret);
-    end if;
-    if v_resp.status not between 200 and 299 then
-      raise exception 'archive._encode_upload_ndjson_commits: part % of % failed: HTTP % %', v_part, v_key, v_resp.status, left(v_resp.content, 200);
-    end if;
-    v_etag := null;
-    foreach h in array v_resp.headers loop
-      if lower(h.field) = 'etag' then v_etag := h.value; end if;
-    end loop;
-    v_parts_xml := v_parts_xml || format('<Part><PartNumber>%s</PartNumber><ETag>%s</ETag></Part>', v_part, v_etag);
-    v_part_payload := '';
-    commit;   -- the horizon-hold window ends here; vacuum may advance before the next part
-    exit parts when v_done;
-  end loop;
-
-  if v_part > 0 then
-    v_resp := archive.s3_signed_request('POST', cfg.endpoint, cfg.bucket, cfg.region, v_key,
-                                       'uploadId=' || archive.s3_url_encode(v_upload_id),
-                                       'application/xml',
-                                       '<CompleteMultipartUpload>' || v_parts_xml || '</CompleteMultipartUpload>',
-                                       v_key_id, v_secret);
-    if v_resp.status not between 200 and 299 or v_resp.content like '%<Error>%' then
-      raise exception 'archive._encode_upload_ndjson_commits: complete multipart for % failed: HTTP % %', v_key, v_resp.status, left(v_resp.content, 200);
-    end if;
-    v_etag := null;
-    v_etag := (xpath('//*[local-name()=''ETag'']/text()', v_resp.content::xml))[1]::text;
-  end if;
-
-  p_s3_key := v_key; p_etag := v_etag; p_rows := v_rows;
-end;
-$$;
+-- archive._encode_upload_ndjson_commits, the third format (per-part-COMMIT, for an otherwise-
+-- unbounded single read) is gone (issue #240): its only caller was the deleted archive.archive_range,
+-- and the archive_fn strategies below cannot use a COMMIT-ing procedure anyway -- archive_fn is a
+-- plain function, and PL/pgSQL forbids transaction control inside one regardless of call context.
+-- They don't need to: pgpm._next_archive_chunk already bounds every call's own [lo, hi) to
+-- config.archive_byte_budget before archive_fn ever runs, so the vacuum-horizon hold is already
+-- small by construction.
 
 -- thin wrapper around the range-based Parquet encoder + a PUT.
 create or replace function archive._encode_upload_parquet(p_parent regclass, p_lo text, p_hi text, p_compress boolean default true)
@@ -1668,213 +1255,15 @@ begin
 end;
 $$;
 
--- ---------------------------------------------------------------------------
--- The unified worker. archive.config's boundary_rule and drop_trigger columns
--- are the only two knobs; everything downstream (the archiver, the ledger
--- write, the retire sweep) is the same code path regardless of which table
--- picked which knob.
--- ---------------------------------------------------------------------------
-
--- archives exactly [p_lo, p_hi) for p_parent: dispatches to whichever encode/upload step
--- archive.config.format configures, then writes the ledger row. p_child, if given, is a
--- convenience column populated only when [p_lo, p_hi) happens to equal one partition's bounds.
-create or replace procedure archive.archive_range(p_parent regclass, p_lo text, p_hi text, p_child name default null)
-language plpgsql as $$
-declare
-  cfg archive.config;
-  v_s3_key text; v_etag text; v_rows bigint;
-begin
-  select * into cfg from archive.config where parent_table = p_parent;
-  if not found then raise exception 'archive.archive_range: % has no archive.config row', p_parent; end if;
-
-  if cfg.format = 'ndjson_commits' then
-    call archive._encode_upload_ndjson_commits(p_parent, p_lo, p_hi, cfg.compress, v_s3_key, v_etag, v_rows);
-  elsif cfg.format = 'ndjson_single' then
-    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
-      from archive._encode_upload_ndjson_single(p_parent, p_lo, p_hi, cfg.compress) t;
-  elsif cfg.format = 'parquet' then
-    select t.s3_key, t.etag, t.rows_archived into v_s3_key, v_etag, v_rows
-      from archive._encode_upload_parquet(p_parent, p_lo, p_hi, cfg.compress) t;
-  else
-    raise exception 'archive.archive_range: unknown format % for %', cfg.format, p_parent;
-  end if;
-
-  -- the ledger row: written only now, after the store confirmed the object. A crash between the
-  -- encode/upload step and this insert just re-archives next tick (a PUT to the same key
-  -- overwrites; the encode/upload step's own cleanup-on-entry finds nothing in flight because the
-  -- upload completed).
-  insert into archive.ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
-  values (p_parent, p_lo, p_hi, p_child, v_s3_key, v_etag, v_rows)
-  on conflict (parent_table, lo)
-    do update set hi = excluded.hi, child_name = excluded.child_name,
-                  s3_key = excluded.s3_key, etag = excluded.etag,
-                  rows_archived = excluded.rows_archived, archived_at = now();
-  commit;
-end;
-$$;
-
--- manual, one-partition-right-now entry point (also used internally by archive._tick_one for
--- partition_aligned tables). Enforces the forward-only guard: archive.file_gate's fast path
--- trusts the ledger's watermark to mean "everything below this is archived" -- true only if
--- coverage is gap-free from wherever the ledger starts. The byte_budget boundary rule keeps that
--- by construction (archive._next_range_byte_budget always extends the watermark forward); this
--- procedure takes an arbitrary child name, so it enforces the same contract explicitly. A
--- re-archive of an already-ledgered partition (the stale-veto self-repair path) is exempt -- it
--- overwrites its own existing row, not extending the frontier.
-create or replace procedure archive.archive_partition(p_parent regclass, p_child name)
-language plpgsql as $$
-declare
-  v_lo text; v_hi text; v_reledger boolean; v_expected_lo text;
-begin
-  select lo, hi into v_lo, v_hi from pgpm.part where parent_table = p_parent and child_name = p_child;
-
-  select exists(select 1 from archive.ledger where parent_table = p_parent and lo = v_lo) into v_reledger;
-  if not v_reledger then
-    select coalesce(archive._file_watermark(p_parent), (select min(lo) from pgpm.part where parent_table = p_parent))
-      into v_expected_lo;
-    if v_lo is distinct from v_expected_lo then
-      raise exception 'archive.archive_partition: % [lo %] is out of order -- % is next expected to archive lo %; archive partitions in ascending lo order (archive.tick always does) so the shared ledger stays gap-free for archive.file_gate''s fast path',
-        p_child, v_lo, p_parent, coalesce(v_expected_lo, '<none>');
-    end if;
-  end if;
-  commit;   -- release this procedure's own read snapshot before the encode/upload step's work
-
-  call archive.archive_range(p_parent, v_lo, v_hi, p_child);
-end;
-$$;
-
--- one unit of work for one archive.config row: picks the next range via whichever boundary_rule
--- is configured, archives it if there is one. p_progress reports whether it made progress, so
--- callers (archive.tick(), archive.run_all()) know when to stop looping.
-create or replace procedure archive._tick_one(p_parent regclass, inout p_progress boolean default false)
-language plpgsql as $$
-declare
-  cfg archive.config;
-  v_lo text; v_hi text; v_child name;
-begin
-  select * into cfg from archive.config where parent_table = p_parent;
-  if not found then raise exception 'archive._tick_one: % has no archive.config row', p_parent; end if;
-
-  if cfg.boundary_rule = 'partition_aligned' then
-    select t.lo, t.hi, t.child_name into v_lo, v_hi, v_child from archive._next_range_partition_aligned(p_parent) t;
-  elsif cfg.boundary_rule = 'byte_budget' then
-    select t.lo, t.hi into v_lo, v_hi from archive._next_range_byte_budget(p_parent, cfg.byte_budget, cfg.probe_sample) t;
-  else
-    raise exception 'archive._tick_one: unknown boundary_rule % for %', cfg.boundary_rule, p_parent;
-  end if;
-
-  if v_lo is null then
-    p_progress := false;
-    return;
-  end if;
-
-  if cfg.boundary_rule = 'partition_aligned' then
-    call archive.archive_partition(p_parent, v_child);
-  else
-    call archive.archive_range(p_parent, v_lo, v_hi);
-  end if;
-  p_progress := true;
-end;
-$$;
-
--- the standing worker: one pg_cron job, every archive.config row, paced. Two passes, not
--- interleaved per table: archiving drains archive._tick_one until each table has nothing left to
--- report, THEN (for drop_trigger = 'self_driving' tables) the retire sweep runs -- unconditionally,
--- not just for tables that archived something just now. That "unconditionally" matters: a
--- partition-aligned table with nothing new to archive could otherwise never retry a partition
--- whose retire() failed earlier for a reason unrelated to archiving (the exact gap #219 fixed for
--- the partition-aligned rule specifically); a byte-budget table that has quiesced (no new data,
--- so no new chunks, ever) would have the identical problem if retiring only ever piggybacked on a
--- fresh chunk. Running the sweep every tick, for every self-driving table, closes both cases the
--- same way.
-create or replace procedure archive.tick()
-language plpgsql as $$
-declare
-  cfg archive.config; pcfg pgpm.config;
-  v_progress boolean; v_iter int; v_up_to text; v_count int;
-begin
-  if not pg_try_advisory_lock(hashtext('pgpm-archiver')) then return; end if;
-
-  for cfg in select * from archive.config loop
-    v_iter := 0;
-    loop
-      v_progress := false;
-      call archive._tick_one(cfg.parent_table, v_progress);
-      exit when not v_progress;
-      v_iter := v_iter + 1;
-      if v_iter > 1000000 then raise exception 'archive.tick: safety limit for %', cfg.parent_table; end if;
-    end loop;
-  end loop;
-
-  for cfg in select * from archive.config where drop_trigger = 'self_driving' loop
-    select * into pcfg from pgpm.config where parent_table = cfg.parent_table;
-    if cfg.boundary_rule = 'partition_aligned' then
-      v_up_to := pgpm._retain_boundary(pcfg);
-    else
-      v_up_to := archive._file_watermark(cfg.parent_table);
-    end if;
-    if v_up_to is not null then
-      v_count := 0;
-      call archive._retire_covered(cfg.parent_table, v_up_to, v_count);
-    end if;
-  end loop;
-
-  perform pg_advisory_unlock(hashtext('pgpm-archiver'));
-end;
-$$;
-
--- the operator's "do it now" for one table: drains archive._tick_one until no more progress, then
--- (if self_driving) runs the same unconditional retire sweep archive.tick() does. Shares
--- archive.tick()'s own advisory lock, so a manual run_all() call and the standing cron job can
--- never race on the same (or a different) table at the same time.
-create or replace procedure archive.run_all(p_parent regclass)
-language plpgsql as $$
-declare
-  cfg archive.config; pcfg pgpm.config;
-  v_progress boolean; v_iter int := 0; v_up_to text; v_count int;
-begin
-  if not pg_try_advisory_lock(hashtext('pgpm-archiver')) then return; end if;
-
-  select * into cfg from archive.config where parent_table = p_parent;
-  if not found then
-    perform pg_advisory_unlock(hashtext('pgpm-archiver'));
-    raise exception 'archive.run_all: % has no archive.config row', p_parent;
-  end if;
-
-  loop
-    v_progress := false;
-    call archive._tick_one(p_parent, v_progress);
-    exit when not v_progress;
-    v_iter := v_iter + 1;
-    if v_iter > 1000000 then raise exception 'archive.run_all: safety limit for %', p_parent; end if;
-  end loop;
-
-  if cfg.drop_trigger = 'self_driving' then
-    select * into pcfg from pgpm.config where parent_table = p_parent;
-    if cfg.boundary_rule = 'partition_aligned' then
-      v_up_to := pgpm._retain_boundary(pcfg);
-    else
-      v_up_to := archive._file_watermark(p_parent);
-    end if;
-    if v_up_to is not null then
-      v_count := 0;
-      call archive._retire_covered(p_parent, v_up_to, v_count);
-    end if;
-  end if;
-
-  perform pg_advisory_unlock(hashtext('pgpm-archiver'));
-end;
-$$;
+-- pgpm_archive's old paced worker (archive.archive_range/archive_partition/_tick_one/tick/run_all,
+-- driven by archive.config's boundary_rule/drop_trigger knobs and a pgpm-archiver pg_cron job) is
+-- gone entirely (issue #240): pgpm.maintain()'s own archive_fn-driven chunking replaced it, with no
+-- second scheduled job -- archiving now rides maintain()'s existing cadence.
 
 -- ---------------------------------------------------------------------------
--- The synchronous hooks: archive a partition INLINE, inside retain()'s own
--- drop transaction. Structurally separate from the paced worker above (a
--- pre_drop hook is a nested call inside retain()'s already-open transaction,
--- and PL/pgSQL forbids issuing COMMIT from inside a block reachable that way,
--- so a synchronous hook can never bound its own vacuum-horizon hold by
--- committing between chunks of work, no matter how it's rewritten) -- no
--- ledger, no gate, no archive.config.boundary_rule/drop_trigger/format
--- involvement, just archive.config's connection settings.
+-- The synchronous functions: archive a partition INLINE, called directly (no
+-- ledger, no automatic scheduling), just archive.config's connection
+-- settings.
 -- ---------------------------------------------------------------------------
 
 -- Small partitions (one part's worth or less) take a plain single PUT; bigger ones stream
@@ -2016,33 +1405,30 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- archive_fn-conforming S3 strategies (issue #239): the same transport as the
--- synchronous hooks above (archive._encode_upload_ndjson_single /
--- archive._encode_upload_parquet -- the pluggable encode/upload step #221 already built for
--- the paced worker, reused here as-is), adapted to pgpm.config.archive_fn's calling contract
--- -- (p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result -- so a table can set
+-- synchronous functions above (archive._encode_upload_ndjson_single /
+-- archive._encode_upload_parquet), adapted to pgpm.config.archive_fn's calling contract --
+-- (p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result -- so a table can set
 -- archive_fn directly and ride pgpm.maintain()'s own byte-budget chunking
--- (pgpm._next_archive_chunk/_archive_step, #237) instead of archive.config's separate
--- boundary_rule/drop_trigger machinery. Connection settings (bucket/region/endpoint/prefix/
--- vault key names/compress) still come from archive.config -- one config surface, not two
+-- (pgpm._next_archive_chunk/_archive_step, #237). Connection settings (bucket/region/endpoint/
+-- prefix/vault key names/compress) still come from archive.config -- one config surface, not two
 -- (docs/retention-write-block-and-merge.md, #242).
 --
 -- archive._encode_upload_ndjson_commits (the third format, with internal COMMITs to bound an
--- otherwise-unbounded single read) is deliberately NOT wired in here: archive_fn is a plain
--- FUNCTION, and PL/pgSQL forbids transaction control inside a function regardless of call
+-- otherwise-unbounded single read) has no archive_fn counterpart and is gone (#240): archive_fn is
+-- a plain FUNCTION, and PL/pgSQL forbids transaction control inside a function regardless of call
 -- context, so it could never call a COMMIT-ing procedure anyway. It also doesn't need to --
 -- pgpm._next_archive_chunk already bounds every call's own [lo, hi) to
 -- config.archive_byte_budget before archive_fn ever runs, so the vacuum-horizon hold this
 -- call needs to bound is already small by construction, the same goal ndjson_commits'
--- internal commits exist to reach a different way.
+-- internal commits existed to reach a different way.
 --
 -- p_child is part of the archive_fn contract's required shape but unused here:
 -- archive._encode_upload_ndjson_single/_encode_upload_parquet already scope their read to
 -- [p_lo, p_hi) off p_parent directly, which pgpm._next_archive_chunk guarantees never spans
 -- more than p_child's own bounds.
 --
--- archive.to_s3/archive.to_s3_parquet (the synchronous hooks above) and the paced worker
--- (archive.tick et al) are untouched and keep working exactly as before; they are deleted
--- only once this path is proven out (#240).
+-- archive.to_s3/archive.to_s3_parquet (the synchronous functions above) are untouched and keep
+-- working exactly as before; the paced worker they used to sit alongside is gone entirely (#240).
 create or replace function pgpm.archive_to_s3_ndjson(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns pgpm.archive_result language plpgsql as $$
 declare
@@ -2083,92 +1469,13 @@ begin
 end;
 $$;
 
--- ---------------------------------------------------------------------------
--- The operator interface: configure a table, register a hook, schedule the
--- standing job.
--- ---------------------------------------------------------------------------
-
--- wires up (or re-wires) archival's connection settings and knobs for one managed table. Call
--- again to change any setting -- an upsert, not an error, on a table already configured. Does NOT
--- register any pre_drop hook: which one to register (archive.file_gate for the paced worker,
--- archive.to_s3/archive.to_s3_parquet for the synchronous hook) depends on which architecture the
--- table uses, so that stays its own explicit pgpm.hook_register call.
-create or replace function archive.configure(
-  p_parent        regclass,
-  p_bucket        text,
-  p_region        text default 'us-east-1',
-  p_endpoint      text default null,
-  p_prefix        text default 'events/',
-  p_boundary_rule text default 'partition_aligned',   -- or 'byte_budget'
-  p_drop_trigger  text default 'self_driving',        -- or 'gate_only'
-  p_format        text default 'ndjson_commits',      -- or 'ndjson_single' / 'parquet'
-  p_compress      boolean default false,
-  p_byte_budget   bigint default 8 * 1024 * 1024,      -- byte_budget rule only
-  p_probe_sample  int default 1000,                    -- byte_budget rule only
-  p_part_bytes    bigint default 8 * 1024 * 1024,      -- ndjson_commits format only
-  p_fetch_rows    int default 20000,                   -- ndjson_commits format only
-  p_vault_key_id  text default 's3_archive_access_key_id',
-  p_vault_secret  text default 's3_archive_secret_access_key'
-) returns void language plpgsql as $$
-begin
-  if not exists (select 1 from pgpm.config where parent_table = p_parent) then
-    raise exception 'archive.configure: % is not managed by pgpm; transmute() it first', p_parent;
-  end if;
-
-  insert into archive.config (
-    parent_table, bucket, region, endpoint, prefix, boundary_rule, drop_trigger, format, compress,
-    byte_budget, probe_sample, part_bytes, fetch_rows, vault_key_id, vault_secret)
-  values (
-    p_parent, p_bucket, p_region, p_endpoint, p_prefix, p_boundary_rule, p_drop_trigger, p_format, p_compress,
-    p_byte_budget, p_probe_sample, p_part_bytes, p_fetch_rows, p_vault_key_id, p_vault_secret)
-  on conflict (parent_table) do update set
-    bucket = excluded.bucket, region = excluded.region, endpoint = excluded.endpoint, prefix = excluded.prefix,
-    boundary_rule = excluded.boundary_rule, drop_trigger = excluded.drop_trigger,
-    format = excluded.format, compress = excluded.compress,
-    byte_budget = excluded.byte_budget, probe_sample = excluded.probe_sample,
-    part_bytes = excluded.part_bytes, fetch_rows = excluded.fetch_rows,
-    vault_key_id = excluded.vault_key_id, vault_secret = excluded.vault_secret;
-end;
-$$;
-
--- the reverse of archive.configure: drops the config row (idempotent -- a no-op if there wasn't
--- one). The ledger is untouched -- it is a record of what was actually archived, not
--- configuration -- and any registered pre_drop hook is untouched too, for the same reason
--- archive.configure never registered one: this function doesn't know which hook(s) this table
--- was using, so it doesn't guess. Unregister explicitly via pgpm.hook_unregister first if wanted.
-create or replace function archive.unconfigure(p_parent regclass) returns void language plpgsql as $$
-begin
-  delete from archive.config where parent_table = p_parent;
-end;
-$$;
-
--- the one standing job, same shape as pgpm.schedule(): one call, every archive.config row, paced
--- by archive.tick(). p_every is a pg_cron schedule (standard 5-field cron, or pg_cron's seconds
--- interval). cron.schedule_in_database (not bare cron.schedule) pins the job to the CURRENT
--- database explicitly, the same way pgpm.schedule() does, since pg_cron's own scheduler process
--- can serve more than one database.
-create or replace function archive.schedule(p_every text default '* * * * *')
-returns bigint language plpgsql as $$
-declare v_jobid bigint;
-begin
-  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-    raise exception 'archive.schedule: pg_cron is not installed in this database; enable it (create extension pg_cron) to schedule the archiver, or call archive.tick() by hand';
-  end if;
-  execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
-                 'pgpm-archiver', p_every, 'call archive.tick()', current_database())
-    into v_jobid;
-  return v_jobid;
-end;
-$$;
-
-create or replace function archive.unschedule() returns int language plpgsql as $$
-declare v_n int := 0;
-begin
-  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-    return 0;   -- nothing scheduled if pg_cron is not here
-  end if;
-  execute 'select count(*)::int from (select cron.unschedule(jobid) from cron.job '
-       || 'where jobname = ''pgpm-archiver'' and database = current_database()) s' into v_n;
-  return v_n;
-end;
-$$;
+-- archive.configure/unconfigure/schedule/unschedule -- the paced worker's operator interface
+-- (issue #233) -- are gone entirely (issue #240), along with the pgpm-archiver pg_cron job they
+-- managed: wire connection settings directly into archive.config (insert/update the row yourself;
+-- it is a plain table, not an API surface with its own invariants to protect) and set
+-- pgpm.config.archive_fn to choose a strategy. No second scheduled job -- pgpm.maintain()'s own
+-- cadence drives archiving.
+drop function if exists archive.configure(regclass, text, text, text, text, text, text, text, boolean, bigint, int, bigint, int, text, text);
+drop function if exists archive.unconfigure(regclass);
+drop function if exists archive.schedule(text);
+drop function if exists archive.unschedule();
