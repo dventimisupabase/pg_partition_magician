@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+- **`pgpm.retire()`: drop only once write-blocked and archive-covered; `pgpm.hook` no longer
+  consulted (#238).** With write-blocking (#235) and ledger-driven archive coverage (#237) both in
+  place, `retire()`'s drop precondition becomes fully internal: past the retention boundary (as
+  before), write-blocked (ensured here via idempotent `pgpm._install_write_block`, not merely
+  assumed -- `retire()` is called by more than one path, and asserting instead of ensuring would
+  make it raise for any caller that reaches an eligible partition without `maintain()` having run
+  first), and `pgpm._archive_fully_covered`. A not-yet-covered child is a normal, retryable state,
+  not a failure: `retire()` returns `false` and logs nothing, the same as an already-retired or
+  concurrently-claimed partition. Only a genuinely unexpected `DROP` failure is logged
+  (`retain_drop_fail`, replacing `retain_hook_fail`; `status()`'s `retain_hook_failures` is renamed
+  `retain_drop_failures` to match what it now actually measures).
+
+  `pgpm.hook`'s `pre_drop` loop is removed from `retire()` entirely -- nothing in `pgpm_core` calls a
+  registered hook anymore. **`pgpm.hook`/`hook_register`/`hook_unregister` are deliberately NOT
+  dropped**: `pgpm_archive`'s existing gate-only architecture still registers `archive.file_gate`
+  through them, and removing the table/functions now would break that before `pgpm_archive` migrates
+  onto the `archive_fn` contract (#239/#240). A registered hook simply never runs anymore; full
+  removal is #240's job. This is a real, known regression for `pgpm_archive`'s `gate_only` and
+  `self_driving`-with-a-failing-hook scenarios in the meantime (documented in
+  `pgpm_archive/README.md` and `docs/strategies-overview.md`; `tests/archive/db/01` and `06` are
+  `skip()`ped with a clear reason rather than rewritten, since re-expressing those scenarios on the
+  new contract is #241's job, not this one's).
+
+  Rewrote `tests/58` (proves a registered `pre_drop` hook, even one that always raises, no longer
+  blocks anything -- the opposite of what it proved before this issue), `tests/59` (the `retain_batch`
+  wedge demonstration now uses a not-yet-archive-covered child instead of a failing hook, and
+  explicitly asserts `retain_drop_failures` stays zero throughout -- the key new distinction), and
+  `tests/60` (removed hook-blocks-a-drop assertions; added write-block-ensured and
+  archive-coverage-gate assertions). New `tests/64_retire_archive_gate_test.sql` (8 assertions, the
+  issue's own test plan): a child crosses the boundary, is write-blocked immediately but stays
+  undropped while chunked archiving is still incomplete, and drops the moment coverage completes (in
+  the very same tick); a `none`-strategy child drops on the very next eligible cycle, exactly as
+  `retain()` always behaved before this whole stack existed.
+
 - **Docs: `docs/retention-write-block-and-merge.md`, the positioning doc for a retention/archiving
   merge stack (#242).** Chunked archiving (#213, #221) can now take several `maintain()` ticks to
   fully archive one large partition, and nothing today stops a backdated write into that

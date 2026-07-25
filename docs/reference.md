@@ -407,13 +407,13 @@ the count dropped. A coarse partition that merely straddles the horizon is **not
 is suspended over un-regrained coarse history until `regrain` splits it (or `regrain` reclaims the aged
 sub-ranges directly). `null` retention drops nothing.
 
-`config.retain_batch` caps how many eligible partitions one call will **attempt** (hooks + drop), oldest
-first; the rest of the backlog waits for later calls -- on the scheduled path, later `maintain` ticks,
-each its own transaction. `null` (the default) is unbounded. The cap bounds attempts, not successes: a
-failing `pre_drop` hook at the head of the backlog defers everything behind it until it clears (the wedge
-shows as a flat `status().retain_backlog` with climbing `retain_hook_failures`). Set it low (typically
-`1`) when a registered hook is slow -- e.g. a synchronous copy to long-term storage -- to bound each
-tick's lock and transaction time to one partition's hooks + drop.
+`config.retain_batch` caps how many eligible partitions one call will **attempt** (write-block ensure,
+archive-coverage check, drop), oldest first; the rest of the backlog waits for later calls -- on the
+scheduled path, later `maintain` ticks, each its own transaction. `null` (the default) is unbounded. The
+cap bounds attempts, not successes: an unexpected drop failure at the head of the backlog defers
+everything behind it until it clears (the wedge shows as a flat `status().retain_backlog` with climbing
+`retain_drop_failures`). A child whose chunked archiving simply hasn't caught up yet is *not* a wedge --
+`retain_drop_failures` stays at zero for that; see [`retire`](#retire).
 
 `retain()` is a loop over [`retire`](#retire): it picks the eligible set and `retire` carries the
 per-partition protocol.
@@ -426,22 +426,25 @@ pgpm.retire(p_parent regclass, p_child name) returns boolean
 
 The sanctioned single-partition drop: `retain()`'s per-partition body, public and claim-guarded, for an
 external assistant (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
-retirement directly. It runs the same protocol `retain()` uses: claim the `pgpm.part` row, run the
-enabled `pre_drop` hooks in registration order, `DROP`, delete the catalog row, log `retain_drop`.
-Returns `true` iff this call dropped the partition.
+retirement directly. It claims the `pgpm.part` row, ensures the child is write-blocked
+(`pgpm._install_write_block`, idempotent -- issue #235), checks `pgpm._archive_fully_covered` (from
+issue #237), and only then `DROP`s, deletes the catalog row, and logs `retain_drop`. Returns `true`
+iff this call dropped the partition.
 
 `retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
 **when**. It refuses (raises) an unmanaged table, a table with no retention policy (`config.retain` is
 null), a partition whose range is not entirely at/below the retention horizon, and an in-flight
 (unattached) drain/regrain child.
 
-It returns `false`, without side effects, when the `pgpm.part` row is absent (already retired by another
-actor) or claimed by a concurrent transaction: the claim is `FOR UPDATE SKIP LOCKED`, so each partition
-has exactly one owner at a time and concurrent assistants -- or an assistant and `retain()` -- never
-double-invoke hooks and never log a spurious failure from a lock race. It also returns `false` when a
-`pre_drop` hook raises: the failure is logged (`retain_hook_fail`) and the partition kept, exactly as
-under `retain()`. A complete worked assistant built on `retire` is in
-[the archive assistant](../pgpm_archive/docs/assistant.md).
+It returns `false`, without side effects and without logging anything, in three normal, retryable
+situations: the `pgpm.part` row is absent (already retired by another actor), it's claimed by a
+concurrent transaction (`FOR UPDATE SKIP LOCKED`, so each partition has exactly one owner at a time), or
+the partition is write-blocked but not yet `pgpm._archive_fully_covered` -- chunked archiving (from
+issue #237) simply hasn't caught up yet. Only a genuinely unexpected failure in the `DROP` itself is
+logged (`retain_drop_fail`) and returns `false`.
+
+As of issue #238, `pgpm.hook`'s `pre_drop` registry is **not** consulted here at all -- see
+[`hook_register`](#hook_register) below for why the table and functions still exist, unused, for now.
 
 ### `regrain`
 
@@ -527,6 +530,15 @@ A procedure that calls `maintain` for every managed table. This is what the sche
 
 ## Lifecycle hooks
 
+> **As of issue #238, this registry is inert.** [`retire`](#retire) no longer calls anything
+> registered here, for any event. `pgpm.hook`/`hook_register`/`hook_unregister` are kept, unchanged,
+> only because `pgpm_archive`'s existing gate-only architecture still registers `archive.file_gate`
+> through them; removing them now would break that before `pgpm_archive` migrates onto the pluggable
+> `archive_fn` contract (see [Archive strategy contract](#archive-strategy-contract) and
+> `docs/retention-write-block-and-merge.md`, #242). Do not register a `pre_drop` hook expecting it to
+> run -- it will not. This section is kept for reference until `pgpm.hook` is removed entirely
+> (planned for #240).
+
 ### `hook_register`
 
 ```sql
@@ -535,27 +547,12 @@ pgpm.hook_register(
 ) returns void
 ```
 
-Registers a user function to run at a lifecycle event. `pre_drop` is the only event today:
-[`retire`](#retire) calls every enabled `pre_drop` hook for a partition, in registration order,
-immediately before dropping it -- e.g. to copy the partition's contents to long-term storage first.
-Because `retire` is the one sanctioned drop path (`retain()` loops over it, and an external assistant
-calls it directly), the hooks fire on **every** retention drop, whoever initiates it. `p_hook` is
-`regprocedure` (e.g. `'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a
-signature that doesn't match the event's contract is refused here, not discovered later at drop time. A
-`pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi text) returns
-void`. Re-registering the same `(parent, event, hook)` just updates `enabled`.
-
-If a hook raises, the partition is **not** dropped: the failure is logged (`retain_hook_fail`, surfaced
-by `status().retain_hook_failures`) and retried on the next `retire()`/`retain()` call. The failure
-affects only that one partition -- drops already made earlier in the same `retain()` call are not
-undone, and hooks already run for those partitions are not re-invoked.
-
-A hook runs inside the calling transaction (`retain()`'s tick, or an assistant's `retire()` call), so a
-slow hook (a synchronous long-term-storage copy) holds that transaction open for as long as it runs. On
-the scheduled path, pair a slow hook with `config.retain_batch = 1` (see [`retain`](#retain)) so each
-maintenance tick attempts at most one partition's hooks + drop, and the rest of an aged-out backlog
-paces across subsequent ticks. A complete, working S3-archival hook is worked through in
-[Archive partitions to S3](../pgpm_archive/docs/to-s3.md).
+Registers a user function against a lifecycle event. `pre_drop` is the only event that has ever
+existed, and (as of #238) nothing calls it anymore. `p_hook` is `regprocedure` (e.g.
+`'myschema.copy_to_s3(regclass,name,text,text)'`), so a nonexistent function or a signature that
+doesn't match the event's contract is refused at registration -- this validation is unchanged and
+still works. A `pre_drop` hook must be `function(p_parent regclass, p_child name, p_lo text, p_hi
+text) returns void`. Re-registering the same `(parent, event, hook)` just updates `enabled`.
 
 ### `hook_unregister`
 
@@ -710,7 +707,7 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint, default_oldest text, newest_bound text,
   last_drained timestamptz, drain_skips bigint, fks_suspended bigint, fks_unvalidated bigint,
-  history_unregrained boolean, retain_hook_failures bigint, retain_backlog bigint
+  history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint
 )
 ```
 
@@ -729,12 +726,13 @@ One row per managed table. Beyond the static config it surfaces:
   `drain_skips ~ 0` is merely slow.
 - `fks_suspended` / `fks_unvalidated` -- preserve-managed incoming FKs currently dropped (RI off) versus
   re-added `NOT VALID` but blocked from full validation by pre-existing orphans.
-- `retain_hook_failures` -- `pre_drop` hook failures since the last successful drop (see `hook_register`);
-  non-zero means a partition is stuck waiting on a failing hook.
+- `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (issue #238; not a
+  child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
+  is genuinely stuck.
 - `retain_backlog` -- partitions whose whole range is past the retention horizon but which are not yet
-  dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks and should fall tick over
-  tick; a flat `retain_backlog` with climbing `retain_hook_failures` is retention wedged on a failing
-  hook.
+  dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks, or while a write-blocked
+  child's chunked archiving is still catching up -- either way it should fall tick over tick. A flat
+  `retain_backlog` with climbing `retain_drop_failures` is retention genuinely wedged.
 
 ### `snapshot`
 
@@ -963,7 +961,8 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 
 ### `pgpm.hook`
 
-The lifecycle hook registry (see `hook_register`).
+The lifecycle hook registry (see [Lifecycle hooks](#lifecycle-hooks) -- inert as of issue #238,
+kept only for `pgpm_archive`'s sake until #240).
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -1025,7 +1024,7 @@ Functions named `pgpm._*` are private and may change without notice. The kind-sp
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
 `_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`,
-`_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`,
+`_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`/`_is_write_blocked`,
 `_run_archive_strategy`/`_archive_noop`,
 `_next_archive_chunk`/`_archive_fully_covered`/`_archive_step`) implements the engine. Do not call
 them directly.
