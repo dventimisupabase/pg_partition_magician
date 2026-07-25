@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **Docs: `docs/retention-write-block-and-merge.md`, the positioning doc for a retention/archiving
+  merge stack (#242).** Chunked archiving (#213, #221) can now take several `maintain()` ticks to
+  fully archive one large partition, and nothing today stops a backdated write into that
+  still-attached, still-writable span -- `archive.file_gate`'s recount only catches the divergence
+  reactively, after the fact. The doc lays out the fix (a `BEFORE INSERT OR UPDATE OR DELETE`
+  trigger that write-blocks a partition the instant it crosses the retention boundary, independent
+  of archiving), the two mechanisms ruled out first with the concrete evidence (`REVOKE` only
+  checks the parent's ACL on a parent-routed write; a spanning lock defeats the point of chunking),
+  the target end state (a pluggable `archive_fn` contract on `pgpm.config`, ledger-driven chunked
+  archiving as the built-in strategy, a unified `retire()` drop precondition, `pgpm.hook` retired),
+  and the implementation order for #235-#241 that follow it. Also settles the module-split question
+  from the prior harmonization stack (#217-#222): the dependency surface a hard `pgpm_core`/archive
+  split would leave behind isn't small enough to be worth it, so `archive` stays a namespace inside
+  the same install, not an independently versioned module. Documentation only -- no code changes,
+  no behavior changes; every mechanism the doc describes is still a plan.
+
 - **Port byte-budget chunked archiving and its ledger onto the `archive_fn` contract (#237).**
   `pgpm_archive`'s `archive._next_range_byte_budget`/`archive.archive_range`/`archive.ledger`
   (#213, #221) proved that archiving a large partition safely means chunking it instead of doing it
