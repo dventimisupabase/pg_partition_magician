@@ -118,14 +118,15 @@ alter table pgpm.config add column if not exists regrain_to text;
 -- deletes), so the source never shrinks and cannot drive progress the way the drain's deletes do; this
 -- cursor is the explicit progress state instead. null = no regrain in flight; reset to null at the swap.
 alter table pgpm.config add column if not exists regrain_cursor text;
--- retain() pacing (issue #189): cap how many eligible partitions ONE retain() call will attempt (hooks
--- + drop), so an aged-out backlog spreads across maintenance ticks (each tick its own transaction via
--- pg_cron) instead of one call carrying the whole backlog -- the drain_batch shape, applied to drops.
--- The cap bounds ATTEMPTS, oldest first: with a failing pre_drop hook at the head, the partitions
--- behind it are not attempted that call (bounded per-tick work is the point; the wedge is surfaced by
--- status().retain_hook_failures alongside a flat retain_backlog). null = unbounded (prior behavior).
--- An operator registering a slow synchronous pre_drop hook (e.g. a long-term-storage copy) should set
--- this low, typically 1, trading retention promptness for bounded per-tick lock/transaction time.
+-- retain() pacing (issue #189): cap how many eligible partitions ONE retain() call will attempt
+-- (write-block, archive-coverage check, drop), so an aged-out backlog spreads across maintenance
+-- ticks (each tick its own transaction via pg_cron) instead of one call carrying the whole backlog
+-- -- the drain_batch shape, applied to drops. The cap bounds ATTEMPTS, oldest first: with an
+-- unexpected drop failure at the head, the partitions behind it are not attempted that call
+-- (bounded per-tick work is the point; the wedge is surfaced by status().retain_drop_failures
+-- alongside a flat retain_backlog -- issue #238). null = unbounded (prior behavior). A table whose
+-- chunked archiving is genuinely still catching up on a large backlog is not a wedge at all: that is
+-- retain_backlog falling tick over tick with retain_drop_failures flat at zero.
 alter table pgpm.config add column if not exists retain_batch int;
 -- the pluggable archive strategy (issue #236): null = strategy 'none' (no archiving, drop as soon as
 -- write-blocked). regprocedure (not text/regproc) so a bad reference is refused right here at
@@ -208,11 +209,16 @@ update pgpm.dropped_fk d set validated_at = d.restored_at
                   and c.contype = 'f' and c.convalidated);
 
 -- lifecycle hook registry: user functions pgpm invokes at specific points in a parent's lifecycle.
--- 'pre_drop' (called by retain(), just before it drops an aged-out partition) is the first event; the
--- check constraint is the extension point for future ones (e.g. a post-attach event), so a typo in the
--- event name fails at registration, not silently at call time. hook_fn is regprocedure, not text/regproc,
--- so pgpm.hook_register validates the function exists with the exact expected signature up front, instead
--- of discovering a bad reference the next time retain() tries to call it.
+-- 'pre_drop' was the first (and, as of issue #236, only real) use: archiving before a drop, now
+-- superseded by config.archive_fn. hook_fn is regprocedure, not text/regproc, so pgpm.hook_register
+-- validates the function exists with the exact expected signature up front, instead of discovering a
+-- bad reference later.
+--
+-- As of issue #238, retire() no longer calls anything registered here -- pre_drop hooks are inert.
+-- This table and hook_register/hook_unregister are kept, unchanged, ONLY because pgpm_archive's
+-- existing gate-only architecture still registers archive.file_gate through them; removing it now
+-- would silently disable that gate's drop-veto before #239/#240 migrate pgpm_archive onto the
+-- archive_fn contract. Do not register a new pre_drop hook expecting it to run -- it will not.
 create table if not exists pgpm.hook (
   id           bigint generated always as identity primary key,
   parent_table regclass     not null,
@@ -681,23 +687,37 @@ $$;
 -- retire(): the sanctioned single-partition drop (issue #195) -- retain()'s per-partition body,
 -- public and claim-guarded, so an external assistant (e.g. an archive-then-drop scanner) or several
 -- cooperating ones can drive retirement themselves through the same protocol retain() uses: claim,
--- pre_drop hooks in registration order, DROP, catalog + log. It never widens what retention may
--- drop: the child's whole range must sit at/below the retention horizon, so a caller only picks
--- WHICH eligible partition and WHEN. Returns true iff this call dropped the partition.
+-- ensure write-blocked, gate on archive coverage, DROP, catalog + log. It never widens what
+-- retention may drop: the child's whole range must sit at/below the retention horizon, so a caller
+-- only picks WHICH eligible partition and WHEN. Returns true iff this call dropped the partition.
+--
+-- Drop precondition, as of issue #238: past the retention horizon (as before), write-blocked, and
+-- pgpm._archive_fully_covered. Write-blocking is ENSURED here (pgpm._install_write_block is
+-- idempotent), not merely asserted: retire() is called by more than one path -- retain()'s own loop,
+-- an external assistant, pgpm_archive's self-driving sweep -- and only maintain() is guaranteed to
+-- have run _enforce_write_blocks first. Asserting (raising) instead would make retire() fail for
+-- every caller that reaches an eligible partition some other way, which defeats the entire point of
+-- retire() being independently callable. Archive coverage is different: a child mid-chunked-archive
+-- is a normal, expected, RETRYABLE state, not a failure -- retire() just returns false, the same way
+-- it already does for a concurrently-claimed partition, so retain()'s batch loop skips it this cycle
+-- without logging anything.
+--
+-- pgpm.hook's pre_drop registry is no longer consulted here at all (previously: hooks ran in
+-- registration order immediately before the DROP). pgpm.hook/hook_register/hook_unregister are
+-- NOT removed by this issue -- pgpm_archive's existing gate-only architecture still registers
+-- archive.file_gate through them, and dropping the table/functions outright would break that
+-- before #239/#240 migrate it onto the archive_fn contract. Any hook registered today simply never
+-- runs anymore; full removal is #240's job, once nothing still depends on it.
 --
 -- Returns false, without side effects, when the pgpm.part row is absent (already retired by another
 -- actor) or claimed by a concurrent transaction: FOR UPDATE SKIP LOCKED (issue #188) gives each
--- partition exactly one owner at a time, so two assistants -- or an assistant and retain() -- never
--- double-invoke hooks (not assumed idempotent) and never log a spurious retain_hook_fail from a
--- lock-race loser. Also returns false when a pre_drop hook raises: the hooks+drop are isolated in a
--- subtransaction, the failure is logged (retain_hook_fail, retried on a later call), and the
--- partition is kept -- a failing long-term-storage copy never lets the drop happen anyway. The claim
--- itself is taken OUTSIDE that subtransaction, so a hook failure keeps the row claimed until the
--- caller's transaction ends (no other actor re-attempts, and re-fails, the same partition mid-call).
+-- partition exactly one owner at a time. The claim is taken OUTSIDE the DROP's own subtransaction,
+-- so an unexpected drop failure (retain_drop_fail, logged, retried on a later call) keeps the row
+-- claimed until the caller's transaction ends.
 create or replace function pgpm.retire(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_boundary text; r record; v_hook record;
+  cfg pgpm.config; v_nsp name; v_boundary text; r record;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -720,24 +740,22 @@ begin
     raise exception 'pg_partition_magician: % is not entirely past the retention horizon (hi %, horizon %)', p_child, r.hi, v_boundary;
   end if;
 
+  perform pgpm._install_write_block(p_parent, p_child);
+
+  if not pgpm._archive_fully_covered(p_parent, p_child) then
+    return false;
+  end if;
+
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
   begin
-    for v_hook in
-      select hook_fn from pgpm.hook
-      where parent_table = p_parent and event = 'pre_drop' and enabled
-      order by id
-    loop
-      execute format('select %s($1,$2,$3,$4)', (v_hook.hook_fn::oid::regproc)::text)
-        using p_parent, p_child, r.lo, r.hi;
-    end loop;
     execute format('drop table %I.%I', v_nsp, p_child);
     delete from pgpm.part where parent_table = p_parent and child_name = p_child;
     insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
     return true;
   exception when others then
     insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (p_parent, 'retain_hook_fail', r.lo, r.hi, left(sqlerrm, 200));
+      values (p_parent, 'retain_drop_fail', r.lo, r.hi, left(sqlerrm, 200));
     return false;
   end;
 end;
@@ -755,11 +773,11 @@ begin
   v_boundary := pgpm._retain_boundary(cfg);
   v_ncast := pgpm._native_type(cfg.control_kind);
 
-  -- retire() carries the per-partition protocol (claim, hooks, drop, bookkeeping, per-partition
-  -- failure isolation -- see there); this loop only picks the eligible set, oldest first, capped by
-  -- retain_batch (issue #189; 'limit all' when null). A retire() that returns false (hook failure,
-  -- or claimed/retired by a concurrent assistant) still consumed its batch slot: the cap bounds
-  -- ATTEMPTS, not successes.
+  -- retire() carries the per-partition protocol (claim, write-block, archive-coverage gate, drop,
+  -- bookkeeping -- see there); this loop only picks the eligible set, oldest first, capped by
+  -- retain_batch (issue #189; 'limit all' when null). A retire() that returns false (archive
+  -- coverage not yet complete -- a normal, retryable state, not a failure -- or claimed/retired by a
+  -- concurrent assistant) still consumed its batch slot: the cap bounds ATTEMPTS, not successes.
   for r in execute format(
     'select child_name from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s order by lo::%s limit %s',
     p_parent::text, v_ncast, v_boundary, v_ncast, v_ncast, coalesce(cfg.retain_batch::text, 'all'))
@@ -839,6 +857,21 @@ begin
       perform pgpm._remove_write_block(p_parent, r.child_name);
     end if;
   end loop;
+end;
+$$;
+
+-- true iff the write-block trigger is actually installed on this child right now (checked directly
+-- against pg_trigger, not re-derived from the boundary formula) -- shared by _archive_step (issue
+-- #237, only ever archives an already-blocked child) and retire() (issue #238) below.
+create or replace function pgpm._is_write_blocked(p_parent regclass, p_child name)
+returns boolean language plpgsql as $$
+declare v_nsp name;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  return exists (
+    select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
+     where t.tgname = 'pgpm_write_block' and c.relname = p_child and c.relnamespace = v_nsp::regnamespace
+  );
 end;
 $$;
 
@@ -1061,27 +1094,21 @@ $$;
 create or replace function pgpm._archive_step(p_parent regclass)
 returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_ncast text; r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
+  cfg pgpm.config; v_ncast text; r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.archive_fn is null then return 0; end if;
 
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_ncast := pgpm._native_type(cfg.control_kind);
 
   -- oldest first, matching retain()'s own convention -- archiving history in age order, though each
   -- child's progress is independent of the others' either way.
   for r in execute format(
-    'select p.child_name from pgpm.part p
-      where p.parent_table = %L::regclass and p.attached
-        and exists (
-          select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
-           where t.tgname = ''pgpm_write_block'' and c.relname = p.child_name and c.relnamespace = %L::regnamespace
-        )
-      order by p.lo::%s',
-    p_parent::text, v_nsp, v_ncast)
+    'select p.child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached order by p.lo::%s',
+    p_parent::text, v_ncast)
   loop
+    if not pgpm._is_write_blocked(p_parent, r.child_name) then continue; end if;
     if pgpm._archive_fully_covered(p_parent, r.child_name) then continue; end if;
 
     select * into v_range from pgpm._next_archive_chunk(p_parent, r.child_name);
@@ -2527,7 +2554,7 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   default_rows bigint, closed_rows bigint,
   default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
-  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_hook_failures bigint,
+  fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_drop_failures bigint,
   retain_backlog bigint
 )
 language plpgsql as $$
@@ -2536,7 +2563,7 @@ declare
   v_drows bigint; v_closed bigint; v_old text;
   v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
   v_fks_susp bigint; v_fks_unval bigint;
-  v_last_retain_id bigint; v_hook_fails bigint;
+  v_last_retain_id bigint; v_drop_fails bigint;
   v_retain_boundary text; v_retain_backlog bigint;
 begin
   for r in select * from pgpm.config loop
@@ -2566,16 +2593,20 @@ begin
            count(*) filter (where restored_at is not null and validated_at is null)
       into v_fks_susp, v_fks_unval
       from pgpm.dropped_fk where parent_table = r.parent_table;
-    -- retain_hook_failures: pre_drop hook failures logged AFTER the last successful drop, same
-    -- since-last-progress shape as drain_skips above -- a hook that starts succeeding again zeroes it.
+    -- retain_drop_failures: unexpected DROP failures (issue #238; previously pre_drop hook
+    -- failures, before pgpm.hook stopped being consulted here) logged AFTER the last successful
+    -- drop, same since-last-progress shape as drain_skips above. Archive coverage not yet complete
+    -- is NOT a failure and is never logged here -- it is the normal, expected reason retain_backlog
+    -- stays non-zero while chunked archiving catches up (see retain_backlog below).
     select max(id) into v_last_retain_id from pgpm.log
       where parent_table = r.parent_table and action = 'retain_drop';
-    select count(*) into v_hook_fails from pgpm.log
-      where parent_table = r.parent_table and action = 'retain_hook_fail'
+    select count(*) into v_drop_fails from pgpm.log
+      where parent_table = r.parent_table and action = 'retain_drop_fail'
         and id > coalesce(v_last_retain_id, 0);
     -- retain_backlog: eligible-but-undropped partitions (whole range at/below the retention horizon,
-    -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks -- it should fall
-    -- tick over tick; flat with retain_hook_failures climbing = wedged on a failing pre_drop hook.
+    -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks, or while
+    -- chunked archiving is still catching up on a write-blocked child -- it should fall tick over
+    -- tick; flat with retain_drop_failures climbing = wedged on an unexpected drop failure.
     v_retain_backlog := 0;
     v_retain_boundary := pgpm._retain_boundary(r);
     if v_retain_boundary is not null then
@@ -2589,7 +2620,7 @@ begin
     coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
     default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
     last_drained := v_last_drained; drain_skips := v_skips;
-    fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_hook_failures := v_hook_fails;
+    fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_drop_failures := v_drop_fails;
     retain_backlog := v_retain_backlog;
     return next;
   end loop;

@@ -32,6 +32,16 @@ select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regcla
 select archive.schedule();   -- one job, every configured table
 ```
 
+> **Known gap, as of `pgpm_core` issue #238:** `pgpm.retire()` no longer consults `pgpm.hook` at
+> all, so `archive.file_gate`'s drop-veto above -- and the `gate_only`/`self_driving` distinction
+> generally -- does not currently protect anything. Registering it is still harmless and still the
+> documented step (removing `pgpm.hook_register` outright would break this module before it has
+> anywhere else to plug in), but a drop can happen before the ledger has actually caught up. This is
+> deliberate, temporary collateral of `pgpm_core` landing its own write-block-and-archive-covered
+> drop precondition (`docs/retention-write-block-and-merge.md`, #242) ahead of migrating this module
+> onto it -- tracked as #239 (port `archive.to_s3`/`to_s3_parquet` onto the new `archive_fn`
+> contract) and #240 (retire the old apparatus this README describes).
+
 `archive.config`'s `vault_key_id`/`vault_secret` columns (defaults:
 `s3_archive_access_key_id`/`s3_archive_secret_access_key`) name the two
 [Vault](https://supabase.com/docs/guides/database/vault) secrets holding your S3 credentials --
