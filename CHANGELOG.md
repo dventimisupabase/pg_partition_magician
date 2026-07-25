@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+- **Port byte-budget chunked archiving and its ledger onto the `archive_fn` contract (#237).**
+  `pgpm_archive`'s `archive._next_range_byte_budget`/`archive.archive_range`/`archive.ledger`
+  (#213, #221) proved that archiving a large partition safely means chunking it instead of doing it
+  as one giant operation; this ports that mechanism, unchanged in intent, onto `pgpm.config.archive_fn`
+  (#236) and the write-block trigger (#235). New `pgpm.archive_ledger` (successor to
+  `archive.ledger`, same shape: `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`,
+  `rows_archived`, `archived_at` -- `s3_key`/`etag` stay null until a real transport strategy, #239,
+  has something to put there). New `pgpm._next_archive_chunk(p_parent, p_child)` picks the next
+  chunk within one already-write-blocked child's own `[lo, hi)` (the one real adaptation from the
+  original, which picked ranges across the whole table since nothing else gated eligibility yet --
+  here that gating is the write-block trigger's job). New `pgpm._archive_fully_covered(p_parent,
+  p_child)`: true once the ledger's ranges for that child reach its own `hi`, or the strategy is
+  `none` -- the intended `retire()` drop precondition once #238 wires it in, not consulted by
+  anything yet. New `pgpm._archive_step(p_parent)` -- one `maintain()` tick's worth: for every
+  attached child that **already has the write-block trigger installed** (checked directly against
+  `pg_trigger`, never re-derived from the boundary formula) and is not yet fully covered, picks its
+  next chunk, runs `pgpm._run_archive_strategy`, and records the result. `pgpm.maintain()` now runs
+  this right after write-blocking, ahead of `retain()`; its summary gains an `archived=N` field.
+  `archive.ledger`/`archive.archive_range`/`archive.tick` in `pgpm_archive` are completely untouched
+  and keep working exactly as before -- they are deleted only once this path replaces them (#240).
+  New `tests/63_archive_chunk_ledger_test.sql` (14 assertions): a multi-chunk partition archives
+  across several `maintain()` ticks with bounded per-tick progress; `_archive_fully_covered` flips
+  true only once the last chunk lands; resuming across ticks never duplicates or skips a range; a
+  child holding real data but not yet write-blocked is never touched even though `archive_fn` is set
+  for the whole table; a `none`-strategy table is immediately fully covered with nothing ever
+  ledgered. Caught and fixed one real bug along the way: `archive_ledger.hi` is `text`, so a plain
+  `max(hi)` compares lexicographically (`'91' > '1000'`) instead of numerically/temporally --
+  `_next_archive_chunk`/`_archive_fully_covered` now cast to the native type first, the same fix
+  `archive._file_watermark` already needed for the identical reason.
+
 - **Write-block a partition the instant it crosses the retention boundary (#235).** Chunked
   archiving can take several `maintain()` ticks to fully archive one large partition, and for the
   whole span between crossing `_retain_boundary()` and the last chunk landing, the partition sat
