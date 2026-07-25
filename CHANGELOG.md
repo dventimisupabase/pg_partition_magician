@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+- **`pgpm.config.archive_fn`: a pluggable archive strategy contract, the first step toward
+  replacing `pgpm.hook`'s `pre_drop` registry (#236).** `pgpm.hook` is generic (any event, any
+  number of hooks) but has only ever had one real use: archiving before a drop. `archive_fn` is a
+  nullable `regprocedure` column narrowing that to one archive strategy per managed table (`null` =
+  strategy `none`, immediately drop-ready) -- casting the reference validates the function exists
+  with exactly this signature at assignment time, not later when a maintenance tick tries to call
+  it, the same reasoning `hook_register`'s `p_hook` parameter already uses. The calling contract:
+  `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns pgpm.archive_result`
+  (`covered_hi text, rows_archived bigint`), expected to be **resumable** -- called once per tick,
+  making bounded incremental progress and reporting how much of `[p_lo, p_hi)` is now durably
+  archived, not finishing the whole range in one call. New `pgpm._run_archive_strategy` dispatches
+  to `config.archive_fn` (or synthesizes an immediate "already covered" result for the `none`
+  strategy); new `pgpm._archive_noop` is a trivial built-in strategy that exists only to exercise
+  real dispatch (an actual regprocedure call, not the null special case) in tests. Schema and
+  contract only: nothing yet calls `_run_archive_strategy` from `retire()`/`retain()`, and
+  `pgpm.hook` is completely untouched -- both continue to work exactly as before. New
+  `tests/62_archive_fn_contract_test.sql` (10 assertions). Positioned in #242
+  (`docs/retention-write-block-and-merge.md`), the next rung after #235's write-block trigger.
+
 - **`archive.configure`/`archive.unconfigure`/`archive.schedule`/`archive.unschedule`: a real
   operator interface for `pgpm_archive`, replacing raw SQL against `archive.config` and a bare
   `cron.schedule` call.** Normal operation should never need a hand-written `insert`/`update`

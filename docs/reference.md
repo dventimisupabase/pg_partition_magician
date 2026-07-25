@@ -550,6 +550,41 @@ pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure) retur
 
 Removes a hook registration.
 
+## Archive strategy contract
+
+`config.archive_fn` (issue #236) narrows `pgpm.hook`'s generic `pre_drop` registry to the one thing
+it has ever really been used for: one archive strategy per managed table. `null` (the default)
+means strategy `none` -- no archiving, a partition is immediately drop-ready. Set it directly:
+
+```sql
+update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;
+```
+
+Casting the reference to `regprocedure` validates that the function exists with exactly this
+signature right away, not later when a maintenance tick tries to call it -- the same reasoning
+`hook_register`'s `p_hook` parameter already uses.
+
+The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns
+pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint)`.
+`archive_fn` is expected to be **resumable**: called once per maintenance tick against the same
+child, making bounded incremental progress and reporting how much of `[p_lo, p_hi)` is now durably
+archived (`covered_hi`, which may be short of `p_hi`) and how many rows this one call archived
+(`rows_archived`, `null` when nothing was actually archived) -- not to archive the whole range in a
+single call. This is the contract the byte-budget chunked archiver and the real S3 upload functions
+implement (see `docs/retention-write-block-and-merge.md`, #242).
+
+`pgpm._run_archive_strategy(p_parent, p_child, p_lo, p_hi)` is the dispatch stub: it looks up
+`config.archive_fn` and calls it, or, for a `null` (`none`) strategy, returns `(p_hi, null)` directly
+-- the whole requested range is trivially "already covered" since there was never anything to
+protect against a drop. `pgpm._archive_noop` is a trivial built-in strategy (always reports the
+whole requested range archived immediately, having actually counted the rows in it) that exists only
+to exercise real dispatch in tests.
+
+This issue is schema and contract only: nothing yet calls `_run_archive_strategy` from
+`retire()`/`retain()`, and `pgpm.hook` is completely untouched -- both continue to work exactly as
+above. A written archive strategy is inert until a later issue wires the drop path to consult it.
+
 ## Scheduling
 
 ### `schedule`
@@ -841,6 +876,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `drain_ambient_floor` | `int` | minimum effective baseline (idle-box guard) |
 | `drain_ambient_baseline` / `drain_ambient_io_baseline` | `numeric` | learned EWMA baselines (lock waits, I/O latency) |
 | `drain_io_read_time` / `drain_io_blks_read` | `numeric` / `bigint` | previous cumulative `pg_stat_database` I/O sample |
+| `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 
 ### `pgpm.part`
 
@@ -924,5 +960,5 @@ excludes `_to_`).
 Functions named `pgpm._*` are private and may change without notice. The kind-specific logic lives in a
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
-`_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`)
-implements the engine. Do not call them directly.
+`_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`,
+`_run_archive_strategy`/`_archive_noop`) implements the engine. Do not call them directly.
