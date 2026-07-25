@@ -1,48 +1,51 @@
 # Archive partitions to S3 before retention drops them
 
-A complete, working `pre_drop` hook that copies a partition's rows to AWS S3 (or any S3-compatible
-store) before `retain()` drops it, and blocks the drop when the copy fails. This is a **worked example
-of a user-supplied hook**, not part of pg_partition_magician: copy it, edit the constants, and own it.
-The [guide](../../docs/guide.md#pre-drop-hooks) introduces the hook mechanism; `hook_register` in the
-[reference](../../docs/reference.md#hook_register) has the full contract.
+A complete, working function that copies a partition's rows to AWS S3 (or any S3-compatible store).
+This is the **synchronous archival strategy**: a plain function, called directly, that reads and
+uploads one partition in a single call -- no ledger, no automatic scheduling, and (since #240
+deleted `pgpm.hook` entirely) no drop-blocking of its own. Copy it, edit the constants, and own it,
+or install it as part of `pgpm_archive` (below) and call it yourself before dropping a partition
+another way.
 
-The function below was verified end-to-end, twice, driven by the real `retain()` path each time:
-against MinIO's full AWS Signature Version 4 enforcement (a 50,000-row partition archived and dropped;
-an endpoint outage blocking the drop with the failure logged and surfaced; the paced backlog draining
-to zero after recovery, empty partitions included), and against a live Supabase project archiving to
+If you want the drop itself gated on archiving actually having happened -- so a failed copy defers
+the drop automatically, with no discipline required of the caller -- that is a different, separate
+mechanism: `pgpm.config.archive_fn` (see [the guide](../../docs/guide.md#archiving-before-a-drop) and
+[the reference](../../docs/reference.md#archive-strategy-contract)). This module ships two
+`archive_fn`-conforming strategies, `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`, built
+on the exact same encode/upload steps this page describes; they ride `pgpm.maintain()`'s own
+byte-budget chunking and `retire()`'s write-block-and-archive-covered drop precondition automatically.
+The functions below are for a simpler case: you want to copy a partition to S3 yourself, on your own
+schedule or trigger, independent of pgpm's own drop timing.
+
+The function below was verified end-to-end, twice, driven by real HTTP calls each time: against
+MinIO's full AWS Signature Version 4 enforcement (a 50,000-row partition archived, then dropped via
+a separate `retire()` call; an endpoint outage causing the archive call itself to raise, surfaced to
+the caller directly), and against a live Supabase project archiving to
 [Supabase Storage's S3-compatible endpoint](https://supabase.com/docs/guides/storage/s3/authentication)
-(same lifecycle, plus a real S3 rejection: a PUT to a missing bucket came back HTTP 404 with the S3 XML
-error captured verbatim in the `retain_hook_fail` log, and the drop deferred). Storage's endpoint also
-carries a path prefix (`/storage/v1/s3`), which is why the path-style branch below splits the host and
-the URI prefix apart instead of assuming a bare host.
+(same shape, plus a real S3 rejection: a PUT to a missing bucket came back HTTP 404 with the S3 XML
+error raised verbatim). Storage's endpoint also carries a path prefix (`/storage/v1/s3`), which is why
+the path-style branch below splits the host and the URI prefix apart instead of assuming a bare host.
 
-> **As of #222, `archive.to_s3`/`archive.to_s3_parquet` also ship as part of an installable
-> module**: `pgpm_archive/install.sql`, reading connection settings (bucket/region/endpoint/prefix/
-> vault secret names) from a per-table `archive.config` row instead of the `c_`-prefixed constants
-> below. This page's worked-example framing, its SQL, and everything it verified are all unchanged
-> and kept below; see [Choosing an archival strategy's name
-> mapping](strategies-overview.md#installing-the-module) for the full picture (including
-> the paced-worker pages' renames), and this page's own ["Register and pace
-> it"](#register-and-pace-it) section for the module-based registration path.
+> **`archive.to_s3`/`archive.to_s3_parquet` also ship as part of an installable module**:
+> `pgpm_archive/install.sql`, reading connection settings (bucket/region/endpoint/prefix/vault secret
+> names) from a per-table `archive.config` row instead of the `c_`-prefixed constants below. This
+> page's worked-example framing, its SQL, and everything it verified are all unchanged and kept
+> below; see this page's own ["Run it yourself, ahead of the drop"](#run-it-yourself-ahead-of-the-drop)
+> section for the module-based call path.
 
 ## The moving parts
 
 - **The [`http` extension](https://github.com/pramsey/pgsql-http)** (on Supabase: `http`, "RESTful
-  Client") makes the PUT. It is synchronous libcurl in the calling backend, which is exactly what a
-  `pre_drop` hook needs: the real HTTP status comes back in the same call, so the hook can decide,
-  before the drop, whether the copy actually succeeded. `pg_net` cannot do this job, twice over: it
-  supports no PUT and only JSON bodies, and it is asynchronous by design (its background worker cannot
-  even see the queued request until the enqueuing transaction commits, which is after the drop already
-  happened).
+  Client") makes the PUT. It is synchronous libcurl in the calling backend, so the real HTTP status
+  comes back in the same call, before the caller does anything else with the partition. `pg_net`
+  cannot do this job, twice over: it supports no PUT and only JSON bodies, and it is asynchronous by
+  design (its background worker cannot even see the queued request until the enqueuing transaction
+  commits).
 - **`pgcrypto`** provides `digest`/`hmac` for AWS Signature Version 4, translated straight from the
   published recipe. No AWS SDK, no external worker.
 - **[Vault](https://supabase.com/docs/guides/database/vault)** holds the AWS credentials encrypted at
-  rest; the hook decrypts them only at call time. On vanilla Postgres without Vault, substitute your
-  own secrets mechanism for the two `vault.decrypted_secrets` lookups.
-- **`config.retain_batch = 1`** paces retention to one partition's hook + drop per maintenance tick.
-  The upload is synchronous inside `retain()`'s transaction, so the cap is what keeps a backlog of
-  aged-out partitions from turning one tick into one long transaction. See
-  [`retain`](../../docs/reference.md#retain).
+  rest; the function decrypts them only at call time. On vanilla Postgres without Vault, substitute
+  your own secrets mechanism for the two `vault.decrypted_secrets` lookups.
 
 ## Store the credentials
 
@@ -53,10 +56,9 @@ select vault.create_secret('AKIAIOSFODNN7EXAMPLE',                     's3_archi
 select vault.create_secret('wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 's3_archive_secret_access_key');
 ```
 
-The role that runs maintenance (on the pg_cron path, the job's owner) needs `select` on
-`vault.decrypted_secrets` for the hook to read them back.
+The role that calls this function needs `select` on `vault.decrypted_secrets` to read them back.
 
-## The hook function
+## The function
 
 Everything lives in a dedicated `archive` schema, not `public`: on Supabase, `public` is typically
 exposed through the Data API, which serves `public` functions as RPC (and PostgreSQL grants
@@ -69,7 +71,7 @@ create extension if not exists pgcrypto;
 create schema if not exists archive;
 
 -- Export the partition's rows to S3 as NDJSON, synchronously, and raise if the upload did not
--- succeed (so retain() keeps the partition and retries next tick).
+-- succeed (so the caller knows not to drop the partition yet).
 create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
@@ -96,7 +98,8 @@ begin
   end if;
 
   -- the partition's rows as newline-delimited JSON, ordered by the control column (round-trips any
-  -- column type; sidesteps CSV quoting). The child still exists: pre_drop runs before the DROP.
+  -- column type; sidesteps CSV quoting). Call this before dropping the partition another way --
+  -- the child still needs to exist when this runs.
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select control_column into v_control from pgpm.config where parent_table = p_parent;
   execute format('select coalesce(string_agg(row_to_json(t)::text, e''\n'' order by t.%I), '''') from %I.%I t',
@@ -149,7 +152,8 @@ begin
            http_header('authorization', v_auth) ],
     v_ctype, v_payload)::http_request);
 
-  -- a non-2xx means the copy is NOT safely in S3: raise, so retain() keeps the partition and retries
+  -- a non-2xx means the copy is NOT safely in S3: raise, so the caller knows this partition is not
+  -- archived and should not be dropped yet
   if v_resp.status not between 200 and 299 then
     raise exception 'archive.to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
   end if;
@@ -157,48 +161,40 @@ end;
 $$;
 ```
 
-A retried upload is naturally safe: a PUT to the same key overwrites, so a hook that succeeded on S3
+A retried upload is naturally safe: a PUT to the same key overwrites, so a call that succeeded on S3
 but failed to report (or a partition retried after a partial outage) never duplicates or corrupts the
 archive.
 
-## Register and pace it
+## Run it yourself, ahead of the drop
 
-Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`), call `archive.configure`
-instead of editing the constants above, then register:
-
-```sql
-select archive.configure('public.events', 'my-archive-bucket');
-
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
-update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
-```
-
-Or, register the hand-rolled function above directly -- same registration either way:
+Recommended: install `pgpm_archive/install.sql` (on top of `pgpm_core`) and set up one
+`archive.config` row for the table instead of editing the constants above:
 
 ```sql
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
-update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
+insert into archive.config (parent_table, bucket) values ('public.events'::regclass, 'my-archive-bucket');
 ```
 
-That is the whole installation. On the scheduled path (`pgpm.schedule()`), each maintenance tick now
-archives and drops at most one aged-out partition; a backlog paces across ticks,
-`status().retain_backlog` counting it down.
+Then, for each partition you want archived, call the function directly before dropping it -- there is
+no registration step and nothing here ties the call to `retire()`/`retain()` automatically:
+
+```sql
+select archive.to_s3('public.events'::regclass, 'events_p2024_01', '2024-01-01', '2024-02-01');
+select pgpm.retire('public.events'::regclass, 'events_p2024_01');   -- or however you drop it
+```
+
+That ordering discipline is entirely yours to keep: nothing prevents `retire()`/`retain()` from
+dropping a partition you haven't archived yet, since (unlike `config.archive_fn`, below) this
+function is not wired into any drop precondition. If you want the drop itself to wait until archiving
+has actually happened, use `config.archive_fn` instead (see the callout at the top of this page) --
+`retire()` will not drop a partition until whichever `archive_fn` strategy is configured reports it
+fully covered.
 
 ## When S3 is down
 
-The hook raises (curl's or S3's error, verbatim), and `retain()` does **not** drop that partition: the
-failure is logged (`retain_hook_fail`, with the error in `method`) and retried next tick. With
-`retain_batch = 1` the cap attempts oldest-first, so a failing head defers the whole backlog behind it;
-the signature to watch for is a **flat `retain_backlog` with climbing `retain_hook_failures`**:
-
-```sql
-select retain_backlog, retain_hook_failures from pgpm.status() where parent = 'public.events'::regclass;
-select method from pgpm.log where action = 'retain_hook_fail' order by id desc limit 1;
-```
-
-Once the outage clears, the next ticks drain the backlog one partition per tick, no intervention
-needed. See the runbook's
-[retention entry](../../docs/runbook.md#storage-is-not-dropping-despite-a-retention-policy).
+The function raises (curl's or S3's error, verbatim) and returns without doing anything else -- no
+partition is dropped as a side effect of calling it, so there is nothing here for a failure to leave
+in an inconsistent state. Handling the failure (retry, alert, skip this partition until next time) is
+entirely the caller's own script's job, not something this function or `retire()` coordinates for you.
 
 ## Honest limits
 
@@ -209,12 +205,13 @@ needed. See the runbook's
   this illustration, not a limit of the technique: the
   [multipart variant below](#when-one-put-is-not-enough-the-multipart-variant) streams a partition of
   any size in bounded memory.
-- **The upload runs inside `retain()`'s transaction.** That is what makes the failure guarantee work,
-  and it is why `retain_batch = 1` matters: without it, one call carries every aged-out partition's
-  upload back-to-back in one transaction.
+- **The upload runs inside whatever transaction the caller runs it in.** Nothing here opens or manages
+  a transaction of its own -- call it standalone (its own implicit transaction, the common case) or
+  as part of a larger script, and the vacuum-horizon hold lasts exactly as long as that transaction
+  does.
 - **Watch the timeout.** The `http` extension defaults to 5 seconds per request; the
-  `http_set_curlopt('CURLOPT_TIMEOUT_MS', ...)` above sizes it for a partition-scale upload. A hook
-  that times out just defers the drop to the next tick, like any other failure.
+  `http_set_curlopt('CURLOPT_TIMEOUT_MS', ...)` above sizes it for a partition-scale upload. A call
+  that times out raises like any other failure -- nothing here retries it for you.
 - **Object keys are not URL-encoded.** Child names are `[a-z0-9_]` so nothing needs encoding; if you
   change `c_prefix`, keep it to unreserved URL characters.
 - **On Supabase, extensions install into the `extensions` schema.** If `http_put`/`http` and
@@ -223,30 +220,30 @@ needed. See the runbook's
 - **Two Supabase ceilings, discovered during live verification.** Supabase Storage enforces the
   project's upload file size limit (**default 50MB**) on the S3 protocol too, per whole object,
   multipart included: an archive bigger than the limit fails with `HTTP 413` / `EntityTooLarge` (the
-  hook raises, the drop defers, loudly) until you raise the limit in the Dashboard under **Storage ->
-  Files -> Settings**. And `statement_timeout` is **2 minutes** there (a server configuration-file
-  setting, so it applies over the pooler and direct connections alike): the whole upload runs inside
-  one statement, so that is this hook's wall-clock ceiling on Supabase; override with a session
-  `set statement_timeout = ...` if a partition legitimately needs longer, or use the
-  [archive assistant](assistant.md), whose per-part statements each only need to fit one part in
-  the window.
+  function raises, loudly) until you raise the limit in the Dashboard under **Storage -> Files ->
+  Settings**. And `statement_timeout` is **2 minutes** there (a server configuration-file setting, so
+  it applies over the pooler and direct connections alike): the whole upload runs inside one
+  statement, so that is this function's wall-clock ceiling on Supabase; override with a session
+  `set statement_timeout = ...` if a partition legitimately needs longer, or use `config.archive_fn`'s
+  byte-budget chunking (see the callout at the top of this page), whose per-chunk calls each only
+  need to fit one chunk in the window.
 
 ## When one PUT is not enough: the multipart variant
 
-The single-PUT hook above holds the whole partition in one `text` value. This variant replaces it
-(same name, same signature, same registration) with one that holds **at most one part in memory**:
-it keyset-paginates the partition on the control column, ships each ~8MiB accumulation as an S3
-multipart part, and completes the upload at the end. Small and empty partitions short-circuit to the
-plain single PUT, so nothing gets slower at the low end. It splits into three functions -- a
-percent-encoder, one shared SigV4 signer (initiate, part, complete, and abort all sign the same way;
-the multipart requests just add a canonical query string), and the hook:
+The single-PUT function above holds the whole partition in one `text` value. This variant replaces it
+(same name, same signature) with one that holds **at most one part in memory**: it keyset-paginates
+the partition on the control column, ships each ~8MiB accumulation as an S3 multipart part, and
+completes the upload at the end. Small and empty partitions short-circuit to the plain single PUT, so
+nothing gets slower at the low end. It splits into three functions -- a percent-encoder, one shared
+SigV4 signer (initiate, part, complete, and abort all sign the same way; the multipart requests just
+add a canonical query string), and the archiver itself:
 
 ```sql
 create schema if not exists archive;
 
--- Multipart variant of the archive.to_s3 pre_drop hook: bounded memory for partitions of any size.
+-- Multipart variant of archive.to_s3: bounded memory for partitions of any size.
 -- Three pieces: a URL-encoder, one shared SigV4 request signer (every S3 call signs the same way),
--- and the hook, which streams the partition in part-sized chunks via keyset pagination.
+-- and the archiver, which streams the partition in part-sized chunks via keyset pagination.
 
 -- RFC 3986 percent-encoding of everything but the unreserved set, byte-wise (UTF-8), as SigV4 requires.
 create or replace function archive.s3_url_encode(p_raw text)
@@ -321,7 +318,7 @@ begin
 end;
 $$;
 
--- The hook. Small partitions (one part's worth or less) take a plain single PUT; bigger ones
+-- The archiver. Small partitions (one part's worth or less) take a plain single PUT; bigger ones
 -- stream through S3 multipart, holding at most one part in memory at a time.
 create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
@@ -441,45 +438,42 @@ $$;
 What changes, honestly:
 
 - **Memory is bounded; transaction duration is not.** Multipart fixes the 1GB `text` cap and the
-  memory ceiling, but the whole upload still runs inside `retain()`'s transaction, and a bigger
-  feasible partition means a longer-open snapshot (held vacuum horizon) while it uploads. S3's own
-  limits (10,000 parts) put the protocol ceiling around 80GB at this part size; the polite ceiling
-  is far lower and set by how long you are willing to hold a transaction open. To bound that hold
-  to one part's network time, entirely in-database, see the
-  [archive assistant](assistant.md) (a committing scanner procedure plus `pgpm.retire`); past
-  that, hand the work to an external worker with a real AWS SDK.
+  memory ceiling, but the whole upload still runs inside whichever transaction the caller runs it
+  in, and a bigger feasible partition means a longer-open snapshot (held vacuum horizon) while it
+  uploads. S3's own limits (10,000 parts) put the protocol ceiling around 80GB at this part size;
+  the polite ceiling is far lower and set by how long you are willing to hold a transaction open. To
+  bound that hold to a chosen chunk size instead, entirely in-database, use `config.archive_fn`'s
+  byte-budget chunking (see the callout at the top of this page); past that, hand the work to an
+  external worker with a real AWS SDK.
 - **A failed upload is aborted, not leaked.** An incomplete multipart upload is invisible in
-  listings but accrues storage. On any failure after initiation, the hook's exception handler sends
-  `AbortMultipartUpload` before re-raising (so `retain()` still keeps the partition and retries).
-  Belt and braces: also set a bucket lifecycle rule (`AbortIncompleteMultipartUpload`) for the day
-  even the abort cannot reach S3.
+  listings but accrues storage. On any failure after initiation, the exception handler sends
+  `AbortMultipartUpload` before re-raising. Belt and braces: also set a bucket lifecycle rule
+  (`AbortIncompleteMultipartUpload`) for the day even the abort cannot reach S3.
 - **The retry is still naturally safe.** Each retry is a fresh multipart upload under the same key;
   completion is atomic on S3's side, so a reader of the bucket never sees a half-written object.
 - **`CompleteMultipartUpload` can fail inside an HTTP 200.** S3's one famous quirk: the complete
-  call can return status 200 with an `<Error>` XML body, so the hook checks both.
+  call can return status 200 with an `<Error>` XML body, so the function checks both.
 
-This exact variant (constants aside) was verified through the real `retain()` path against both
-MinIO and a live Supabase project archiving to Supabase Storage's S3-compatible endpoint, same
-scenario on each: ~26MiB partitions archived as 3-part multipart uploads (ETags carrying the `-3`
-part count) with every row account-checked across part boundaries (150,000 contiguous ids per
-object, no lost or doubled line at any seam); an empty partition taking the single-PUT fast path
-(bare-MD5 ETag); a simulated network failure during part 2 blocking the drop, with the abort
-confirmed on the store (`ListMultipartUploads` showing zero incomplete uploads left behind); and
-the retried partition re-archiving completely on the next tick. The two stores returned
-**identical composite ETags** for the same partitions: the part boundaries are deterministic, so
-the per-part MD5s match wherever the object lands.
+This exact variant (constants aside) was verified against both MinIO and a live Supabase project
+archiving to Supabase Storage's S3-compatible endpoint, same scenario on each: ~26MiB partitions
+archived as 3-part multipart uploads (ETags carrying the `-3` part count) with every row
+account-checked across part boundaries (150,000 contiguous ids per object, no lost or doubled line
+at any seam); an empty partition taking the single-PUT fast path (bare-MD5 ETag); a simulated
+network failure during part 2 raising with the abort confirmed on the store (`ListMultipartUploads`
+showing zero incomplete uploads left behind); and the retried partition re-archiving completely on
+the next call. The two stores returned **identical composite ETags** for the same partitions: the
+part boundaries are deterministic, so the per-part MD5s match wherever the object lands.
 
 ## A columnar variant: Parquet instead of NDJSON
 
-Both hooks above write NDJSON. A Parquet archive is directly queryable by DuckDB, Athena,
+Both functions above write NDJSON. A Parquet archive is directly queryable by DuckDB, Athena,
 Redshift Spectrum, Spark, Trino, and Snowflake with no separate conversion step -- but on
 Supabase there is currently no in-database extension that emits it (pg_parquet is no longer
 available there; pg_duckdb, pg_lake, and pg_mooncake never were). This variant closes that gap
 without any extension: it hand-rolls a Parquet file, Thrift compact-protocol footer and all, in
-the same PL/pgSQL-plus-`pgcrypto`-plus-`http` toolbox as the hooks above. See
+the same PL/pgSQL-plus-`pgcrypto`-plus-`http` toolbox as the functions above. See
 [pg_partition_magician#199](https://github.com/dventimisupabase/pg_partition_magician/issues/199)
-for the fuller design discussion; this is that issue's "minimal-viable Parquet" rung, wired into
-a real `pre_drop` hook.
+for the fuller design discussion; this is that issue's "minimal-viable Parquet" rung.
 
 **Scope, deliberately narrow.** One row group, one uncompressed PLAIN-encoded data page per
 column, and six types: `int4`, `int8`, `float8`, `boolean`, `text` (UTF8), and
@@ -496,17 +490,19 @@ since both are just called "varint"). Iceberg is
 out of scope: it needs a second binary format (Avro, for manifests) plus a catalog commit
 protocol, neither of which reduces to a single PL/pgSQL function the way a flat Parquet file does.
 
-**This holds the vacuum horizon like the hooks above, not like the archive assistant.** The
+**This holds the vacuum horizon like the functions above, not like a chunked strategy.** The
 encoder reads every column of a partition via `array_agg(col order by ctid)`, with no `COMMIT` in
 between -- each column's array has to come from the same snapshot as every other column's, or a
 concurrent write between two column reads could misalign rows across columns. That means one
-in-memory value, one upload, exactly the shape (and the same ceiling) as the single-PUT hook at
-the top of this page: no attempt is made here to preserve the
-[archive assistant](assistant.md)'s per-part-committing, bounded-horizon-hold design --
-Parquet's footer needs every row group's byte offsets, known only once its data is built, so a
-streaming, row-group-per-slice writer that commits between slices would be a materially bigger
-rewrite than reusing the assistant's existing pattern. Consider this the Parquet analogue of
-`archive.to_s3`, not of `archive.partition`.
+in-memory value, one upload, exactly the shape (and the same ceiling) as the single-PUT function at
+the top of this page: no attempt is made here to bound the hold by chunking. Parquet's footer needs
+every row group's byte offsets, known only once its data is built, so a streaming,
+row-group-per-slice writer that commits between slices would be a materially bigger rewrite; see
+[Chunked, cross-partition Parquet archival](chunked-parquet.md) for the strategy that does bound the
+hold, by choosing file boundaries independent of partition boundaries entirely rather than trying to
+commit partway through one Parquet file. Consider this page's function the Parquet analogue of
+`archive.to_s3`, not of `pgpm.archive_to_s3_parquet` (the `archive_fn` strategy built on the same
+encoder, see the callout at the top of this page).
 
 **A binary payload needs one new piece: a bytea-native request signer.** `archive.s3_signed_request`
 above hashes its payload via `digest(convert_to(p_payload, 'UTF8'), 'sha256')`, which requires the
@@ -521,7 +517,7 @@ through it and fetched back from MinIO came back byte-for-byte identical, both b
 adding SigV4 signing to the request.
 
 ```sql
-create schema if not exists archive;   -- if not already created for the hooks above
+create schema if not exists archive;   -- if not already created for the functions above
 
 -- ---------------------------------------------------------------------------
 -- Byte-level primitives
@@ -1104,8 +1100,7 @@ $$;
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
 -- heap (where ctid is no longer comparable): docs/chunked-parquet.md's Parquet range
--- reader and docs/assistant.md's NDJSON-with-commits range reader (#221) both call this.
--- Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
+-- reader calls this too. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
 -- contract regrain() already enforces, an inherited limitation, not a new gap. (On a partitioned
@@ -1310,7 +1305,7 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- Transport: a bytea-native SigV4 signer, and the pre_drop hook
+-- Transport: a bytea-native SigV4 signer, and the archiver itself
 -- ---------------------------------------------------------------------------
 -- Why a separate signer from archive.s3_signed_request (to-s3.md's multipart
 -- variant): that one hashes the payload via digest(convert_to(p_payload, 'UTF8'), 'sha256'),
@@ -1377,16 +1372,16 @@ begin
 end;
 $$;
 
--- The hook: single PUT, same shape and ceiling as archive.to_s3's basic (non-multipart)
+-- The archiver: single PUT, same shape and ceiling as archive.to_s3's basic (non-multipart)
 -- variant -- one in-memory value, one call sends it. That is a deliberate, honest match, not
 -- a shortcut: archive._pq_to_parquet reads every column via array_agg() with no COMMIT in
 -- between (each column's array must come from the same snapshot as every other column's, or
 -- concurrent writes between column reads could misalign rows across columns), so this holds
--- the vacuum horizon for the whole read+upload -- like the synchronous hook, not like the
--- per-part-committing archive assistant (assistant.md). A streaming, row-group-per-slice
--- writer that preserves the assistant's bounded-horizon commit pattern is a bigger rewrite
--- (Parquet's footer needs every row group's byte offsets, known only once its data is built)
--- and is not attempted here; see the honest-limits note below.
+-- the vacuum horizon for the whole read+upload -- like the synchronous NDJSON function, not
+-- like a chunked, byte-budget-bounded strategy. A streaming, row-group-per-slice writer that
+-- commits between slices is a bigger rewrite (Parquet's footer needs every row group's byte
+-- offsets, known only once its data is built) and is not attempted here; see the honest-limits
+-- note below, and chunked-parquet.md for the strategy that does bound the hold.
 create or replace function archive.to_s3_parquet(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
@@ -1418,39 +1413,40 @@ end;
 $$;
 ```
 
-## Register the Parquet hook
+## Call it directly, before dropping the partition
 
-Same shape as the hooks above; only the function name changes (and, on `pgpm_archive`, the same
-`archive.config` row already covers this hook too -- no separate configuration needed):
+Same shape as the NDJSON function above: no registration, no automatic tie to `retire()`/`retain()`.
+Archive first, then drop, in your own script:
 
 ```sql
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3_parquet(regclass,name,text,text)');
-update pgpm.config set retain_batch = 1 where parent_table = 'public.events'::regclass;
+select archive.to_s3_parquet('public.events'::regclass, 'events_p2024_01', '2024-01-01', '2024-02-01');
+select pgpm.retire('public.events'::regclass, 'events_p2024_01');
 ```
 
-## Verified end-to-end, through the real `retire()` path
+## Verified end-to-end
 
-Driven against a live `http`-extension Postgres instance and MinIO, through `pgpm.retire()` (the
-same sanctioned drop path `retain()` uses), not a standalone call to the encoder:
+Driven against a live `http`-extension Postgres instance and MinIO:
 
-- **Happy path**: a real partition (`transmute`d, `obtain`ed, 50 real rows) archived and dropped in
-  one `retire()` call. The object fetched back from MinIO and read by both pyarrow and DuckDB
-  (two independent Parquet implementations, agreeing) matched the source rows exactly -- same ids,
-  same payloads, same order.
-- **Backstop veto**: pointing the hook at a broken endpoint made `retire()` return `false` and
-  leave the partition and its row in place, with `retain_hook_fail` logging the real S3 error
-  verbatim (`HTTP 404`, `NoSuchBucket`) -- the same failure contract as `archive.to_s3` above.
-- **Self-repair**: restoring the working endpoint and calling `retire()` again on the same
-  partition archived and dropped it cleanly, no intervention beyond fixing the endpoint.
+- **Happy path**: a real partition (`transmute`d, `obtain`ed, 50 real rows) archived by a direct call,
+  then dropped by a separate `pgpm.retain()` call. The object fetched back from MinIO and read by
+  both pyarrow and DuckDB (two independent Parquet implementations, agreeing) matched the source rows
+  exactly -- same ids, same payloads, same order.
+- **A real failure surfaces immediately**: pointing the function at a broken endpoint raised the real
+  S3 error verbatim (`HTTP 404`, `NoSuchBucket`) -- the same failure contract as `archive.to_s3`
+  above -- with the partition left untouched, since nothing had dropped it yet.
+- **Self-repair**: restoring the working endpoint and calling the function again on the same
+  partition archived it cleanly, no intervention beyond fixing the endpoint.
 - **GZIP on, through the same real path**: a second partition (3,000 rows, all six types
-  including a nullable column), archived and dropped in one `retire()` call with `c_compress :=
-  true`. Every column's page in the fetched object carried Thrift `codec = GZIP`; pyarrow and
-  DuckDB (agreeing) decompressed and matched the source rows exactly, same as the uncompressed
-  pass above.
+  including a nullable column), archived with `c_compress := true`. Every column's page in the
+  fetched object carried Thrift `codec = GZIP`; pyarrow and DuckDB (agreeing) decompressed and
+  matched the source rows exactly, same as the uncompressed pass above.
+
+See `tests/archive/db/04_parquet_and_sync_archive_test.sql` for this exact shape (direct call, then a
+separate drop) exercised as part of this project's own CI.
 
 ## Honest limits, for the Parquet variant
 
-- **Same ceiling as the single-PUT hook, not the multipart one.** The payload is one in-memory
+- **Same ceiling as the single-PUT function, not the multipart one.** The payload is one in-memory
   `bytea` (Postgres's ~1GB cap, same practical ceiling as the `text` variant above); nothing here
   streams. Chunking the *already-built* Parquet `bytea` into fixed-size byte ranges for a
   multipart upload is mechanically straightforward (S3 multipart just concatenates bytes; it does
@@ -1472,7 +1468,7 @@ same sanctioned drop path `retain()` uses), not a standalone call to the encoder
   output would be. This is the minimal-viable rung, not the ambitious one; see #199 for
   pg_parquet/Iceberg as the extension-dependent alternative if that tradeoff matters more than the
   zero-dependency property does.
-- **This hook's horizon-hold is bounded by partition size, which is emergent, not by a chosen
+- **This function's horizon-hold is bounded by partition size, which is emergent, not by a chosen
   file size.** If partitions grow large enough (or unevenly enough) that this matters, see
   [Chunked, cross-partition Parquet archival](chunked-parquet.md), which decouples
   Parquet file boundaries from partition boundaries entirely so the hold is bounded by a target

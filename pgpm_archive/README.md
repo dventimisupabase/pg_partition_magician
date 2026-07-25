@@ -6,9 +6,11 @@ store) before `pgpm.retain()` drops them.
 ## Why this lives apart from `pg_partition_magician` core
 
 The [root project](../README.md) manages a partition's *lifecycle* -- when it's created, when it's
-retired. What happens to a partition's data on its way out is a separate concern, and this add-on
-answers it: nothing here is required for ordinary partitioning, and `pgpm_core` has zero dependency
-on this schema.
+retired. What happens to a partition's data on its way out is a separate concern: this add-on
+supplies the transport (S3 signing, encoding, credentials), while `pgpm_core` itself owns the
+drop precondition (write-blocked and archive-covered) that makes archiving-before-drop safe.
+Nothing here is required for ordinary partitioning, and `pgpm_core` has zero dependency on this
+schema.
 
 ## Install
 
@@ -19,33 +21,25 @@ psql "$DATABASE_URL" -f pgpm_core/install.sql
 psql "$DATABASE_URL" -f pgpm_archive/install.sql
 ```
 
-Then configure the table, register the gate hook, and schedule the standing job:
+Then configure the table's connection settings and set its archive strategy:
 
 ```sql
-select archive.configure('public.events', 'my-archive-bucket',
-  p_region        => 'us-east-1',
-  p_boundary_rule => 'partition_aligned',   -- or 'byte_budget'
-  p_drop_trigger  => 'self_driving',        -- or 'gate_only'
-  p_format        => 'ndjson_commits');     -- or 'ndjson_single' / 'parquet'
+insert into archive.config (parent_table, bucket, region) values
+  ('public.events'::regclass, 'my-archive-bucket', 'us-east-1');
 
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.file_gate(regclass,name,text,text)');
-select archive.schedule();   -- one job, every configured table
+update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;   -- or pgpm.archive_to_s3_parquet
 ```
 
-> **Known gap, as of `pgpm_core` issue #238:** `pgpm.retire()` no longer consults `pgpm.hook` at
-> all, so `archive.file_gate`'s drop-veto above -- and the `gate_only`/`self_driving` distinction
-> generally -- does not currently protect anything. Registering it is still harmless and still the
-> documented step (removing `pgpm.hook_register` outright would break this module before it has
-> anywhere else to plug in), but a drop can happen before the ledger has actually caught up. This is
-> deliberate, temporary collateral of `pgpm_core` landing its own write-block-and-archive-covered
-> drop precondition (`docs/retention-write-block-and-merge.md`, #242) ahead of migrating this module
-> onto it -- tracked as #239 (port `archive.to_s3`/`to_s3_parquet` onto the new `archive_fn`
-> contract) and #240 (retire the old apparatus this README describes).
+That is the whole installation: no gate to register, no separate schedule. `pgpm.maintain()` (on
+the pg_cron path, `pgpm.maintain_all()`) archives each eligible child in bounded, byte-budget-sized
+chunks on its own schedule, and `pgpm.retire()` will not drop a partition until archiving has
+actually caught up with it (`docs/retention-write-block-and-merge.md`, #242, in the root project).
 
 `archive.config`'s `vault_key_id`/`vault_secret` columns (defaults:
 `s3_archive_access_key_id`/`s3_archive_secret_access_key`) name the two
 [Vault](https://supabase.com/docs/guides/database/vault) secrets holding your S3 credentials --
-create those once, as a privileged role, before the first `archive.tick()`:
+create those once, as a privileged role, before the first archive attempt:
 
 ```sql
 select vault.create_secret('AKIAIOSFODNN7EXAMPLE',                     's3_archive_access_key_id');
@@ -54,28 +48,25 @@ select vault.create_secret('wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 's3_archi
 
 ## Two architectures, and how to pick
 
-- **The synchronous hook** (`archive.to_s3` / `archive.to_s3_parquet`): archives a partition
-  inline, inside `retain()`'s own drop transaction. Simplest mental model; holds the vacuum
-  horizon for the whole read-and-upload.
-- **The paced worker** (everything else -- `archive.tick()`/`archive.run_all()`): an
-  independently-paced procedure that archives ahead of any drop, records what it's archived in a
-  ledger, and commits between chunks of work to bound the vacuum-horizon hold. Two independent
-  knobs (`boundary_rule`: partition-aligned or byte-budget-aligned; `drop_trigger`: who actually
-  calls `retire()`) plus a format/compression choice on top.
+- **`config.archive_fn`** (`pgpm.archive_to_s3_ndjson` / `pgpm.archive_to_s3_parquet`): the normal
+  way to use this module. `pgpm.maintain()` drives byte-budget-sized chunks automatically, ahead of
+  every drop, ledgered in `pgpm.archive_ledger`; `retire()`'s own drop precondition waits for full
+  coverage. No registration, no schedule, no gate to wire up yourself.
+- **The synchronous functions** (`archive.to_s3` / `archive.to_s3_parquet`): called directly, by
+  you, whenever you decide to archive a partition -- no ledger, no automatic scheduling, and
+  nothing tying the call to a drop. Simplest mental model; holds the vacuum horizon for the whole
+  read-and-upload, and the archive-then-drop ordering is entirely your own script's discipline to
+  keep.
 
 Read **[`docs/strategies-overview.md`](docs/strategies-overview.md) first** -- it's the map across
-all of this and the fastest way to land on a configuration. Then, whichever architecture fits:
+both and the fastest way to land on a configuration. Then, whichever fits:
 
-- **[`docs/to-s3.md`](docs/to-s3.md)**: the synchronous hook, worked end-to-end (SigV4 signing,
-  Vault credentials, the multipart variant for larger partitions, a Parquet variant).
-- **[`docs/assistant.md`](docs/assistant.md)**: the paced worker's partition-aligned rule --
-  bounded vacuum-horizon holds via per-part commits, assistant-owned drops via `pgpm.retire`.
-- **[`docs/chunked-parquet.md`](docs/chunked-parquet.md)**: the paced worker's byte-budget-aligned
-  rule -- decouples file size from partition size entirely, so the horizon-hold bound is a
-  deliberate choice instead of an emergent one.
-
-Each page keeps its own hand-rolled SQL and verified names alongside the module's -- see
-`docs/strategies-overview.md`'s name-mapping table if you're cross-referencing both.
+- **[`docs/to-s3.md`](docs/to-s3.md)**: the synchronous functions, worked end-to-end (SigV4
+  signing, Vault credentials, the multipart variant for larger partitions, a Parquet variant).
+- **[`docs/chunked-parquet.md`](docs/chunked-parquet.md)**: the byte-budget strategy behind
+  `config.archive_fn` -- decouples file size from partition size entirely, so the horizon-hold
+  bound is a deliberate choice instead of an emergent one, and the Parquet range encoder both
+  paths share.
 
 ## Testing
 
@@ -84,5 +75,5 @@ Each page keeps its own hand-rolled SQL and verified names alongside the module'
 ```
 
 Brings up a MinIO service and a `pgsql-http`-enabled PostgreSQL 17 image (see the root
-[`ONBOARDING.md`](../ONBOARDING.md) for the full harness), and runs `tests/archive/db/*.sql`
-against it, one disposable database per file.
+[`ONBOARDING.md`](../ONBOARDING.md) for the full harness) and runs `tests/archive/db/*.sql`
+against it.

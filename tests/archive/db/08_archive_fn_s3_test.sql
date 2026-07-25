@@ -15,6 +15,7 @@
 -- retain_batch is forced to 0 on both fixtures so pgpm.maintain()'s own pgpm.retain() call never
 -- drops what this test wants to keep inspecting via pgpm.part/_archive_fully_covered afterward --
 -- this test is about the archive_fn adapter, not retire()'s drop precondition (tests/64 covers that).
+begin;
 select plan(10);
 
 -- --- Part A: pgpm.archive_to_s3_ndjson -------------------------------------------------
@@ -111,4 +112,4 @@ select ok(
   'the monolith is fully covered after the single tick (parquet)');
 
 select * from finish();
--- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).
+rollback;

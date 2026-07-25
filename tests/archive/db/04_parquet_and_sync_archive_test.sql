@@ -6,6 +6,7 @@
 -- itself raises on any HTTP failure), then both drop normally via pgpm.retain() -- archive_fn stays
 -- unset for this table, so the drop precondition never depended on this function having been
 -- called; archiving first is purely the operator's own manual discipline, same as always.
+begin;
 select plan(3);
 
 select mk_archive_table('a4', 60, 10, 20, p_paused => false);   -- monolith [0, 70), premakes 4 ahead
@@ -30,4 +31,4 @@ select is(pgpm.retain('public.a4'), 2,
   'both partitions drop normally afterward -- archiving first is the operator''s own manual step, not tied to the drop precondition');
 
 select * from finish();
--- no teardown: the harness runs each db/ test in a throwaway database (disposable-db).
+rollback;
