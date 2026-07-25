@@ -2,6 +2,87 @@
 
 ## [Unreleased]
 
+- **Docs/CI: describe the retention/archiving merge as it now actually works; breaking change
+  (#241).** Closes out the stack #242-#240 built: `pgpm.hook` and `pgpm_archive`'s old paced-worker
+  scanning apparatus (`archive.tick`/`file_gate`/`configure`/`schedule` and friends) are gone, and
+  archiving is configured per table via `pgpm.config.archive_fn` -- a partition only drops once it
+  is write-blocked and, if `archive_fn` is set, fully archived. **Breaking**: any table that relied
+  on `pgpm.hook_register`/`archive.configure`/`archive.schedule` for archiving-before-drop needs to
+  set `config.archive_fn` instead; there is no migration shim (pre-1.0, no live installs, #217's
+  precedent).
+
+  - `pgpm_archive/docs/assistant.md` (the partition-aligned, `archive.tick`/`file_gate`-driven paced
+    worker) is deleted outright, not banner-and-keep: every function it documented is gone with no
+    successor (the `archive_fn` contract only ported the byte-budget rule, #237, never the
+    partition-aligned one), so there is nothing left for it to point at.
+  - `pgpm_archive/docs/chunked-parquet.md` and `docs/strategies-overview.md` are rewritten to
+    describe the current, much smaller design space: `config.archive_fn`'s built-in byte-budget
+    strategy (automatic, drop-gated) versus the synchronous `archive.to_s3`/`archive.to_s3_parquet`
+    functions (manual, no automatic tie to a drop). The old "two knobs, four configurations" table
+    (boundary rule x drop-trigger rule) and the module name-mapping table are both gone -- there is
+    only one built-in strategy now, and its names never diverged from the module's own.
+  - `pgpm_archive/docs/to-s3.md` and `pgpm_archive/README.md` drop every `pgpm.hook_register`/
+    `archive.configure`/`archive.schedule` reference; the synchronous functions are reframed
+    honestly as **not** gating a drop on their own (a real behavior change from the old
+    hook-based design, where a failed copy blocked the drop automatically) -- `config.archive_fn`
+    is now the path for that guarantee.
+  - `docs/guide.md`'s "Pre-drop hooks" section is replaced with "Archiving before a drop", describing
+    `config.archive_fn` directly; `docs/runbook.md` and `ONBOARDING.md` had their own stale
+    `retain_hook_failures`/`archive.config` shape references fixed to match #238's renames and
+    #240's column drops.
+  - `test.sh`'s `archive` track no longer provisions a disposable database per test file: nothing
+    in `tests/archive/db/*.sql` commits internally anymore (the old paced worker's internal commits
+    were the only reason it needed to), so it now installs once and runs every file via `pg_prove`
+    against one shared database, each wrapped in its own `BEGIN`/`ROLLBACK` -- the same pattern the
+    default channel matrix already uses. `tests/archive/db/04_parquet_and_sync_hook_test.sql` is
+    renamed to `04_parquet_and_sync_archive_test.sql` ("hook" no longer being the right word for a
+    plain function call).
+  - Backfills the `CHANGELOG.md` entries #239 and #240 should have landed with (below), which this
+    issue's own audit found missing.
+
+- **Port `archive.to_s3`/`archive.to_s3_parquet` onto the `archive_fn` contract (#239).**
+  `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet` (in the `pgpm` schema, defined in the
+  optional `pgpm_archive/install.sql`) adapt the existing synchronous functions' transport onto
+  `pgpm.config.archive_fn`'s calling contract, so a table can ride `pgpm.maintain()`'s own
+  byte-budget chunking (#237) instead of a separate schedule. Both delegate to the exact same
+  encode/upload steps the synchronous functions already use
+  (`archive._encode_upload_ndjson_single`/`archive._encode_upload_parquet`) and read connection
+  settings from the same `archive.config` row, so there is no second, independently configured
+  surface. `archive._encode_upload_ndjson_commits` (the third format, with internal `COMMIT`s) has
+  no `archive_fn` counterpart and cannot: `archive_fn` is a plain function, and PL/pgSQL forbids
+  transaction control inside one regardless of call context -- it does not need one anyway, since
+  `pgpm._next_archive_chunk` already bounds every call to `config.archive_byte_budget` before
+  `archive_fn` ever runs. Widens `pgpm.archive_result` (`covered_hi`, `rows_archived`) to also carry
+  `s3_key`/`etag`, threaded through `pgpm._archive_step`'s ledger insert -- closing the gap #237's
+  own comment flagged ("`s3_key`/`etag` stay null until a real strategy has something to put
+  there"). New `tests/archive/db/08_archive_fn_s3_test.sql` (10 assertions, against real MinIO):
+  both strategies dispatch via `config.archive_fn`, chunk via `pgpm.maintain()`, ledger every chunk
+  with a non-null `s3_key`/`etag`, and the uploaded NDJSON object round-trips exactly through a
+  direct MinIO fetch.
+
+- **Delete the old paced worker and `pgpm.hook` entirely (#240).** Cutover: everything the old
+  paced/`self_driving` apparatus existed to do -- pick ranges, record a ledger, gate a drop on a
+  recount, drive the drop itself on a schedule -- is now done by the unified `archive_fn` path
+  (#235-#239). Deletion only, no new behavior. Deleted from `pgpm_archive/install.sql`:
+  `archive.tick`, `_tick_one`, `_next_range_partition_aligned`, `_next_range_byte_budget`,
+  `_retire_covered`, `file_gate`, `_file_watermark`, `archive_range`, `archive_partition`,
+  `run_all`, the `archive.ledger` table, and the `archive.configure`/`unconfigure`/`schedule`/
+  `unschedule` operator interface (#233), along with the `pgpm-archiver` pg_cron job they
+  registered. `archive.config`'s `boundary_rule`/`drop_trigger`/`format`/`byte_budget`/
+  `probe_sample` columns are dropped (`ALTER TABLE ... DROP COLUMN IF EXISTS`, upgrade-safe);
+  `part_bytes`/`fetch_rows` stay, still used by `archive.to_s3`'s own multipart chunking. Deleted
+  `pgpm.hook`/`hook_register`/`hook_unregister` from `pgpm_core` entirely: `retire()` stopped
+  consulting it in #238, and #239 gave `archive.file_gate` -- its last real registrant -- a
+  replacement on the `archive_fn` contract, so nothing depended on it anymore. `archive.to_s3`/
+  `archive.to_s3_parquet` (the synchronous functions) and `pgpm.archive_to_s3_ndjson`/
+  `archive_to_s3_parquet` (the `archive_fn` strategies, #239) are untouched and keep working
+  exactly as before. Deleted `tests/58` (`pgpm.hook` mechanics, the registry it tested no longer
+  exists) and `tests/archive/db/01/02/03/05/06/07` (each tested exactly the deleted
+  paced-worker/operator-interface/hook surface); rewrote `tests/archive/db/04` to call
+  `archive.to_s3_parquet` directly with no hook registration; stripped the now-impossible
+  `pgpm.hook` assertions from `tests/62` and fixed dangling `tests/58` cross-references in
+  `tests/59`/`60`/`64`/`63`.
+
 - **`pgpm.retire()`: drop only once write-blocked and archive-covered; `pgpm.hook` no longer
   consulted (#238).** With write-blocking (#235) and ledger-driven archive coverage (#237) both in
   place, `retire()`'s drop precondition becomes fully internal: past the retention boundary (as

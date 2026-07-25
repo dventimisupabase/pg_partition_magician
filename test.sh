@@ -27,12 +27,13 @@
 #
 # The `archive` track is also separate: it installs the OPTIONAL pgpm_archive module on top of the
 # core and exercises it against a real MinIO container standing in for S3 (tests/archive/). Its own
-# image (pgpm_test:17-archive) adds pgsql-http on top of the stock pg17 image. Like `timescale`
-# (and unlike `observe`), each tests/archive/db/*.sql runs against a fresh throwaway database --
-# historically because the old paced worker's archive.tick()/archive._encode_upload_ndjson_commits
-# committed internally as part of normal operation, which a BEGIN/ROLLBACK-wrapped test would not
-# actually undo. That apparatus is gone (issue #240; nothing left in this track commits
-# internally), but the harness itself is unchanged for now -- updating it to match is #241's job.
+# image (pgpm_test:17-archive) adds pgsql-http on top of the stock pg17 image. Unlike `timescale`,
+# it installs once and runs every tests/archive/db/*.sql via pg_prove against one shared database,
+# each file wrapped in its own BEGIN/ROLLBACK -- the same pattern the default matrix uses. This used
+# to need a disposable database per file, because the old paced worker's
+# archive.tick()/archive._encode_upload_ndjson_commits committed internally as part of normal
+# operation, which a rolled-back transaction would not undo. That apparatus is gone (issue #240);
+# nothing left in this track commits internally, so a shared database is safe.
 # It is a standalone, path-filtered CI workflow (like `observe`'s), not wired into the default Test
 # Suite or the release gate.
 set -euo pipefail
@@ -257,13 +258,14 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
 }
 
 # The pgpm_archive track: PG17 + pgsql-http against a real MinIO container standing in for S3.
-# Each tests/archive/db/*.sql runs against a fresh throwaway database (disposable-db, like
-# timescale, unlike observe) -- see the comment at this file's top for why (historical, #240
-# deleted the internally-committing apparatus that made it necessary). MinIO has no docker-compose
-# service of its own for the `mc` client, so bucket setup runs as a one-off `docker run` against the
-# network name pinned in docker-compose.yml (pgpm_test_net) rather than a compose-managed service.
+# Installs once into the `postgres` database and runs every tests/archive/db/*.sql via pg_prove,
+# each file wrapped in its own BEGIN/ROLLBACK -- the same shared-database pattern the default
+# matrix uses, not a disposable database per file (that was only ever needed for the old paced
+# worker's internal commits, gone since #240). MinIO has no docker-compose service of its own for
+# the `mc` client, so bucket setup runs as a one-off `docker run` against the network name pinned
+# in docker-compose.yml (pgpm_test_net) rather than a compose-managed service.
 run_archive() {
-  local prof="archive" svc="archive" fail=0 f db out
+  local prof="archive" svc="archive" fail=0
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
   local net="pgpm_test_net"
   echo; echo "========================================="
@@ -283,24 +285,13 @@ run_archive() {
   docker run --rm --network "$net" --entrypoint sh minio/mc -c \
     "mc alias set local http://minio:9000 minioadmin minioadmin && mc mb -p local/archive-test-bucket" >/dev/null
 
-  for f in tests/archive/db/*.sql; do
-    db="t_$(basename "$f" .sql | tr -cd 'a-z0-9_')"
-    echo "--- ${f##*/} (db: $db) ---"
-    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
-      -c "drop database if exists $db" -c "create database $db" >/dev/null
-    $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q \
-      -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
-    $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
-    $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
-    $DC "${px[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
-    # -tA gives clean TAP (no table chrome); no ON_ERROR_STOP so every assertion reports.
-    out=$($DC "${px[@]}" -d "$db" -tAq -f "/repo/$f" 2>&1)
-    echo "$out" | grep -E '^(ok|not ok|1\.\.|# )' || true
-    if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then
-      echo "FAIL: $f"; fail=1
-    fi
-    $DC "${px[@]}" -d postgres -q -c "drop database if exists $db" >/dev/null
-  done
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
+  $DC --profile "$prof" exec -T "$svc" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/archive/db/*.sql' \
+    || fail=1
 
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi

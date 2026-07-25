@@ -353,46 +353,43 @@ data kept for a window *from arrival*, retain on an ingestion timestamp rather t
 the policy.
 
 **Drops can also be driven from outside the schedule.** `pgpm.retire(parent, child)` is the sanctioned
-single-partition drop -- the same protocol `retain` runs (pre-drop hooks, `DROP`, bookkeeping), callable
-one partition at a time. It never drops anything retention would not (the partition's whole range must
-be past the horizon), and each partition is claim-guarded so several cooperating "assistants" -- say, an
-external archiver that uploads a partition to long-term storage and then retires it immediately -- can
-work alongside the scheduled `retain` without stepping on each other. See `retire` in the
-[reference](reference.md#retire), and the complete worked assistant in
-[the archive assistant](../pgpm_archive/docs/assistant.md).
+single-partition drop -- the same protocol `retain` runs (write-block ensure, archive-coverage check,
+`DROP`, bookkeeping), callable one partition at a time. It never drops anything retention would not
+(the partition's whole range must be past the horizon), and each partition is claim-guarded so several
+cooperating callers can work alongside the scheduled `retain` without stepping on each other. See
+`retire` in the [reference](reference.md#retire).
 
-### Pre-drop hooks
+### Archiving before a drop
 
-To do something with a partition's data before it is dropped -- the common case is copying it to
-long-term storage (e.g. S3) -- register a `pre_drop` hook:
+A partition gets a `BEFORE INSERT OR UPDATE OR DELETE` trigger the moment it crosses the retention
+horizon, independent of whether or how it is archived -- a backdated write into an eligible,
+not-yet-dropped range is rejected outright rather than silently diverging an archive from what is
+still live. If you also want the *drop* itself to wait until archiving has actually happened, set
+`config.archive_fn` to a resumable archive strategy:
 
 ```sql
-create schema if not exists archive;   -- keep hook machinery out of API-exposed schemas
-
-create function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
-returns void language plpgsql as $$
-begin
-  -- e.g. perform aws_s3.query_export_to_s3(...) against p_child, or notify an external worker
-end;
-$$;
-
-select pgpm.hook_register('public.events', 'pre_drop', 'archive.to_s3(regclass,name,text,text)');
+update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;
 ```
 
-If the hook raises, the partition is not dropped -- retention retries on a later cycle instead of
-silently dropping data whose copy failed. The hooks fire on **every** retention drop, whether `retain`
-or a direct `retire` call initiates it. See `hook_register` in the [reference](reference.md) for the
-full contract (signature, multiple hooks, disabling one, and how failures are isolated). For a
-complete, working `archive_to_s3` (the `http` extension for the PUT, SigV4 signing via `pgcrypto`,
-credentials in Vault, verified against real signature enforcement), see
-[Archive partitions to S3](../pgpm_archive/docs/to-s3.md).
+`null` (the default) means no archiving -- a write-blocked partition is immediately drop-ready, the
+same behavior as before this contract existed. With `archive_fn` set, `pgpm.maintain()` archives each
+eligible child in bounded chunks on its own schedule (sized by `config.archive_byte_budget`), and
+`pgpm.retire()` will not drop a child until `pgpm._archive_fully_covered` confirms every chunk has
+landed -- a child mid-archive is a normal, retryable state, not a failure, and nothing here fails
+loudly the way a hook used to; `retire()` just returns `false` and tries again next tick. See [the
+reference](reference.md#archive-strategy-contract) for the full calling contract
+(`archive_fn(p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result`), and [the pgpm_archive
+add-on](../pgpm_archive/README.md) for two ready-made S3 strategies
+(`pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) built on this contract.
 
-A hook runs inside the calling transaction (`retain`'s tick, or an assistant's `retire` call), so a slow
-hook (a synchronous copy to long-term storage) holds it open for as long as it runs. Pair a slow hook with `config.retain_batch = 1`: each maintenance tick
-then attempts at most one partition's hooks + drop (oldest first), and an aged-out backlog paces across
-subsequent ticks instead of one call carrying it all. `status().retain_backlog` tracks the eligible
-partitions still awaiting their turn; it falling tick over tick is a paced backlog draining, while flat
-with `retain_hook_failures` climbing is retention wedged on a failing hook.
+`status().retain_backlog` tracks partitions still waiting on their turn to drop; it falling tick over
+tick is normal draining (either a paced backlog or archiving still catching up), while flat with
+`retain_drop_failures` climbing means something else is wrong -- an unexpected `DROP` failure, not
+archiving simply not having caught up yet (that shows as `retain_drop_failures` staying at zero). See
+the runbook's
+[retention entry](runbook.md#storage-is-not-dropping-despite-a-retention-policy) for the full
+diagnostic.
 
 ## Incoming foreign keys
 

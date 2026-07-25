@@ -365,26 +365,30 @@ lingers and storage does not fall. It bounds storage only when maintenance runs 
 (Watch the unit, too: `retain` is an **interval** for `time`/`uuidv7` and a **count of intervals** for
 `id` -- a misread makes the horizon far longer than intended.)
 
-Two more shapes look like this symptom but are working as designed: a `retain_batch` cap paces drops one
-batch per tick, so a large aged-out backlog takes several ticks to clear (`retain_backlog` falling tick
-over tick is that pacing, not a stall); and a failing `pre_drop` hook blocks its partition's drop on
-purpose (a copy to long-term storage failed; dropping anyway would lose data) -- with `retain_batch` set,
-it defers the whole backlog behind it, since the cap attempts oldest first.
+Three more shapes look like this symptom but are working as designed: a `retain_batch` cap paces drops
+one batch per tick, so a large aged-out backlog takes several ticks to clear (`retain_backlog` falling
+tick over tick is that pacing, not a stall); a child with `config.archive_fn` set defers its own drop
+until archiving actually catches up (`retain_backlog` flat with `retain_drop_failures` staying at
+**zero** -- this is not a failure, just chunked archiving still in progress); and an unexpected `DROP`
+failure blocks that one partition on purpose (`retain_drop_failures` climbing instead).
 
 **Steps.**
 
 1. Confirm the policy is set and that maintenance can act on it:
 
    ```sql
-   select parent, paused, closed_rows, retain_backlog, retain_hook_failures
+   select parent, paused, closed_rows, retain_backlog, retain_drop_failures
      from pgpm.status() where parent = 'public.events'::regclass;
-   select retain, retain_batch from pgpm.config where parent_table = 'public.events'::regclass;
+   select retain, retain_batch, archive_fn from pgpm.config where parent_table = 'public.events'::regclass;
    ```
 
    `paused = true` means maintenance is doing nothing; a large `closed_rows` means the drain is behind, so
-   the aged tail has not been homed (or reclaimed) yet. A flat `retain_backlog` with climbing
-   `retain_hook_failures` is retention wedged on a failing `pre_drop` hook: fix (or unregister) the hook
-   and the backlog resumes; the hook's own error is in the log (`retain_hook_fail` rows, `method`).
+   the aged tail has not been homed (or reclaimed) yet. A flat `retain_backlog` with `retain_drop_failures`
+   also flat at zero, and `archive_fn` set, means chunked archiving simply hasn't caught up yet for the
+   partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
+   `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
+   with `retain_drop_failures` actually **climbing** is a real, unexpected `DROP` failure: the error is in
+   the log (`retain_drop_fail` rows, `method`).
 
 2. Run a maintenance pass, or force the reclaim by hand:
 
