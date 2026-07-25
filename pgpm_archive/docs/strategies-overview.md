@@ -231,3 +231,12 @@ archiver), `archive._tick_one` (picks a range per `boundary_rule`), and
 config-driven worker, the same code path regardless of which knobs a table uses. The three
 implementation pages below are unaffected by that packaging -- they describe the same mechanisms
 under their original names, and remain the place to read *why* each piece works the way it does.
+
+A fourth mechanism *is* now taking shape one level down, in `pgpm_core` itself: write-blocking plus
+a ledger-driven archive coverage check as `pgpm.retire()`'s own drop precondition
+(`docs/retention-write-block-and-merge.md`, #242), replacing `pgpm.hook`'s `pre_drop` registry
+entirely. As of that stack's #238, `retire()` no longer calls any registered hook -- so
+`archive.file_gate`'s veto, and the `gate_only`/`self_driving` distinction this whole page is built
+around, are currently inert (see the callout in [`../README.md`](../README.md)). Nothing above is
+rewritten yet; that is #239 (port `archive.to_s3`/`to_s3_parquet` onto the new `archive_fn`
+contract) and #240 (retire this apparatus once the new one covers it).
