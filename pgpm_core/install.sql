@@ -764,6 +764,78 @@ begin
 end;
 $$;
 
+-- write-block on retain-eligibility (issue #235; docs/retention-write-block-and-merge.md). A
+-- partition past _retain_boundary() is drop-eligible, and for however long it takes chunked
+-- archiving to finish covering it (or forever, for a table with no archive strategy at all), it
+-- should not accept writes either -- a backdated write into that span, including into a range some
+-- earlier archive chunk already covered, would silently diverge the archive from what is live. Two
+-- alternatives were ruled out empirically, not on paper: REVOKEing INSERT/UPDATE/DELETE on the
+-- child does nothing, because a parent-routed write is checked against the PARENT's ACL, never the
+-- child's; and a lock spanning the whole (unbounded, chunked) archiving window defeats the reason
+-- chunking exists. A BEFORE ROW trigger on the specific child is checked regardless of routing,
+-- can't be bypassed by an owner or superuser the way a privilege check can, and is torn down for
+-- free by the eventual DROP TABLE.
+create or replace function pgpm._write_block_raise() returns trigger
+language plpgsql as $$
+begin
+  raise exception 'pg_partition_magician: % is past its retention boundary and is no longer writable', tg_table_name;
+end;
+$$;
+
+-- idempotent: a no-op if the child is already blocked, so a repeat _enforce_write_blocks tick (every
+-- maintain() call revisits every attached child) never raises a duplicate-trigger error.
+create or replace function pgpm._install_write_block(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare v_nsp name; v_child regclass;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_child := format('%I.%I', v_nsp, p_child)::regclass;
+  if exists (select 1 from pg_trigger where tgrelid = v_child and tgname = 'pgpm_write_block') then
+    return;
+  end if;
+  execute format(
+    'create trigger pgpm_write_block before insert or update or delete on %I.%I'
+    || ' for each row execute function pgpm._write_block_raise()', v_nsp, p_child);
+end;
+$$;
+
+-- the reverse: an operator loosening config.retain can make a previously-eligible partition
+-- ineligible again, so this needs to run just as often as _install_write_block. drop ... if exists
+-- makes it just as idempotent on a child that was never blocked.
+create or replace function pgpm._remove_write_block(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare v_nsp name;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  execute format('drop trigger if exists pgpm_write_block on %I.%I', v_nsp, p_child);
+end;
+$$;
+
+-- reconciles every attached child's write-block state against current eligibility in one pass,
+-- reusing the exact _retain_boundary() retire() itself checks so "eligible to write-block" and
+-- "eligible to drop" can never disagree. A table with no retention policy (config.retain null) has
+-- no boundary at all, so nothing is ever eligible and nothing is ever blocked.
+create or replace function pgpm._enforce_write_blocks(p_parent regclass)
+returns void language plpgsql as $$
+declare
+  cfg pgpm.config; v_boundary text; r record; v_eligible boolean;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  v_boundary := pgpm._retain_boundary(cfg);
+
+  for r in select child_name, hi from pgpm.part where parent_table = p_parent and attached
+  loop
+    v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
+    if v_eligible then
+      perform pgpm._install_write_block(p_parent, r.child_name);
+    else
+      perform pgpm._remove_write_block(p_parent, r.child_name);
+    end if;
+  end loop;
+end;
+$$;
+
 -- ===================== pluggable archive strategy (issue #236) =====================
 -- Narrows pgpm.hook's generic pre_drop registry to the one thing it was ever really used for:
 -- one archive strategy per managed table (config.archive_fn). Schema and contract only here --
@@ -1937,6 +2009,16 @@ begin
   else
     v_note := v_note || ' obtain_backoff';
   end if;
+
+  -- Write-block on retain-eligibility (issue #235), ahead of retain()'s own drop logic: a partition
+  -- is blocked from writes the instant it crosses the boundary, whether or not (or how far along)
+  -- it is being archived -- not yet gated on by retire()'s drop precondition itself (#238).
+  begin
+    perform pgpm._enforce_write_blocks(p_parent);
+  exception when others then
+    v_note := v_note || ' write_block_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'write_block_skip', left(sqlerrm, 200));
+  end;
 
   begin
     v_dropped := pgpm.retain(p_parent);

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **Write-block a partition the instant it crosses the retention boundary (#235).** Chunked
+  archiving can take several `maintain()` ticks to fully archive one large partition, and for the
+  whole span between crossing `_retain_boundary()` and the last chunk landing, the partition sat
+  attached and, with nothing to stop it, fully writable -- a backdated write into that span,
+  including into a range some earlier chunk already archived and ledgered, would silently diverge
+  the archive from what is live. `REVOKE` on the child does nothing (a parent-routed write is
+  checked against the *parent's* ACL, never the child's), and a lock spanning the whole archiving
+  window defeats the reason chunking exists, so instead: a `BEFORE INSERT OR UPDATE OR DELETE`
+  trigger (`pgpm._install_write_block`) is installed on a child the moment its whole range is
+  at/below the horizon, and removed (`pgpm._remove_write_block`) if an operator loosens
+  `config.retain` and the child becomes ineligible again -- both idempotent, so a repeat
+  `_enforce_write_blocks` tick never raises a duplicate-trigger error. `pgpm.maintain()` now runs
+  `_enforce_write_blocks` every tick, ahead of `retain()`'s own drop logic. Purely additive: not
+  wired into `retire()`'s drop precondition yet (that's #238), and `pgpm.hook` is untouched -- a
+  write-blocked partition still drops exactly as before, the trigger going with the table on
+  `DROP TABLE`. New `tests/61_write_block_test.sql` (22 assertions): a child crossing the boundary
+  gets the trigger; parent-routed and direct-to-child inserts, updates, and deletes are all
+  rejected; a sibling child still under the boundary is unaffected; reads through the parent are
+  unaffected; re-running `maintain()` is idempotent; loosening `config.retain` removes the trigger.
+  First rung of the retention/archiving merge stack positioned in #242
+  (`docs/retention-write-block-and-merge.md`).
+
 - **`pgpm.config.archive_fn`: a pluggable archive strategy contract, the first step toward
   replacing `pgpm.hook`'s `pre_drop` registry (#236).** `pgpm.hook` is generic (any event, any
   number of hooks) but has only ever had one real use: archiving before a drop. `archive_fn` is a

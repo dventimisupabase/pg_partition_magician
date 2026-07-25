@@ -495,12 +495,21 @@ chosen steps.
 pgpm.maintain(p_parent regclass) returns text
 ```
 
-The per-table tick: `obtain`, `retain`, one drain step, restore any preserved FK whose tail has drained,
-and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the oldest frozen coarse child.
+The per-table tick: `obtain`, enforce write-blocks on every attached child against the retention
+boundary, `retain`, one drain step, restore any preserved FK whose tail has drained, and -- when
+auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the oldest frozen coarse child.
 A no-op while paused. Every step is isolated in its own subtransaction under a short `lock_timeout`, so it
 never blocks or deadlocks the live workload; a step that loses a lock race is deferred and retried next
 tick. Returns a one-line summary, for example
 `obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`.
+
+Write-blocking (issue #235): a child whose whole range sits at/below the retention horizon
+(`_retain_boundary`, the same one `retain` itself uses) gets a `BEFORE INSERT OR UPDATE OR DELETE`
+trigger the moment it becomes eligible, independent of whether or how it is archived -- a backdated
+write into an eligible-but-not-yet-dropped range (including one a chunked archiver already covered)
+is rejected rather than silently diverging the archive from what is live. Loosening `config.retain`
+removes the trigger from a partition that becomes ineligible again. Not yet a `retire()` drop
+precondition -- a write-blocked partition drops exactly as before.
 
 ### `maintain_all`
 
@@ -961,4 +970,5 @@ Functions named `pgpm._*` are private and may change without notice. The kind-sp
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
 `_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`,
+`_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`,
 `_run_archive_strategy`/`_archive_noop`) implements the engine. Do not call them directly.
