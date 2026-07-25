@@ -127,6 +127,15 @@ alter table pgpm.config add column if not exists regrain_cursor text;
 -- An operator registering a slow synchronous pre_drop hook (e.g. a long-term-storage copy) should set
 -- this low, typically 1, trading retention promptness for bounded per-tick lock/transaction time.
 alter table pgpm.config add column if not exists retain_batch int;
+-- the pluggable archive strategy (issue #236): null = strategy 'none' (no archiving, drop as soon as
+-- write-blocked). regprocedure (not text/regproc) so a bad reference is refused right here at
+-- assignment, not discovered later when a maintenance tick tries to call it -- the same reasoning
+-- pgpm.hook.hook_fn already uses. Contract: archive_fn(p_parent regclass, p_child name, p_lo text,
+-- p_hi text) returns pgpm.archive_result, called once per tick, expected to make bounded
+-- incremental progress and report how much of [lo, hi) is now durably archived (not to finish the
+-- whole range in one call). Not yet consulted by retire()/retain() (#238) -- see
+-- pgpm._run_archive_strategy and pgpm._archive_noop below.
+alter table pgpm.config add column if not exists archive_fn regprocedure;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -824,6 +833,73 @@ begin
       perform pgpm._remove_write_block(p_parent, r.child_name);
     end if;
   end loop;
+end;
+$$;
+
+-- ===================== pluggable archive strategy (issue #236) =====================
+-- Narrows pgpm.hook's generic pre_drop registry to the one thing it was ever really used for:
+-- one archive strategy per managed table (config.archive_fn). Schema and contract only here --
+-- nothing calls this yet (that's #238, once #237/#239 give it something real to dispatch to), and
+-- pgpm.hook is untouched.
+
+-- archive_fn's return shape: how much of a requested [lo, hi) a single call durably archived.
+-- covered_hi is the native-grid value up to which [lo, ...) is now durably archived by THIS call --
+-- may be less than hi, since a real strategy is expected to be resumable (called again next tick to
+-- make further bounded progress, not to finish the whole range at once). rows_archived is how many
+-- rows this call actually archived; null when nothing was actually archived (the 'none' strategy,
+-- or a strategy that made no progress this tick). No CREATE OR REPLACE TYPE exists in PostgreSQL, so
+-- guard creation the same way the rest of this file guards idempotent DDL.
+do $$ begin
+  if not exists (
+    select 1 from pg_type where typname = 'archive_result' and typnamespace = 'pgpm'::regnamespace
+  ) then
+    create type pgpm.archive_result as (covered_hi text, rows_archived bigint);
+  end if;
+end $$;
+
+-- the trivial built-in strategy: exists only to exercise real dispatch (a real regprocedure call,
+-- not a null-strategy special case) in tests. Always reports the whole requested range archived
+-- immediately -- functionally what a 'none'-strategy table already gets from
+-- _run_archive_strategy's null handling below, just reached via a real archive_fn call.
+create or replace function pgpm._archive_noop(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare cfg pgpm.config; v_nsp name; v_rows bigint; v_result pgpm.archive_result;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
+                 v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, p_hi))
+    into v_rows;
+  v_result.covered_hi := p_hi;
+  v_result.rows_archived := v_rows;
+  return v_result;
+end;
+$$;
+
+-- the dispatch stub: looks up config.archive_fn and calls it. A null archive_fn (strategy 'none')
+-- never actually archives anything, so the requested range is trivially "already fully covered" --
+-- there is nothing to protect against a drop.
+create or replace function pgpm._run_archive_strategy(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare cfg pgpm.config; v_result pgpm.archive_result;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  if cfg.archive_fn is null then
+    v_result.covered_hi := p_hi;
+    v_result.rows_archived := null;
+    return v_result;
+  end if;
+  -- select * from fn(...), not select fn(...): the latter returns the composite as ONE column,
+  -- which EXECUTE ... INTO a named-composite variable maps positionally (1 source column against
+  -- pgpm.archive_result's 2 fields) rather than assigning the whole value -- covered_hi would end
+  -- up holding the composite's own text form and rows_archived would stay null. Calling it as a
+  -- FROM-item expands its fields into real output columns first.
+  execute format('select * from %s($1,$2,$3,$4)', (cfg.archive_fn::oid::regproc)::text)
+    into v_result using p_parent, p_child, p_lo, p_hi;
+  return v_result;
 end;
 $$;
 
