@@ -18,6 +18,77 @@
   the same install, not an independently versioned module. Documentation only -- no code changes,
   no behavior changes; every mechanism the doc describes is still a plan.
 
+- **Port byte-budget chunked archiving and its ledger onto the `archive_fn` contract (#237).**
+  `pgpm_archive`'s `archive._next_range_byte_budget`/`archive.archive_range`/`archive.ledger`
+  (#213, #221) proved that archiving a large partition safely means chunking it instead of doing it
+  as one giant operation; this ports that mechanism, unchanged in intent, onto `pgpm.config.archive_fn`
+  (#236) and the write-block trigger (#235). New `pgpm.archive_ledger` (successor to
+  `archive.ledger`, same shape: `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`,
+  `rows_archived`, `archived_at` -- `s3_key`/`etag` stay null until a real transport strategy, #239,
+  has something to put there). New `pgpm._next_archive_chunk(p_parent, p_child)` picks the next
+  chunk within one already-write-blocked child's own `[lo, hi)` (the one real adaptation from the
+  original, which picked ranges across the whole table since nothing else gated eligibility yet --
+  here that gating is the write-block trigger's job). New `pgpm._archive_fully_covered(p_parent,
+  p_child)`: true once the ledger's ranges for that child reach its own `hi`, or the strategy is
+  `none` -- the intended `retire()` drop precondition once #238 wires it in, not consulted by
+  anything yet. New `pgpm._archive_step(p_parent)` -- one `maintain()` tick's worth: for every
+  attached child that **already has the write-block trigger installed** (checked directly against
+  `pg_trigger`, never re-derived from the boundary formula) and is not yet fully covered, picks its
+  next chunk, runs `pgpm._run_archive_strategy`, and records the result. `pgpm.maintain()` now runs
+  this right after write-blocking, ahead of `retain()`; its summary gains an `archived=N` field.
+  `archive.ledger`/`archive.archive_range`/`archive.tick` in `pgpm_archive` are completely untouched
+  and keep working exactly as before -- they are deleted only once this path replaces them (#240).
+  New `tests/63_archive_chunk_ledger_test.sql` (14 assertions): a multi-chunk partition archives
+  across several `maintain()` ticks with bounded per-tick progress; `_archive_fully_covered` flips
+  true only once the last chunk lands; resuming across ticks never duplicates or skips a range; a
+  child holding real data but not yet write-blocked is never touched even though `archive_fn` is set
+  for the whole table; a `none`-strategy table is immediately fully covered with nothing ever
+  ledgered. Caught and fixed one real bug along the way: `archive_ledger.hi` is `text`, so a plain
+  `max(hi)` compares lexicographically (`'91' > '1000'`) instead of numerically/temporally --
+  `_next_archive_chunk`/`_archive_fully_covered` now cast to the native type first, the same fix
+  `archive._file_watermark` already needed for the identical reason.
+
+- **Write-block a partition the instant it crosses the retention boundary (#235).** Chunked
+  archiving can take several `maintain()` ticks to fully archive one large partition, and for the
+  whole span between crossing `_retain_boundary()` and the last chunk landing, the partition sat
+  attached and, with nothing to stop it, fully writable -- a backdated write into that span,
+  including into a range some earlier chunk already archived and ledgered, would silently diverge
+  the archive from what is live. `REVOKE` on the child does nothing (a parent-routed write is
+  checked against the *parent's* ACL, never the child's), and a lock spanning the whole archiving
+  window defeats the reason chunking exists, so instead: a `BEFORE INSERT OR UPDATE OR DELETE`
+  trigger (`pgpm._install_write_block`) is installed on a child the moment its whole range is
+  at/below the horizon, and removed (`pgpm._remove_write_block`) if an operator loosens
+  `config.retain` and the child becomes ineligible again -- both idempotent, so a repeat
+  `_enforce_write_blocks` tick never raises a duplicate-trigger error. `pgpm.maintain()` now runs
+  `_enforce_write_blocks` every tick, ahead of `retain()`'s own drop logic. Purely additive: not
+  wired into `retire()`'s drop precondition yet (that's #238), and `pgpm.hook` is untouched -- a
+  write-blocked partition still drops exactly as before, the trigger going with the table on
+  `DROP TABLE`. New `tests/61_write_block_test.sql` (22 assertions): a child crossing the boundary
+  gets the trigger; parent-routed and direct-to-child inserts, updates, and deletes are all
+  rejected; a sibling child still under the boundary is unaffected; reads through the parent are
+  unaffected; re-running `maintain()` is idempotent; loosening `config.retain` removes the trigger.
+  First rung of the retention/archiving merge stack positioned in #242
+  (`docs/retention-write-block-and-merge.md`).
+
+- **`pgpm.config.archive_fn`: a pluggable archive strategy contract, the first step toward
+  replacing `pgpm.hook`'s `pre_drop` registry (#236).** `pgpm.hook` is generic (any event, any
+  number of hooks) but has only ever had one real use: archiving before a drop. `archive_fn` is a
+  nullable `regprocedure` column narrowing that to one archive strategy per managed table (`null` =
+  strategy `none`, immediately drop-ready) -- casting the reference validates the function exists
+  with exactly this signature at assignment time, not later when a maintenance tick tries to call
+  it, the same reasoning `hook_register`'s `p_hook` parameter already uses. The calling contract:
+  `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns pgpm.archive_result`
+  (`covered_hi text, rows_archived bigint`), expected to be **resumable** -- called once per tick,
+  making bounded incremental progress and reporting how much of `[p_lo, p_hi)` is now durably
+  archived, not finishing the whole range in one call. New `pgpm._run_archive_strategy` dispatches
+  to `config.archive_fn` (or synthesizes an immediate "already covered" result for the `none`
+  strategy); new `pgpm._archive_noop` is a trivial built-in strategy that exists only to exercise
+  real dispatch (an actual regprocedure call, not the null special case) in tests. Schema and
+  contract only: nothing yet calls `_run_archive_strategy` from `retire()`/`retain()`, and
+  `pgpm.hook` is completely untouched -- both continue to work exactly as before. New
+  `tests/62_archive_fn_contract_test.sql` (10 assertions). Positioned in #242
+  (`docs/retention-write-block-and-merge.md`), the next rung after #235's write-block trigger.
+
 - **`archive.configure`/`archive.unconfigure`/`archive.schedule`/`archive.unschedule`: a real
   operator interface for `pgpm_archive`, replacing raw SQL against `archive.config` and a bare
   `cron.schedule` call.** Normal operation should never need a hand-written `insert`/`update`

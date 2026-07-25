@@ -495,12 +495,27 @@ chosen steps.
 pgpm.maintain(p_parent regclass) returns text
 ```
 
-The per-table tick: `obtain`, `retain`, one drain step, restore any preserved FK whose tail has drained,
-and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the oldest frozen coarse child.
-A no-op while paused. Every step is isolated in its own subtransaction under a short `lock_timeout`, so it
-never blocks or deadlocks the live workload; a step that loses a lock race is deferred and retried next
-tick. Returns a one-line summary, for example
-`obtained=2 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`.
+The per-table tick: `obtain`, enforce write-blocks on every attached child against the retention
+boundary, one chunked-archiving step, `retain`, one drain step, restore any preserved FK whose tail
+has drained, and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the
+oldest frozen coarse child. A no-op while paused. Every step is isolated in its own subtransaction
+under a short `lock_timeout`, so it never blocks or deadlocks the live workload; a step that loses a
+lock race is deferred and retried next tick. Returns a one-line summary, for example
+`obtained=2 archived=1 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`.
+
+Write-blocking (issue #235): a child whose whole range sits at/below the retention horizon
+(`_retain_boundary`, the same one `retain` itself uses) gets a `BEFORE INSERT OR UPDATE OR DELETE`
+trigger the moment it becomes eligible, independent of whether or how it is archived -- a backdated
+write into an eligible-but-not-yet-dropped range (including one a chunked archiver already covered)
+is rejected rather than silently diverging the archive from what is live. Loosening `config.retain`
+removes the trigger from a partition that becomes ineligible again. Not yet a `retire()` drop
+precondition -- a write-blocked partition drops exactly as before.
+
+Chunked archiving (issue #237): `archived=N` counts how many chunks this tick recorded via
+`pgpm._archive_step` -- see [Archive strategy contract](#archive-strategy-contract) for the
+mechanism. It only ever considers a child the write-block step above has already protected, so it
+always runs after write-blocking within the same tick, and (like write-blocking) it is not yet a
+`retire()` drop precondition either.
 
 ### `maintain_all`
 
@@ -549,6 +564,74 @@ pgpm.hook_unregister(p_parent regclass, p_event text, p_hook regprocedure) retur
 ```
 
 Removes a hook registration.
+
+## Archive strategy contract
+
+`config.archive_fn` (issue #236) narrows `pgpm.hook`'s generic `pre_drop` registry to the one thing
+it has ever really been used for: one archive strategy per managed table. `null` (the default)
+means strategy `none` -- no archiving, a partition is immediately drop-ready. Set it directly:
+
+```sql
+update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;
+```
+
+Casting the reference to `regprocedure` validates that the function exists with exactly this
+signature right away, not later when a maintenance tick tries to call it -- the same reasoning
+`hook_register`'s `p_hook` parameter already uses.
+
+The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns
+pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint)`.
+`archive_fn` is expected to be **resumable**: called once per maintenance tick against the same
+child, making bounded incremental progress and reporting how much of `[p_lo, p_hi)` is now durably
+archived (`covered_hi`, which may be short of `p_hi`) and how many rows this one call archived
+(`rows_archived`, `null` when nothing was actually archived) -- not to archive the whole range in a
+single call. This is the contract the byte-budget chunked archiver and the real S3 upload functions
+implement (see `docs/retention-write-block-and-merge.md`, #242).
+
+`pgpm._run_archive_strategy(p_parent, p_child, p_lo, p_hi)` is the dispatch stub: it looks up
+`config.archive_fn` and calls it, or, for a `null` (`none`) strategy, returns `(p_hi, null)` directly
+-- the whole requested range is trivially "already covered" since there was never anything to
+protect against a drop. `pgpm._archive_noop` is a trivial built-in strategy (always reports the
+whole requested range archived immediately, having actually counted the rows in it) that exists only
+to exercise real dispatch in tests.
+
+This issue is schema and contract only: nothing yet calls `_run_archive_strategy` from
+`retire()`/`retain()`, and `pgpm.hook` is completely untouched -- both continue to work exactly as
+above. A written archive strategy is inert until a later issue wires the drop path to consult it.
+
+### Byte-budget chunked archiving
+
+`pgpm.maintain()`'s per-tick archiving step (issue #237; `archived=N` in its summary) is the
+built-in way to drive the contract above without hand-writing a resumable `archive_fn`. It ports
+`pgpm_archive`'s own byte-budget chunker (#213, #221) onto the contract, unchanged in intent: never
+archive a whole large partition as one giant operation, chunk it instead.
+
+- `config.archive_byte_budget` (default 8 MiB) and `config.archive_probe_sample` (default 1000) --
+  the same two knobs the original chunker took as parameters -- estimate how many rows fit the
+  budget via a sampled average row width.
+- `pgpm.archive_ledger` (successor to `pgpm_archive`'s `archive.ledger`, same shape:
+  `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`, `rows_archived`, `archived_at`) records
+  one row per chunk. `s3_key`/`etag` stay `null` until a real transport strategy (#239) has
+  something to put there -- the `archive_fn` contract does not carry them yet.
+- `pgpm._next_archive_chunk(p_parent, p_child)` picks the next chunk **within one child's own
+  `[lo, hi)`** -- resuming from wherever that child's ledger coverage left off, extended to the next
+  distinct control value so a run of ties never splits across two chunks. Unlike the original
+  (which picked ranges across the whole table, gated by the frontier and retention horizon
+  directly), this is scoped to a single already-write-blocked child, because that gating is now the
+  write-block trigger's job (#235).
+- `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
+  that child reach its own `hi` (or the strategy is `none`) -- the intended `retire()` drop
+  precondition once #238 wires it in. Not consulted by anything yet.
+- `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: for every
+  attached child that **already has the write-block trigger installed** (checked directly, not
+  re-derived from the boundary formula) and is not yet fully covered, it picks the next chunk, runs
+  `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
+  trigger yet is never touched, however far past the byte budget's reach it sits.
+
+`pgpm_archive`'s own `archive.ledger`/`archive._next_range_byte_budget`/`archive.tick` are untouched
+by any of this and keep working exactly as their own docs describe; they are retired only once this
+path replaces them (#240).
 
 ## Scheduling
 
@@ -806,7 +889,7 @@ this before each drain step.
 
 ## Catalog
 
-All `pgpm` state lives in four tables. Treat them as read-mostly; use the functions above to mutate them.
+All `pgpm` state lives in these tables. Treat them as read-mostly; use the functions above to mutate them.
 
 ### `pgpm.config`
 
@@ -841,6 +924,8 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `drain_ambient_floor` | `int` | minimum effective baseline (idle-box guard) |
 | `drain_ambient_baseline` / `drain_ambient_io_baseline` | `numeric` | learned EWMA baselines (lock waits, I/O latency) |
 | `drain_io_read_time` / `drain_io_blks_read` | `numeric` / `bigint` | previous cumulative `pg_stat_database` I/O sample |
+| `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
+| `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 
 ### `pgpm.part`
 
@@ -907,6 +992,21 @@ Preserve-managed incoming FKs and their lifecycle.
 | `validated_at` | `timestamptz` | set = fully validated; null with `restored_at` set = re-added `NOT VALID` (orphans pending) |
 | `dropped_at` | `timestamptz` | when the FK was captured and dropped |
 
+### `pgpm.archive_ledger`
+
+One row per archived chunk (issue #237). See [Byte-budget chunked archiving](#byte-budget-chunked-archiving).
+
+| Column | Type | Meaning |
+|---|---|---|
+| `parent_table` | `regclass` | the managed partitioned parent (primary key with `lo`) |
+| `lo` | `text` | native-grid start of this chunk |
+| `hi` | `text` | native-grid end of this chunk |
+| `child_name` | `name` | the child this chunk belongs to |
+| `s3_key` | `text` | null until a real transport strategy (#239) populates it |
+| `etag` | `text` | null until a real transport strategy (#239) populates it |
+| `rows_archived` | `bigint` | rows this chunk archived; null if the strategy reported no progress |
+| `archived_at` | `timestamptz` | when this chunk was recorded |
+
 ## Partition naming
 
 A fine (one-step) partition is named `<rel>_p<lo>`; a coarse or monolith partition (wider than one step)
@@ -924,5 +1024,8 @@ excludes `_to_`).
 Functions named `pgpm._*` are private and may change without notice. The kind-specific logic lives in a
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
-`_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`)
-implements the engine. Do not call them directly.
+`_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`,
+`_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`,
+`_run_archive_strategy`/`_archive_noop`,
+`_next_archive_chunk`/`_archive_fully_covered`/`_archive_step`) implements the engine. Do not call
+them directly.

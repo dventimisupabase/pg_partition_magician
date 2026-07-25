@@ -127,6 +127,21 @@ alter table pgpm.config add column if not exists regrain_cursor text;
 -- An operator registering a slow synchronous pre_drop hook (e.g. a long-term-storage copy) should set
 -- this low, typically 1, trading retention promptness for bounded per-tick lock/transaction time.
 alter table pgpm.config add column if not exists retain_batch int;
+-- the pluggable archive strategy (issue #236): null = strategy 'none' (no archiving, drop as soon as
+-- write-blocked). regprocedure (not text/regproc) so a bad reference is refused right here at
+-- assignment, not discovered later when a maintenance tick tries to call it -- the same reasoning
+-- pgpm.hook.hook_fn already uses. Contract: archive_fn(p_parent regclass, p_child name, p_lo text,
+-- p_hi text) returns pgpm.archive_result, called once per tick, expected to make bounded
+-- incremental progress and report how much of [lo, hi) is now durably archived (not to finish the
+-- whole range in one call). Not yet consulted by retire()/retain() (#238) -- see
+-- pgpm._run_archive_strategy and pgpm._archive_noop below.
+alter table pgpm.config add column if not exists archive_fn regprocedure;
+-- byte-budget chunking knobs (issue #237, porting archive._next_range_byte_budget's own
+-- c_byte_budget/c_probe_sample constants): archive_byte_budget estimates how many rows make up
+-- roughly this many bytes (via a sampled average row width), and archive_probe_sample caps how many
+-- rows that sample scans. Same defaults as the original. Ignored entirely by a 'none' strategy.
+alter table pgpm.config add column if not exists archive_byte_budget bigint not null default 8 * 1024 * 1024;
+alter table pgpm.config add column if not exists archive_probe_sample int not null default 1000;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -752,6 +767,327 @@ begin
     if pgpm.retire(p_parent, r.child_name) then v_dropped := v_dropped + 1; end if;
   end loop;
   return v_dropped;
+end;
+$$;
+
+-- write-block on retain-eligibility (issue #235; docs/retention-write-block-and-merge.md). A
+-- partition past _retain_boundary() is drop-eligible, and for however long it takes chunked
+-- archiving to finish covering it (or forever, for a table with no archive strategy at all), it
+-- should not accept writes either -- a backdated write into that span, including into a range some
+-- earlier archive chunk already covered, would silently diverge the archive from what is live. Two
+-- alternatives were ruled out empirically, not on paper: REVOKEing INSERT/UPDATE/DELETE on the
+-- child does nothing, because a parent-routed write is checked against the PARENT's ACL, never the
+-- child's; and a lock spanning the whole (unbounded, chunked) archiving window defeats the reason
+-- chunking exists. A BEFORE ROW trigger on the specific child is checked regardless of routing,
+-- can't be bypassed by an owner or superuser the way a privilege check can, and is torn down for
+-- free by the eventual DROP TABLE.
+create or replace function pgpm._write_block_raise() returns trigger
+language plpgsql as $$
+begin
+  raise exception 'pg_partition_magician: % is past its retention boundary and is no longer writable', tg_table_name;
+end;
+$$;
+
+-- idempotent: a no-op if the child is already blocked, so a repeat _enforce_write_blocks tick (every
+-- maintain() call revisits every attached child) never raises a duplicate-trigger error.
+create or replace function pgpm._install_write_block(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare v_nsp name; v_child regclass;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_child := format('%I.%I', v_nsp, p_child)::regclass;
+  if exists (select 1 from pg_trigger where tgrelid = v_child and tgname = 'pgpm_write_block') then
+    return;
+  end if;
+  execute format(
+    'create trigger pgpm_write_block before insert or update or delete on %I.%I'
+    || ' for each row execute function pgpm._write_block_raise()', v_nsp, p_child);
+end;
+$$;
+
+-- the reverse: an operator loosening config.retain can make a previously-eligible partition
+-- ineligible again, so this needs to run just as often as _install_write_block. drop ... if exists
+-- makes it just as idempotent on a child that was never blocked.
+create or replace function pgpm._remove_write_block(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare v_nsp name;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  execute format('drop trigger if exists pgpm_write_block on %I.%I', v_nsp, p_child);
+end;
+$$;
+
+-- reconciles every attached child's write-block state against current eligibility in one pass,
+-- reusing the exact _retain_boundary() retire() itself checks so "eligible to write-block" and
+-- "eligible to drop" can never disagree. A table with no retention policy (config.retain null) has
+-- no boundary at all, so nothing is ever eligible and nothing is ever blocked.
+create or replace function pgpm._enforce_write_blocks(p_parent regclass)
+returns void language plpgsql as $$
+declare
+  cfg pgpm.config; v_boundary text; r record; v_eligible boolean;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  v_boundary := pgpm._retain_boundary(cfg);
+
+  for r in select child_name, hi from pgpm.part where parent_table = p_parent and attached
+  loop
+    v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
+    if v_eligible then
+      perform pgpm._install_write_block(p_parent, r.child_name);
+    else
+      perform pgpm._remove_write_block(p_parent, r.child_name);
+    end if;
+  end loop;
+end;
+$$;
+
+-- ===================== pluggable archive strategy (issue #236) =====================
+-- Narrows pgpm.hook's generic pre_drop registry to the one thing it was ever really used for:
+-- one archive strategy per managed table (config.archive_fn). Schema and contract only here --
+-- nothing calls this yet (that's #238, once #237/#239 give it something real to dispatch to), and
+-- pgpm.hook is untouched.
+
+-- archive_fn's return shape: how much of a requested [lo, hi) a single call durably archived.
+-- covered_hi is the native-grid value up to which [lo, ...) is now durably archived by THIS call --
+-- may be less than hi, since a real strategy is expected to be resumable (called again next tick to
+-- make further bounded progress, not to finish the whole range at once). rows_archived is how many
+-- rows this call actually archived; null when nothing was actually archived (the 'none' strategy,
+-- or a strategy that made no progress this tick). No CREATE OR REPLACE TYPE exists in PostgreSQL, so
+-- guard creation the same way the rest of this file guards idempotent DDL.
+do $$ begin
+  if not exists (
+    select 1 from pg_type where typname = 'archive_result' and typnamespace = 'pgpm'::regnamespace
+  ) then
+    create type pgpm.archive_result as (covered_hi text, rows_archived bigint);
+  end if;
+end $$;
+
+-- the trivial built-in strategy: exists only to exercise real dispatch (a real regprocedure call,
+-- not a null-strategy special case) in tests. Always reports the whole requested range archived
+-- immediately -- functionally what a 'none'-strategy table already gets from
+-- _run_archive_strategy's null handling below, just reached via a real archive_fn call.
+create or replace function pgpm._archive_noop(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare cfg pgpm.config; v_nsp name; v_rows bigint; v_result pgpm.archive_result;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
+                 v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, p_hi))
+    into v_rows;
+  v_result.covered_hi := p_hi;
+  v_result.rows_archived := v_rows;
+  return v_result;
+end;
+$$;
+
+-- the dispatch stub: looks up config.archive_fn and calls it. A null archive_fn (strategy 'none')
+-- never actually archives anything, so the requested range is trivially "already fully covered" --
+-- there is nothing to protect against a drop.
+create or replace function pgpm._run_archive_strategy(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns pgpm.archive_result language plpgsql as $$
+declare cfg pgpm.config; v_result pgpm.archive_result;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  if cfg.archive_fn is null then
+    v_result.covered_hi := p_hi;
+    v_result.rows_archived := null;
+    return v_result;
+  end if;
+  -- select * from fn(...), not select fn(...): the latter returns the composite as ONE column,
+  -- which EXECUTE ... INTO a named-composite variable maps positionally (1 source column against
+  -- pgpm.archive_result's 2 fields) rather than assigning the whole value -- covered_hi would end
+  -- up holding the composite's own text form and rows_archived would stay null. Calling it as a
+  -- FROM-item expands its fields into real output columns first.
+  execute format('select * from %s($1,$2,$3,$4)', (cfg.archive_fn::oid::regproc)::text)
+    into v_result using p_parent, p_child, p_lo, p_hi;
+  return v_result;
+end;
+$$;
+
+-- ============= byte-budget chunked archiving on the archive_fn contract (issue #237) =============
+-- Ports archive._next_range_byte_budget/archive.archive_range/archive.ledger (#213, #221) -- the
+-- mechanism that makes archiving a large partition safe without one giant transaction -- onto the
+-- archive_fn contract, unchanged in intent. The one real adaptation: the original picked a range
+-- across the WHOLE table, bounded by the frontier and the retention horizon directly, because
+-- nothing else gated eligibility yet. Here that gating is already done per child by the write-block
+-- trigger (#235) -- a child only becomes a candidate once _enforce_write_blocks has actually
+-- installed it -- so the chunk picker only ever needs to work within ONE already-eligible child's
+-- own [lo, hi), never across partition boundaries. archive.ledger/archive.archive_range/archive.tick
+-- in pgpm_archive are untouched and keep working exactly as before; they are deleted only once this
+-- path is proven out (#240).
+
+-- successor to archive.ledger, same shape (parent_table, lo, hi, child_name nullable, s3_key, etag,
+-- rows_archived, archived_at), primary key (parent_table, lo) since a chunk always belongs to
+-- exactly one child and one parent's chunks never overlap. s3_key/etag stay null until a real
+-- strategy (#239) has something to put there -- the archive_fn contract (#236) does not carry them
+-- yet. rows_archived is nullable (unlike the original's not null): the contract explicitly allows a
+-- strategy to report no progress on a given call.
+create table if not exists pgpm.archive_ledger (
+  parent_table  regclass    not null,
+  lo            text        not null,
+  hi            text        not null,
+  child_name    name,
+  s3_key        text,
+  etag          text,
+  rows_archived bigint,
+  archived_at   timestamptz not null default now(),
+  primary key (parent_table, lo)
+);
+create index if not exists archive_ledger_parent_child_hi_idx on pgpm.archive_ledger (parent_table, child_name, hi desc);
+
+-- picks the next chunk to archive within ONE child: resumes from wherever pgpm.archive_ledger's
+-- coverage of THIS child left off (or the child's own lo, on the first call), estimates how many
+-- rows fit config.archive_byte_budget via a sampled average row width (config.archive_probe_sample
+-- rows), then extends to the next distinct control value past the probed boundary so a run of ties
+-- never splits across two chunks -- identical reasoning to the original, just scoped to the child's
+-- own table instead of the parent. Returns no rows once the child is fully covered.
+create or replace function pgpm._next_archive_chunk(p_parent regclass, p_child name)
+returns table(lo text, hi text)
+language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_ncast text;
+  v_child_lo text; v_child_hi text; v_lo text;
+  v_avg numeric; v_batch int; v_batch_count int; v_probe_hi_col text; v_probe_hi text;
+  v_next_distinct_col text; v_stop text;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+
+  select p.lo, p.hi into v_child_lo, v_child_hi from pgpm.part p
+   where p.parent_table = p_parent and p.child_name = p_child;
+  if not found then raise exception 'pg_partition_magician: %.% is not a tracked partition', p_parent, p_child; end if;
+
+  -- hi is stored as text; a plain max() would compare lexicographically ('91' > '1000'), not
+  -- numerically/temporally -- cast to the native type first, the same fix archive._file_watermark
+  -- already needed for this exact reason.
+  execute format('select max(hi::%s)::text from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
+                 v_ncast, p_parent::text, p_child)
+    into v_lo;
+  v_lo := coalesce(v_lo, v_child_lo);
+
+  if not pgpm._native_gt(cfg.control_kind, v_child_hi, v_lo) then
+    return;   -- already fully covered
+  end if;
+
+  execute format(
+    'select avg(pg_column_size(t.*))::numeric from (select * from %I.%I t where t.%I >= %L order by t.%I limit %s) t',
+    v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo), cfg.control_column, cfg.archive_probe_sample)
+    into v_avg;
+  if coalesce(v_avg, 0) <= 0 then
+    -- no rows remain in [v_lo, child_hi) for this child. Unlike the original (which read ahead of a
+    -- still-moving frontier, where "nothing yet" could mean "not yet arrived"), this child is
+    -- already write-blocked and frozen -- nothing will EVER land here again, so the rest of its
+    -- range is trivially covered with zero rows archived.
+    lo := v_lo; hi := v_child_hi;
+    return next;
+    return;
+  end if;
+  v_batch := greatest(1, floor(cfg.archive_byte_budget::numeric / v_avg))::int;
+
+  execute format(
+    'select count(*), max(%I)::text from (select %I from %I.%I t where t.%I >= %L order by t.%I limit %s) s',
+    cfg.control_column, cfg.control_column, v_nsp, p_child, cfg.control_column,
+    pgpm._encode(cfg.control_kind, v_lo), cfg.control_column, v_batch)
+    into v_batch_count, v_probe_hi_col;
+
+  if v_batch_count < v_batch then
+    v_stop := v_child_hi;   -- the byte budget reaches past this child's own live end
+  else
+    v_probe_hi := pgpm._decode(cfg.control_kind, v_probe_hi_col);
+    -- extend to the next distinct value past the boundary, so hi never splits a run of ties (a
+    -- child's own CHECK bounds every row here to < v_child_hi already, so this can never overshoot it)
+    execute format('select min(%I)::text from %I.%I t where t.%I > %L',
+                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col)
+      into v_next_distinct_col;
+    v_stop := case when v_next_distinct_col is null then v_child_hi
+                   else pgpm._decode(cfg.control_kind, v_next_distinct_col) end;
+  end if;
+
+  if not pgpm._native_gt(cfg.control_kind, v_stop, v_lo) then
+    return;   -- no progress possible this call
+  end if;
+
+  lo := v_lo; hi := v_stop;
+  return next;
+end;
+$$;
+
+-- true once pgpm.archive_ledger's recorded ranges for this child reach its own hi, or the strategy
+-- is 'none' (nothing to protect against a drop). Chunks for a given child are gapless and
+-- monotonically forward by construction (_next_archive_chunk always resumes exactly where the last
+-- one left off), so the ledger's own max(hi) reaching the child's hi is exactly "the union covers
+-- [lo, hi)" -- the same watermark reasoning archive._file_watermark already relied on.
+create or replace function pgpm._archive_fully_covered(p_parent regclass, p_child name)
+returns boolean language plpgsql as $$
+declare cfg pgpm.config; v_ncast text; v_child_hi text; v_watermark text;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  if cfg.archive_fn is null then return true; end if;
+
+  select p.hi into v_child_hi from pgpm.part p where p.parent_table = p_parent and p.child_name = p_child;
+  if not found then raise exception 'pg_partition_magician: %.% is not a tracked partition', p_parent, p_child; end if;
+
+  -- hi is text; cast to the native type before max()'ing, same reasoning (and the same fix) as
+  -- _next_archive_chunk above -- a plain max() would compare lexicographically.
+  v_ncast := pgpm._native_type(cfg.control_kind);
+  execute format('select max(hi::%s)::text from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
+                 v_ncast, p_parent::text, p_child)
+    into v_watermark;
+
+  return v_watermark is not null and not pgpm._native_gt(cfg.control_kind, v_child_hi, v_watermark);
+end;
+$$;
+
+-- one maintenance tick's worth of chunked archiving: for every attached child that ALREADY has the
+-- write-block trigger installed (checked directly against pg_trigger, not re-derived from the
+-- boundary formula -- this is what keeps archiving from ever running ahead of write-blocking) and is
+-- not yet fully covered, pick its next chunk, run the configured strategy, and record progress.
+-- Returns how many chunks were recorded this call. A 'none' strategy (archive_fn null) has nothing
+-- to do -- every child is already "covered" per _archive_fully_covered above.
+create or replace function pgpm._archive_step(p_parent regclass)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_ncast text; r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  if cfg.archive_fn is null then return 0; end if;
+
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+
+  -- oldest first, matching retain()'s own convention -- archiving history in age order, though each
+  -- child's progress is independent of the others' either way.
+  for r in execute format(
+    'select p.child_name from pgpm.part p
+      where p.parent_table = %L::regclass and p.attached
+        and exists (
+          select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
+           where t.tgname = ''pgpm_write_block'' and c.relname = p.child_name and c.relnamespace = %L::regnamespace
+        )
+      order by p.lo::%s',
+    p_parent::text, v_nsp, v_ncast)
+  loop
+    if pgpm._archive_fully_covered(p_parent, r.child_name) then continue; end if;
+
+    select * into v_range from pgpm._next_archive_chunk(p_parent, r.child_name);
+    if not found then continue; end if;
+
+    v_result := pgpm._run_archive_strategy(p_parent, r.child_name, v_range.lo, v_range.hi);
+
+    insert into pgpm.archive_ledger (parent_table, lo, hi, child_name, rows_archived)
+    values (p_parent, v_range.lo, v_result.covered_hi, r.child_name, v_result.rows_archived);
+    v_count := v_count + 1;
+  end loop;
+  return v_count;
 end;
 $$;
 
@@ -1814,7 +2150,7 @@ create or replace function pgpm.maintain(p_parent regclass)
 returns text language plpgsql as $$
 declare
   cfg pgpm.config;
-  v_made int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
+  v_made int := 0; v_archived int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
   v_regrain text := 'skipped'; v_regrain_child name;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
@@ -1861,6 +2197,27 @@ begin
   else
     v_note := v_note || ' obtain_backoff';
   end if;
+
+  -- Write-block on retain-eligibility (issue #235), ahead of retain()'s own drop logic: a partition
+  -- is blocked from writes the instant it crosses the boundary, whether or not (or how far along)
+  -- it is being archived -- not yet gated on by retire()'s drop precondition itself (#238).
+  begin
+    perform pgpm._enforce_write_blocks(p_parent);
+  exception when others then
+    v_note := v_note || ' write_block_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'write_block_skip', left(sqlerrm, 200));
+  end;
+
+  -- Byte-budget chunked archiving (issue #237), one tick's worth per write-blocked, not-yet-covered
+  -- child: only ever runs after the write-block step above, on children that step has already
+  -- protected. Not a retire()/retain() drop precondition yet (#238) -- archiving here only records
+  -- progress, it never causes anything to be dropped.
+  begin
+    v_archived := pgpm._archive_step(p_parent);
+  exception when others then
+    v_note := v_note || ' archive_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'archive_skip', left(sqlerrm, 200));
+  end;
 
   begin
     v_dropped := pgpm.retain(p_parent);
@@ -2025,8 +2382,8 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
   end;
 
-  return format('obtained=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
-                v_made, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
+  return format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
+                v_made, v_archived, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
 end;
 $$;
 
