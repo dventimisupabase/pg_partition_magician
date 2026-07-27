@@ -11,6 +11,8 @@ on:
       - 'pgpm_archive/install.sql'
       - 'pgpm_core/install.sql'
       - 'tests/archive/**'
+      - 'scripts/verify_parquet*.py'
+      - 'scripts/requirements-verify.txt'
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -21,6 +23,8 @@ on:
       - 'pgpm_archive/install.sql'
       - 'pgpm_core/install.sql'
       - 'tests/archive/**'
+      - 'scripts/verify_parquet*.py'
+      - 'scripts/requirements-verify.txt'
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -34,5 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Run the archive track
         run: ./test.sh archive

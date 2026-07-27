@@ -745,10 +745,11 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- Compression: GZIP (RFC 1952) wrapping a from-scratch DEFLATE (RFC 1951)
--- encoder -- LZ77 matching plus a fixed Huffman code. Ported rename-only from
--- prototypes/parquet-writer/ (pq._* -> archive._pq_*), where this same logic
--- was verified end-to-end (pyarrow + DuckDB, including cross-partition
--- ranges) before this port; nothing else changes.
+-- encoder -- LZ77 matching plus a fixed Huffman code. Originally built and
+-- verified end-to-end (pyarrow + DuckDB, including cross-partition ranges) in
+-- a standalone prototype before being ported rename-only (pq._* ->
+-- archive._pq_*); that verification now runs directly against these
+-- functions instead (scripts/verify_parquet.py/verify_parquet_range.py).
 -- ---------------------------------------------------------------------------
 
 -- CRC-32/ISO-HDLC (the checksum RFC 1952's gzip trailer requires), table-driven.

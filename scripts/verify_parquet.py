@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Verify pq.to_parquet() output against two independent Parquet readers.
+"""Verify pgpm_archive's Parquet writer (archive._pq_to_parquet) against two
+independent Parquet readers.
 
-Not testing "in Postgres": pq.to_parquet() only has to produce bytes; every
-assertion here runs outside the database, against pyarrow (Arrow's C++ reader)
-and DuckDB (its own from-scratch reader). Agreement between two independent
-implementations is the point, not just "it opened".
+Not testing "in Postgres": archive._pq_to_parquet()'s only job is to produce
+bytes; every assertion here runs outside the database, against pyarrow
+(Arrow's C++ reader) and DuckDB (its own from-scratch reader). Agreement
+between two independent implementations is the point, not just "it opened".
+
+Assumes pgpm_core/install.sql and pgpm_archive/install.sql are already
+installed in the target database -- this script only tests, it does not
+install (see test.sh's run_archive(), which does both against the same
+running instance).
 
 Usage:
-  ./.venv/bin/python verify.py [dsn]
+  python3 verify_parquet.py [dsn]
 
-Defaults to the docker-compose pg17 service (localhost:5517).
+Defaults to the docker-compose archive service (localhost:5520), the PG17 +
+pgsql-http image pgpm_archive's own CI track uses.
 """
 import datetime
 import os
@@ -20,8 +27,7 @@ import duckdb
 import psycopg2
 import pyarrow.parquet as pq
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DSN = sys.argv[1] if len(sys.argv) > 1 else "postgresql://postgres:postgres@localhost:5517/postgres"
+DSN = sys.argv[1] if len(sys.argv) > 1 else "postgresql://postgres:postgres@localhost:5520/postgres"
 
 FAILURES = []
 
@@ -35,17 +41,16 @@ def run(conn, sql, params=None):
 
 
 def to_parquet_bytes(conn, table):
-    rows = run(conn, f"select pq.to_parquet('{table}'::regclass)")
+    # explicit false: archive._pq_to_parquet's own p_compress defaults to true in
+    # production (unlike the prototype this script was ported from, which defaulted to
+    # false) -- relying on the default here would silently test the compressed path
+    # under an "uncompressed" name.
+    rows = run(conn, f"select archive._pq_to_parquet('{table}'::regclass, false)")
     return bytes(rows[0][0])
 
 
 def to_parquet_bytes_compressed(conn, table):
-    rows = run(conn, f"select pq.to_parquet('{table}'::regclass, true)")
-    return bytes(rows[0][0])
-
-
-def to_parquet_bytes_compressed_dynamic(conn, table):
-    rows = run(conn, f"select pq.to_parquet('{table}'::regclass, true, true)")
+    rows = run(conn, f"select archive._pq_to_parquet('{table}'::regclass, true)")
     return bytes(rows[0][0])
 
 
@@ -366,6 +371,17 @@ def test_mixed_required_and_optional_columns(conn):
     check("mixed NOT NULL (id) and nullable (note, score) columns", expected, arrow_rows, duck_rows)
 
 
+# ---------------------------------------------------------------------------
+# GZIP compression: p_compress => true routes column pages through
+# archive._pq_gzip_compress_dynamic (a real per-block Huffman code, RFC 1951
+# 3.2.2/3.2.7, issue #206) -- production's only compressed path now, unlike
+# the prototype this script was ported from, which also exposed a p_dynamic
+# toggle to compare against the older fixed-Huffman archive._pq_gzip_compress
+# during that feature's own development. Same correctness bar as every other
+# case here (both real readers, row-for-row against the live source), plus a
+# real smaller-than-uncompressed check.
+# ---------------------------------------------------------------------------
+
 def test_compressed_repetitive_text(conn):
     # a repeated phrase forces real LZ77 back-references, not just Huffman-coded literals --
     # the case compression exists for.
@@ -401,6 +417,31 @@ def test_compressed_nullable_mixed(conn):
           expected, arrow_rows, duck_rows)
 
 
+def test_compressed_realistic_columns(conn):
+    # the shapes #206's own pre-build measurement predicted a real win on: a sequential
+    # id, jittered epoch-like values, and realistic-range floats -- not just repetitive
+    # text or a low-entropy adversarial case. Plain int8/float8 (no timestamp type):
+    # cross-reader datetime comparison is its own fiddly normalization problem, already
+    # covered by test_timestamptz.
+    make_table(conn, "t_gzip_real",
+               "id int8 not null, ts_micros int8 not null, price float8 not null", None)
+    run(conn, "insert into t_gzip_real (id, ts_micros, price) select g, "
+              "1753000000000000 + g::bigint * 1000000 + (random() * 2000000)::bigint, "
+              "round((random() * 499 + 0.99)::numeric, 2)::float8 "
+              "from generate_series(1, 20000) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed(conn, "t_gzip_real")
+    uncompressed_raw = to_parquet_bytes(conn, "t_gzip_real")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_gzip_real", ["id", "ts_micros", "price"])
+    ok = check("gzip-compressed: realistic id/timestamp/float columns", expected, arrow_rows, duck_rows)
+    if len(raw) >= len(uncompressed_raw):
+        FAILURES.append(f"realistic columns: compressed ({len(raw)}) not smaller than uncompressed ({len(uncompressed_raw)})")
+        ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: gzip codec smaller-than-uncompressed on realistic columns "
+          f"({len(uncompressed_raw)} -> {len(raw)} bytes)")
+
+
 def test_compressed_low_entropy_still_correct(conn):
     # md5 hex text barely compresses (small alphabet gives short LZ77 matches everywhere, not
     # long ones) -- the point is correctness under a near-worst-case input, not ratio.
@@ -421,99 +462,9 @@ def test_compressed_empty_table(conn):
     check("gzip-compressed: empty table (0 rows), still a valid Parquet file", expected, arrow_rows, duck_rows)
 
 
-# ---------------------------------------------------------------------------
-# Dynamic Huffman (issue #206): p_dynamic => true on pq.to_parquet routes column
-# pages through pq._gzip_compress_dynamic (a real per-block Huffman code, RFC
-# 1951 3.2.7's meta-alphabet) instead of pq._gzip_compress's fixed tables. Same
-# correctness bar as every other case here (both real readers, row-for-row against
-# the live source), plus a real measured size comparison against the fixed variant.
-# ---------------------------------------------------------------------------
-
-def test_dynamic_repetitive_text(conn):
-    make_table(conn, "t_dyn_rep", "id int4 not null, note text not null", None)
-    run(conn, "insert into t_dyn_rep (id, note) select g, repeat('the quick brown fox jumps over the lazy dog ', 4) || g::text from generate_series(1, 400) g")
-    conn.commit()
-    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_rep")
-    fixed_raw = to_parquet_bytes_compressed(conn, "t_dyn_rep")
-    arrow_rows, duck_rows = read_with_both_readers(raw)
-    expected = fetch_expected(conn, "t_dyn_rep", ["id", "note"])
-    ok = check("dynamic Huffman: repetitive text, both readers agree", expected, arrow_rows, duck_rows)
-    if codec_of(raw) != "GZIP":
-        FAILURES.append(f"dynamic gzip codec: expected GZIP, got {codec_of(raw)}")
-        ok = False
-    if len(raw) >= len(fixed_raw):
-        FAILURES.append(f"dynamic Huffman: not smaller than fixed ({len(raw)} vs {len(fixed_raw)})")
-        ok = False
-    print(f"{'PASS' if ok else 'FAIL'}: dynamic Huffman codec + smaller-than-fixed "
-          f"(fixed {len(fixed_raw)} -> dynamic {len(raw)} bytes, "
-          f"{100*(len(fixed_raw)-len(raw))/len(fixed_raw):.1f}% smaller)")
-
-
-def test_dynamic_nullable_mixed(conn):
-    make_table(conn, "t_dyn_null", "id int4 not null, note text, score float8", None)
-    run(conn, "insert into t_dyn_null (id, note, score) select g, "
-              "case when g % 3 = 0 then null else repeat('hello world ', 5) || g::text end, "
-              "case when g % 7 = 0 then null else g * 1.5 end "
-              "from generate_series(1, 300) g")
-    conn.commit()
-    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_null")
-    arrow_rows, duck_rows = read_with_both_readers(raw)
-    expected = fetch_expected(conn, "t_dyn_null", ["id", "note", "score"])
-    check("dynamic Huffman: nullable columns (definition levels + values both compressed)",
-          expected, arrow_rows, duck_rows)
-
-
-def test_dynamic_realistic_columns(conn):
-    # the shapes the pre-build measurement (#206) predicted a real win on: a
-    # sequential id, jittered epoch-like values, and realistic-range floats -- not
-    # just repetitive text or an adversarial case. Plain int8/float8 (no timestamp
-    # type): cross-reader datetime comparison is its own fiddly normalization
-    # problem, already covered by test_timestamptz -- this test's own point is the
-    # compression win on a realistic multi-column numeric shape, not re-testing
-    # timestamp handling.
-    make_table(conn, "t_dyn_real",
-               "id int8 not null, ts_micros int8 not null, price float8 not null", None)
-    run(conn, "insert into t_dyn_real (id, ts_micros, price) select g, "
-              "1753000000000000 + g::bigint * 1000000 + (random() * 2000000)::bigint, "
-              "round((random() * 499 + 0.99)::numeric, 2)::float8 "
-              "from generate_series(1, 20000) g")
-    conn.commit()
-    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_real")
-    fixed_raw = to_parquet_bytes_compressed(conn, "t_dyn_real")
-    arrow_rows, duck_rows = read_with_both_readers(raw)
-    expected = fetch_expected(conn, "t_dyn_real", ["id", "ts_micros", "price"])
-    ok = check("dynamic Huffman: realistic id/timestamp/float columns", expected, arrow_rows, duck_rows)
-    pct = 100 * (len(fixed_raw) - len(raw)) / len(fixed_raw)
-    if pct <= 0:
-        FAILURES.append(f"dynamic Huffman: no size win on realistic columns ({len(raw)} vs fixed {len(fixed_raw)})")
-        ok = False
-    print(f"{'PASS' if ok else 'FAIL'}: dynamic Huffman on realistic columns "
-          f"(fixed {len(fixed_raw)} -> dynamic {len(raw)} bytes, {pct:.1f}% smaller)")
-
-
-def test_dynamic_low_entropy_still_correct(conn):
-    make_table(conn, "t_dyn_hash", "id int4 not null, h text not null", None)
-    run(conn, "insert into t_dyn_hash (id, h) select g, md5(g::text) from generate_series(1, 500) g")
-    conn.commit()
-    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_hash")
-    arrow_rows, duck_rows = read_with_both_readers(raw)
-    expected = fetch_expected(conn, "t_dyn_hash", ["id", "h"])
-    check("dynamic Huffman: low-entropy hex text (near-worst-case for LZ77)", expected, arrow_rows, duck_rows)
-
-
-def test_dynamic_empty_table(conn):
-    make_table(conn, "t_dyn_empty", "id int4 not null, note text not null", None)
-    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_empty")
-    arrow_rows, duck_rows = read_with_both_readers(raw)
-    expected = fetch_expected(conn, "t_dyn_empty", ["id", "note"])
-    check("dynamic Huffman: empty table (0 rows), still a valid Parquet file", expected, arrow_rows, duck_rows)
-
-
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
-    run(conn, open(os.path.join(HERE, "parquet_writer.sql")).read())
-    conn.commit()
 
     tests = [
         test_int32_basic,
@@ -538,13 +489,9 @@ def main():
         test_mixed_required_and_optional_columns,
         test_compressed_repetitive_text,
         test_compressed_nullable_mixed,
+        test_compressed_realistic_columns,
         test_compressed_low_entropy_still_correct,
         test_compressed_empty_table,
-        test_dynamic_repetitive_text,
-        test_dynamic_nullable_mixed,
-        test_dynamic_realistic_columns,
-        test_dynamic_low_entropy_still_correct,
-        test_dynamic_empty_table,
     ]
     for t in tests:
         try:

@@ -6,3 +6,7 @@ bench/vendor/
 
 # supabase CLI scratch (linked-project ref, etc.)
 supabase/.temp/
+
+# venv for scripts/verify_parquet*.py, created on demand by test.sh's archive track
+/.venv-verify/
+__pycache__/

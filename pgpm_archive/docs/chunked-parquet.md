@@ -192,10 +192,9 @@ end;
 $$;
 ```
 
-A prototype of this same encoder, with its own from-scratch test tables and both readers
-verifying it independently, lives in
-[`prototypes/parquet-writer/`](../../prototypes/parquet-writer/README.md#the-cross-partition-range-variant)
--- the standalone spike this section grew from, same as the whole-relation encoder before it.
+This encoder is verified end-to-end (pyarrow + DuckDB agreeing, not just "it opened"),
+independently of the pgTAP suite, by `scripts/verify_parquet_range.py` (run via `./test.sh
+archive`) -- the same independent-reader bar the whole-relation encoder is held to.
 
 ## The gate is gone: `retire()` checks coverage directly
 
