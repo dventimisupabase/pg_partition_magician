@@ -27,8 +27,7 @@ insert into public.a8 (id, payload) values (11000, 'frontier');   -- advances th
 
 select mk_archive_config('a8', false);
 update pgpm.config set retain_batch = 0 where parent_table = 'public.a8'::regclass;
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.a8'::regclass;
+select pgpm.set_archive_fn('public.a8', 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure);
 
 -- boundary = grid_floor(11000 - 3000, 1000) = 8000: eligible = monolith [0,6000), [6000,7000),
 -- [7000,8000), the same shape as 04's own Part A fixture (transplanted directly so the
@@ -89,8 +88,7 @@ insert into public.a8p (id, payload) values (11000, 'frontier');
 
 select mk_archive_config('a8p', false);
 update pgpm.config set retain_batch = 0 where parent_table = 'public.a8p'::regclass;
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.a8p'::regclass;
+select pgpm.set_archive_fn('public.a8p', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 
 select pgpm.maintain('public.a8p');
 

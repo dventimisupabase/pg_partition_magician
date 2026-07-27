@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **Restore a function-based operator interface for archiving; no more raw SQL as the config
+  surface.** Issue #240's deletion of the old paced worker collaterally deleted its
+  `archive.configure`/`unconfigure` operator interface too, regressing back to `insert into
+  archive.config` / `update pgpm.config set archive_fn = ...` as the documented way to set up
+  archiving -- exactly the "raw SQL as the user interface" pattern issue #233 existed to eliminate.
+  Two new functions restore it, scoped to the current (schedule-free) architecture:
+  - `pgpm.set_archive_fn(p_parent, p_archive_fn regprocedure default null)` in `pgpm_core`, matching
+    the existing `set_regrain`/`set_drain_adaptive`/`set_drain_ambient` convention -- the operator
+    switch for `config.archive_fn`.
+  - `archive.configure(p_parent, p_bucket, ...)` / `archive.unconfigure(p_parent)` in
+    `pgpm_archive` -- an upsert/delete on `archive.config`, guarded by a pgpm-managed check. Narrower
+    than the old, deleted interface: connection settings only, no scheduling knob (there is nothing
+    left to schedule now that `pgpm.maintain()` drives archiving for every managed table).
+  Every README/reference/guide example and test fixture that showed raw SQL now calls these
+  instead. No behavior change to the underlying columns; purely an interface restoration.
+
 - **Fold `pgpm_archive/docs/` into `pgpm_archive/README.md`; no more docs subfolder.** The three
   pages (`strategies-overview.md`, `to-s3.md`, `chunked-parquet.md`, ~2000 lines total) are gone;
   their narrative, honest-limits, and verified-end-to-end content now lives directly in

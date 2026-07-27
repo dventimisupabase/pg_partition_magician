@@ -366,11 +366,10 @@ A partition gets a `BEFORE INSERT OR UPDATE OR DELETE` trigger the moment it cro
 horizon, independent of whether or how it is archived -- a backdated write into an eligible,
 not-yet-dropped range is rejected outright rather than silently diverging an archive from what is
 still live. If you also want the *drop* itself to wait until archiving has actually happened, set
-`config.archive_fn` to a resumable archive strategy:
+`config.archive_fn` to a resumable archive strategy with `pgpm.set_archive_fn`:
 
 ```sql
-update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;
+select pgpm.set_archive_fn('public.events', 'myschema.my_archiver(regclass,name,text,text)'::regprocedure);
 ```
 
 `null` (the default) means no archiving -- a write-blocked partition is immediately drop-ready, the
