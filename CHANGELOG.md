@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **Fold `pgpm_observe` into `pgpm_core`; one less optional module.** Its four functions
+  (`_observe_has_pgfr`, `observe_window`, `impact_report`, `feathering_validation`) move rename-only
+  into `pgpm_core/install.sql`, right after `snapshot()`; no behavior change, no new install-time
+  cost (the PGFR-aware code was never install-time-coupled to PGFR -- a PL/pgSQL function body isn't
+  resolved against `pgfr_analyze` until called). PGFR stays **never a dependency**: the two
+  PGFR-backed functions still raise a clear error until it's installed, exactly as before.
+  **Operationally breaking**: `pgpm_observe/install.sql` no longer exists; drop it from any install
+  script (re-running `pgpm_core/install.sql` already brings the functions along, so nothing else
+  changes). The test track follows the same split as the functions' own PGFR-optionality: the
+  PGFR-absent gate (no real PGFR needed) moves into the main suite as
+  `tests/65_observe_no_pgfr_test.sql`; the PGFR-present correlation, which does need a real vendored
+  PGFR install, stays its own track (`tests/observe/db/with_pgfr_test.sql`, `./test.sh observe`,
+  `.github/workflows/observe.yml`).
+
 - **Retire the `prototypes/parquet-writer/` prototype; its independent-reader verification moves
   into `scripts/`, wired into CI.** Both features it was built for (the Parquet writer, #199, and
   dynamic Huffman coding, #206) had already been ported rename-only into `pgpm_archive/install.sql`;

@@ -781,13 +781,13 @@ down. Use it before retaining an id-partitioned table by a time horizon.
 
 ### Observability with pg_flight_recorder (`observe`)
 
-An **optional add-on** (`pgpm_observe/install.sql`) that correlates `pgpm.log` against
+Part of `pgpm_core`: functions that correlate `pgpm.log` against
 [`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR) telemetry. `pgpm.log`
 records exactly when pgpm ran each operation, but pgpm keeps no history of what the rest of the database was
 doing; PGFR samples that history continuously but does not know which spikes were pgpm's. These functions
 bridge the two over a `pgpm.log` time window. It is **read-only and one-directional** (pgpm never writes into
-PGFR, and PGFR needs no changes), and PGFR is **never a dependency**: the module installs anywhere, and the
-PGFR-backed functions raise a `pgpm`-prefixed error when PGFR is absent.
+PGFR, and PGFR needs no changes), and PGFR is **never a dependency**: the PGFR-backed functions raise a
+`pgpm`-prefixed error when PGFR is absent.
 
 ```sql
 pgpm.observe_window(p_parent regclass, p_since interval default '7 days') returns table (

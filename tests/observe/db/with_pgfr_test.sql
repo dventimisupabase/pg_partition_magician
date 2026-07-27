@@ -1,9 +1,10 @@
--- observe track :: PGFR PRESENT
--- With pg_flight_recorder installed, impact_report correlates pgpm's window against
--- PGFR telemetry, and feathering_validation cross-checks each backoff reason against
--- what PGFR independently sampled. Determinism: we replace the snapshot table with
--- three synthetic rows so the checkpoint/WAL deltas are exact (no reliance on cron or
--- real checkpoints). One forced checkpoint occurs between the -4min and -1min rows.
+-- pg_flight_recorder correlation, PGFR PRESENT: impact_report correlates pgpm's window against
+-- PGFR telemetry, and feathering_validation cross-checks each backoff reason against what PGFR
+-- independently sampled. Requires a real vendored PGFR install (run by ./test.sh observe); the
+-- PGFR-absent gate lives in the main suite (tests/65_observe_no_pgfr_test.sql). Determinism: we
+-- replace the snapshot table with three synthetic rows so the checkpoint/WAL deltas are exact (no
+-- reliance on cron or real checkpoints). One forced checkpoint occurs between the -4min and -1min
+-- rows.
 begin;
 select plan(8);
 

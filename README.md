@@ -47,7 +47,6 @@ subset in any order is fine.
 |---|---|---|
 | **`pgpm_core`** | The product itself: `transmute`/`obtain`/`drain`/`retain`/`maintain`. | Always. |
 | **`pgpm_hypertable`** | A one-time [migration tool](#migrating-from-timescaledb) (`from_hypertable`) that converts a TimescaleDB hypertable to a pgpm-managed table, then hands off to `transmute`. Not something you keep using afterward. | Only if migrating off TimescaleDB (Apache edition). |
-| **`pgpm_observe`** | Read-only [reporting](#observability-optional) correlating `pgpm.log` against `pg_flight_recorder` (PGFR) samples. | Only if you want workload-impact reporting; installs fine without PGFR present. |
 | **`pgpm_archive`** | Ready-made S3 [archive strategies](#archiving-optional) for `config.archive_fn` (see `retain` above). | Only if you want `retain` to archive a partition's data before dropping it; without it, `archive_fn` stays `null` and partitions just drop. |
 
 ## Install
@@ -115,24 +114,21 @@ psql "$DATABASE_URL" -f pgpm_hypertable/install.sql
 
 See the [reference](docs/reference.md#migrating-from-timescaledb-from_hypertable) for the phases and knobs.
 
-## Observability (optional)
+## Observability
 
 pgpm logs every operation to `pgpm.log` but keeps no system-wide history. With
-[`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR) installed, the optional
-`pgpm_observe` add-on reports what the workload experienced during a conversion (checkpoints, WAL, waits,
-latency) and validates each adaptive-feathering backoff against PGFR's independent sampling.
+[`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR) installed,
+`pgpm.impact_report` reports what the workload experienced during a conversion (checkpoints, WAL, waits,
+latency) and `pgpm.feathering_validation` validates each adaptive-feathering backoff against PGFR's
+independent sampling.
 
 ```sql
 select pgpm.impact_report('public.events');
 select * from pgpm.feathering_validation('public.events');
 ```
 
-It is read-only, and PGFR is **never a dependency** (the PGFR-backed functions raise a clear error if it is
-absent). Load it on top of the core:
-
-```bash
-psql "$DATABASE_URL" -f pgpm_observe/install.sql
-```
+Both ship with `pgpm_core`, read-only, and PGFR is **never a dependency**: they raise a clear error until
+it's installed.
 
 ## Archiving (optional)
 
