@@ -553,7 +553,7 @@ range in a single call. `s3_key`/`etag` are optional: a transport strategy that 
 identifier to report (issue #239's `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) sets
 them; a strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none`
 strategy) leaves them `null`. This is the contract the byte-budget chunked archiver and the real S3
-upload functions implement (see `docs/retention-write-block-and-merge.md`, #242).
+upload functions implement.
 
 `pgpm._run_archive_strategy(p_parent, p_child, p_lo, p_hi)` is the dispatch stub: it looks up
 `config.archive_fn` and calls it, or, for a `null` (`none`) strategy, returns `(p_hi, null)` directly

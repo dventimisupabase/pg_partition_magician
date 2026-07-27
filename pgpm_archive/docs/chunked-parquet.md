@@ -7,9 +7,8 @@ is a deliberate, bounded choice, never an emergent consequence of how big a part
 grow. It reuses the [Parquet encoder](to-s3.md#a-columnar-variant-parquet-instead-of-ndjson) and the
 bytea-native SigV4 signer from that page rather than duplicating them.
 
-This is the mechanism behind `pgpm.config.archive_fn` (see
-[`docs/retention-write-block-and-merge.md`](../../docs/retention-write-block-and-merge.md), #242):
-`pgpm_core` itself now drives byte-budget chunked archiving as part of `pgpm.maintain()`, ahead of
+This is the mechanism behind `pgpm.config.archive_fn`: `pgpm_core` itself now drives byte-budget
+chunked archiving as part of `pgpm.maintain()`, ahead of
 every drop, and `pgpm.retire()` will not drop a partition until its own coverage check
 (`pgpm._archive_fully_covered`) says archiving has actually caught up -- no separate gate function
 to register, no drop-trigger choice to make. Setting `pgpm.config.archive_fn` to
@@ -50,8 +49,8 @@ second piece of state that could drift out of sync with what was actually archiv
 This is scoped per already-write-blocked child, not per managed table: `pgpm._next_archive_chunk`
 picks the next chunk within one child's own `[lo, hi)`, resuming from wherever that child's own
 ledger coverage left off. A child only ever becomes a candidate once the write-block trigger is
-installed on it (`docs/retention-write-block-and-merge.md`, #242) -- that gating, and the frontier/
-retention-horizon math behind it, is `pgpm_core`'s job now, not this page's. A large child can take
+installed on it -- that gating, and the frontier/retention-horizon math behind it, is
+`pgpm_core`'s job now, not this page's. A large child can take
 several `maintain()` ticks to fully archive; `pgpm.retire()` simply will not drop it until
 `_archive_fully_covered` says the last chunk has landed.
 
@@ -223,9 +222,8 @@ left off:
 - **The child's own `hi`**: unlike the original design (which had to compute a frozen floor and a
   retention horizon itself, since nothing else gated eligibility), a child only becomes a candidate
   once `pgpm`'s write-block trigger is already installed on it -- which only happens once that
-  child is both frozen and past the retention horizon (`docs/retention-write-block-and-merge.md`,
-  #242). The child's own `hi` is already a safe, fixed ceiling; there is no separate floor/horizon
-  math to redo here.
+  child is both frozen and past the retention horizon. The child's own `hi` is already a safe,
+  fixed ceiling; there is no separate floor/horizon math to redo here.
 
 `pgpm._archive_step(p_parent)`, called once per `pgpm.maintain()` tick, is the orchestrator: for
 every attached child that already has the write-block trigger and is not yet fully covered, it

@@ -1,5 +1,5 @@
--- Byte-budget chunked archiving, ported onto the archive_fn contract (issue #237; see
--- docs/retention-write-block-and-merge.md, #242). archive._next_range_byte_budget/archive.ledger
+-- Byte-budget chunked archiving, ported onto the archive_fn contract (issue #237).
+-- archive._next_range_byte_budget/archive.ledger
 -- (#213, #221) proved that archiving a large partition safely means never doing it as one giant
 -- transaction; this ports that mechanism -- unchanged in intent -- onto pgpm.config.archive_fn
 -- (#236) and pgpm._install_write_block's trigger (#235): pgpm._archive_step only ever picks up a

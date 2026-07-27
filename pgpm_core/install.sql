@@ -753,7 +753,7 @@ begin
 end;
 $$;
 
--- write-block on retain-eligibility (issue #235; docs/retention-write-block-and-merge.md). A
+-- write-block on retain-eligibility (issue #235). A
 -- partition past _retain_boundary() is drop-eligible, and for however long it takes chunked
 -- archiving to finish covering it (or forever, for a table with no archive strategy at all), it
 -- should not accept writes either -- a backdated write into that span, including into a range some

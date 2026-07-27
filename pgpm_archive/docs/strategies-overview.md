@@ -31,9 +31,8 @@ have not archived yet -- that ordering is entirely your own script's responsibil
 ## `config.archive_fn`: automatic, bounded, drop-gated
 
 [Chunked, cross-partition Parquet archival](chunked-parquet.md) is the built-in strategy behind
-`pgpm.config.archive_fn` (see
-[`docs/retention-write-block-and-merge.md`](../../docs/retention-write-block-and-merge.md), #242):
-an already-write-blocked child is archived in byte-budget-sized chunks, one per `maintain()` tick,
+`pgpm.config.archive_fn`: an already-write-blocked child is archived in byte-budget-sized chunks,
+one per `maintain()` tick,
 recorded in `pgpm.archive_ledger`; `pgpm.retire()` checks `pgpm._archive_fully_covered` directly and
 will not drop a child until the last chunk has landed. There is no separate gate function to
 register and no drop-trigger choice to make -- write-blocking and archive-coverage are both
