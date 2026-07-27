@@ -1446,12 +1446,21 @@ separate drop) exercised as part of this project's own CI.
 
 ## Honest limits, for the Parquet variant
 
-- **Same ceiling as the single-PUT function, not the multipart one.** The payload is one in-memory
-  `bytea` (Postgres's ~1GB cap, same practical ceiling as the `text` variant above); nothing here
-  streams. Chunking the *already-built* Parquet `bytea` into fixed-size byte ranges for a
-  multipart upload is mechanically straightforward (S3 multipart just concatenates bytes; it does
-  not care that a byte-range boundary falls in the middle of a row group), but it was not built in
-  this pass -- said plainly rather than implied.
+- **Same ceiling as the single-PUT function, not the multipart one -- and multipart would not
+  actually raise it (issue #211).** The payload is one in-memory `bytea` (Postgres's ~1GB cap,
+  same practical ceiling as the `text` variant above); nothing here streams. Chunking the
+  *already-built* Parquet `bytea` into fixed-size byte ranges for a multipart upload is
+  mechanically straightforward (S3 multipart just concatenates bytes; it does not care that a
+  byte-range boundary falls in the middle of a row group), but it would not buy anything: the
+  encoder already has to hold the whole file as one `bytea` before any network call happens, so a
+  partition whose Parquet encoding would exceed Postgres's ~1GB value cap fails during *encoding*,
+  before transport is ever reached -- multipart cannot fix a problem that happens upstream of
+  transport entirely. (Raw S3's own single-PUT limit is 5GB, well above that ceiling, and Supabase
+  Storage's project upload-size limit is enforced per whole object, multipart included -- neither
+  endpoint has a transport-level limit multipart would actually get past here.) The real fix for a
+  Parquet file too big to hold comfortably in memory is
+  [the byte-budget chunked strategy](chunked-parquet.md), which sidesteps the problem by choosing
+  smaller file boundaries instead of trying to stream-multipart one giant file.
 - **Nullable columns supported, but only single-level (no nesting).** This schema is always flat
   (no repeated fields, no groups), so `max_definition_level` never needs to exceed 1 and the
   definition-levels bitmap stays a single bit-packed run per page. A nested/repeated schema would
