@@ -2119,6 +2119,21 @@ begin
 end;
 $$;
 
+-- Operator switch for the archive-before-drop strategy (issue #236's config.archive_fn contract).
+-- p_archive_fn names any (p_parent regclass, p_child name, p_lo text, p_hi text) returns
+-- pgpm.archive_result function -- pgpm_archive ships two (pgpm.archive_to_s3_ndjson/
+-- archive_to_s3_parquet), or bring your own. Casting the argument to regprocedure validates that
+-- the function exists with exactly this signature right away, not later when a maintenance tick
+-- tries to call it. null (the default) turns archiving off: retire()'s drop precondition then only
+-- waits on the write-block, never on coverage.
+create or replace function pgpm.set_archive_fn(p_parent regclass, p_archive_fn regprocedure default null)
+returns void language plpgsql as $$
+begin
+  update pgpm.config set archive_fn = p_archive_fn where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
 -- pause/resume the scheduled lifecycle for one table. transmute registers a table paused by default
 -- (the deliberate two-step: convert, inspect, then go live), and maintenance is a no-op while paused.
 -- These are the first-class way to flip config.paused, so operators never hand-edit the catalog.

@@ -12,8 +12,8 @@
 -- config surface both share:
 --   - The archive_fn strategies (pgpm.archive_to_s3_ndjson / archive_to_s3_parquet,
 --     in the pgpm schema, not archive -- they are pgpm_core contract implementations
---     that happen to live in this optional module): set pgpm.config.archive_fn to
---     one of them and pgpm.maintain()'s own byte-budget chunking (pgpm._archive_step,
+--     that happen to live in this optional module): pgpm.set_archive_fn(parent, one
+--     of them) and pgpm.maintain()'s own byte-budget chunking (pgpm._archive_step,
 --     pgpm.archive_ledger) drives archiving automatically, ahead of every drop.
 --     This is the normal way to use this module.
 --   - The synchronous functions (archive.to_s3 / archive.to_s3_parquet): archive a
@@ -22,15 +22,22 @@
 --     before dropping a partition another way.
 --
 -- The old paced worker (archive.tick(), archive.config's boundary_rule/drop_trigger/
--- format knobs, archive.file_gate, the archive.configure/schedule operator interface,
--- and pgpm.hook, the pre_drop registry it and the synchronous functions used to
--- register through) existed to do by hand what pgpm.maintain()'s archive_fn path now
--- does natively; it was deleted once that path was proven out (issue #240).
+-- format knobs, archive.file_gate, and pgpm.hook, the pre_drop registry it and the
+-- synchronous functions used to register through) existed to do by hand what
+-- pgpm.maintain()'s archive_fn path now does natively; it was deleted once that path
+-- was proven out (issue #240), and its archive.configure/schedule operator interface
+-- went with it. archive.configure/unconfigure below are its reintroduced, narrower
+-- successor for THIS architecture: connection settings only, no schedule knob (there
+-- is nothing left to schedule -- pgpm.maintain()'s own schedule already drives
+-- archiving for every managed table).
 --
--- Surface (all in the archive schema, except the archive_fn strategies noted below):
+-- Surface (all in the archive schema, except the archive_fn switch/strategies noted below):
 --   archive.config                 per-table connection settings; one row per
 --                                  managed table using either path above.
+--   archive.configure / unconfigure   sets/clears a table's archive.config row.
 --   archive.to_s3 / archive.to_s3_parquet     the synchronous functions.
+--   pgpm.set_archive_fn             the archive_fn switch (in pgpm_core; sets/clears
+--                                  pgpm.config.archive_fn for a table).
 --   pgpm.archive_to_s3_ndjson / pgpm.archive_to_s3_parquet   the archive_fn strategies.
 -- =============================================================================
 
@@ -77,6 +84,48 @@ alter table archive.config drop column if exists probe_sample;
 -- (issue #240): pgpm.archive_ledger, populated by the archive_fn strategies below via
 -- pgpm._archive_step, is its successor.
 drop table if exists archive.ledger;
+
+-- Operator interface for archive.config: an upsert with every connection-setting column as a
+-- named, defaulted parameter, guarding that p_parent is actually pgpm-managed first -- an operator
+-- should never need a raw `insert into archive.config` for normal use. Needed by BOTH paths this
+-- module ships (the archive_fn strategies and the synchronous functions), which is exactly why
+-- this stays a separate call from pgpm.set_archive_fn: connection settings and the choice to
+-- automate archiving are orthogonal.
+create or replace function archive.configure(
+  p_parent       regclass,
+  p_bucket       text,
+  p_region       text    default 'us-east-1',
+  p_endpoint     text    default null,
+  p_prefix       text    default 'events/',
+  p_vault_key_id text    default 's3_archive_access_key_id',
+  p_vault_secret text    default 's3_archive_secret_access_key',
+  p_compress     boolean default false,
+  p_part_bytes   bigint  default 8 * 1024 * 1024,
+  p_fetch_rows   int     default 20000
+) returns void language plpgsql as $$
+begin
+  if not exists (select 1 from pgpm.config where parent_table = p_parent) then
+    raise exception 'archive.configure: % is not managed by pgpm; transmute() it first', p_parent;
+  end if;
+  insert into archive.config
+    (parent_table, bucket, region, endpoint, prefix, vault_key_id, vault_secret, compress, part_bytes, fetch_rows)
+  values
+    (p_parent, p_bucket, p_region, p_endpoint, p_prefix, p_vault_key_id, p_vault_secret, p_compress, p_part_bytes, p_fetch_rows)
+  on conflict (parent_table) do update set
+    bucket = excluded.bucket, region = excluded.region, endpoint = excluded.endpoint,
+    prefix = excluded.prefix, vault_key_id = excluded.vault_key_id, vault_secret = excluded.vault_secret,
+    compress = excluded.compress, part_bytes = excluded.part_bytes, fetch_rows = excluded.fetch_rows;
+end;
+$$;
+
+-- Deletes a table's connection settings, idempotent. Does not touch pgpm.config.archive_fn (see
+-- pgpm.set_archive_fn) or drop anything already archived.
+create or replace function archive.unconfigure(p_parent regclass)
+returns void language plpgsql as $$
+begin
+  delete from archive.config where parent_table = p_parent;
+end;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Key discovery and S3 transport primitives
@@ -2042,13 +2091,13 @@ begin
 end;
 $$;
 
--- archive.configure/unconfigure/schedule/unschedule -- the paced worker's operator interface
--- (issue #233) -- are gone entirely (issue #240), along with the pgpm-archiver pg_cron job they
--- managed: wire connection settings directly into archive.config (insert/update the row yourself;
--- it is a plain table, not an API surface with its own invariants to protect) and set
--- pgpm.config.archive_fn to choose a strategy. No second scheduled job -- pgpm.maintain()'s own
--- cadence drives archiving.
+-- The paced worker's archive.schedule/unschedule (issue #233) -- wrapping a second, now-redundant
+-- pgpm-archiver pg_cron job -- are gone entirely (issue #240): pgpm.maintain()'s own cadence
+-- drives archiving, so there is nothing left to schedule. The old archive.configure/unconfigure
+-- (issue #233's 15-arg signature, which also set the paced worker's own boundary_rule/drop_trigger
+-- knobs) went with them -- but NOT the reintroduced, narrower archive.configure/unconfigure defined
+-- earlier in this file (connection settings only): dropping THAT signature here would undo the very
+-- functions this file just (re)created, since install.sql runs top to bottom.
 drop function if exists archive.configure(regclass, text, text, text, text, text, text, text, boolean, bigint, int, bigint, int, text, text);
-drop function if exists archive.unconfigure(regclass);
 drop function if exists archive.schedule(text);
 drop function if exists archive.unschedule();

@@ -533,15 +533,15 @@ A procedure that calls `maintain` for every managed table. This is what the sche
 `config.archive_fn` (issue #236) is one archive strategy per managed table, superseding the old
 `pgpm.hook` generic `pre_drop` registry (removed entirely, issue #240) -- archiving before a drop
 was its only real use. `null` (the default) means strategy `none` -- no archiving, a partition is
-immediately drop-ready. Set it directly:
+immediately drop-ready. Set it with `pgpm.set_archive_fn`:
 
 ```sql
-update pgpm.config set archive_fn = 'myschema.my_archiver(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;
+select pgpm.set_archive_fn('public.events', 'myschema.my_archiver(regclass,name,text,text)'::regprocedure);
 ```
 
-Casting the reference to `regprocedure` validates that the function exists with exactly this
-signature right away, not later when a maintenance tick tries to call it.
+Casting the second argument to `regprocedure` validates that the function exists with exactly this
+signature right away, not later when a maintenance tick tries to call it. A bare `null` (or calling
+`pgpm.set_archive_fn` with no second argument) turns archiving back off.
 
 The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns
 pgpm.archive_result`, where `pgpm.archive_result` is `(covered_hi text, rows_archived bigint, s3_key
@@ -604,11 +604,10 @@ paced worker this path replaced -- are deleted entirely (issue #240).
 `pgpm_archive` (the optional module, `pgpm_archive/install.sql`) ships two `archive_fn`-conforming
 strategies, issue #239: `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet` (both in the
 `pgpm` schema, not `archive` -- they are `pgpm_core` contract implementations that happen to live in
-this optional module). Set either directly:
+this optional module). Set either via `pgpm.set_archive_fn`:
 
 ```sql
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;
+select pgpm.set_archive_fn('public.events', 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure);
 ```
 
 Both delegate to `archive._encode_upload_ndjson_single` / `archive._encode_upload_parquet` for the

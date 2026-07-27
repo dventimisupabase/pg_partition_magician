@@ -24,11 +24,10 @@ psql "$DATABASE_URL" -f pgpm_archive/install.sql
 Then configure the table's connection settings and set its archive strategy:
 
 ```sql
-insert into archive.config (parent_table, bucket, region) values
-  ('public.events'::regclass, 'my-archive-bucket', 'us-east-1');
+select archive.configure('public.events'::regclass, 'my-archive-bucket', p_region => 'us-east-1');
 
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;   -- or pgpm.archive_to_s3_parquet
+select pgpm.set_archive_fn('public.events',
+  'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure);   -- or pgpm.archive_to_s3_parquet
 ```
 
 That is the whole installation: no gate to register, no separate schedule. `pgpm.maintain()` (on
@@ -406,8 +405,7 @@ ticks as its own size requires; `retire()` will not drop it early.
 ### Set `config.archive_fn`
 
 ```sql
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;
+select pgpm.set_archive_fn('public.events', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 ```
 
 That is the whole installation: no gate to register, no separate schedule, no drop-trigger choice.

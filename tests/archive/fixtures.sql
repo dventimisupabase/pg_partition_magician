@@ -33,15 +33,13 @@ end;
 $$;
 
 -- an archive.config row wired to the test MinIO bucket/endpoint (test.sh creates
--- archive-test-bucket via `mc mb` before any test file runs). archive.config is a plain
--- connection-settings table (issue #240 deleted the archive.configure() operator interface along
--- with the paced-worker knobs it used to also set), so this just upserts it directly.
+-- archive-test-bucket via `mc mb` before any test file runs), via the archive.configure()
+-- operator interface (reintroduced, narrower than the paced-worker-era one issue #240 deleted:
+-- connection settings only, no scheduling knob).
 create or replace function mk_archive_config(p_name text, p_compress boolean default false)
 returns void language plpgsql as $$
 begin
-  insert into archive.config (parent_table, bucket, endpoint, prefix, compress)
-  values (('public.' || p_name)::regclass, 'archive-test-bucket', 'http://minio:9000', p_name || '/', p_compress)
-  on conflict (parent_table) do update set
-    bucket = excluded.bucket, endpoint = excluded.endpoint, prefix = excluded.prefix, compress = excluded.compress;
+  perform archive.configure(('public.' || p_name)::regclass, 'archive-test-bucket',
+    p_endpoint => 'http://minio:9000', p_prefix => p_name || '/', p_compress => p_compress);
 end;
 $$;

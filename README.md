@@ -140,8 +140,7 @@ partition only drops once it's been fully archived -- automatically, in bounded 
 every drop:
 
 ```sql
-update pgpm.config set archive_fn = 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure
-  where parent_table = 'public.events'::regclass;
+select pgpm.set_archive_fn('public.events', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 ```
 
 Load it on top of the core:
