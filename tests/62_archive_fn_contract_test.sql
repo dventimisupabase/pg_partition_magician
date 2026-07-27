@@ -1,4 +1,4 @@
--- Pluggable archive_fn contract (issue #236; see docs/retention-write-block-and-merge.md, #242).
+-- Pluggable archive_fn contract (issue #236).
 -- Narrowed pgpm.hook's old generic pre_drop registry (removed entirely, issue #240) to one archive
 -- STRATEGY per managed table (config.archive_fn, nullable regprocedure -- null = strategy 'none',
 -- immediately drop-ready) and defines the calling contract a real strategy (#237's chunked port,

@@ -34,7 +34,7 @@ update pgpm.config set archive_fn = 'pgpm.archive_to_s3_ndjson(regclass,name,tex
 That is the whole installation: no gate to register, no separate schedule. `pgpm.maintain()` (on
 the pg_cron path, `pgpm.maintain_all()`) archives each eligible child in bounded, byte-budget-sized
 chunks on its own schedule, and `pgpm.retire()` will not drop a partition until archiving has
-actually caught up with it (`docs/retention-write-block-and-merge.md`, #242, in the root project).
+actually caught up with it.
 
 `archive.config`'s `vault_key_id`/`vault_secret` columns (defaults:
 `s3_archive_access_key_id`/`s3_archive_secret_access_key`) name the two

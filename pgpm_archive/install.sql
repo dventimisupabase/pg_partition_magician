@@ -25,8 +25,7 @@
 -- format knobs, archive.file_gate, the archive.configure/schedule operator interface,
 -- and pgpm.hook, the pre_drop registry it and the synchronous functions used to
 -- register through) existed to do by hand what pgpm.maintain()'s archive_fn path now
--- does natively; it was deleted once that path was proven out (issue #240; see
--- docs/retention-write-block-and-merge.md, #242).
+-- does natively; it was deleted once that path was proven out (issue #240).
 --
 -- Surface (all in the archive schema, except the archive_fn strategies noted below):
 --   archive.config                 per-table connection settings; one row per
@@ -1982,8 +1981,7 @@ $$;
 -- (p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result -- so a table can set
 -- archive_fn directly and ride pgpm.maintain()'s own byte-budget chunking
 -- (pgpm._next_archive_chunk/_archive_step, #237). Connection settings (bucket/region/endpoint/
--- prefix/vault key names/compress) still come from archive.config -- one config surface, not two
--- (docs/retention-write-block-and-merge.md, #242).
+-- prefix/vault key names/compress) still come from archive.config -- one config surface, not two.
 --
 -- archive._encode_upload_ndjson_commits (the third format, with internal COMMITs to bound an
 -- otherwise-unbounded single read) has no archive_fn counterpart and is gone (#240): archive_fn is

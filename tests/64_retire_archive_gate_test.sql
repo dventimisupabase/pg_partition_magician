@@ -1,4 +1,4 @@
--- Full lifecycle test for issue #238 (see docs/retention-write-block-and-merge.md, #242):
+-- Full lifecycle test for issue #238:
 -- pgpm.retire()'s drop precondition is now write-blocked + pgpm._archive_fully_covered, not a
 -- pre_drop hook (pgpm.hook itself is gone entirely, issue #240). This is the issue's own test plan:
 -- a child crosses the retention boundary, becomes write-blocked immediately, but stays UNDROPPED

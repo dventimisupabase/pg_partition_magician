@@ -1,4 +1,4 @@
--- Write-block on retain-eligibility (issue #235; see docs/retention-write-block-and-merge.md).
+-- Write-block on retain-eligibility (issue #235).
 -- Chunked archiving can take several maintain() ticks to fully archive one large partition, and
 -- for the whole span between crossing _retain_boundary() and the last chunk landing, the
 -- partition sits attached and, absent anything to stop it, fully writable -- a backdated write in

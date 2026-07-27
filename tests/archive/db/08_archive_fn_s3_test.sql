@@ -1,5 +1,5 @@
--- Real S3 archive strategies on the archive_fn contract (issue #239; see
--- docs/retention-write-block-and-merge.md, #242). pgpm.archive_to_s3_ndjson /
+-- Real S3 archive strategies on the archive_fn contract (issue #239).
+-- pgpm.archive_to_s3_ndjson /
 -- pgpm.archive_to_s3_parquet adapt the encode/upload transport archive._encode_upload_ndjson_single
 -- / archive._encode_upload_parquet onto pgpm.config.archive_fn's contract, so a table can set
 -- archive_fn directly and ride pgpm.maintain()'s own byte-budget chunking
