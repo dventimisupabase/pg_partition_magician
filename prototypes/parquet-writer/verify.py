@@ -44,6 +44,11 @@ def to_parquet_bytes_compressed(conn, table):
     return bytes(rows[0][0])
 
 
+def to_parquet_bytes_compressed_dynamic(conn, table):
+    rows = run(conn, f"select pq.to_parquet('{table}'::regclass, true, true)")
+    return bytes(rows[0][0])
+
+
 def codec_of(raw):
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
         f.write(raw)
@@ -416,6 +421,94 @@ def test_compressed_empty_table(conn):
     check("gzip-compressed: empty table (0 rows), still a valid Parquet file", expected, arrow_rows, duck_rows)
 
 
+# ---------------------------------------------------------------------------
+# Dynamic Huffman (issue #206): p_dynamic => true on pq.to_parquet routes column
+# pages through pq._gzip_compress_dynamic (a real per-block Huffman code, RFC
+# 1951 3.2.7's meta-alphabet) instead of pq._gzip_compress's fixed tables. Same
+# correctness bar as every other case here (both real readers, row-for-row against
+# the live source), plus a real measured size comparison against the fixed variant.
+# ---------------------------------------------------------------------------
+
+def test_dynamic_repetitive_text(conn):
+    make_table(conn, "t_dyn_rep", "id int4 not null, note text not null", None)
+    run(conn, "insert into t_dyn_rep (id, note) select g, repeat('the quick brown fox jumps over the lazy dog ', 4) || g::text from generate_series(1, 400) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_rep")
+    fixed_raw = to_parquet_bytes_compressed(conn, "t_dyn_rep")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_dyn_rep", ["id", "note"])
+    ok = check("dynamic Huffman: repetitive text, both readers agree", expected, arrow_rows, duck_rows)
+    if codec_of(raw) != "GZIP":
+        FAILURES.append(f"dynamic gzip codec: expected GZIP, got {codec_of(raw)}")
+        ok = False
+    if len(raw) >= len(fixed_raw):
+        FAILURES.append(f"dynamic Huffman: not smaller than fixed ({len(raw)} vs {len(fixed_raw)})")
+        ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: dynamic Huffman codec + smaller-than-fixed "
+          f"(fixed {len(fixed_raw)} -> dynamic {len(raw)} bytes, "
+          f"{100*(len(fixed_raw)-len(raw))/len(fixed_raw):.1f}% smaller)")
+
+
+def test_dynamic_nullable_mixed(conn):
+    make_table(conn, "t_dyn_null", "id int4 not null, note text, score float8", None)
+    run(conn, "insert into t_dyn_null (id, note, score) select g, "
+              "case when g % 3 = 0 then null else repeat('hello world ', 5) || g::text end, "
+              "case when g % 7 = 0 then null else g * 1.5 end "
+              "from generate_series(1, 300) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_dyn_null", ["id", "note", "score"])
+    check("dynamic Huffman: nullable columns (definition levels + values both compressed)",
+          expected, arrow_rows, duck_rows)
+
+
+def test_dynamic_realistic_columns(conn):
+    # the shapes the pre-build measurement (#206) predicted a real win on: a
+    # sequential id, jittered epoch-like values, and realistic-range floats -- not
+    # just repetitive text or an adversarial case. Plain int8/float8 (no timestamp
+    # type): cross-reader datetime comparison is its own fiddly normalization
+    # problem, already covered by test_timestamptz -- this test's own point is the
+    # compression win on a realistic multi-column numeric shape, not re-testing
+    # timestamp handling.
+    make_table(conn, "t_dyn_real",
+               "id int8 not null, ts_micros int8 not null, price float8 not null", None)
+    run(conn, "insert into t_dyn_real (id, ts_micros, price) select g, "
+              "1753000000000000 + g::bigint * 1000000 + (random() * 2000000)::bigint, "
+              "round((random() * 499 + 0.99)::numeric, 2)::float8 "
+              "from generate_series(1, 20000) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_real")
+    fixed_raw = to_parquet_bytes_compressed(conn, "t_dyn_real")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_dyn_real", ["id", "ts_micros", "price"])
+    ok = check("dynamic Huffman: realistic id/timestamp/float columns", expected, arrow_rows, duck_rows)
+    pct = 100 * (len(fixed_raw) - len(raw)) / len(fixed_raw)
+    if pct <= 0:
+        FAILURES.append(f"dynamic Huffman: no size win on realistic columns ({len(raw)} vs fixed {len(fixed_raw)})")
+        ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: dynamic Huffman on realistic columns "
+          f"(fixed {len(fixed_raw)} -> dynamic {len(raw)} bytes, {pct:.1f}% smaller)")
+
+
+def test_dynamic_low_entropy_still_correct(conn):
+    make_table(conn, "t_dyn_hash", "id int4 not null, h text not null", None)
+    run(conn, "insert into t_dyn_hash (id, h) select g, md5(g::text) from generate_series(1, 500) g")
+    conn.commit()
+    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_hash")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_dyn_hash", ["id", "h"])
+    check("dynamic Huffman: low-entropy hex text (near-worst-case for LZ77)", expected, arrow_rows, duck_rows)
+
+
+def test_dynamic_empty_table(conn):
+    make_table(conn, "t_dyn_empty", "id int4 not null, note text not null", None)
+    raw = to_parquet_bytes_compressed_dynamic(conn, "t_dyn_empty")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_dyn_empty", ["id", "note"])
+    check("dynamic Huffman: empty table (0 rows), still a valid Parquet file", expected, arrow_rows, duck_rows)
+
+
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
@@ -447,6 +540,11 @@ def main():
         test_compressed_nullable_mixed,
         test_compressed_low_entropy_still_correct,
         test_compressed_empty_table,
+        test_dynamic_repetitive_text,
+        test_dynamic_nullable_mixed,
+        test_dynamic_realistic_columns,
+        test_dynamic_low_entropy_still_correct,
+        test_dynamic_empty_table,
     ]
     for t in tests:
         try:

@@ -51,12 +51,17 @@ contract.
   and Snowflake with no conversion step, at the cost of being a from-scratch, zero-dependency
   writer with real limits (six types, no dictionary encoding, no statistics, one row group -- see
   [Archive partitions to S3](to-s3.md#honest-limits-for-the-parquet-variant)).
-- **Compression**: GZIP on or off, for either format. The compressor (`archive._pq_gzip_compress`)
-  takes any `bytea` and returns a valid gzip container -- it has nothing to do with Parquet
-  specifically. `archive.config.compress` (one column, read by every function on both pages) picks
-  it per table; it is not free (PR #205 measured real compression time from ~50ms/MB on highly
-  compressible data up to ~2.6s/MB on near-incompressible data), and that time counts against
-  whichever vacuum-horizon hold applies to the strategy in use.
+- **Compression**: GZIP on or off, for either format. The compressor
+  (`archive._pq_gzip_compress_dynamic`, issue #206 -- a real per-block Huffman code, not a fixed
+  RFC 1951 3.2.6 table; the older `archive._pq_gzip_compress` stays defined and directly callable
+  as a simpler, slightly cheaper rung, but every call site this module drives on its own has used
+  the dynamic variant since #206) takes any `bytea` and returns a valid gzip container -- it has
+  nothing to do with Parquet specifically. `archive.config.compress` (one column, read by every
+  function on both pages) picks it per table; it is not free (PR #205 measured real compression
+  time from ~50ms/MB on highly compressible data up to ~2.6s/MB on near-incompressible data, for
+  the fixed-Huffman variant -- dynamic Huffman costs somewhat more building the per-block code, not
+  separately measured), and that time counts against whichever vacuum-horizon hold applies to the
+  strategy in use.
 
 ## What's built, what's a gap
 
