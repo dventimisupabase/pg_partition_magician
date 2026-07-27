@@ -1431,7 +1431,7 @@ $$;
 -- p_nullable decides whether the definition-levels block gets prepended at all.
 --
 -- p_order_by defaults to 'ctid' (this function's original, whole-relation ordering,
--- unchanged byte-for-byte); docs/chunked-parquet.md's cross-partition range reader
+-- unchanged byte-for-byte); README.md's cross-partition range reader (archive._pq_to_parquet_range)
 -- passes an explicit '(control column, key columns)' order-by instead, since ctid is not
 -- comparable once a read spans more than one child's heap. This one definition serves both
 -- callers -- it is deliberately NOT redeclared with a different parameter list anywhere
@@ -1721,7 +1721,7 @@ $$;
 -- needs every row group's byte offset, known only once the whole file's bytes
 -- exist, so there is no way to COMMIT partway through building one -- a
 -- structural fact about the format, not a gap
--- (docs/to-s3.md#honest-limits-for-the-parquet-variant, #211).
+-- (README.md#honest-limits-for-the-parquet-variant, #211).
 -- ---------------------------------------------------------------------------
 
 -- single read, single PUT (optionally one gzip member for the whole body). No pagination, so no

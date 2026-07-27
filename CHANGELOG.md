@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **Fold `pgpm_archive/docs/` into `pgpm_archive/README.md`; no more docs subfolder.** The three
+  pages (`strategies-overview.md`, `to-s3.md`, `chunked-parquet.md`, ~2000 lines total) are gone;
+  their narrative, honest-limits, and verified-end-to-end content now lives directly in
+  `pgpm_archive/README.md`, one file instead of four. The ~1000+ lines of embedded SQL those pages
+  reproduced (the SigV4 signer, the multipart uploader, the from-scratch Parquet/DEFLATE/GZIP
+  writer) are dropped rather than carried over: they were byte-for-byte identical to what's already
+  shipped in `pgpm_archive/install.sql`, so keeping a second copy in the docs was pure drift risk
+  for no benefit. The merged README points at `install.sql` by function name instead. No behavior
+  change; purely a documentation consolidation.
+
 - **Fold `pgpm_observe` into `pgpm_core`; one less optional module.** Its four functions
   (`_observe_has_pgfr`, `observe_window`, `impact_report`, `feathering_validation`) move rename-only
   into `pgpm_core/install.sql`, right after `snapshot()`; no behavior change, no new install-time
