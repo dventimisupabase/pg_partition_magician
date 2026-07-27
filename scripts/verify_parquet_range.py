@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Verify pq.to_parquet_range() against two independent Parquet readers.
+"""Verify pgpm_archive's cross-partition range writer (archive._pq_to_parquet_range)
+against two independent Parquet readers.
 
-Companion to verify.py, for the cross-partition range-query variant (the first rung of
-the chunked, cross-partition Parquet archival design: archive-chunked-parquet-design.md).
-Same verification shape as verify.py (pyarrow + DuckDB agreeing on value equality, not just
-"it opened"), but every table here is a real range-PARTITIONED parent with several children,
-because the property under test -- ordering by (control column, real key) instead of ctid --
-only matters once ctid stops being a valid tiebreak (it is not comparable across more than
-one child's heap).
+Companion to verify_parquet.py, for the cross-partition range-query variant used by
+the byte-budget chunked archiving strategy (pgpm_archive/docs/chunked-parquet.md).
+Same verification shape as verify_parquet.py (pyarrow + DuckDB agreeing on value
+equality, not just "it opened"), but every table here is a real range-PARTITIONED
+parent with several children, because the property under test -- ordering by
+(control column, real key) instead of ctid -- only matters once ctid stops being a
+valid tiebreak (it is not comparable across more than one child's heap).
+
+Assumes pgpm_core/install.sql and pgpm_archive/install.sql are already installed in
+the target database -- this script only tests, it does not install (see test.sh's
+run_archive(), which does both against the same running instance).
 
 Usage:
-  ./.venv/bin/python verify_range.py [dsn]
+  python3 verify_parquet_range.py [dsn]
 
-Defaults to the docker-compose pg17 service (localhost:5517).
+Defaults to the docker-compose archive service (localhost:5520), the PG17 +
+pgsql-http image pgpm_archive's own CI track uses.
 """
 import datetime
 import os
@@ -23,8 +29,7 @@ import duckdb
 import psycopg2
 import pyarrow.parquet as pq
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DSN = sys.argv[1] if len(sys.argv) > 1 else "postgresql://postgres:postgres@localhost:5517/postgres"
+DSN = sys.argv[1] if len(sys.argv) > 1 else "postgresql://postgres:postgres@localhost:5520/postgres"
 
 FAILURES = []
 
@@ -38,7 +43,7 @@ def run(conn, sql, params=None):
 
 
 def to_parquet_range_bytes(conn, parent, control, lo, hi, compress=False):
-    rows = run(conn, "select pq.to_parquet_range(%s::regclass, %s, %s, %s, %s)",
+    rows = run(conn, "select archive._pq_to_parquet_range(%s::regclass, %s, %s, %s, %s)",
                (parent, control, lo, hi, compress))
     return bytes(rows[0][0])
 
@@ -62,7 +67,7 @@ def _norm(v):
     # timezone concept in the Parquet type itself); psycopg2 and pyarrow both give back a
     # tz-aware one for what postgres sent as timestamptz. Same value, so treat a naive
     # datetime as UTC before comparing rather than failing on a tzinfo difference (see
-    # verify.py's test_timestamptz, which hits the identical divergence).
+    # verify_parquet.py's test_timestamptz, which hits the identical divergence).
     if isinstance(v, datetime.datetime) and v.tzinfo is None:
         return v.replace(tzinfo=datetime.timezone.utc)
     return v
@@ -261,9 +266,9 @@ def test_range_composite_key_two_cols(conn):
 
 
 def test_range_unique_constraint_fallback(conn):
-    # No PRIMARY KEY, but a real UNIQUE CONSTRAINT -- pq._key_columns must fall back to it,
-    # mirroring pgpm.regrain_step's v_keyidx preference order (PK, else a constraint-backed
-    # unique index).
+    # No PRIMARY KEY, but a real UNIQUE CONSTRAINT -- archive._key_columns must fall back to
+    # it, mirroring pgpm.regrain_step's v_keyidx preference order (PK, else a
+    # constraint-backed unique index).
     run(conn, "drop table if exists t_range_unique_constraint")
     run(
         conn,
@@ -367,8 +372,9 @@ def test_range_pruning_skips_untouched_partition(conn):
 
 def test_range_compressed_across_children(conn):
     # gzip compression through the SAME cross-partition range path (spans p1+p2), not just
-    # pq.to_parquet's single-relation path -- the two entry points share _gzip_compress, but
-    # each wires it into its own page-building loop independently, so each needs its own check.
+    # archive._pq_to_parquet's single-relation path -- the two entry points share
+    # archive._pq_gzip_compress_dynamic, but each wires it into its own page-building loop
+    # independently, so each needs its own check.
     make_events_fixture(conn)
     raw = to_parquet_range_bytes(conn, "t_range_events", "ts", "2026-01-01", "2026-03-01", compress=True)
     arrow_rows, duck_rows = read_with_both_readers(raw)
@@ -380,8 +386,6 @@ def test_range_compressed_across_children(conn):
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
-    run(conn, open(os.path.join(HERE, "parquet_writer.sql")).read())
-    conn.commit()
 
     tests = [
         test_range_two_children,

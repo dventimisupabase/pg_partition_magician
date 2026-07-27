@@ -49,6 +49,7 @@ docker compose --profile pg15 down -v
 | `pgpm_core/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
 | `pgpm_core/extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
+| `scripts/verify_parquet.py` / `verify_parquet_range.py` | Independent-reader (pyarrow + DuckDB) verification of `archive._pq_to_parquet`/`_range`, run by `./test.sh archive` against a venv (`scripts/requirements-verify.txt`) after the pgTAP suite. Ported in from a standalone prototype once its code was fully absorbed into `pgpm_archive/install.sql` |
 | `Dockerfile` / `docker-compose.yml` / `test.sh` | PG 15–18 channel test matrix (pg_cron + pgtap), Docker-only |
 | `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |

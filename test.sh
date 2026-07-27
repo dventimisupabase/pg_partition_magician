@@ -33,7 +33,12 @@
 # to need a disposable database per file, because the old paced worker's
 # archive.tick()/archive._encode_upload_ndjson_commits committed internally as part of normal
 # operation, which a rolled-back transaction would not undo. That apparatus is gone (issue #240);
-# nothing left in this track commits internally, so a shared database is safe.
+# nothing left in this track commits internally, so a shared database is safe. After the pgTAP
+# suite, it also runs scripts/verify_parquet.py/verify_parquet_range.py (a venv-installed Python
+# step, not psql) against the same running instance: independent-reader (pyarrow + DuckDB)
+# verification of archive._pq_to_parquet/_range, ported into this repo proper from a standalone
+# prototype (prototypes/parquet-writer/, removed) once that prototype's code was fully absorbed
+# into pgpm_archive/install.sql.
 # It is a standalone, path-filtered CI workflow (like `observe`'s), not wired into the default Test
 # Suite or the release gate.
 set -euo pipefail
@@ -291,6 +296,21 @@ run_archive() {
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
   $DC --profile "$prof" exec -T "$svc" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/archive/db/*.sql' \
+    || fail=1
+
+  # Independent-reader verification (pyarrow + DuckDB, scripts/verify_parquet*.py): runs on the
+  # host against the archive service's published port (5520), not inside the container like the
+  # pgTAP suite above -- these are plain psycopg2 scripts, not psql. Reuses a venv across runs
+  # (only (re)installs requirements the first time) since pyarrow/DuckDB are not instant to
+  # install; safe to delete .venv-verify to force a clean reinstall.
+  echo "--- independent-reader verification (pyarrow + DuckDB) ---"
+  if [ ! -d .venv-verify ]; then
+    python3 -m venv .venv-verify
+    .venv-verify/bin/pip install -q -r scripts/requirements-verify.txt
+  fi
+  .venv-verify/bin/python scripts/verify_parquet.py "postgresql://postgres:postgres@localhost:5520/postgres" \
+    || fail=1
+  .venv-verify/bin/python scripts/verify_parquet_range.py "postgresql://postgres:postgres@localhost:5520/postgres" \
     || fail=1
 
   $DC --profile "$prof" down -v

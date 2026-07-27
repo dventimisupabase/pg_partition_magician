@@ -1,0 +1,6 @@
+# Dependencies for scripts/verify_parquet.py and scripts/verify_parquet_range.py --
+# independent-reader (pyarrow + DuckDB) verification of pgpm_archive's Parquet
+# writer, run by test.sh's archive track (./test.sh archive).
+psycopg2-binary
+pyarrow
+duckdb

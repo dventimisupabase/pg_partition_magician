@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Retire the `prototypes/parquet-writer/` prototype; its independent-reader verification moves
+  into `scripts/`, wired into CI.** Both features it was built for (the Parquet writer, #199, and
+  dynamic Huffman coding, #206) had already been ported rename-only into `pgpm_archive/install.sql`;
+  keeping the prototype's own copy of the SQL around any longer was just a second, drifting copy of
+  already-shipped code. Its two genuinely load-bearing pieces -- `verify.py`/`verify_range.py`,
+  which check `archive._pq_to_parquet`/`_range`'s output against two independent Parquet readers
+  (pyarrow and DuckDB), something the pgTAP-based archive test track never did -- move to
+  `scripts/verify_parquet.py`/`verify_parquet_range.py`, retargeted to call the real shipped
+  `archive._pq_*` functions directly (no more local install step) against `pgpm_core`+
+  `pgpm_archive` installed by `test.sh`'s own `run_archive()`. `./test.sh archive` now runs both,
+  in a venv (`scripts/requirements-verify.txt`), right after the pgTAP suite, against the same
+  running instance -- closing a real gap the archive test track's own docs had flagged (no
+  independent-reader re-verification of a real compressed Parquet object). The now-redundant
+  fixed-vs-dynamic-Huffman comparison tests (meaningful during #206's own development, not for
+  ongoing regression coverage, since production exposes no such toggle) were folded into the
+  plain compressed-output tests instead of duplicated. `prototypes/` (the whole tree) is deleted.
+
 - **Docs/CI: describe the retention/archiving merge as it now actually works; breaking change
   (#241).** Closes out the stack #242-#240 built: `pgpm.hook` and `pgpm_archive`'s old paced-worker
   scanning apparatus (`archive.tick`/`file_gate`/`configure`/`schedule` and friends) are gone, and
