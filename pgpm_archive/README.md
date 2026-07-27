@@ -75,9 +75,10 @@ near-incompressible data.
   multipart path and would not benefit from one -- a Parquet file's footer needs every row group's
   byte offset, known only once the whole file is built, so the encoder already holds the entire
   file in memory (Postgres's ~1GB cap) before any upload starts. For a partition whose Parquet
-  encoding would exceed that, use the automatic path instead: `config.archive_fn` chunks by a
-  target byte budget (`config.archive_byte_budget`, default 8 MiB) that's independent of partition
-  size, so no single upload ever needs to hold a whole large partition in memory.
+  encoding would exceed that, use the [automatic path](#automatic-vs-manual) instead:
+  `config.archive_fn` chunks by a target byte budget (`config.archive_byte_budget`, default 8 MiB)
+  that's independent of partition size, so no single upload ever needs to hold a whole large
+  partition in memory.
 - **On Supabase**: Storage enforces the project's upload size limit (default 50MB) on the S3
   protocol too, and `statement_timeout` is 2 minutes -- both apply to a single manual call. The
   automatic path's chunking keeps each upload well under both.
