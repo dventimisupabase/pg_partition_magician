@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **Rewrite `pgpm_archive/README.md` from the ground up for simplicity and concision.** The
+  previous version (post the docs/ fold) had grown into an engineering narrative: architecture
+  rationale ("why this lives apart from core"), internal-mechanism recitation ("the gate is gone,
+  `retire()` checks coverage directly"), and "verified end-to-end" proof-of-work sections that
+  don't help someone trying to use the module. Cut all of that -- most of it (the byte-budget
+  chunker's mechanics, the ledger, coverage checking) was already covered properly in
+  `docs/reference.md`'s "Byte-budget chunked archiving" section anyway, just re-explained in
+  different words. The new README is six short sections: Install, Automatic vs. manual (a small
+  comparison table replacing the old multi-section "choosing a strategy" essay), NDJSON or
+  Parquet, Limits (only the constraints a user actually needs to know before hitting them), and
+  Testing. ~500 lines down to ~95. No content lost that isn't already documented elsewhere
+  (`docs/reference.md` for the full contract, `docs/guide.md` for the operator's view).
+
 - **Restore a function-based operator interface for archiving; no more raw SQL as the config
   surface.** Issue #240's deletion of the old paced worker collaterally deleted its
   `archive.configure`/`unconfigure` operator interface too, regressing back to `insert into
