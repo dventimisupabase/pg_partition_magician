@@ -20,10 +20,12 @@
 # reusable .github/workflows/timescale.yml. It exercises pgpm.from_hypertable against real hypertables
 # (tests/timescale/).
 #
-# The `observe` track is also separate: it installs the OPTIONAL pgpm_observe module on top of the core,
-# both with and without pg_flight_recorder present, and asserts the gate + the impact_report /
-# feathering_validation correlation against PGFR telemetry (tests/observe/). PGFR is vendored under
-# bench/vendor/ and needs only pg_cron, so the track runs on the stock pgpm_test:15 image.
+# The `observe` track is also separate: pgpm_core ships pg_flight_recorder (PGFR) correlation functions
+# (observe_window/impact_report/feathering_validation) that are always present but only do anything
+# useful with PGFR installed (the PGFR-absent gate is a plain test in the main suite,
+# tests/65_observe_no_pgfr_test.sql). This track installs the vendored PGFR and asserts the
+# impact_report/feathering_validation correlation against its telemetry (tests/observe/). PGFR is
+# vendored under bench/vendor/ and needs only pg_cron, so the track runs on the stock pgpm_test:15 image.
 #
 # The `archive` track is also separate: it installs the OPTIONAL pgpm_archive module on top of the
 # core and exercises it against a real MinIO container standing in for S3 (tests/archive/). Its own
@@ -199,7 +201,8 @@ run_timescale() {
   echo "TimescaleDB track: PASS"
 }
 
-run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + correlation (PGFR present)
+run_observe() {  # pg_flight_recorder observability track: impact_report/feathering_validation correlation
+                 # against a real PGFR install (the PGFR-absent gate is tests/65 in the main suite)
   local prof="pg15" svc="postgres15" fail=0 out
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
   local pgfr="/repo/bench/vendor/pg_flight_recorder"          # container path (repo mounted at /repo)
@@ -215,9 +218,9 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
     git -C "$pgfr_host" checkout --quiet "$pgfr_sha"
   fi
   echo; echo "========================================="
-  echo "pg_flight_recorder observability track (pg15)"
+  echo "pg_flight_recorder correlation track (pg15)"
   echo "========================================="
-  $DC --profile "$prof" down -v 2>/dev/null || true   # fresh container: the with-PGFR phase installs into postgres
+  $DC --profile "$prof" down -v 2>/dev/null || true
   $DC --profile "$prof" up -d
   for _ in $(seq 1 90); do $DC "${px[@]}" -d postgres -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1; done
 
@@ -229,19 +232,9 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
     if echo "$out" | grep -qE '^not ok|^# Looks like you failed|ERROR:'; then echo "FAIL: $f"; fail=1; fi
   }
 
-  # 1) PGFR ABSENT: the optional module installs and gates without pg_flight_recorder. pgpm core needs no
-  #    pg_cron to install, and pg_cron can only be created in cron.database_name -- so this fresh db omits it.
-  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
-    -c "drop database if exists t_obs_nopgfr" -c "create database t_obs_nopgfr" >/dev/null
-  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q -c "create extension if not exists pgtap;" >/dev/null
-  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
-  $DC "${px[@]}" -d t_obs_nopgfr -v ON_ERROR_STOP=1 -q -f /repo/pgpm_observe/install.sql >/dev/null
-  run_observe_file t_obs_nopgfr /repo/tests/observe/db/01_no_pgfr_test.sql
-  $DC "${px[@]}" -d postgres -q -c "drop database if exists t_obs_nopgfr" >/dev/null
-
-  # 2) PGFR PRESENT: pg_flight_recorder requires pg_cron, which lives only in cron.database_name (postgres),
-  #    so this runs in the postgres db. The test wraps itself in BEGIN/ROLLBACK, so it leaves no state.
-  #    disable() unschedules PGFR's cron so the synthetic snapshots in the test stay deterministic.
+  # pg_flight_recorder requires pg_cron, which lives only in cron.database_name (postgres), so this runs in
+  # the postgres db. The test wraps itself in BEGIN/ROLLBACK, so it leaves no state. disable() unschedules
+  # PGFR's cron so the synthetic snapshots in the test stay deterministic.
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists pg_cron; create extension if not exists pgtap;" >/dev/null
   # The vendored PGFR install is best-effort (|| true): without pg_stat_statements preloaded (the test image
@@ -254,8 +247,7 @@ run_observe() {  # pg_flight_recorder observability track: gate (PGFR absent) + 
   fi
   $DC "${px[@]}" -d postgres -q -c "select pgfr_record.disable()" >/dev/null 2>&1 || true
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
-  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_observe/install.sql >/dev/null
-  run_observe_file postgres /repo/tests/observe/db/02_with_pgfr_test.sql
+  run_observe_file postgres /repo/tests/observe/db/with_pgfr_test.sql
 
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "observe track: FAIL"; return 1; fi

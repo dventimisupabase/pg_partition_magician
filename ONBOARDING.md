@@ -21,6 +21,8 @@ psql, or other tooling needed on the host.
 ./test.sh timescale # the from_hypertable track: TimescaleDB 2.9.1 + 2.16.1 / PG15
                     # (the big fleet clusters), its own image, NOT in the default matrix
                     # (TS_VERSIONS='2.9.1' ./test.sh timescale runs just one)
+./test.sh observe   # the pg_flight_recorder correlation track: PG15 + a vendored PGFR install,
+                    # NOT in the default matrix
 ./test.sh archive   # the pgpm_archive track: PG17 + pgsql-http against a MinIO stand-in
                     # for S3, its own image, NOT in the default matrix
 ```
@@ -44,7 +46,6 @@ docker compose --profile pg15 down -v
 |---|---|
 | `pgpm_core/install.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
 | `pgpm_hypertable/install.sql` | Optional TimescaleDB-only add-on: migrate a hypertable to a pgpm-managed partition set. Loaded on top of the core, only where `timescaledb` exists |
-| `pgpm_observe/install.sql` | Optional observability add-on: correlates `pgpm.log` against `pg_flight_recorder` telemetry (impact report, feathering validation). Installs anywhere; the PGFR-backed functions gate at call time. PGFR is never a dependency |
 | `pgpm_archive/` | Optional archival add-on, deliberately **not referenced from this repo's own `README.md`**: it supplies S3 transport (connection settings in `archive.config`: bucket, region, endpoint, prefix, vault key names, compression) for two archive strategies -- `pgpm.config.archive_fn` (the normal, automatic path: `pgpm.maintain()` drives bounded chunks, `retire()` won't drop until fully covered) and `archive.to_s3`/`archive.to_s3_parquet` (synchronous functions, called directly, no automatic tie to a drop). `README.md` is its own front door; `docs/*.md` holds the narrative/honest-limits/verification pages |
 | `pgpm_core/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
 | `pgpm_core/extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
@@ -54,6 +55,7 @@ docker compose --profile pg15 down -v
 | `fixtures/demo.sql` | Builds + transmutes the three demo tables (time / id / uuidv7); loaded by the harness, runnable by hand |
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `tests/timescale/` | The `from_hypertable` track: its own `Dockerfile` (TimescaleDB + pgTAP), `fixtures.sql`, and `db/*.sql` tests, run by `./test.sh timescale` (disposable-db per file) |
+| `tests/observe/` | The `pg_flight_recorder` correlation track: `db/with_pgfr_test.sql` against a real vendored PGFR install, run by `./test.sh observe`. The PGFR-absent gate is a plain test in the main suite instead (`tests/65_observe_no_pgfr_test.sql`) |
 | `tests/archive/` | The `pgpm_archive` track: `fixtures.sql` (a `vault.decrypted_secrets` stub + small managed-table/config builders) and `db/*.sql` tests against a real MinIO service, run by `./test.sh archive` (one shared database, each file wrapped in its own BEGIN/ROLLBACK, like the default matrix) |
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |

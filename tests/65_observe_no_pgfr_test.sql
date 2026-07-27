@@ -1,7 +1,10 @@
--- observe track :: PGFR ABSENT
--- The observe module must install on a database with no pg_flight_recorder, the
--- pure-pgpm window summary must still work, and the PGFR-delegating functions must
--- refuse with a clear pgpm-prefixed error (the "optional, never required" contract).
+-- pg_flight_recorder correlation, PGFR ABSENT (issue #157/observe fold): the pure-pgpm window
+-- summary must work standalone, and the PGFR-delegating functions must refuse with a clear
+-- pgpm-prefixed error (the "PGFR is never a dependency" contract). The PGFR-present correlation
+-- itself needs a real vendored PGFR install and lives in its own track (tests/observe/,
+-- ./test.sh observe).
+create extension if not exists pgtap;
+
 begin;
 select plan(6);
 

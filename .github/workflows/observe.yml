@@ -1,14 +1,15 @@
 name: Observe track
 
-# The optional pg_flight_recorder observability module (pgpm_observe). Separate from the main matrix: it
-# installs PGFR (vendored under bench/vendor/) alongside pgpm and exercises the correlation functions.
-# PG15 only and PGFR needs only pg_cron, so it runs on the stock pgpm_test:15 image (built by compose).
-# Path-filtered so it runs only when the module, its tests, the harness, or the vendored PGFR change.
+# pgpm_core's pg_flight_recorder (PGFR) correlation functions (impact_report/feathering_validation),
+# verified against a real PGFR install. Separate from the main matrix because it vendors PGFR
+# (bench/vendor/) alongside pgpm; the PGFR-absent gate is a plain test in the main suite instead
+# (tests/65_observe_no_pgfr_test.sql). PG15 only and PGFR needs only pg_cron, so it runs on the stock
+# pgpm_test:15 image (built by compose). Path-filtered so it runs only when the core, its tests, the
+# harness, or the vendored PGFR change.
 on:
   push:
     branches: [ main ]
     paths:
-      - 'pgpm_observe/install.sql'
       - 'pgpm_core/install.sql'
       - 'tests/observe/**'
       - 'bench/vendor/pg_flight_recorder/**'
@@ -19,7 +20,6 @@ on:
   pull_request:
     branches: [ main ]
     paths:
-      - 'pgpm_observe/install.sql'
       - 'pgpm_core/install.sql'
       - 'tests/observe/**'
       - 'bench/vendor/pg_flight_recorder/**'
@@ -31,7 +31,7 @@ on:
 
 jobs:
   observe:
-    name: pgpm_observe with pg_flight_recorder / PG15
+    name: pg_flight_recorder correlation / PG15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
