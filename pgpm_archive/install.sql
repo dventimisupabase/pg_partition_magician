@@ -476,6 +476,59 @@ language sql immutable as $$
   select archive._pq_plain_bytearray(convert_to(v, 'UTF8'));
 $$;
 
+-- FIXED_LEN_BYTE_ARRAY(16), no logical-type annotation: the 16 raw bytes uuid_send() already
+-- gives (RFC 4122 byte order) are exactly what Parquet's PLAIN encoding wants for a fixed-length
+-- type -- no length prefix (unlike BYTE_ARRAY), no byte-order conversion (unlike int32/int64/
+-- float8's reverse_bytes). A reader sees fixed-size binary(16), not a typed UUID -- the newer
+-- LogicalType.UUID annotation this project doesn't write is optional, not required, for a valid,
+-- readable column.
+create or replace function archive._pq_plain_uuid(v uuid) returns bytea
+language sql immutable as $$
+  select uuid_send(v);
+$$;
+
+-- Minimal two's-complement byte width that can hold every unscaled integer a numeric(p,*) column
+-- can produce: max magnitude is 10^p - 1, so find the smallest n with a signed n-byte range
+-- (2^(8n-1) - 1) covering it. Loop, not a lookup table, so it stays correct for any precision
+-- Postgres itself allows (up to 1000).
+create or replace function archive._pq_decimal_byte_width(p_precision int4) returns int4
+language plpgsql immutable as $$
+declare
+  v_max numeric := (10::numeric ^ p_precision) - 1;
+  n int4 := 1;
+begin
+  while (2::numeric ^ (8*n - 1)) - 1 < v_max loop
+    n := n + 1;
+  end loop;
+  return n;
+end;
+$$;
+
+-- Parquet DECIMAL's physical encoding: the unscaled integer (value * 10^scale, exact since numeric
+-- arithmetic is exact), two's complement, big-endian, in exactly p_bytes (from
+-- _pq_decimal_byte_width, sized to the column's own declared precision so every value fits).
+-- Negative values: two's complement of a negative n-byte-wide integer is 2^(8n) + value (value
+-- already negative, so this subtracts its magnitude) -- the standard construction, computed exactly
+-- in `numeric` since PL/pgSQL has no native bignum-to-bytes primitive to lean on. Encodes from the
+-- least-significant byte backward (repeated %256/div256, the same shape _pq_varint's loop already
+-- uses), landing the most-significant byte at index 0 -- big-endian, as the format requires.
+create or replace function archive._pq_plain_decimal(v numeric, p_scale int4, p_bytes int4) returns bytea
+language plpgsql immutable as $$
+declare
+  v_scaled numeric := round(v * (10::numeric ^ p_scale));
+  v_unsigned numeric;
+  buf bytea := decode(repeat('00', p_bytes), 'hex');
+  i int4;
+begin
+  v_unsigned := case when v_scaled < 0 then (2::numeric ^ (8*p_bytes)) + v_scaled else v_scaled end;
+  for i in reverse (p_bytes-1)..0 loop
+    buf := set_byte(buf, i, (v_unsigned % 256)::int4);
+    v_unsigned := trunc(v_unsigned / 256);
+  end loop;
+  return buf;
+end;
+$$;
+
 create or replace function archive._pq_plain_boolean_array(vals boolean[]) returns bytea
 language plpgsql immutable as $$
 declare
@@ -1372,16 +1425,34 @@ language sql immutable as $$
 $$;
 
 -- p_converted: parquet ConvertedType code, or -1 for "none"
-create or replace function archive._pq_build_schema_leaf(p_name text, p_ptype int4, p_converted int4, p_nullable boolean) returns bytea
+-- p_type_length (FIXED_LEN_BYTE_ARRAY's declared byte width -- uuid's fixed 16, or a decimal
+-- column's own computed width) and p_scale/p_precision (DECIMAL's schema-level annotation) are all
+-- optional trailing params, each omitted from the Thrift struct when null -- byte-for-byte
+-- unchanged for the six original types, which pass none of them. Field-id deltas are tracked via
+-- v_last rather than hardcoded literals, since which fields actually get written now varies.
+create or replace function archive._pq_build_schema_leaf(
+  p_name text, p_ptype int4, p_converted int4, p_nullable boolean,
+  p_type_length int4 default null, p_scale int4 default null, p_precision int4 default null
+) returns bytea
 language plpgsql immutable as $$
 declare
-  buf bytea;
+  buf bytea := ''::bytea;
+  v_last int4 := 0;
 begin
-  buf := archive._pq_write_i32(0, 1, p_ptype);                                     -- type
-  buf := buf || archive._pq_write_i32(1, 3, case when p_nullable then 1 else 0 end); -- repetition_type
-  buf := buf || archive._pq_write_binary(3, 4, convert_to(p_name, 'UTF8'));        -- name
+  buf := buf || archive._pq_write_i32(v_last, 1, p_ptype); v_last := 1;                     -- type
+  if p_type_length is not null then
+    buf := buf || archive._pq_write_i32(v_last, 2, p_type_length); v_last := 2;             -- type_length
+  end if;
+  buf := buf || archive._pq_write_i32(v_last, 3, case when p_nullable then 1 else 0 end); v_last := 3; -- repetition_type
+  buf := buf || archive._pq_write_binary(v_last, 4, convert_to(p_name, 'UTF8')); v_last := 4;          -- name
   if p_converted >= 0 then
-    buf := buf || archive._pq_write_i32(4, 6, p_converted);                       -- converted_type
+    buf := buf || archive._pq_write_i32(v_last, 6, p_converted); v_last := 6;               -- converted_type
+  end if;
+  if p_scale is not null then
+    buf := buf || archive._pq_write_i32(v_last, 7, p_scale); v_last := 7;                   -- scale
+  end if;
+  if p_precision is not null then
+    buf := buf || archive._pq_write_i32(v_last, 8, p_precision); v_last := 8;               -- precision
   end if;
   buf := buf || archive._pq_stop();
   return buf;
@@ -1488,12 +1559,19 @@ $$;
 -- defaults): a second, differently-aritied "replacement" would coexist as a distinct
 -- overload rather than actually replacing this one, and a 4-arg call would become ambiguous
 -- between the two (see #209).
-create or replace function archive._pq_encode_column_data(p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid') returns bytea
+-- p_decimal_scale/p_decimal_bytes are only meaningful (and only passed) for p_pgtype = 'numeric':
+-- the scale to multiply by before rounding to an integer, and the fixed byte width
+-- _pq_decimal_byte_width already sized to the column's own declared precision.
+create or replace function archive._pq_encode_column_data(
+  p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid',
+  p_decimal_scale int4 default null, p_decimal_bytes int4 default null
+) returns bytea
 language plpgsql as $$
 declare
   values_payload bytea := ''::bytea;
   is_present boolean[] := '{}';
   arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
+  arr_uuid uuid[]; arr_num numeric[];
   present_bools boolean[] := '{}';
   i int4; n int4;
 begin
@@ -1542,6 +1620,22 @@ begin
         values_payload := values_payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
       end if;
     end loop;
+  elsif p_pgtype = 'uuid' then
+    execute format('select array_agg(%I::uuid order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_uuid;
+    n := coalesce(array_length(arr_uuid,1),0);
+    for i in 1..n loop
+      is_present[i] := (arr_uuid[i] is not null);
+      if arr_uuid[i] is not null then values_payload := values_payload || archive._pq_plain_uuid(arr_uuid[i]); end if;
+    end loop;
+  elsif p_pgtype = 'numeric' then
+    execute format('select array_agg(%I::numeric order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_num;
+    n := coalesce(array_length(arr_num,1),0);
+    for i in 1..n loop
+      is_present[i] := (arr_num[i] is not null);
+      if arr_num[i] is not null then
+        values_payload := values_payload || archive._pq_plain_decimal(arr_num[i], p_decimal_scale, p_decimal_bytes);
+      end if;
+    end loop;
   else
     raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
   end if;
@@ -1568,6 +1662,10 @@ declare
   v_col_ptypes int4[] := '{}';
   v_col_converted int4[] := '{}';
   v_col_nullable boolean[] := '{}';
+  v_col_typelen int4[] := '{}';
+  v_col_scale int4[] := '{}';
+  v_col_precision int4[] := '{}';
+  v_precision int4; v_scale int4;
   v_ncols int4;
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
@@ -1587,7 +1685,7 @@ begin
   v_from_sql := format('%I.%I', v_schema, v_table);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname
+    select a.attname, a.attnotnull, t.typname, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_relation and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1597,12 +1695,33 @@ begin
 
     case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'float8'      then v_col_pgtypes := v_col_pgtypes || 'float8'::text;      v_col_ptypes := v_col_ptypes || 5; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'bool'        then v_col_pgtypes := v_col_pgtypes || 'bool'::text;        v_col_ptypes := v_col_ptypes || 0; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'text'        then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'timestamptz' then v_col_pgtypes := v_col_pgtypes || 'timestamptz'::text; v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'timestamp'   then v_col_pgtypes := v_col_pgtypes || 'timestamp'::text;   v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'uuid'        then v_col_pgtypes := v_col_pgtypes || 'uuid'::text;        v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || 16; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'json'        then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'jsonb'       then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'numeric'     then
+        if v_col.atttypmod = -1 then
+          raise exception 'archive._pq_to_parquet: column % is numeric with no declared precision/scale; declare it numeric(p,s) to archive it as Parquet DECIMAL', v_col.attname;
+        end if;
+        v_precision := ((v_col.atttypmod - 4) >> 16) & 65535;
+        v_scale := (v_col.atttypmod - 4) & 65535;
+        v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
+        v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
       else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
     end case;
   end loop;
@@ -1616,7 +1735,8 @@ begin
 
   v_body := v_magic;
   for i in 1..v_ncols loop
-    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i]);
+    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i],
+      'ctid', v_col_scale[i], v_col_typelen[i]);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
@@ -1632,7 +1752,8 @@ begin
         archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset,
           case when p_compress then 2 else 0 end,
           case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
-    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
+    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i],
+      v_col_typelen[i], v_col_scale[i], v_col_precision[i]);
   end loop;
 
   v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
@@ -1666,6 +1787,10 @@ declare
   v_col_ptypes int4[] := '{}';
   v_col_converted int4[] := '{}';
   v_col_nullable boolean[] := '{}';
+  v_col_typelen int4[] := '{}';
+  v_col_scale int4[] := '{}';
+  v_col_precision int4[] := '{}';
+  v_precision int4; v_scale int4;
   v_ncols int4;
   v_num_rows bigint;
   v_magic bytea := convert_to('PAR1', 'UTF8');
@@ -1696,7 +1821,7 @@ begin
                         v_schema, v_table, p_control, p_lo, p_control, p_hi);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname
+    select a.attname, a.attnotnull, t.typname, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_parent and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1706,12 +1831,33 @@ begin
 
     case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'float8'      then v_col_pgtypes := v_col_pgtypes || 'float8'::text;      v_col_ptypes := v_col_ptypes || 5; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'bool'        then v_col_pgtypes := v_col_pgtypes || 'bool'::text;        v_col_ptypes := v_col_ptypes || 0; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'text'        then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'timestamptz' then v_col_pgtypes := v_col_pgtypes || 'timestamptz'::text; v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'timestamp'   then v_col_pgtypes := v_col_pgtypes || 'timestamp'::text;   v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || 10;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'uuid'        then v_col_pgtypes := v_col_pgtypes || 'uuid'::text;        v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || -1;
+                              v_col_typelen := v_col_typelen || 16; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'json'        then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'jsonb'       then v_col_pgtypes := v_col_pgtypes || 'text'::text;        v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+                              v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+      when 'numeric'     then
+        if v_col.atttypmod = -1 then
+          raise exception 'archive._pq_to_parquet_range: column % is numeric with no declared precision/scale; declare it numeric(p,s) to archive it as Parquet DECIMAL', v_col.attname;
+        end if;
+        v_precision := ((v_col.atttypmod - 4) >> 16) & 65535;
+        v_scale := (v_col.atttypmod - 4) & 65535;
+        v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
+        v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
       else raise exception 'archive._pq_to_parquet_range: unsupported column type % for column %', v_col.typname, v_col.attname;
     end case;
   end loop;
@@ -1725,7 +1871,8 @@ begin
 
   v_body := v_magic;
   for i in 1..v_ncols loop
-    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by);
+    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by,
+      v_col_scale[i], v_col_typelen[i]);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
@@ -1741,7 +1888,8 @@ begin
         archive._pq_build_column_metadata(v_col_ptypes[i], v_col_names[i], v_num_rows, v_total_uncompressed, v_page_offset,
           case when p_compress then 2 else 0 end,
           case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
-    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i]);
+    v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i],
+      v_col_typelen[i], v_col_scale[i], v_col_precision[i]);
   end loop;
 
   v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
@@ -2100,3 +2248,12 @@ $$;
 drop function if exists archive.configure(regclass, text, text, text, text, text, text, text, boolean, bigint, int, bigint, int, text, text);
 drop function if exists archive.schedule(text);
 drop function if exists archive.unschedule();
+
+-- archive._pq_build_schema_leaf and archive._pq_encode_column_data both grew new trailing
+-- optional params (type_length/scale/precision, and p_decimal_scale/p_decimal_bytes -- uuid and
+-- numeric(p,s) support). CREATE OR REPLACE does not change a function's arg count for an
+-- already-installed old signature; drop it explicitly so re-running this file over a prior install
+-- doesn't leave both the old- and new-arity versions coexisting as ambiguous overloads (#209's
+-- gotcha, again).
+drop function if exists archive._pq_build_schema_leaf(text, int4, int4, boolean);
+drop function if exists archive._pq_encode_column_data(text, text, text, boolean, text);

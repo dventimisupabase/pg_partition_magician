@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+- **Parquet writer: add `uuid`, `json`/`jsonb`, and `numeric(p,s)`.** Six supported types
+  becomes nine. `uuid` encodes as `FIXED_LEN_BYTE_ARRAY(16)` (the raw bytes `uuid_send()` already
+  gives, no logical-type annotation -- readers get fixed-size binary, not a typed UUID).
+  `json`/`jsonb` reuse the existing text-encoding path verbatim, tagged `ConvertedType.JSON`
+  instead of `UTF8`. `numeric(p,s)` is a real Parquet DECIMAL: a scaled-integer, two's-complement,
+  big-endian encoding sized to the column's own declared precision (`archive._pq_decimal_byte_width`
+  computes the minimal byte width for any precision Postgres allows). Bare, unconstrained `numeric`
+  (no declared precision/scale) is refused with a clear error -- Parquet DECIMAL needs one fixed
+  precision/scale for the whole column, and Postgres's bare `numeric` can vary per row. Arrays and
+  composite types remain out of scope (real nested/repeated-schema support, a materially bigger
+  lift than adding a type).
+  - `archive._pq_build_schema_leaf` gained three new optional trailing params
+    (`p_type_length`/`p_scale`/`p_precision`), each omitted from the Thrift schema element when
+    null -- byte-for-byte unchanged for the six original types.
+  - `archive._pq_encode_column_data` gained two new optional trailing params
+    (`p_decimal_scale`/`p_decimal_bytes`), used only for `numeric`.
+  - Both changed arg counts, so `install.sql` now also drops the old-signature overloads
+    (`archive._pq_build_schema_leaf(text,int4,int4,boolean)` /
+    `archive._pq_encode_column_data(text,text,text,boolean,text)`) so re-running it over a prior
+    install doesn't leave both versions coexisting as ambiguous overloads.
+  - `scripts/verify_parquet.py` gained 8 new test functions (uuid/jsonb/numeric, each with a
+    nullable variant, plus the bare-numeric refusal), all green first try against real pyarrow +
+    DuckDB round-trips; `test_unsupported_type_refused` now uses an `int4[]` array instead of
+    `jsonb`, since jsonb is supported now.
+
 - **Rewrite `pgpm_archive/README.md` from the ground up for simplicity and concision.** The
   previous version (post the docs/ fold) had grown into an engineering narrative: architecture
   rationale ("why this lives apart from core"), internal-mechanism recitation ("the gate is gone,

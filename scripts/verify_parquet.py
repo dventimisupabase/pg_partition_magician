@@ -279,7 +279,9 @@ def test_large_row_count(conn):
 
 
 def test_unsupported_type_refused(conn):
-    make_table(conn, "t_unsupported", "n int4 not null, j jsonb not null", None)
+    # arrays are the "hard" tier deliberately not built (real LIST/repetition-level support);
+    # jsonb/uuid/numeric(p,s) are all supported now, so this can no longer use jsonb.
+    make_table(conn, "t_unsupported", "n int4 not null, arr int4[] not null", None)
     try:
         to_parquet_bytes(conn, "t_unsupported")
         FAILURES.append("unsupported type: expected an exception, got none")
@@ -369,6 +371,157 @@ def test_mixed_required_and_optional_columns(conn):
     arrow_rows, duck_rows = read_with_both_readers(raw)
     expected = fetch_expected(conn, "t_mixed_null", ["id", "note", "score"])
     check("mixed NOT NULL (id) and nullable (note, score) columns", expected, arrow_rows, duck_rows)
+
+
+# ---------------------------------------------------------------------------
+# uuid / json/jsonb / numeric(p,s): FIXED_LEN_BYTE_ARRAY(16) with no logical-type
+# annotation for uuid (readers see fixed-size binary, not a typed UUID, but the raw
+# bytes -- from uuid_send() -- round-trip exactly); json/jsonb reuse the plain text
+# encoding path verbatim, annotated ConvertedType.JSON instead of UTF8; numeric(p,s)
+# is real Parquet DECIMAL (FIXED_LEN_BYTE_ARRAY, scaled-integer two's complement,
+# byte width sized to the declared precision) -- bare, unconstrained `numeric` (no
+# declared precision/scale) is refused, since Parquet DECIMAL needs one fixed
+# precision/scale for the whole column and Postgres's bare numeric can vary per row.
+# ---------------------------------------------------------------------------
+
+def test_uuid(conn):
+    make_table(conn, "t_uuid", "u uuid not null", None)
+    for v in [
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    ]:
+        run(conn, "insert into t_uuid (u) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_uuid")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected_raw = run(conn, "select uuid_send(u) from t_uuid order by ctid")
+    expected = [{"u": bytes(r[0])} for r in expected_raw]
+    ok = True
+    for i, exp in enumerate(expected):
+        a = arrow_rows[i]["u"]
+        d = duck_rows[i]["u"]
+        av = bytes(a) if a is not None else a
+        dv = bytes(d) if d is not None else d
+        if av != exp["u"]:
+            FAILURES.append(f"uuid: row {i} pyarrow={av!r} expected={exp['u']!r}")
+            ok = False
+        if dv != exp["u"]:
+            FAILURES.append(f"uuid: row {i} duckdb={dv!r} expected={exp['u']!r}")
+            ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: uuid as fixed_len_byte_array(16), raw-byte round-trip ({len(expected)} rows)")
+
+
+def test_uuid_nullable(conn):
+    make_table(conn, "t_uuid_null", "u uuid", None)
+    vals = ["550e8400-e29b-41d4-a716-446655440000", None, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", None]
+    for v in vals:
+        run(conn, "insert into t_uuid_null (u) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_uuid_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected_raw = run(conn, "select uuid_send(u) from t_uuid_null order by ctid")
+    expected = [{"u": (bytes(r[0]) if r[0] is not None else None)} for r in expected_raw]
+    ok = True
+    for i, exp in enumerate(expected):
+        a = arrow_rows[i]["u"]
+        d = duck_rows[i]["u"]
+        av = bytes(a) if a is not None else a
+        dv = bytes(d) if d is not None else d
+        if av != exp["u"]:
+            FAILURES.append(f"uuid nullable: row {i} pyarrow={av!r} expected={exp['u']!r}")
+            ok = False
+        if dv != exp["u"]:
+            FAILURES.append(f"uuid nullable: row {i} duckdb={dv!r} expected={exp['u']!r}")
+            ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: nullable uuid, mixed with nulls ({len(expected)} rows)")
+
+
+def test_jsonb(conn):
+    make_table(conn, "t_jsonb", "j jsonb not null", None)
+    values = [
+        '{"a": 1, "b": [1, 2, 3]}',
+        "[]",
+        '"just a string"',
+        "42",
+        "true",
+        "null",   # the JSON null literal, distinct from SQL NULL (column is NOT NULL)
+        '{"nested": {"x": {"y": 1.5}}}',
+    ]
+    for v in values:
+        run(conn, "insert into t_jsonb (j) values (%s::jsonb)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_jsonb")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected_raw = run(conn, "select j::text from t_jsonb order by ctid")
+    expected = [{"j": r[0]} for r in expected_raw]
+    check("jsonb: objects/arrays/scalars/the JSON null literal", expected, arrow_rows, duck_rows)
+
+
+def test_jsonb_nullable(conn):
+    make_table(conn, "t_jsonb_null", "j jsonb", None)
+    values = ['{"a": 1}', None, "[1,2,3]", None]
+    for v in values:
+        run(conn, "insert into t_jsonb_null (j) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_jsonb_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected_raw = run(conn, "select j::text from t_jsonb_null order by ctid")
+    expected = [{"j": r[0]} for r in expected_raw]
+    check("nullable jsonb, mixed with SQL NULL", expected, arrow_rows, duck_rows)
+
+
+def test_numeric(conn):
+    make_table(conn, "t_numeric", "n numeric(10,2) not null", None)
+    for v in ["0.00", "1.50", "-1.50", "99999999.99", "-99999999.99", "0.01", "-0.01"]:
+        run(conn, "insert into t_numeric (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric", ["n"])
+    check("numeric(10,2) as a real Parquet DECIMAL", expected, arrow_rows, duck_rows)
+
+
+def test_numeric_negative_scale_precision_edge(conn):
+    # a single-digit precision/scale combination (numeric(3,1)): the smallest realistic byte
+    # width (1 byte), boundary values at the very edge of what 1 byte can hold.
+    make_table(conn, "t_numeric_small", "n numeric(3,1) not null", None)
+    for v in ["0.0", "99.9", "-99.9", "12.3"]:
+        run(conn, "insert into t_numeric_small (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric_small")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric_small", ["n"])
+    check("numeric(3,1), minimal 1-byte-wide DECIMAL", expected, arrow_rows, duck_rows)
+
+
+def test_numeric_nullable(conn):
+    make_table(conn, "t_numeric_null", "n numeric(6,3)", None)
+    for v in [None, "1.234", None, "-1.234", "0.000"]:
+        run(conn, "insert into t_numeric_null (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric_null")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric_null", ["n"])
+    check("nullable numeric(6,3), mixed with nulls", expected, arrow_rows, duck_rows)
+
+
+def test_numeric_no_typmod_refused(conn):
+    make_table(conn, "t_numeric_bare", "n numeric not null", None)
+    run(conn, "insert into t_numeric_bare (n) values (1.23456789)")
+    conn.commit()
+    try:
+        to_parquet_bytes(conn, "t_numeric_bare")
+        FAILURES.append("numeric no typmod: expected an exception, got none")
+        print("FAIL: bare numeric (no declared precision/scale) correctly refused")
+    except psycopg2.Error as e:
+        conn.rollback()
+        if "numeric" in str(e).lower() and "precision" in str(e).lower():
+            print("PASS: bare numeric (no declared precision/scale) correctly refused")
+        else:
+            FAILURES.append(f"numeric no typmod: wrong error: {e}")
+            print("FAIL: bare numeric (no declared precision/scale) correctly refused")
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +640,14 @@ def main():
         test_nullable_text_with_empty_string,
         test_nullable_bool,
         test_mixed_required_and_optional_columns,
+        test_uuid,
+        test_uuid_nullable,
+        test_jsonb,
+        test_jsonb_nullable,
+        test_numeric,
+        test_numeric_negative_scale_precision_edge,
+        test_numeric_nullable,
+        test_numeric_no_typmod_refused,
         test_compressed_repetitive_text,
         test_compressed_nullable_mixed,
         test_compressed_realistic_columns,
