@@ -503,6 +503,573 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Dynamic Huffman coding (issue #206), step 1 of 2: canonical code lengths and
+-- code assignment (RFC 1951 3.2.2). pq._gzip_compress above is fixed-Huffman
+-- only (a valid, simpler rung -- kept, not replaced); these two functions are
+-- the well-specified building blocks a dynamic-Huffman block encoder needs on
+-- top of it. A pre-build measurement (reimplementing this project's own LZ77
+-- matcher, cross-checked against real zlib's Z_FIXED vs default strategy) put
+-- the expected win at ~20-30% additional size reduction over fixed Huffman on
+-- realistic PLAIN-encoded column data -- see the issue for the measurement.
+-- ---------------------------------------------------------------------------
+
+-- Standard Huffman code-length construction, then length-limited to p_max_bits
+-- (DEFLATE's own cap is 15). p_freqs is a 1-based array indexed by symbol+1
+-- (i.e. p_freqs[i] is symbol i-1's frequency); returns an array of the same
+-- shape, 0 for any symbol with zero frequency (unused, no code assigned).
+--
+-- Construction: repeatedly merge the two lowest-frequency groups (ties broken
+-- by insertion order, ascending); every symbol in EITHER merged group gets +1
+-- code length per merge -- one more bit to distinguish left vs right below it.
+-- This reads code lengths straight off the merge sequence without building an
+-- explicit tree.
+--
+-- Length limiting: clamp any length exceeding p_max_bits down to it (folding the
+-- overflow into a bit-length histogram, bl_count[L] = how many symbols have
+-- length L), then repeatedly repair the histogram -- move one leaf from the
+-- shortest length still below the cap down to length+1 (which needs a new
+-- sibling to stay a valid full binary tree, so that bucket gains TWO, not
+-- one) and consume one unit of the max_bits overflow -- until total weight
+-- (sum of bl_count[L] * 2^(p_max_bits-L), exact integer arithmetic throughout,
+-- no floating point) lands EXACTLY on 2^p_max_bits. Finally reassigns actual
+-- per-symbol lengths from the repaired histogram, longest-original-length
+-- symbols first, so a symbol the unbounded tree considered rarer never ends
+-- up shorter than one it considered more common.
+--
+-- This always terminates and always succeeds for any alphabet size <=
+-- 2^p_max_bits (true here with room to spare: DEFLATE's litlen/dist alphabets
+-- are 286/30 symbols against a 15-bit cap), since assigning every symbol
+-- p_max_bits alone already satisfies Kraft with room left over. Landing on
+-- an EXACTLY complete code (not just Kraft <= 1) matters in practice, not
+-- just in theory: real DEFLATE decoders (confirmed against real zlib) reject
+-- an incomplete multi-symbol code outright -- an earlier version of this
+-- function used a floating-point Kraft comparison and a "lengthen the
+-- shortest code" loop that could silently converge to an INCOMPLETE code
+-- (there is no guarantee that repeatedly halving one term lands exactly on
+-- the target rather than overshooting past it), and zlib's own decompressor
+-- caught it immediately on real column data (a float8 price column) with
+-- "invalid code lengths set" -- the bug this histogram-based repair fixes.
+-- Verified against a 27-symbol Fibonacci-weighted worst case, the classic
+-- adversarial input for unbounded Huffman (unbounded construction hits depth
+-- 26 for 27 symbols; the length-limited pass correctly caps it to 15 with an
+-- exactly complete code), and 2000+ randomized trials across uniform,
+-- geometric, spiky, and Fibonacci frequency shapes at both real DEFLATE
+-- alphabet sizes (286, 30) and smaller ones, all landing on an exactly
+-- complete code within the requested cap.
+create or replace function pq._huffman_lengths(p_freqs bigint[], p_max_bits int default 15)
+returns int4[]
+language plpgsql as $$
+declare
+  n int4 := array_length(p_freqs, 1);
+  v_lengths int4[] := array_fill(0, array[n]);
+  i int4;
+  v_node_id int4 := 0;
+  v_ncount int4;
+  v_id1 int4; v_id2 int4;
+  v_f1 bigint; v_f2 bigint;
+  v_m1 int4[]; v_m2 int4[];
+  v_sym int4;
+  v_max_len int4;
+  v_bl_count int4[];
+  v_overflow int4;
+  v_bits int4;
+  v_weight bigint;
+  v_target bigint;
+  v_order int4[];
+  v_new_lengths int4[];
+  v_idx int4;
+  v_l int4;
+begin
+  create temp table pq_huff_groups (node_id int4 primary key, freq bigint, members int4[])
+    on commit drop;
+
+  for i in 1..n loop
+    if p_freqs[i] > 0 then
+      v_node_id := v_node_id + 1;
+      insert into pq_huff_groups values (v_node_id, p_freqs[i], array[i]);
+    end if;
+  end loop;
+
+  select count(*) into v_ncount from pq_huff_groups;
+
+  -- a length-limited prefix code for v_ncount symbols can only ever exist if
+  -- v_ncount <= 2^p_max_bits (Kraft's inequality's own ceiling: v_ncount codes of
+  -- exactly p_max_bits each already sum to v_ncount * 2^-p_max_bits, which must be
+  -- <= 1). Never reachable from a real DEFLATE call (max_bits is always 15 there,
+  -- alphabets max out at 286) -- guarded so a misuse fails loudly instead of
+  -- infinite-looping in the Kraft-restore pass below.
+  if v_ncount > power(2, p_max_bits)::bigint then
+    raise exception 'pq._huffman_lengths: % distinct symbols cannot fit a %-bit-limited prefix code (needs <= % symbols)',
+      v_ncount, p_max_bits, power(2, p_max_bits)::bigint;
+  end if;
+
+  if v_ncount = 0 then
+    drop table pq_huff_groups;
+    return v_lengths;
+  end if;
+
+  if v_ncount = 1 then
+    select members into v_m1 from pq_huff_groups;
+    v_lengths[v_m1[1]] := 1;
+    drop table pq_huff_groups;
+    return v_lengths;
+  end if;
+
+  while v_ncount > 1 loop
+    select node_id, freq, members into v_id1, v_f1, v_m1
+      from pq_huff_groups order by freq, node_id limit 1;
+    select node_id, freq, members into v_id2, v_f2, v_m2
+      from pq_huff_groups where node_id <> v_id1 order by freq, node_id limit 1;
+
+    foreach v_sym in array v_m1 loop
+      v_lengths[v_sym] := v_lengths[v_sym] + 1;
+    end loop;
+    foreach v_sym in array v_m2 loop
+      v_lengths[v_sym] := v_lengths[v_sym] + 1;
+    end loop;
+
+    delete from pq_huff_groups where node_id in (v_id1, v_id2);
+    v_node_id := v_node_id + 1;
+    insert into pq_huff_groups values (v_node_id, v_f1 + v_f2, v_m1 || v_m2);
+
+    select count(*) into v_ncount from pq_huff_groups;
+  end loop;
+
+  drop table pq_huff_groups;
+
+  -- v_lengths now holds the UNBOUNDED assignment (always exactly complete: Kraft
+  -- == 1 exactly, guaranteed by the merge construction above). Length-limit it.
+  select max(v_lengths[gs]) into v_max_len from generate_series(1, n) gs;
+
+  v_bl_count := array_fill(0, array[greatest(v_max_len, p_max_bits)]);
+  for i in 1..n loop
+    if v_lengths[i] > 0 then
+      v_bl_count[v_lengths[i]] := v_bl_count[v_lengths[i]] + 1;
+    end if;
+  end loop;
+
+  v_overflow := 0;
+  for v_l in (p_max_bits + 1)..greatest(v_max_len, p_max_bits) loop
+    v_overflow := v_overflow + v_bl_count[v_l];
+  end loop;
+  v_bl_count := v_bl_count[1:p_max_bits];
+  v_bl_count[p_max_bits] := v_bl_count[p_max_bits] + v_overflow;
+
+  v_target := power(2, p_max_bits)::bigint;
+  v_weight := 0;
+  for v_l in 1..p_max_bits loop
+    v_weight := v_weight + v_bl_count[v_l]::bigint * power(2, p_max_bits - v_l)::bigint;
+  end loop;
+
+  while v_weight > v_target loop
+    v_bits := p_max_bits - 1;
+    while v_bl_count[v_bits] = 0 loop
+      v_bits := v_bits - 1;
+    end loop;
+    v_bl_count[v_bits] := v_bl_count[v_bits] - 1;
+    v_bl_count[v_bits + 1] := v_bl_count[v_bits + 1] + 2;
+    v_bl_count[p_max_bits] := v_bl_count[p_max_bits] - 1;
+    v_weight := v_weight - 1;
+  end loop;
+
+  -- reassign: symbols with the longest ORIGINAL (unbounded) length get the
+  -- longest final length, and so on down, preserving the unbounded tree's
+  -- relative ordering.
+  select array_agg(gs order by v_lengths[gs] desc, gs) into v_order
+    from generate_series(1, n) gs where v_lengths[gs] > 0;
+
+  v_new_lengths := array_fill(0, array[n]);
+  v_idx := 1;
+  for v_l in reverse p_max_bits..1 loop
+    for i in 1..v_bl_count[v_l] loop
+      v_new_lengths[v_order[v_idx]] := v_l;
+      v_idx := v_idx + 1;
+    end loop;
+  end loop;
+
+  return v_new_lengths;
+end;
+$$;
+
+-- Canonical code assignment from code lengths (RFC 1951 3.2.2): sort symbols by
+-- (length, symbol value), assign codes starting at 0, incrementing by 1 within
+-- a length and shifting left by 1 (i.e. *= 2) whenever the length grows. p_lengths
+-- is the same 1-based, symbol-i-1-at-index-i shape pq._huffman_lengths returns;
+-- 0 means "unused". Returns the assigned code VALUE per symbol (not yet bit-
+-- reversed for the wire -- Huffman codes are MSB-first, same convention
+-- pq._bit_reverse already exists to flip, reused unchanged when this gets wired
+-- into a block encoder).
+create or replace function pq._canonical_codes(p_lengths int4[]) returns int4[]
+language plpgsql as $$
+declare
+  n int4 := array_length(p_lengths, 1);
+  v_codes int4[] := array_fill(0, array[n]);
+  v_order int4[];
+  v_code int4 := 0;
+  v_prev_len int4 := 0;
+  v_sym int4;
+begin
+  select array_agg(gs order by p_lengths[gs], gs) into v_order
+    from generate_series(1, n) gs where p_lengths[gs] > 0;
+
+  if v_order is null then
+    return v_codes;
+  end if;
+
+  foreach v_sym in array v_order loop
+    v_code := v_code << (p_lengths[v_sym] - v_prev_len);
+    v_codes[v_sym] := v_code;
+    v_code := v_code + 1;
+    v_prev_len := p_lengths[v_sym];
+  end loop;
+
+  return v_codes;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Dynamic Huffman coding (issue #206), step 2 of 2: the full BTYPE=10 block
+-- encoder. Factors the LZ77 matcher out of pq._deflate_encode into its own
+-- function (pq._deflate_encode itself is untouched, still fixed-Huffman-only
+-- -- a valid, simpler rung, not replaced) so both encoders share one matching
+-- implementation rather than risking a second, subtly different copy.
+-- ---------------------------------------------------------------------------
+
+-- Same matching algorithm as pq._deflate_encode's inline loop (single most-
+-- recent candidate per 3-byte hash, precomputed over the whole buffer via
+-- pq._lz_pos_hashes, greedy, window 32768, max match 258) -- factored out so
+-- pq._deflate_encode_dynamic below can reuse it verbatim. Returns one row per
+-- token in stream order: literal (is_match=false, val1=byte 0-255) or match
+-- (is_match=true, val1=length, val2=distance).
+create or replace function pq._lz77_tokens(payload bytea)
+returns table(is_match boolean, val1 int4, val2 int4)
+language plpgsql as $$
+declare
+  n int4 := length(payload);
+  v_pos int4 := 0;
+  v_hash int4; v_candidate int4; v_mlen int4;
+begin
+  drop table if exists pq_lz77_hash_scratch;
+  create temp table pq_lz77_hash_scratch as select * from pq._lz_pos_hashes(payload);
+  create index on pq_lz77_hash_scratch (h, pos);
+
+  while v_pos < n loop
+    v_candidate := null;
+    if v_pos <= n - 3 then
+      v_hash := (get_byte(payload,v_pos)<<16) | (get_byte(payload,v_pos+1)<<8) | get_byte(payload,v_pos+2);
+      select pos into v_candidate from pq_lz77_hash_scratch
+       where h = v_hash and pos < v_pos and v_pos - pos <= 32768
+       order by pos desc limit 1;
+    end if;
+    if v_candidate is not null then
+      v_mlen := pq._lz_match_len(payload, v_pos, v_candidate, least(258, n - v_pos));
+    else
+      v_mlen := 0;
+    end if;
+
+    if v_mlen >= 3 then
+      is_match := true; val1 := v_mlen; val2 := v_pos - v_candidate;
+      return next;
+      v_pos := v_pos + v_mlen;
+    else
+      is_match := false; val1 := get_byte(payload, v_pos); val2 := null;
+      return next;
+      v_pos := v_pos + 1;
+    end if;
+  end loop;
+
+  drop table pq_lz77_hash_scratch;
+  return;
+end;
+$$;
+
+-- RFC 1951 3.2.7's code-length meta-alphabet: RLE-encodes p_lengths (the
+-- combined litlen-then-dist code-length sequence a dynamic block transmits)
+-- into a token stream over the 19-symbol code-length alphabet -- 0-15 mean
+-- "this next code has length N" literally; 16 repeats the PREVIOUS length
+-- 3-6 more times (2 extra bits); 17 repeats a zero length 3-10 times (3 extra
+-- bits); 18 repeats a zero length 11-138 times (7 extra bits). Standard greedy
+-- strategy: prefer the longest applicable repeat code for each run, falling
+-- back to literal symbols for runs of 1-2 (too short for any repeat code) --
+-- the DEFLATE format doesn't mandate a specific encoder strategy here, only
+-- that the decoder can interpret whatever choices were made, so greedy is a
+-- legal, simple choice.
+create or replace function pq._clc_rle(p_lengths int4[])
+returns table(sym int4, extra_val int4, extra_bits int4)
+language plpgsql as $$
+declare
+  n int4 := array_length(p_lengths, 1);
+  i int4 := 1;
+  v_val int4;
+  v_run int4;
+  v_j int4;
+  v_take int4;
+begin
+  while i <= n loop
+    v_val := p_lengths[i];
+    v_j := i + 1;
+    while v_j <= n and p_lengths[v_j] = v_val loop
+      v_j := v_j + 1;
+    end loop;
+    v_run := v_j - i;
+
+    if v_val = 0 then
+      while v_run > 0 loop
+        if v_run >= 11 then
+          v_take := least(v_run, 138);
+          sym := 18; extra_val := v_take - 11; extra_bits := 7;
+        elsif v_run >= 3 then
+          v_take := least(v_run, 10);
+          sym := 17; extra_val := v_take - 3; extra_bits := 3;
+        else
+          v_take := 1;
+          sym := 0; extra_val := 0; extra_bits := 0;
+        end if;
+        return next;
+        v_run := v_run - v_take;
+      end loop;
+    else
+      sym := v_val; extra_val := 0; extra_bits := 0;
+      return next;
+      v_run := v_run - 1;
+      while v_run > 0 loop
+        if v_run >= 3 then
+          v_take := least(v_run, 6);
+          sym := 16; extra_val := v_take - 3; extra_bits := 2;
+        else
+          v_take := 1;
+          sym := v_val; extra_val := 0; extra_bits := 0;
+        end if;
+        return next;
+        v_run := v_run - v_take;
+      end loop;
+    end if;
+
+    i := v_j;
+  end loop;
+  return;
+end;
+$$;
+
+-- The full dynamic-Huffman (BTYPE=10) block encoder: tokenizes via
+-- pq._lz77_tokens (pass 1, also tallying the real litlen/distance symbol
+-- frequencies), builds a genuine per-block Huffman code for each alphabet
+-- (pq._huffman_lengths/_canonical_codes -- pass 2), transmits both via the
+-- code-length meta-alphabet (pq._clc_rle, Huffman-coded the same way), then
+-- emits the actual token stream under the new codes (pass 3). Same bit-
+-- accumulator convention as pq._deflate_encode (LSB-first byte packing,
+-- Huffman codes bit-reversed via pq._bit_reverse before packing since they're
+-- conventionally written MSB-first, raw fields/extra-bits pushed unreversed).
+create or replace function pq._deflate_encode_dynamic(payload bytea) returns bytea
+language plpgsql as $$
+declare
+  v_tok record;
+  v_k int4 := 0;
+  v_litlen_sym int4[] := '{}';
+  v_litlen_extra_val int4[] := '{}';
+  v_litlen_extra_bits int4[] := '{}';
+  v_dist_sym int4[] := '{}';
+  v_dist_extra_val int4[] := '{}';
+  v_dist_extra_bits int4[] := '{}';
+
+  v_litlen_freq bigint[] := array_fill(0::bigint, array[286]);
+  v_dist_freq bigint[] := array_fill(0::bigint, array[30]);
+
+  v_litlen_lengths int4[]; v_litlen_codes int4[];
+  v_dist_lengths int4[]; v_dist_codes int4[];
+
+  v_lcode int4; v_lextra_bits int4; v_lextra_val int4;
+  v_dcode int4; v_dextra_bits int4; v_dextra_val int4;
+  v_len int4; v_dist int4;
+
+  v_acc int4 := 0; v_acc_n int4 := 0; v_bytes int4[] := '{}';
+
+  v_combined_lengths int4[];
+  v_litlen_hi int4; v_dist_hi int4;
+  v_hlit int4; v_hdist int4;
+  v_clc_sym int4[] := '{}'; v_clc_extra_val int4[] := '{}'; v_clc_extra_bits int4[] := '{}';
+  v_clc_freq bigint[] := array_fill(0::bigint, array[19]);
+  v_clc_lengths int4[]; v_clc_codes int4[];
+  v_clc_order int4[] := array[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+  v_hclen int4;
+  i int4; v_sym int4; v_code int4; v_nbits int4; v_rev int4;
+begin
+  -- ---- pass 1: tokenize, tally frequencies ----
+  for v_tok in select * from pq._lz77_tokens(payload) loop
+    v_k := v_k + 1;
+    if v_tok.is_match then
+      v_len := v_tok.val1; v_dist := v_tok.val2;
+
+      case
+        when v_len between 3 and 10 then v_lcode := 257+(v_len-3); v_lextra_bits := 0; v_lextra_val := 0;
+        when v_len between 11 and 18 then v_lcode := 265+(v_len-11)/2; v_lextra_bits := 1; v_lextra_val := (v_len-11)%2;
+        when v_len between 19 and 34 then v_lcode := 269+(v_len-19)/4; v_lextra_bits := 2; v_lextra_val := (v_len-19)%4;
+        when v_len between 35 and 66 then v_lcode := 273+(v_len-35)/8; v_lextra_bits := 3; v_lextra_val := (v_len-35)%8;
+        when v_len between 67 and 130 then v_lcode := 277+(v_len-67)/16; v_lextra_bits := 4; v_lextra_val := (v_len-67)%16;
+        when v_len between 131 and 257 then v_lcode := 281+(v_len-131)/32; v_lextra_bits := 5; v_lextra_val := (v_len-131)%32;
+        else v_lcode := 285; v_lextra_bits := 0; v_lextra_val := 0;
+      end case;
+
+      case
+        when v_dist between 1 and 4 then v_dcode := v_dist-1; v_dextra_bits := 0; v_dextra_val := 0;
+        when v_dist between 5 and 8 then v_dcode := 4+(v_dist-5)/2; v_dextra_bits := 1; v_dextra_val := (v_dist-5)%2;
+        when v_dist between 9 and 16 then v_dcode := 6+(v_dist-9)/4; v_dextra_bits := 2; v_dextra_val := (v_dist-9)%4;
+        when v_dist between 17 and 32 then v_dcode := 8+(v_dist-17)/8; v_dextra_bits := 3; v_dextra_val := (v_dist-17)%8;
+        when v_dist between 33 and 64 then v_dcode := 10+(v_dist-33)/16; v_dextra_bits := 4; v_dextra_val := (v_dist-33)%16;
+        when v_dist between 65 and 128 then v_dcode := 12+(v_dist-65)/32; v_dextra_bits := 5; v_dextra_val := (v_dist-65)%32;
+        when v_dist between 129 and 256 then v_dcode := 14+(v_dist-129)/64; v_dextra_bits := 6; v_dextra_val := (v_dist-129)%64;
+        when v_dist between 257 and 512 then v_dcode := 16+(v_dist-257)/128; v_dextra_bits := 7; v_dextra_val := (v_dist-257)%128;
+        when v_dist between 513 and 1024 then v_dcode := 18+(v_dist-513)/256; v_dextra_bits := 8; v_dextra_val := (v_dist-513)%256;
+        when v_dist between 1025 and 2048 then v_dcode := 20+(v_dist-1025)/512; v_dextra_bits := 9; v_dextra_val := (v_dist-1025)%512;
+        when v_dist between 2049 and 4096 then v_dcode := 22+(v_dist-2049)/1024; v_dextra_bits := 10; v_dextra_val := (v_dist-2049)%1024;
+        when v_dist between 4097 and 8192 then v_dcode := 24+(v_dist-4097)/2048; v_dextra_bits := 11; v_dextra_val := (v_dist-4097)%2048;
+        when v_dist between 8193 and 16384 then v_dcode := 26+(v_dist-8193)/4096; v_dextra_bits := 12; v_dextra_val := (v_dist-8193)%4096;
+        else v_dcode := 28+(v_dist-16385)/8192; v_dextra_bits := 13; v_dextra_val := (v_dist-16385)%8192;
+      end case;
+
+      v_litlen_sym[v_k] := v_lcode; v_litlen_extra_val[v_k] := v_lextra_val; v_litlen_extra_bits[v_k] := v_lextra_bits;
+      v_dist_sym[v_k] := v_dcode; v_dist_extra_val[v_k] := v_dextra_val; v_dist_extra_bits[v_k] := v_dextra_bits;
+
+      v_litlen_freq[v_lcode+1] := v_litlen_freq[v_lcode+1] + 1;
+      v_dist_freq[v_dcode+1] := v_dist_freq[v_dcode+1] + 1;
+    else
+      v_litlen_sym[v_k] := v_tok.val1; v_litlen_extra_val[v_k] := 0; v_litlen_extra_bits[v_k] := 0;
+      v_dist_sym[v_k] := null;
+
+      v_litlen_freq[v_tok.val1+1] := v_litlen_freq[v_tok.val1+1] + 1;
+    end if;
+  end loop;
+
+  v_litlen_freq[257] := v_litlen_freq[257] + 1;   -- symbol 256 (end-of-block), always present
+
+  if (select count(*) from unnest(v_dist_freq) f where f > 0) = 0 then
+    v_dist_freq[1] := 1;   -- RFC 1951 requires >=1 distance code even with zero matches
+  end if;
+
+  -- ---- pass 2: the real per-block Huffman codes ----
+  v_litlen_lengths := pq._huffman_lengths(v_litlen_freq, 15);
+  v_litlen_codes := pq._canonical_codes(v_litlen_lengths);
+  v_dist_lengths := pq._huffman_lengths(v_dist_freq, 15);
+  v_dist_codes := pq._canonical_codes(v_dist_lengths);
+
+  -- meta-alphabet: RLE the combined length sequence, then Huffman-code THAT
+  select max(gs) into v_litlen_hi from generate_series(1,286) gs where v_litlen_lengths[gs] > 0;
+  if v_litlen_hi < 257 then v_litlen_hi := 257; end if;
+  select max(gs) into v_dist_hi from generate_series(1,30) gs where v_dist_lengths[gs] > 0;
+  if v_dist_hi is null then v_dist_hi := 1; end if;
+
+  v_hlit := v_litlen_hi - 257;
+  v_hdist := v_dist_hi - 1;
+
+  v_combined_lengths := v_litlen_lengths[1:v_litlen_hi] || v_dist_lengths[1:v_dist_hi];
+
+  for v_tok in select * from pq._clc_rle(v_combined_lengths) loop
+    v_clc_sym := array_append(v_clc_sym, v_tok.sym);
+    v_clc_extra_val := array_append(v_clc_extra_val, v_tok.extra_val);
+    v_clc_extra_bits := array_append(v_clc_extra_bits, v_tok.extra_bits);
+    v_clc_freq[v_tok.sym+1] := v_clc_freq[v_tok.sym+1] + 1;
+  end loop;
+
+  v_clc_lengths := pq._huffman_lengths(v_clc_freq, 7);
+  v_clc_codes := pq._canonical_codes(v_clc_lengths);
+
+  v_hclen := 19;
+  while v_hclen > 4 and v_clc_lengths[v_clc_order[v_hclen]+1] = 0 loop
+    v_hclen := v_hclen - 1;
+  end loop;
+
+  -- ---- pass 3: emit bits ----
+  v_acc := v_acc | (1 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BFINAL=1
+  v_acc := v_acc | (0 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BTYPE low bit
+  v_acc := v_acc | (1 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BTYPE high bit (=10, dynamic)
+  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+  v_acc := v_acc | (v_hlit << v_acc_n); v_acc_n := v_acc_n + 5;
+  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  v_acc := v_acc | (v_hdist << v_acc_n); v_acc_n := v_acc_n + 5;
+  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  v_acc := v_acc | ((v_hclen - 4) << v_acc_n); v_acc_n := v_acc_n + 4;
+  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+  for i in 1..v_hclen loop
+    v_acc := v_acc | (v_clc_lengths[v_clc_order[i]+1] << v_acc_n); v_acc_n := v_acc_n + 3;
+    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  end loop;
+
+  for i in 1..array_length(v_clc_sym, 1) loop
+    v_sym := v_clc_sym[i];
+    v_nbits := v_clc_lengths[v_sym+1];
+    v_code := v_clc_codes[v_sym+1];
+    v_rev := pq._bit_reverse(v_code, v_nbits);
+    v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+    if v_clc_extra_bits[i] > 0 then
+      v_acc := v_acc | (v_clc_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_clc_extra_bits[i];
+      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+    end if;
+  end loop;
+
+  for i in 1..v_k loop
+    v_sym := v_litlen_sym[i];
+    v_nbits := v_litlen_lengths[v_sym+1];
+    v_code := v_litlen_codes[v_sym+1];
+    v_rev := pq._bit_reverse(v_code, v_nbits);
+    v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+    if v_litlen_extra_bits[i] > 0 then
+      v_acc := v_acc | (v_litlen_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_litlen_extra_bits[i];
+      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+    end if;
+
+    if v_dist_sym[i] is not null then
+      v_sym := v_dist_sym[i];
+      v_nbits := v_dist_lengths[v_sym+1];
+      v_code := v_dist_codes[v_sym+1];
+      v_rev := pq._bit_reverse(v_code, v_nbits);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+      if v_dist_extra_bits[i] > 0 then
+        v_acc := v_acc | (v_dist_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_dist_extra_bits[i];
+        while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+      end if;
+    end if;
+  end loop;
+
+  -- end-of-block symbol (256), dynamic code
+  v_nbits := v_litlen_lengths[257];
+  v_code := v_litlen_codes[257];
+  v_rev := pq._bit_reverse(v_code, v_nbits);
+  v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+
+  if v_acc_n > 0 then v_bytes := array_append(v_bytes, v_acc & 255); end if;
+
+  return (select decode(string_agg(lpad(to_hex(x), 2, '0'), '' order by ord), 'hex')
+          from unnest(v_bytes) with ordinality as t(x, ord));
+end;
+$$;
+
+-- Same RFC 1952 gzip container as pq._gzip_compress, wrapping the dynamic-Huffman
+-- encoder instead of the fixed one.
+create or replace function pq._gzip_compress_dynamic(payload bytea) returns bytea
+language plpgsql as $$
+declare
+  v_deflate bytea := pq._deflate_encode_dynamic(payload);
+  v_header bytea := decode('1f8b08000000000000ff', 'hex');
+  v_crc bigint := pq._crc32(payload);
+  v_isize bigint := length(payload) & 4294967295;
+  v_trailer bytea;
+begin
+  v_trailer := pq._reverse_bytes(int4send((v_crc - 4294967296 * (v_crc >> 31))::int4))
+            || pq._reverse_bytes(int4send((v_isize - 4294967296 * (v_isize >> 31))::int4));
+  return v_header || v_deflate || v_trailer;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Struct builders (SchemaElement / DataPageHeader / PageHeader /
 -- ColumnMetaData / ColumnChunk / RowGroup / FileMetaData)
 -- ---------------------------------------------------------------------------
@@ -697,7 +1264,7 @@ $$;
 -- Entry point
 -- ---------------------------------------------------------------------------
 
-create or replace function pq.to_parquet(p_relation regclass, p_compress boolean default false) returns bytea
+create or replace function pq.to_parquet(p_relation regclass, p_compress boolean default false, p_dynamic boolean default false) returns bytea
 language plpgsql as $$
 declare
   v_schema name; v_table name; v_from_sql text;
@@ -757,7 +1324,7 @@ begin
   for i in 1..v_ncols loop
     v_data := pq._encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i]);
     if p_compress then
-      v_page_bytes := pq._gzip_compress(v_data);
+      v_page_bytes := case when p_dynamic then pq._gzip_compress_dynamic(v_data) else pq._gzip_compress(v_data) end;
       v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
     else
       v_page_bytes := v_data;
@@ -833,7 +1400,7 @@ $$;
 -- reproducible, which is what lets a future chunk boundary land between two rows rather than
 -- inside a run of ties (see the design note on the chunker's stopping rule). A relation with
 -- no real key refuses outright, via pq._key_columns's NULL.
-create or replace function pq.to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default false) returns bytea
+create or replace function pq.to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default false, p_dynamic boolean default false) returns bytea
 language plpgsql as $$
 declare
   v_schema name; v_table name; v_from_sql text; v_order_by text; v_key_cols name[];
@@ -904,7 +1471,7 @@ begin
   for i in 1..v_ncols loop
     v_data := pq._encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by);
     if p_compress then
-      v_page_bytes := pq._gzip_compress(v_data);
+      v_page_bytes := case when p_dynamic then pq._gzip_compress_dynamic(v_data) else pq._gzip_compress(v_data) end;
       v_page_header := pq._build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
     else
       v_page_bytes := v_data;

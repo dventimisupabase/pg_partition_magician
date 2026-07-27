@@ -166,7 +166,7 @@ begin
   for i in 1..v_ncols loop
     v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by);
     if p_compress then
-      v_page_bytes := archive._pq_gzip_compress(v_data);
+      v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
     else
       v_page_bytes := v_data;
@@ -311,10 +311,11 @@ it is not directly re-checked either.
   is on by default for Parquet here (`archive._pq_to_parquet_range`'s `p_compress`), off by default
   for NDJSON, and its cost is not free against the byte budget either way: PR #205 measured real
   compression time from ~50ms/MB on highly compressible data up to ~2.6s/MB on near-incompressible
-  data, and that time is part of the horizon-hold for any chunk that compresses, on top of the
-  read-and-upload time the budget was already sized around. A byte budget picked to bound the hold
-  at N seconds under the uncompressed assumption may run longer than N once compression is in the
-  loop.
+  data (the fixed-Huffman variant; dynamic Huffman, #206, costs somewhat more building the
+  per-block code, not separately measured), and that time is part of the horizon-hold for any chunk
+  that compresses, on top of the read-and-upload time the budget was already sized around. A byte
+  budget picked to bound the hold at N seconds under the uncompressed assumption may run longer
+  than N once compression is in the loop.
 - **Parquet cannot use a per-part-commit technique, and never will.** A Parquet file's footer needs
   every row group's byte offset, known only once the whole file's bytes exist -- there is no way to
   `COMMIT` partway through building one. This is a structural fact about the format (see [Archive
