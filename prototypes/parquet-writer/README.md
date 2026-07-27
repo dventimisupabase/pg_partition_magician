@@ -5,14 +5,19 @@ pg_parquet, pg_duckdb, pg_lake, or pg_mooncake). Prototype for
 [pg_partition_magician#199](https://github.com/dventimisupabase/pg_partition_magician/issues/199);
 not shipped code, not wired into pgpm_core.
 
-**This encoder is now also wired into a real `pre_drop` hook**, verified
-end-to-end through `pgpm.retire()` against MinIO: see
+**This encoder is now also ported into production**, called directly via
+`archive.to_s3_parquet` or automatically via the `pgpm.config.archive_fn`
+contract (`pgpm.archive_to_s3_parquet`), verified end-to-end through
+`pgpm.retire()` against MinIO: see
 [`pgpm_archive/docs/to-s3.md`](../../pgpm_archive/docs/to-s3.md#a-columnar-variant-parquet-instead-of-ndjson).
-That version renames the `pq.*` functions here into the `archive` schema and
-adds a bytea-native SigV4 signer (`archive.s3_signed_request_bytea`), since
-the existing text-based signer's `convert_to(payload, 'UTF8')` call rejects
-a real Parquet payload's binary content. This directory stays as the
-standalone spike the docs version grew from.
+That version renames the `pq.*` functions here into the `archive` schema
+(`archive._pq_*`) and adds a bytea-native SigV4 signer
+(`archive.s3_signed_request_bytea`), since the existing text-based signer's
+`convert_to(payload, 'UTF8')` call rejects a real Parquet payload's binary
+content. This directory stays as the standalone spike production code ports
+from -- most recently the dynamic Huffman encoder (see "Dynamic Huffman
+coding" below, issue #206), built and verified here first, then ported
+rename-only into `pgpm_archive/install.sql` as the new default GZIP codec.
 
 ## Scope
 
@@ -144,6 +149,38 @@ checked row-for-row against the live source table -- covering plain columns, nul
 (the definition-levels bitmap and the values are compressed together as one page), an empty
 table, and a cross-partition range spanning two children.
 
+## Dynamic Huffman coding
+
+The GZIP compressor above is fixed-Huffman only (RFC 1951 3.2.6's constant tables) -- a valid,
+simpler rung, still the default `pq._gzip_compress`. `pq._huffman_lengths`/`pq._canonical_codes`
+(RFC 1951 3.2.2), `pq._lz77_tokens` (the matcher above, factored out so both encoders share one
+implementation), `pq._clc_rle` (the RFC 1951 3.2.7 code-length meta-alphabet), and
+`pq._deflate_encode_dynamic`/`pq._gzip_compress_dynamic` add a real per-block Huffman code
+instead, for issue #206. A pre-build measurement (reimplementing this project's own LZ77 matcher
+in Python, cross-checked against real zlib's `Z_FIXED` vs. default strategy) put the expected win
+at ~20-30% additional size reduction over fixed Huffman on realistic PLAIN-encoded column data;
+confirmed afterward end to end (both pyarrow and DuckDB reading real compressed Parquet files),
+24-35% smaller in the cases measured.
+
+**A real bug, not just a theoretical risk.** An earlier version of the length-limiting step (any
+Huffman code longer than 15 bits has to be shortened, DEFLATE's own cap) clamped overflowing
+lengths then used a floating-point Kraft-sum check (`while sum(2^-length) > 1: lengthen the
+shortest code`) to restore validity. That can silently converge to an **incomplete** code (Kraft
+sum `< 1`, gaps in the code space) since repeatedly halving one term has no guarantee of landing
+exactly on the target rather than overshooting past it -- and real zlib rejects an incomplete
+multi-symbol code outright (`invalid code lengths set`), caught live on a float8 price column
+during verification. Fixed with exact-integer arithmetic instead: clamp into a bit-length
+histogram (`bl_count[L]`), repair by moving one leaf from the shortest under-cap length down a
+level (gains a sibling, so weight is conserved) while consuming one unit of the max-length
+overflow, looping until total weight lands **exactly** on `2^max_bits` -- verified against a
+27-symbol Fibonacci-weighted worst case (the classic adversarial input for unbounded Huffman) and
+2000+ randomized trials, all landing on an exactly-complete code.
+
+This is now the default GZIP codec in production (`pgpm_archive/install.sql`'s
+`archive._pq_gzip_compress_dynamic`) for every call site that module drives on its own -- the
+older fixed-Huffman `archive._pq_gzip_compress` stays defined and directly callable as a simpler,
+slightly cheaper rung, matching how it's kept here.
+
 ## Layout
 
 `parquet_writer.sql` implements, bottom-up:
@@ -175,6 +212,10 @@ table, and a cross-partition range spanning two children.
    search for match length, lazy evaluation driven by the greedy parse) plus
    fixed-Huffman bit-packing and a CRC-32 trailer. Optional, via
    `p_compress` on `pq.to_parquet`/`to_parquet_range`.
+7. A dynamic-Huffman variant of the same compressor (`pq._gzip_compress_dynamic`, see "Dynamic
+   Huffman coding" above): `pq._huffman_lengths`/`_canonical_codes` (canonical Huffman
+   construction), `pq._lz77_tokens` (the matcher from item 6, factored out and shared), `pq._clc_rle`
+   (the code-length meta-alphabet), and `pq._deflate_encode_dynamic` (the full block encoder).
 
 ## Verification
 
@@ -194,11 +235,14 @@ a definition-levels byte boundary, an all-null column, a nullable column
 declared but with no actual nulls, an empty table with a nullable column,
 `NULL` staying distinct from `''` in a nullable text column, a nullable
 boolean, and a table mixing `NOT NULL` and nullable columns together. Plus
-four `p_compress => true` cases: repetitive text (real LZ77 matches, checked
-smaller than the uncompressed version and `codec: GZIP` via pyarrow),
-nullable columns compressed, low-entropy hex text (near-worst-case for
-LZ77 -- correctness under a bad ratio, not the ratio itself), and an empty
-table.
+four `p_compress => true` cases (fixed Huffman): repetitive text (real LZ77
+matches, checked smaller than the uncompressed version and `codec: GZIP` via
+pyarrow), nullable columns compressed, low-entropy hex text (near-worst-case
+for LZ77 -- correctness under a bad ratio, not the ratio itself), and an
+empty table. Plus five more `p_dynamic => true` cases (issue #206) mirroring
+those: repetitive text (also checked smaller than the fixed-Huffman output),
+nullable columns, a realistic multi-column id/timestamp/price shape (checked
+smaller than fixed Huffman too), low-entropy hex text, and an empty table.
 
 Note on the DuckDB side of `read_with_both_readers()`: it fetches raw
 tuples, not `.fetchdf()` (pandas). Pandas represents SQL `NULL` as `NaN`,
@@ -212,4 +256,4 @@ python3 -m venv .venv && ./.venv/bin/pip install pyarrow psycopg2-binary duckdb 
 ./.venv/bin/python verify.py
 ```
 
-All 24 cases pass against a live PG17 container as of this writing.
+All 29 cases pass against a live PG17 container as of this writing.
