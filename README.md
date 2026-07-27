@@ -20,8 +20,8 @@ and manages the whole lifecycle:
 - **`drain`**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
   self-tuning against checkpoint pressure (`set_drain_adaptive`).
 - **`retain`**: drop partitions past a policy. Set `config.archive_fn` to a resumable archive
-  strategy -- e.g. archive to long-term storage -- and a partition only drops once it's fully
-  archived, never before.
+  strategy -- e.g. archive to long-term storage, see the optional [`pgpm_archive`](#archiving-optional)
+  add-on for ready-made ones -- and a partition only drops once it's fully archived, never before.
 - **`maintain`**: the one procedure `pg_cron` calls (`obtain`, `drain`, `retain`, optional auto-`regrain`).
 
 The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."
@@ -36,6 +36,19 @@ your key; `p_incoming_fks => 'preserve'` re-adds each one once the move is idle)
 `pg_partman` is excellent, but it is a compiled C extension: it needs `CREATE EXTENSION`, the binary, and
 privileges some managed or locked-down environments do not grant. `pg_partition_magician` is just tables,
 views, and PL/pgSQL, so it installs anywhere you can run SQL and schedule a job.
+
+## Modules
+
+`pgpm_core` is the only required piece. Everything else is an independent, optional add-on that
+loads on top of it (never before it); none of the add-ons depend on each other, and installing any
+subset in any order is fine.
+
+| Directory | What it's for | When you need it |
+|---|---|---|
+| **`pgpm_core`** | The product itself: `transmute`/`obtain`/`drain`/`retain`/`maintain`. | Always. |
+| **`pgpm_hypertable`** | A one-time [migration tool](#migrating-from-timescaledb) (`from_hypertable`) that converts a TimescaleDB hypertable to a pgpm-managed table, then hands off to `transmute`. Not something you keep using afterward. | Only if migrating off TimescaleDB (Apache edition). |
+| **`pgpm_observe`** | Read-only [reporting](#observability-optional) correlating `pgpm.log` against `pg_flight_recorder` (PGFR) samples. | Only if you want workload-impact reporting; installs fine without PGFR present. |
+| **`pgpm_archive`** | Ready-made S3 [archive strategies](#archiving-optional) for `config.archive_fn` (see `retain` above). | Only if you want `retain` to archive a partition's data before dropping it; without it, `archive_fn` stays `null` and partitions just drop. |
 
 ## Install
 
@@ -120,6 +133,30 @@ absent). Load it on top of the core:
 ```bash
 psql "$DATABASE_URL" -f pgpm_observe/install.sql
 ```
+
+## Archiving (optional)
+
+`retain` drops partitions past a policy, but data doesn't have to just disappear: the optional
+`pgpm_archive` add-on supplies ready-made archive strategies (NDJSON and Parquet, to S3 or any
+S3-compatible store, optionally GZIP-compressed) for `config.archive_fn`. Set it once (after the
+one-time connection setup covered in [`pgpm_archive/README.md`](pgpm_archive/README.md)), and a
+partition only drops once it's been fully archived -- automatically, in bounded chunks, ahead of
+every drop:
+
+```sql
+update pgpm.config set archive_fn = 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure
+  where parent_table = 'public.events'::regclass;
+```
+
+Load it on top of the core:
+
+```bash
+psql "$DATABASE_URL" -f pgpm_archive/install.sql
+```
+
+See [`pgpm_archive/README.md`](pgpm_archive/README.md) for the full picture: connection setup,
+choosing NDJSON vs. Parquet, and the synchronous alternative (`archive.to_s3`/`archive.to_s3_parquet`)
+for manual, one-off archiving instead of the automatic `archive_fn` path.
 
 ## Documentation
 
