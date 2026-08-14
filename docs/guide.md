@@ -250,7 +250,9 @@ select pgpm.regrain_history('public.events');   -- split the oldest coarse child
 
 `regrain_history` regrains the oldest coarse child (the monolith) to the configured partition step. For a
 hierarchical split (monolith to per-year to per-month, to bound the transient disk on a tight volume),
-call `pgpm.regrain(parent, child, target_step)` with chosen steps.
+call `pgpm.regrain(parent, child, target_step)` with chosen steps. Each child you name must still be
+**coarse**, wider than one grid step: a child already exactly one step wide cannot be subdivided further
+and `regrain` refuses it.
 
 **Auto-regrain** (paced across maintenance ticks):
 

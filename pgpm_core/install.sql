@@ -1175,6 +1175,24 @@ begin
   if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
     return 'nosubdiv';
   end if;
+  -- ...and the first fine sub-range must not be named as the SOURCE child (issue #266). _part_name encodes
+  -- lo and, for the id kind, never the step, and it appends _to_<hi> only for a COARSE child -- so a source
+  -- exactly one step wide renders identically to its own first sub-range. Unguarded that is silent data
+  -- loss, not a mis-name: the "does the destination exist yet?" check below finds the SOURCE and treats it
+  -- as an already-created destination, the anti-join copy moves nothing, v_moved < v_batch advances the
+  -- cursor as though the sub-range were complete, and the swap's DROP TABLE takes those rows with it.
+  -- Computed from v_lo rather than the cursor, so a regrain resumed past the first sub-range is refused too
+  -- instead of reaching the swap with the collision already behind it. A raise, not a soft status: no later
+  -- tick makes this reachable, so it is a refusal like 'nokey', not a retry like 'default_dirty'.
+  v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_lo);
+  v_sub_lo  := case when pgpm._native_gt(cfg.control_kind, v_lo, v_grid_lo) then v_lo else v_grid_lo end;
+  v_sub_hi  := pgpm._grid_next(cfg.control_kind, v_step, v_grid_lo);
+  if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
+  v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
+  if v_sub_name = p_child then
+    raise exception 'pg_partition_magician: cannot regrain % at target step % -- its first fine sub-range [%, %) would be named %, which IS the source child, so the swap would drop those rows instead of splitting them. A child spanning exactly one grid step carries no _to_<hi> suffix to tell it apart from its own first sub-range. For an id-kind table no target step avoids this (the name encodes only lo); for a time/uuidv7 table, choose a target step that renders in a different name format. Regraining a COARSE child (one wider than a single step) is unaffected.',
+      p_child, v_step, v_sub_lo, v_sub_hi, v_sub_name;
+  end if;
   -- the DEFAULT must hold no rows inside the range (else a fine-child ATTACH at the swap would fail) --
   -- a stray there is the drain's job first
   execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',

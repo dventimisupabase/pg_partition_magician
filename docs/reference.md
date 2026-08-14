@@ -458,7 +458,14 @@ children in budget-sized microbatches and swaps them in for the coarse child, th
 source; the kept children are insert-only, so the product has no bloat. The whole call runs in one
 transaction, so it is **atomic and gap-free**. Retention-aware: a sub-range entirely below the horizon is
 reclaimed, never materialized. Refuses (as an exception) when the child is not frozen, the target step
-does not subdivide it, or the `DEFAULT` holds rows in its range.
+does not subdivide it, the `DEFAULT` holds rows in its range, or the child's first fine sub-range would
+carry the child's own name (see below).
+
+Only a **coarse** child can be regrained: one whose range is wider than a single grid step. A child exactly
+one step wide has no `_to_<hi>` suffix in its name to distinguish it from its own first fine sub-range, so
+regraining it is refused rather than allowed to collide. This is the shape `regrain_history` and
+auto-regrain already select for, so it affects only a hand-picked `pgpm.regrain(parent, child, step)` on a
+one-step-wide child.
 
 ```sql
 -- split the monolith into the configured fine granularity, once the frontier has passed it
