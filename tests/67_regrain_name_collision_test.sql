@@ -1,19 +1,26 @@
 -- regrain must never name a fine sub-range the same as the source child it is splitting (issue #266).
--- pgpm._part_name renders the id kind as lpad(lo, 19, '0') with NO step in the name, and appends
--- _to_<hi> only for a COARSE child (one wider than a single step at its own step). So a source child
--- exactly one config step wide and its own FIRST fine sub-range render the same relation name. Left
--- unguarded, regrain_step's "does the destination exist yet?" check finds the SOURCE, treats it as the
--- already-created destination, copies nothing, advances the cursor as though the sub-range were done, and
--- the swap's DROP TABLE then destroys that sub-range's rows -- silently, with a return value one lower
--- than the number of sub-ranges. These tests pin the refusal and the conservation it protects.
+--
+-- pgpm._part_name gives a one-step range the historical name _p<lo> and a WIDER range the explicit
+-- _p<lo>_to_<hi>, and the comment above it states the reason: the wide form exists "so it can never
+-- collide with the fine child at its low edge". The flaw is that "wider" was judged at the child's OWN
+-- step. A child exactly one step wide is not wide on its own grid, so it kept the bare _p<lo>; regrain
+-- then reinterprets it on a FINER grid, where its own first sub-range also renders _p<lo>.
+--
+-- Unguarded that was silent data loss: regrain_step's "does the destination exist yet?" check found the
+-- SOURCE, treated it as an already-created destination, the anti-join copy moved nothing, the cursor
+-- advanced as though the sub-range were done, and the swap's DROP TABLE took those rows with it.
+--
+-- The cure is to finish the stated design: before splitting, rename the source to its own name as
+-- rendered on the TARGET grid, where it IS wider than one step and therefore always takes the explicit
+-- _to_ form. The fine sub-range names are then free, and the collision is structurally impossible.
 create extension if not exists pgtap;
 begin;
-select plan(9);
+select plan(14);
 
--- ============================ the colliding case ============================
+-- ======================= the case that used to destroy rows =======================
 -- 400 ids over a step of 1000: the monolith is [0, 1000), exactly ONE grid step wide, so its name
--- carries no _to_<hi> suffix. Its first fine sub-range at a target step of 100 is [0, 100), which
--- renders identically.
+-- carries no _to_<hi>. Its own first sub-range at a target step of 100 is [0, 100), which renders
+-- identically on the source grid.
 create table public.rnc (id bigint primary key, payload text);
 insert into public.rnc select g, 'x' from generate_series(1, 400) g;
 select pgpm.transmute('public.rnc', 'id', 1000);
@@ -22,39 +29,50 @@ insert into public.rnc values (900000, 'frontier');   -- advance the frontier so
 select is(
   pgpm._part_name('rnc', 'id', '1000', '0', '1000'),
   pgpm._part_name('rnc', 'id', '100', '0', '100'),
-  'the source child and its own first fine sub-range render the same relation name');
+  'the collision is real: source and its own first sub-range render the same name on the source grid');
 
 select is((select count(*)::int from public.rnc), 401,
-  'baseline: 401 rows before any regrain');
+  'baseline: 401 rows before the regrain');
 
-select throws_ok(
-  $$ select pgpm.regrain('public.rnc', 'rnc_p0000000000000000000', '100') $$,
-  'P0001', NULL,
-  'regrain refuses when the first fine sub-range would be named as the source child');
+select is(
+  (select pgpm.regrain('public.rnc', 'rnc_p0000000000000000000', '100'))::int,
+  10, 'a one-step-wide child now regrains into ALL 10 sub-ranges (the bug returned 9)');
 
--- the refusal must be total: pgpm.regrain loops regrain_step in one transaction, so a raise rolls the
--- whole attempt back. Assert the state is untouched rather than trusting that.
 select is((select count(*)::int from public.rnc), 401,
-  'the refusal mutated nothing: all 401 rows still present');
+  'the regrain is lossless: all 401 rows survive');
 
 select is(
   (select count(*)::int from generate_series(1, 99) g
     where not exists (select 1 from public.rnc where id = g)),
-  0, 'the first sub-range''s rows (ids 1..99) are intact -- this is what the bug destroyed');
+  0, 'the first sub-range''s rows (ids 1..99) survive -- this is exactly what the bug destroyed');
 
 select ok(
   to_regclass('public.rnc_p0000000000000000000') is not null,
-  'the source child still exists (the swap never ran)');
+  'the first fine child took the natural _p<lo> name, freed by renaming the source');
 
 select is(
   (select attached from pgpm.part
     where parent_table = 'public.rnc'::regclass and child_name = 'rnc_p0000000000000000000'),
-  true, 'the source child is still attached and still registered');
+  true, 'that fine child is attached and registered');
 
--- ============================ the coarse case still works ============================
--- 2500 ids over a step of 1000: the monolith is [0, 3000), three steps wide, so it IS coarse and its
--- name carries _to_<hi>. Its first fine sub-range is named differently, so nothing collides and the
--- guard must not fire.
+select is(
+  (select count(*)::int from pgpm.part p
+    where p.parent_table = 'public.rnc'::regclass and p.attached
+      and p.lo::numeric >= 0 and p.hi::numeric <= 1000),
+  10, 'ten fine children now cover the old one-step child''s range');
+
+select ok(
+  to_regclass('public.rnc_p0000000000000000000_to_0000000000000001000') is null,
+  'the transitional coarse-form source name is gone (the swap dropped it)');
+
+select cmp_ok(
+  (select count(*) from pgpm.log
+    where parent_table = 'public.rnc'::regclass and action = 'regrain_rename'),
+  '>', 0::bigint, 'the rename is recorded in pgpm.log');
+
+-- ======================= the already-coarse case is untouched =======================
+-- 2500 ids over a step of 1000: the monolith is [0, 3000), three steps wide, so it already carries
+-- _to_<hi> and nothing needs renaming. This is the path regrain_history and auto-regrain always take.
 create table public.rcc (id bigint primary key, payload text);
 insert into public.rcc select g, 'x' from generate_series(1, 2500) g;
 select pgpm.transmute('public.rcc', 'id', 1000);
@@ -62,10 +80,30 @@ insert into public.rcc values (900000, 'frontier');
 
 select is(
   (select pgpm.regrain('public.rcc', 'rcc_p0000000000000000000_to_0000000000000003000', '100'))::int,
-  30, 'a coarse source child still regrains into all 30 fine children');
+  30, 'a coarse source child still regrains into all 30 fine children, losslessly');
 
-select is((select count(*)::int from public.rcc), 2501,
-  'the coarse regrain is lossless: every row survives the swap');
+-- ======================= the rename survives across ticks =======================
+-- regrain() loops inside one transaction, but a feathered regrain is one regrain_step per tick, so the
+-- rename has to be visible to the NEXT call. Drive it a step at a time and pin the hand-off.
+create table public.rnd (id bigint primary key, payload text);
+insert into public.rnd select g, 'x' from generate_series(1, 400) g;
+select pgpm.transmute('public.rnd', 'id', 1000);
+insert into public.rnd values (900000, 'frontier');
+
+select pgpm.regrain_step('public.rnd', 'rnd_p0000000000000000000', '100', 50);   -- first tick: renames
+
+select is(
+  (select child_name from pgpm.part
+    where parent_table = 'public.rnd'::regclass and attached and lo::numeric = 0),
+  'rnd_p0000000000000000000_to_0000000000000001000'::name,
+  'after the first tick pgpm.part tracks the source under its new coarse-form name');
+
+select ok(
+  to_regclass('public.rnd_p0000000000000000000_to_0000000000000001000') is not null,
+  'the source table itself was renamed, not copied');
+
+select is((select count(*)::int from public.rnd), 401,
+  'the rename tick moved no rows and lost none');
 
 select * from finish();
 rollback;
