@@ -460,6 +460,14 @@ transaction, so it is **atomic and gap-free**. Retention-aware: a sub-range enti
 reclaimed, never materialized. Refuses (as an exception) when the child is not frozen, the target step
 does not subdivide it, or the `DEFAULT` holds rows in its range.
 
+A child whose range is exactly one grid step wide carries the plain `_p<lo>` name, which is also what its
+own first fine sub-range would be called. Regrain renames such a child to its explicit-range form
+(`_p<lo>_to_<hi>`) before splitting it, logged as `regrain_rename`, so the sub-range names are free. The
+rename is metadata-only, the child is dropped at the swap anyway, and `pgpm.part` is updated with it, so
+the only visible effect is the transitional name. Anything driving a regrain across ticks by hand should
+re-read the child name from `pgpm.part` rather than assuming it; `regrain`, `regrain_history` and
+auto-regrain all do.
+
 ```sql
 -- split the monolith into the configured fine granularity, once the frontier has passed it
 select pgpm.regrain_history('public.events');

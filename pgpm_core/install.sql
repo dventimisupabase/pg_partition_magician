@@ -1130,6 +1130,7 @@ declare
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
+  v_child_name name; v_src_name name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -1143,7 +1144,8 @@ begin
   if not found then
     raise exception 'pg_partition_magician: % is not an attached managed partition of %', p_child, p_parent;
   end if;
-  v_child := format('%I.%I', v_nsp, p_child)::regclass;
+  v_child      := format('%I.%I', v_nsp, p_child)::regclass;
+  v_child_name := p_child;   -- may be renamed below (#266); v_child is an oid and follows it for free
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
@@ -1174,6 +1176,40 @@ begin
   -- the target step must actually subdivide the child
   if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
     return 'nosubdiv';
+  end if;
+  -- ...and the source must not be named as its own first fine sub-range (issue #266). _part_name gives a
+  -- one-step range the bare _p<lo> and a wider one the explicit _p<lo>_to_<hi>, and the note above it says
+  -- why: the wide form exists "so it can never collide with the fine child at its low edge". But "wider"
+  -- was judged on the child's OWN grid. A child exactly one step wide is not wide there, so it kept _p<lo>
+  -- -- and regrain then reinterprets it on a FINER grid, where its own first sub-range renders _p<lo> too.
+  -- That was silent data loss, not a cosmetic clash: the "does the destination exist yet?" check below
+  -- found the SOURCE, took it for an already-created destination, the anti-join copy moved nothing,
+  -- v_moved < v_batch advanced the cursor as though the sub-range were done, and the swap's DROP TABLE took
+  -- those rows with it.
+  --
+  -- Finish the design instead of refusing: rename the source to its own name as rendered on the TARGET
+  -- grid. `nosubdiv` above already established v_hi > grid_next(v_step, v_lo), so on that grid the source
+  -- IS wider than one step and always takes the explicit _to_ form, which no one-step sub-range can equal.
+  -- This is safe precisely because of the other half of that note: the name is a human-facing LABEL and
+  -- pgpm.part holds the authoritative bounds. v_child is an oid, so every later statement here follows the
+  -- table with no re-resolution. Derived from v_lo rather than the cursor, so it also fires for a regrain
+  -- resumed past its first sub-range instead of reaching the swap with the collision still ahead of it.
+  v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_lo);
+  v_sub_lo  := case when pgpm._native_gt(cfg.control_kind, v_lo, v_grid_lo) then v_lo else v_grid_lo end;
+  v_sub_hi  := pgpm._grid_next(cfg.control_kind, v_step, v_grid_lo);
+  if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
+  if pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi) = v_child_name then
+    v_src_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_lo, v_hi);
+    if to_regclass(format('%I.%I', v_nsp, v_src_name)) is not null then
+      raise exception 'pg_partition_magician: cannot regrain % at target step % -- splitting it needs the transitional name %, which is already taken by another relation. Drop or rename that relation, then re-run.',
+        v_child_name, v_step, v_src_name;
+    end if;
+    execute format('alter table %s rename to %I', v_child::text, v_src_name);
+    update pgpm.part set child_name = v_src_name
+     where parent_table = p_parent and child_name = v_child_name;
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (p_parent, 'regrain_rename', v_lo, v_hi, v_child_name || ' -> ' || v_src_name);
+    v_child_name := v_src_name;
   end if;
   -- the DEFAULT must hold no rows inside the range (else a fine-child ATTACH at the swap would fail) --
   -- a stray there is the drain's job first
@@ -1238,6 +1274,12 @@ begin
     v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo);
     v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi);
     v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
+    -- invariant (#266): the rename above makes this unreachable. Assert it anyway -- when it was false the
+    -- failure was silent row destruction, so a future change to _part_name must break loudly here.
+    if v_sub_name = v_child_name then
+      raise exception 'pg_partition_magician: internal error regraining % -- sub-range [%, %) resolves to the source child itself; refusing rather than copying into the table about to be dropped.',
+        v_child_name, v_sub_lo, v_sub_hi;
+    end if;
     if to_regclass(format('%I.%I', v_nsp, v_sub_name)) is null then
       execute format('create table %I.%I (like %I.%I including defaults including generated including storage including indexes including constraints excluding identity)',
                      v_nsp, v_sub_name, v_nsp, v_rel);
@@ -1293,7 +1335,7 @@ begin
     insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'regrain_attach', r.lo, r.hi, 'check_skip');
     v_made := v_made + 1;
   end loop;
-  delete from pgpm.part where parent_table = p_parent and child_name = p_child;
+  delete from pgpm.part where parent_table = p_parent and child_name = v_child_name;   -- not p_child: #266 may have renamed it
   execute format('drop table %s', v_child::text);
   -- re-add the FK(s) this swap dropped, against the new parent (the copies now hold every key). Only if WE
   -- dropped them (v_fk > 0): a v_fk = 0 means a drain already had them suspended, and re-adding mid-drain
@@ -1310,10 +1352,17 @@ $$;
 -- statuses become a hard error here (the operator gets a clear refusal); maintain() instead just skips.
 create or replace function pgpm.regrain(p_parent regclass, p_child name, p_target_step text default null)
 returns int language plpgsql as $$
-declare v_status text; v_iter int := 0;
+declare v_status text; v_iter int := 0; v_child name := p_child; v_next name; v_lo text;
 begin
+  -- regrain_step may rename the source child on its first pass (#266: a child exactly one step wide is
+  -- renamed to its coarse-form name on the target grid so its own first sub-range can take _p<lo>). Follow
+  -- it by lo, which never changes, and re-resolve the name each iteration -- otherwise every iteration after
+  -- the first would look up a name that no longer exists. Only the source is attached at that lo during the
+  -- copy phase (fine children stay attached = false until the swap), so the lookup is unambiguous.
+  select lo into v_lo from pgpm.part
+   where parent_table = p_parent and child_name = p_child and attached;
   loop
-    v_status := pgpm.regrain_step(p_parent, p_child, p_target_step, null);
+    v_status := pgpm.regrain_step(p_parent, v_child, p_target_step, null);
     if v_status like 'swapped:%' then return split_part(v_status, ':', 2)::int; end if;
     if v_status in ('active', 'default_dirty', 'nosubdiv', 'nokey', 'idle') then
       raise exception 'pg_partition_magician: cannot regrain % -- %', p_child,
@@ -1326,6 +1375,11 @@ begin
     end if;
     v_iter := v_iter + 1;
     if v_iter > 10000000 then raise exception 'pg_partition_magician: regrain safety limit'; end if;
+    if v_lo is not null then
+      select p.child_name into v_next from pgpm.part p
+       where p.parent_table = p_parent and p.lo = v_lo and p.attached;
+      v_child := coalesce(v_next, v_child);
+    end if;
   end loop;
 end;
 $$;
