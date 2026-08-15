@@ -484,11 +484,41 @@ One resumable microbatch of `regrain`: it **copies** (never deletes) a within-ho
 budget-sized batch into its fine child, skips a below-horizon sub-range (discarded with the source at the
 swap), and performs the atomic swap once the cursor (`config.regrain_cursor`) reaches the coarse `hi`. The
 source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
-`copied:N`, `swapped:K` (regrain complete, K children attached), or a soft no-progress status: `active`
-(not frozen yet), `default_dirty` (a stray sits in the range), or `nosubdiv` (the step does not subdivide).
-This is the unit `maintain` paces across ticks; because it copies, the cross-tick path opens **no**
-read gap (unlike the drain). Its one FK touch is the swap's `DETACH`, which transiently drops and re-adds
-any incoming FK within that single transaction.
+`prepared` (the first tick, which installs change capture and copies nothing), `reconciled:N`,
+`copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
+complete, K children attached), or a soft no-progress status: `active` (not frozen yet), `default_dirty`
+(a stray sits in the range), or `nosubdiv` (the step does not subdivide). This is the unit `maintain`
+paces across ticks; because it copies, the cross-tick path opens **no** read gap (unlike the drain). Its
+one FK touch is the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that
+single transaction.
+
+Committed DML against the source while a regrain is in flight is honoured. A trigger on the source records
+changed keys into a per-parent delta table, and a reconcile pass treats the **source** as the authority for
+each captured key, so a row inserted, deleted or updated mid-regrain is not lost, resurrected or reverted
+by the swap. The reconcile is bounded by the same budget as the copy and takes the tick when there is work,
+so a burst of DML paces itself rather than landing inside the swap. If writes outpace it the regrain stalls
+at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
+work is done under the swap's lock.
+
+Note the first tick therefore does no copying. A regrain that used to take N ticks now takes N + 1.
+
+### `regrain_cancel`
+
+```sql
+pgpm.regrain_cancel(p_parent regclass) returns int
+```
+
+Stops an in-flight regrain and reclaims what it has built, returning the number of in-flight fine children
+dropped. It removes change capture, clears the delta, drops every not-yet-attached copy, and resets
+`config.regrain_cursor`. The parent is untouched: the source child still holds every row, so this costs the
+copying work already done and nothing else.
+
+The copies are **dropped, not kept**. Keeping them would let a later regrain resume from copies made before
+the cancel, which were therefore never reconciled.
+
+Abandoning a regrain without calling this (turning auto-regrain off mid-flight, say) is safe: `maintain`
+sweeps orphaned capture each tick and logs `regrain_capture_orphan`. The verb exists so an operator can stop
+one deliberately and get the disk back.
 
 ### `regrain_history`
 

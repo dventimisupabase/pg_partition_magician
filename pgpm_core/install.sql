@@ -1117,6 +1117,304 @@ $$;
 -- not-yet-attached children between ticks, but since the source still holds those rows, the parent's count
 -- is never short and snapshot() must NOT union those copies (it would double-count).
 
+-- ===================== regrain change capture and reconcile (issue #267) =====================
+--
+-- regrain COPIES, and its copy is resume-safe three ways: a `>= max(dest.ctl)` high-water bound, a
+-- `not exists` anti-join on the reused key, and a cursor that advances past a completed sub-range and
+-- never returns. NONE of the three is a reconcile -- the copy only ever ADDS rows and only ever moves
+-- FORWARD -- and the swap then drops the source, so without this apparatus the copy silently becomes the
+-- authority for everything that changed after it ran: a committed INSERT is destroyed, a committed DELETE
+-- comes back, a committed UPDATE reverts.
+--
+-- "Frozen" (regrain_step's precondition) does NOT mean immutable: it only says the write frontier has
+-- moved past the child. A backdated INSERT or an explicit low id routes straight into it, a
+-- cross-partition UPDATE can move a row in, and DELETE/payload-UPDATE of history never involved the
+-- frontier at all. So capture must be correct however much arrives, not merely for a well-behaved
+-- append-only workload.
+--
+-- Shape: the delta table and its trigger function are PER PARENT and persistent (named from the parent,
+-- which is stable -- naming from the child would break, since #266's fix renames the source mid-flight);
+-- only the trigger on the source child is per regrain. Lifecycle therefore reduces to rows, not
+-- relations, and an abandoned regrain leaks a trigger the janitor removes rather than an orphan table.
+
+create or replace function pgpm._regrain_capture_names(
+  p_parent regclass, out nsp name, out delta name, out fn name
+) returns record language plpgsql stable as $$
+declare v_rel name;
+begin
+  select n.nspname, c.relname into nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  delta := left(v_rel || '_pgpm_regrain_delta', 63)::name;
+  fn    := left(v_rel || '_pgpm_regrain_capture', 63)::name;
+end;
+$$;
+
+-- Install capture for a regrain of p_child: mint the per-parent delta table and trigger function if this
+-- parent has never regrained, clear any residue from a previous regrain, and put the trigger on the source
+-- child. CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which conflicts with ROW EXCLUSIVE, so in-flight DML
+-- blocks the install and DML afterwards sees the trigger: once this commits nothing can have slipped past
+-- uncaptured. That lock is why this is its own tick -- sharing a transaction with a copy batch would hold
+-- it across the batch instead of for an O(1) statement.
+create or replace function pgpm._regrain_capture_install(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare
+  v_nsp name; v_delta name; v_fn name; v_keyidx oid; v_keycols text; v_newvals text; v_oldvals text;
+  v_bad text;
+begin
+  select nsp, delta, fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_names(p_parent);
+
+  select coalesce(
+           (select i.indexrelid from pg_index i where i.indrelid = p_parent and i.indisprimary limit 1),
+           (select con.conindid from pg_constraint con join pg_index i on i.indexrelid = con.conindid
+             where con.conrelid = p_parent and con.contype = 'u'
+               and i.indpred is null and i.indexprs is null limit 1))
+    into v_keyidx;
+  if v_keyidx is null then
+    raise exception 'pg_partition_magician: cannot capture regrain changes on % -- no primary key or unique constraint', p_parent;
+  end if;
+
+  -- A NULL key component can never be matched by the row-constructor reconcile below, so its change would
+  -- be silently lost -- the exact failure this apparatus exists to prevent. PK columns are NOT NULL, but a
+  -- reused UNIQUE key may legitimately permit nulls, so refuse rather than lose the change.
+  select string_agg(quote_ident(a.attname), ', ') into v_bad
+    from pg_index i
+    cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+   where i.indexrelid = v_keyidx and not a.attnotnull;
+  if v_bad is not null then
+    raise exception 'pg_partition_magician: cannot regrain % -- its reused key has nullable column(s) (%), and a NULL key component cannot be reconciled, so a concurrent change to such a row would be lost. Add NOT NULL to those columns, then re-run.',
+      p_parent, v_bad;
+  end if;
+
+  select string_agg(quote_ident(a.attname), ', ' order by k.ord),
+         string_agg('new.' || quote_ident(a.attname), ', ' order by k.ord),
+         string_agg('old.' || quote_ident(a.attname), ', ' order by k.ord)
+    into v_keycols, v_newvals, v_oldvals
+    from pg_index i
+    cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+   where i.indexrelid = v_keyidx;
+
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
+    execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols, p_parent::text);
+    -- monotonic ordering column so a reconcile pass can batch by a pgpm_seq watermark: a batch processes
+    -- and deletes rows at or below the watermark, and anything arriving mid-batch lands higher for the next
+    -- pass. Excluded by name wherever key columns are introspected.
+    execute format('alter table %I.%I add column pgpm_seq bigint generated always as identity', v_nsp, v_delta);
+    execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);
+  end if;
+  execute format('truncate %I.%I', v_nsp, v_delta);   -- residue from an earlier regrain is not ours
+
+  execute format('create or replace function %I.%I() returns trigger language plpgsql as $pgpm$
+    begin
+      if tg_op = ''DELETE'' then
+        insert into %I.%I (%s) values (%s); return old;
+      elsif tg_op = ''UPDATE'' then
+        insert into %I.%I (%s) values (%s), (%s); return new;   -- old + new: a key change dirties both
+      else
+        insert into %I.%I (%s) values (%s); return new;
+      end if;
+    end $pgpm$',
+    v_nsp, v_fn,
+    v_nsp, v_delta, v_keycols, v_oldvals,
+    v_nsp, v_delta, v_keycols, v_oldvals, v_newvals,
+    v_nsp, v_delta, v_keycols, v_newvals);
+
+  execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, p_child);
+  execute format('create trigger pgpm_regrain_capture after insert or update or delete on %I.%I for each row execute function %I.%I()',
+                 v_nsp, p_child, v_nsp, v_fn);
+end;
+$$;
+
+-- true iff p_child currently carries the capture trigger
+create or replace function pgpm._regrain_capture_active(p_parent regclass, p_child name)
+returns boolean language plpgsql stable as $$
+declare v_nsp name;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  return exists (select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
+                  where t.tgname = 'pgpm_regrain_capture' and c.relname = p_child
+                    and c.relnamespace = v_nsp::regnamespace);
+end;
+$$;
+
+-- how many captured changes are still outstanding (used by the swap gate and by status)
+create or replace function pgpm._regrain_delta_count(p_parent regclass)
+returns bigint language plpgsql stable as $$
+declare v_nsp name; v_delta name; v_n bigint;
+begin
+  select nsp, delta into v_nsp, v_delta from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return 0; end if;
+  execute format('select count(*) from %I.%I', v_nsp, v_delta) into v_n;
+  return v_n;
+end;
+$$;
+
+-- Reconcile up to p_batch captured keys, returning how many were consumed.
+--
+-- THE CONTRACT: for each captured key the SOURCE is the authority, not the recorded change. Delete the
+-- key's row from its fine child, then reinsert the source's current row for that key if it still exists.
+-- One rule covers all three defects, and critically it covers keys the copy has NEVER SEEN, which the
+-- INSERT case needs and which any replay-the-change design would miss. It is idempotent and
+-- order-independent per key, which is what makes it safe under READ COMMITTED: a synchronous
+-- apply-the-change trigger is not, because it can fire against a copy that does not hold the row yet and
+-- then be overwritten by a copy statement running from an earlier snapshot.
+--
+-- ELIGIBILITY: only keys whose control value lies strictly BELOW the cursor, i.e. in a sub-range the copy
+-- has already finished. Two reasons. The copy can still reach anything at or above the cursor by itself,
+-- so reconciling there is wasted work; and writing into the sub-range currently being copied would move
+-- max(dest.ctl), which the copy uses as its resume point, making it skip the rows in between. At the swap
+-- the cursor is at hi, so everything becomes eligible.
+create or replace function pgpm._regrain_reconcile(
+  p_parent regclass, p_child name, p_lo text, p_hi text, p_step text, p_cursor text, p_batch int
+) returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_rel name; v_delta name; v_ncast text; v_keycols text; v_dkey text;
+  v_skey text; v_cols text; v_wm bigint; v_elig text; v_ctl text; v_sub_name name; v_n int := 0; r record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select delta into v_delta from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return 0; end if;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+
+  select string_agg(quote_ident(attname), ', ' order by attnum),
+         '(' || string_agg('d.' || quote_ident(attname), ', ' order by attnum) || ')',
+         '(' || string_agg('s.' || quote_ident(attname), ', ' order by attnum) || ')'
+    into v_keycols, v_dkey, v_skey
+    from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
+      and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
+  -- generated columns are omitted from the reinsert: they recompute, they are never inserted into
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped and attgenerated = '';
+
+  -- native control value of a delta row, decoded (uuidv7 stores a uuid but grids on its timestamp)
+  v_ctl := format('pgpm._decode(%L, %I::text)::%s', cfg.control_kind, cfg.control_column, v_ncast);
+
+  -- A captured key whose control has left this child's range belongs to a row a cross-partition UPDATE
+  -- moved out. Its OLD-key entry (still in range) already covers the removal here, so this entry can never
+  -- apply -- and it can never become eligible either, so leaving it would wedge the swap gate permanently.
+  -- Discard it.
+  execute format('delete from %I.%I where not (%3$s >= %4$L::%5$s and %3$s < %6$L::%5$s)',
+                 v_nsp, v_delta, v_ctl, p_lo, v_ncast, p_hi);
+
+  -- eligible: in this child's range AND behind the cursor
+  v_elig := format('%1$s >= %2$L::%3$s and %1$s < %4$L::%3$s and %1$s < %5$L::%3$s',
+                   v_ctl, p_lo, v_ncast, p_hi, p_cursor);
+
+  execute format('select max(pgpm_seq) from (select pgpm_seq from %I.%I where %s order by pgpm_seq limit %s) t',
+                 v_nsp, v_delta, v_elig, greatest(p_batch, 1)) into v_wm;
+  if v_wm is null then return 0; end if;
+
+  -- one pair of set-based statements per distinct fine child touched, not per key
+  for r in execute format(
+    'select distinct pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %I::text)) as sub_lo
+       from %I.%I where pgpm_seq <= %s and %s',
+    cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
+    v_nsp, v_delta, v_wm, v_elig)
+  loop
+    v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, p_step, r.sub_lo,
+                                  pgpm._grid_next(cfg.control_kind, p_step, r.sub_lo));
+    -- No fine child means the sub-range was skipped as aged (regrain_aged): it is never materialized and
+    -- its rows go with the source, so there is nothing to reconcile into. Counted, not silent.
+    if to_regclass(format('%I.%I', v_nsp, v_sub_name)) is null then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'regrain_reconcile_aged', r.sub_lo, null, v_sub_name);
+      continue;
+    end if;
+    execute format(
+      'delete from %I.%I d where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
+          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text)) = %L)',
+      v_nsp, v_sub_name, v_dkey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
+      cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column, r.sub_lo);
+    execute format(
+      'insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
+          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text)) = %L)',
+      v_nsp, v_sub_name, v_cols, v_cols, v_nsp, p_child, v_skey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
+      cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column, r.sub_lo);
+  end loop;
+
+  execute format('delete from %I.%I where pgpm_seq <= %s and %s', v_nsp, v_delta, v_wm, v_elig);
+  get diagnostics v_n = row_count;
+  if v_n > 0 then
+    insert into pgpm.log (parent_table, action, lo, hi, rows)
+      values (p_parent, 'regrain_reconcile', p_lo, p_hi, v_n);
+  end if;
+  return v_n;
+end;
+$$;
+
+-- The janitor (#267). Change capture is installed per regrain and normally dies with the source at the
+-- swap, but a regrain can be abandoned silently: the operator sets regrain_to to null mid-flight, or drives
+-- a manual regrain of child A while auto-regrain is working child B and the two clobber the shared cursor.
+-- A left-behind trigger taxes every write to that child and fills a delta nobody reads.
+--
+-- The child that legitimately carries capture is derivable with no extra state: the attached child whose
+-- range covers regrain_cursor, and none at all when the cursor is null. `hi` is inclusive here because a
+-- regrain awaiting its swap sits with the cursor exactly at hi. Deliberately conservative: it only tears
+-- down capture it can prove is orphaned, never one that might still be live.
+--
+-- Mirrors _enforce_write_blocks: reconcile every child's state against current policy, once per tick.
+create or replace function pgpm._enforce_regrain_capture(p_parent regclass)
+returns void language plpgsql as $$
+declare cfg pgpm.config; v_nsp name; v_keep boolean; r record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then return; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  for r in select child_name, lo, hi from pgpm.part where parent_table = p_parent
+  loop
+    if not pgpm._regrain_capture_active(p_parent, r.child_name) then continue; end if;
+    v_keep := cfg.regrain_cursor is not null
+          and not pgpm._native_gt(cfg.control_kind, r.lo, cfg.regrain_cursor)       -- lo <= cursor
+          and not pgpm._native_gt(cfg.control_kind, cfg.regrain_cursor, r.hi);      -- cursor <= hi
+    if not v_keep then
+      execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'regrain_capture_orphan', r.lo, r.hi, r.child_name);
+    end if;
+  end loop;
+end;
+$$;
+
+-- Stop an in-flight regrain and reclaim what it has built. Returns the number of in-flight fine children
+-- dropped. The janitor above handles the silent abandonments; this is the operator's deliberate escape.
+--
+-- The copies MUST be dropped, not kept. Keeping them looks thriftier, but a later regrain would resume from
+-- copies made before this cancel and therefore never reconciled, which is exactly the bug #267 closes. The
+-- source still holds every row, so discarding them costs only the work, never data.
+create or replace function pgpm.regrain_cancel(p_parent regclass)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_delta name; v_dropped int := 0; r record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  for r in select child_name from pgpm.part where parent_table = p_parent loop
+    execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+  end loop;
+
+  select delta into v_delta from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is not null then
+    execute format('truncate %I.%I', v_nsp, v_delta);
+  end if;
+
+  for r in select child_name from pgpm.part where parent_table = p_parent and not attached loop
+    execute format('drop table if exists %I.%I', v_nsp, r.child_name);
+    delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
+    v_dropped := v_dropped + 1;
+  end loop;
+
+  update pgpm.config set regrain_cursor = null where parent_table = p_parent;
+  insert into pgpm.log (parent_table, action, rows) values (p_parent, 'regrain_cancel', v_dropped);
+  return v_dropped;
+end;
+$$;
+
 -- one resumable microbatch of regrain work on coarse child p_child toward target step p_target_step.
 -- Returns: 'copied:N' (copied N rows into the current fine child), 'swapped:K' (cursor reached hi -> detached
 -- the source, attached K fine children, dropped it: regrain done), or a soft no-progress status ('active' =
@@ -1130,7 +1428,7 @@ declare
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
-  v_child_name name; v_src_name name;
+  v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_i int; v_delta_name name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -1218,6 +1516,36 @@ begin
                  cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
   if v_has then return 'default_dirty'; end if;
 
+  -- #267: change capture must be installed AND COMMITTED before any copy reads the source, or every change
+  -- made during the first batch is lost. Its own tick, so CREATE TRIGGER's SHARE ROW EXCLUSIVE is an O(1)
+  -- hold rather than one spanning a copy batch. Setting the cursor here too keeps the janitor's invariant
+  -- ("cursor null => no child carries the trigger") true from the first tick, so it cannot tear down a
+  -- regrain that is one tick old.
+  if not pgpm._regrain_capture_active(p_parent, v_child_name) then
+    -- A cursor already set with no capture installed means copies exist that were made WITHOUT capture:
+    -- an interrupted regrain from before this apparatus, or one the janitor cleaned up mid-flight. Those
+    -- copies are unreconciled, so resuming from them would reintroduce exactly this bug. Discard and
+    -- restart, which is cheap: the source still holds every row.
+    if cfg.regrain_cursor is not null then
+      for r in execute format(
+        'select child_name from pgpm.part where parent_table = %L::regclass and not attached'
+        || ' and lo::%s >= %L::%s and hi::%s <= %L::%s',
+        p_parent::text, v_ncast, v_lo, v_ncast, v_ncast, v_hi, v_ncast)
+      loop
+        execute format('drop table if exists %I.%I', v_nsp, r.child_name);
+        delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
+        v_made := v_made + 1;
+      end loop;
+      insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+        values (p_parent, 'regrain_restart', v_lo, v_hi, v_made, 'copies predate change capture');
+    end if;
+    perform pgpm._regrain_capture_install(p_parent, v_child_name);
+    update pgpm.config set regrain_cursor = v_lo where parent_table = p_parent;
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (p_parent, 'regrain_prepare', v_lo, v_hi, v_child_name);
+    return 'prepared';
+  end if;
+
   -- retention horizon (matches retain() and the drain's retain_reclaim, issue #91)
   if cfg.retain is not null then
     if cfg.control_kind = 'id'
@@ -1249,6 +1577,13 @@ begin
      or pgpm._native_gt(cfg.control_kind, v_cursor, v_hi) then   -- cursor > coarse hi
     v_cursor := v_lo;
   end if;
+
+  -- #267: reconcile captured changes before copying more. Only sub-ranges the copy has already finished
+  -- are eligible (see _regrain_reconcile), so this never disturbs max(dest.ctl) in the sub-range being
+  -- copied. Bounded by the same budget as the copy, and it takes the tick when there is work, so a burst
+  -- of DML paces itself instead of landing in the swap.
+  v_rec := pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_cursor, v_batch);
+  if v_rec > 0 then return 'reconciled:' || v_rec; end if;
 
   -- advance over any aged (below-horizon) sub-ranges without copying them: they would be dropped by retain()
   -- the instant they became partitions, so they are simply discarded with the source at the swap (never
@@ -1312,6 +1647,15 @@ begin
     return 'copied:' || v_moved;
   end if;
 
+  -- #267: do not ENTER the swap carrying a backlog. The residual reconcile below runs inside the swap
+  -- transaction, so it must be small; the gate is what keeps it so. Checked before the DETACH, because once
+  -- that holds ACCESS EXCLUSIVE no further writes can arrive and the residual is only what was in flight at
+  -- that instant. Deliberately no forcing: if writes outpace reconciliation the regrain stalls here
+  -- indefinitely, which is correct -- the source stays attached, reads are unaffected, the table is
+  -- consistent, and status() shows it. Forcing would put an unbounded reconcile under the lock.
+  v_delta_n := pgpm._regrain_delta_count(p_parent);
+  if v_delta_n > v_batch then return 'reconciling:' || v_delta_n; end if;
+
   -- cursor reached hi: every sub-range is copied (or aged and skipped). Swap atomically -- detach the source,
   -- attach every not-yet-attached fine child within its range (metadata-only via each child's validated
   -- CHECK), drop the source whole (no DELETE; the aged rows that were never copied go with it).
@@ -1323,6 +1667,12 @@ begin
   -- drain is idle, gated on no closed rows), so leave the re-add to that lifecycle rather than fight it.
   v_fk := pgpm.suspend_incoming_fks(p_parent, true);
   execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
+  -- #267: the correctness backstop. The DETACH above holds ACCESS EXCLUSIVE on the source, so no further
+  -- writes can arrive and this terminates. The cursor is at hi, so every captured key is now eligible.
+  -- Bounded by the gate; the loop only covers what landed between the gate and the DETACH.
+  for v_i in 1 .. 100 loop
+    exit when pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_hi, greatest(v_batch, 1000)) = 0;
+  end loop;
   for r in execute format(
     'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and not attached and lo::%s >= %L::%s and hi::%s <= %L::%s order by lo::%s',
     p_parent::text, v_ncast, v_lo, v_ncast, v_ncast, v_hi, v_ncast, v_ncast)
@@ -1337,6 +1687,12 @@ begin
   end loop;
   delete from pgpm.part where parent_table = p_parent and child_name = v_child_name;   -- not p_child: #266 may have renamed it
   execute format('drop table %s', v_child::text);
+  -- the capture trigger went with the dropped source (#267); clear the delta so the next regrain of this
+  -- parent starts from an empty one and status() does not report a phantom backlog.
+  select delta into v_delta_name from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta_name)) is not null then
+    execute format('truncate %I.%I', v_nsp, v_delta_name);
+  end if;
   -- re-add the FK(s) this swap dropped, against the new parent (the copies now hold every key). Only if WE
   -- dropped them (v_fk > 0): a v_fk = 0 means a drain already had them suspended, and re-adding mid-drain
   -- would break the drain's own leash -- maintain re-adds those once the drain is idle.
@@ -1884,7 +2240,7 @@ declare
   cfg pgpm.config; v_nsp name; v_rel name; v_monreg regclass; v_restored regclass;
   v_mon name; v_mon_lo text; v_mon_hi text; v_ncast text; v_outside boolean;
   v_idcols name[]; v_idmax bigint[]; v_col name; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
-  r pgpm.dropped_fk%rowtype;
+  r pgpm.dropped_fk%rowtype; v_cdelta name; v_cfn name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then
@@ -1894,6 +2250,9 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_ncast := pgpm._native_type(cfg.control_kind);
+  -- resolve the regrain change-capture names (#267) NOW, while the parent still exists: they are derived
+  -- from it, and the drop below would leave the lookup with nothing to read.
+  select delta, fn into v_cdelta, v_cfn from pgpm._regrain_capture_names(p_parent);
 
   -- THE GATE (REDESIGN.md section 13): a clean (metadata-only) reverse needs the original table still
   -- intact as the MONOLITH, holding the whole table, with nothing landed outside it. The monolith is the
@@ -1980,6 +2339,12 @@ begin
       execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
     end if;
   end loop;
+
+  -- the per-parent regrain change-capture apparatus (#267) is a side relation, not a partition, so the
+  -- parent's DROP above does not take it. Drop it here or untransmute leaves it orphaned. Names were
+  -- resolved up front, before the parent went away.
+  execute format('drop table if exists %I.%I', v_nsp, v_cdelta);
+  execute format('drop function if exists %I.%I()', v_nsp, v_cfn);
 
   -- forget all pgpm state for this table (matched by the dropped parent's oid, which p_parent still
   -- carries), and log the reversal against the restored table.
@@ -2271,6 +2636,7 @@ begin
   -- coverage, below).
   begin
     perform pgpm._enforce_write_blocks(p_parent);
+    perform pgpm._enforce_regrain_capture(p_parent);   -- #267: reap capture left by an abandoned regrain
   exception when others then
     v_note := v_note || ' write_block_deferred';
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'write_block_skip', left(sqlerrm, 200));
