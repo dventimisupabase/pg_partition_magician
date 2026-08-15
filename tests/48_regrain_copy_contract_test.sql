@@ -16,7 +16,10 @@ select pgpm.obtain('public.cc');
 insert into public.cc (id, payload) values (10000, 'frontier');   -- advance frontier past B -> monolith frozen
 select pgpm.set_regrain('public.cc', '50');                        -- enable feathered auto-regrain to step 50
 
--- one maintain tick: a partial COPY (one budget microbatch), the regrain is NOT finished and copies are in flight
+-- Two maintain ticks: the first installs change capture and returns 'prepared' without copying (#267 --
+-- CREATE TRIGGER takes SHARE ROW EXCLUSIVE, so it gets its own tick to keep that hold O(1)), the second
+-- does a partial COPY of one budget microbatch. The regrain is NOT finished and copies are in flight.
+select pgpm.maintain('public.cc');
 select pgpm.maintain('public.cc');
 
 select is(

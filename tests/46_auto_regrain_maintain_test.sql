@@ -17,11 +17,15 @@ select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
   1::bigint, 'a coarse monolith awaits regraining before any tick');
 
--- one maintain tick makes PARTIAL progress (one microbatch), not the whole regrain in a single tick
+-- maintain ticks make PARTIAL progress (one microbatch each), not the whole regrain in a single tick.
+-- The FIRST tick installs change capture and returns 'prepared' without copying (#267): CREATE TRIGGER
+-- takes SHARE ROW EXCLUSIVE, and giving it its own tick keeps that hold O(1) instead of spanning a copy
+-- batch. So the first copy microbatch lands on the second tick.
+select pgpm.maintain('public.ar');
 select pgpm.maintain('public.ar');
 select cmp_ok(
   (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'regrain_copy'),
-  '>', 0::bigint, 'one maintain tick feathered a regrain copy microbatch (cross-tick pacing)');
+  '>', 0::bigint, 'maintain ticks feather regrain copy microbatches (cross-tick pacing)');
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),
   1::bigint, 'after a single tick the coarse child is still mid-regrain (not finished in one tick)');
