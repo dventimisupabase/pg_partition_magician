@@ -1271,6 +1271,7 @@ create or replace function pgpm._regrain_reconcile(
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_delta name; v_ncast text; v_keycols text; v_dkey text;
   v_skey text; v_cols text; v_wm bigint; v_elig text; v_ctl text; v_sub_name name; v_n int := 0; r record;
+  v_lo_lit text; v_hi_lit text; v_cur_lit text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   select n.nspname, c.relname into v_nsp, v_rel
@@ -1289,19 +1290,27 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped and attgenerated = '';
 
-  -- native control value of a delta row, decoded (uuidv7 stores a uuid but grids on its timestamp)
-  v_ctl := format('pgpm._decode(%L, %I::text)::%s', cfg.control_kind, cfg.control_column, v_ncast);
+  -- Compare in ENCODED space -- the control column's own type, against _encode'd boundaries -- exactly as
+  -- the copy does with its v_lo_lit/v_hi_lit. Decoding per row instead (pgpm._decode(...)::native) is a
+  -- function call the planner cannot index, which silently turned every reconcile tick into a seq scan of
+  -- the WHOLE delta rather than an indexed read of one batch: measured 272 ms to pick 5000 rows out of a
+  -- 300k delta, against 1.0 ms once the pgpm_seq index is usable. That made the tick scale with the delta
+  -- instead of with the budget, so draining a large delta cost O(delta^2 / batch). uuidv7 compares
+  -- correctly this way because a UUIDv7 sorts by its embedded timestamp, which is why the copy can do it too.
+  v_ctl     := quote_ident(cfg.control_column);
+  v_lo_lit  := pgpm._encode(cfg.control_kind, p_lo);
+  v_hi_lit  := pgpm._encode(cfg.control_kind, p_hi);
+  v_cur_lit := pgpm._encode(cfg.control_kind, p_cursor);
 
   -- A captured key whose control has left this child's range belongs to a row a cross-partition UPDATE
   -- moved out. Its OLD-key entry (still in range) already covers the removal here, so this entry can never
   -- apply -- and it can never become eligible either, so leaving it would wedge the swap gate permanently.
   -- Discard it.
-  execute format('delete from %I.%I where not (%3$s >= %4$L::%5$s and %3$s < %6$L::%5$s)',
-                 v_nsp, v_delta, v_ctl, p_lo, v_ncast, p_hi);
+  execute format('delete from %I.%I where not (%3$s >= %4$L and %3$s < %5$L)',
+                 v_nsp, v_delta, v_ctl, v_lo_lit, v_hi_lit);
 
   -- eligible: in this child's range AND behind the cursor
-  v_elig := format('%1$s >= %2$L::%3$s and %1$s < %4$L::%3$s and %1$s < %5$L::%3$s',
-                   v_ctl, p_lo, v_ncast, p_hi, p_cursor);
+  v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl, v_lo_lit, v_hi_lit, v_cur_lit);
 
   execute format('select max(pgpm_seq) from (select pgpm_seq from %I.%I where %s order by pgpm_seq limit %s) t',
                  v_nsp, v_delta, v_elig, greatest(p_batch, 1)) into v_wm;
