@@ -453,12 +453,18 @@ pgpm.regrain(p_parent regclass, p_child name, p_target_step text default null) r
 ```
 
 Splits one **frozen** coarse child `p_child` into finer children of width `p_target_step` (default
-`config.partition_step`), returning the number of fine children created. It moves rows into standalone
-children in budget-sized microbatches and swaps them in for the coarse child, then drops the now-empty
-source; the kept children are insert-only, so the product has no bloat. The whole call runs in one
-transaction, so it is **atomic and gap-free**. Retention-aware: a sub-range entirely below the horizon is
-reclaimed, never materialized. Refuses (as an exception) when the child is not frozen, the target step
-does not subdivide it, or the `DEFAULT` holds rows in its range.
+`config.partition_step`), returning the number of fine children created. It **copies** rows into standalone
+children in budget-sized microbatches, then swaps them in for the coarse child and drops that source whole,
+rows and all. It never deletes from the source, which is what keeps a read of the parent from ever being
+short mid-regrain; the fine children are insert-only, so the product has no bloat. The whole call runs in
+one transaction, so it is **atomic and gap-free**. Retention-aware: a sub-range entirely below the horizon
+is reclaimed, never materialized. Refuses (as an exception) when the child is not frozen, the target step
+does not subdivide it, the `DEFAULT` holds rows in its range, or another regrain is already in flight on
+the same parent.
+
+Only one regrain runs per parent at a time. `config.regrain_cursor` and the change-capture delta are both
+per parent, so a second concurrent regrain is refused rather than allowed to reset the first one's cursor
+and discard its captured changes.
 
 A child whose range is exactly one grid step wide carries the plain `_p<lo>` name, which is also what its
 own first fine sub-range would be called. Regrain renames such a child to its explicit-range form

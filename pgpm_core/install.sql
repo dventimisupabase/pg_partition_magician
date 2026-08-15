@@ -1437,7 +1437,7 @@ declare
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
-  v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_i int; v_delta_name name;
+  v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_i int; v_delta_name name; v_busy name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -1484,6 +1484,25 @@ begin
   if not pgpm._native_gt(cfg.control_kind, v_hi, pgpm._grid_next(cfg.control_kind, v_step, v_lo)) then
     return 'nosubdiv';
   end if;
+  -- ONE regrain per parent at a time (#267). This is a correctness guard, not tidiness: both
+  -- config.regrain_cursor and the change-capture delta are per parent, so a second regrain starting on a
+  -- different child would reset the first one's cursor AND truncate its delta at prepare, silently
+  -- discarding captured changes the first regrain had not applied yet. That is the same class of loss this
+  -- apparatus exists to prevent. The cursor thrash alone predates capture (each child resets the cursor
+  -- into its own range), so this refusal closes a pre-existing hazard too.
+  --
+  -- Placed BEFORE the #266 rename below, so a refused regrain mutates nothing at all -- not even the
+  -- transitional rename of the child it was never going to split. After the soft statuses above, so a
+  -- not-yet-frozen child still answers 'active' rather than raising.
+  select p.child_name into v_busy from pgpm.part p
+   where p.parent_table = p_parent and p.child_name <> v_child_name
+     and pgpm._regrain_capture_active(p_parent, p.child_name)
+   limit 1;
+  if v_busy is not null then
+    raise exception 'pg_partition_magician: cannot regrain % -- a regrain of % is already in flight on this parent, and pgpm runs one regrain per parent (config.regrain_cursor and the change-capture delta are both per parent). Let it finish, or abandon it with pgpm.regrain_cancel(%), then re-run.',
+      v_child_name, v_busy, p_parent;
+  end if;
+
   -- ...and the source must not be named as its own first fine sub-range (issue #266). _part_name gives a
   -- one-step range the bare _p<lo> and a wider one the explicit _p<lo>_to_<hi>, and the note above it says
   -- why: the wide form exists "so it can never collide with the fine child at its low edge". But "wider"
