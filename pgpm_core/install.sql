@@ -1250,6 +1250,30 @@ begin
 end;
 $$;
 
+-- Discard captured keys whose control has left this child's range: a cross-partition UPDATE moved the row
+-- out, and its OLD-key entry (still in range) already covers the removal here. Such an entry can never
+-- apply AND can never become eligible, so leaving it forever would wedge the swap gate, which counts every
+-- delta row.
+--
+-- Deliberately NOT part of the per-tick reconcile. The predicate is a negated range, which no index serves,
+-- so running it per tick meant a seq scan of the whole delta on every tick -- O(delta) work per tick and
+-- O(delta^2 / batch) overall, which is the same shape #272 removed from the watermark query and which the
+-- bench/regrain_perf.sh guard caught still present here. It is only the swap gate that these rows can
+-- affect, so it runs once, immediately before that gate.
+create or replace function pgpm._regrain_delta_purge(p_parent regclass, p_lo text, p_hi text)
+returns void language plpgsql as $$
+declare cfg pgpm.config; v_nsp name; v_delta name;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select delta into v_delta from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return; end if;
+  execute format('delete from %I.%I where not (%3$s >= %4$L and %3$s < %5$L)',
+                 v_nsp, v_delta, quote_ident(cfg.control_column),
+                 pgpm._encode(cfg.control_kind, p_lo), pgpm._encode(cfg.control_kind, p_hi));
+end;
+$$;
+
 -- Reconcile up to p_batch captured keys, returning how many were consumed.
 --
 -- THE CONTRACT: for each captured key the SOURCE is the authority, not the recorded change. Delete the
@@ -1290,6 +1314,16 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped and attgenerated = '';
 
+  -- The delta is populated by a trigger and nothing analyzes it, so on its first ticks it carries no usable
+  -- row estimate and the planner misplans one of the statements below into a seq scan of the WHOLE delta.
+  -- Measured: 1 seq scan reading every delta row per tick without stats, 0 with them. Same failure #164
+  -- fixed for freshly minted children ("it sits at reltuples = -1 until autovacuum, and anything touching
+  -- it misplans"), so it gets the same treatment. One-time: once analyzed the estimate stays good enough
+  -- as the delta grows (47k estimated against 50k actual still planned correctly).
+  if (select coalesce(reltuples, -1) from pg_class where oid = format('%I.%I', v_nsp, v_delta)::regclass) <= 0 then
+    perform pgpm._analyze(format('%I.%I', v_nsp, v_delta)::regclass);
+  end if;
+
   -- Compare in ENCODED space -- the control column's own type, against _encode'd boundaries -- exactly as
   -- the copy does with its v_lo_lit/v_hi_lit. Decoding per row instead (pgpm._decode(...)::native) is a
   -- function call the planner cannot index, which silently turned every reconcile tick into a seq scan of
@@ -1301,13 +1335,6 @@ begin
   v_lo_lit  := pgpm._encode(cfg.control_kind, p_lo);
   v_hi_lit  := pgpm._encode(cfg.control_kind, p_hi);
   v_cur_lit := pgpm._encode(cfg.control_kind, p_cursor);
-
-  -- A captured key whose control has left this child's range belongs to a row a cross-partition UPDATE
-  -- moved out. Its OLD-key entry (still in range) already covers the removal here, so this entry can never
-  -- apply -- and it can never become eligible either, so leaving it would wedge the swap gate permanently.
-  -- Discard it.
-  execute format('delete from %I.%I where not (%3$s >= %4$L and %3$s < %5$L)',
-                 v_nsp, v_delta, v_ctl, v_lo_lit, v_hi_lit);
 
   -- eligible: in this child's range AND behind the cursor
   v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl, v_lo_lit, v_hi_lit, v_cur_lit);
@@ -1681,6 +1708,7 @@ begin
   -- that instant. Deliberately no forcing: if writes outpace reconciliation the regrain stalls here
   -- indefinitely, which is correct -- the source stays attached, reads are unaffected, the table is
   -- consistent, and status() shows it. Forcing would put an unbounded reconcile under the lock.
+  perform pgpm._regrain_delta_purge(p_parent, v_lo, v_hi);   -- junk cannot be allowed to wedge the gate
   v_delta_n := pgpm._regrain_delta_count(p_parent);
   if v_delta_n > v_batch then return 'reconciling:' || v_delta_n; end if;
 
