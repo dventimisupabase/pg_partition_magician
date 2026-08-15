@@ -9,6 +9,7 @@
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #   ./test.sh observe                    # the pg_flight_recorder observability track (PG15)
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
+#   ./test.sh perf                       # regrain's data-coupled-work guard (PG17, scan counters)
 #
 # Channels:
 #   psql    pgpm_core/install.sql via psql -f         (the source)
@@ -57,7 +58,8 @@ for arg in "$@"; do
     timescale) TRACK="timescale" ;;
     observe) TRACK="observe" ;;
     archive) TRACK="archive" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive"; exit 1 ;;
+    perf) TRACK="perf" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf"; exit 1 ;;
   esac
 done
 
@@ -309,6 +311,31 @@ run_archive() {
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"
 }
+
+# ------------------------------------------------------------------------------------------------------
+# The `perf` track: guard regrain against data-coupled work (issue #267, PRs #271/#272).
+#
+# NOT part of the pgTAP suite, and deliberately so. Its assertions read pg_stat_all_tables scan counters,
+# which are flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports growth of 0 when read
+# inside the same transaction and 20000 across transactions. pgTAP wraps each file in BEGIN/ROLLBACK, so
+# the same assertions there would read 0 unconditionally and pass however badly the code regressed. Every
+# tick in the harness runs in its own transaction, which is also how maintain drives it in production.
+run_perf() {
+  local prof="pg17" svc="postgres17" c="pgpm_test-17"
+  $DC --profile "$prof" up -d --wait "$svc"
+  psql_run "$prof" "$svc" -q -f /repo/pgpm_core/install.sql >/dev/null
+  bash "$(dirname "$0")/bench/regrain_perf.sh" "$c" pgpm_perf /repo/pgpm_core/install.sql
+  local rc=$?
+  $DC --profile "$prof" down -v
+  if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
+  echo "perf track: PASS"
+}
+
+if [ "$TRACK" = "perf" ]; then
+  run_perf
+  echo; echo "All requested tests passed."
+  exit 0
+fi
 
 if [ "$TRACK" = "timescale" ]; then
   run_timescale

@@ -1,0 +1,42 @@
+name: Perf guard
+
+# Guards regrain against DATA-COUPLED WORK: a blocking lock may last milliseconds, but it must never last
+# a duration coupled to data size (issue #263's acceptance rule).
+#
+# Separate from the pgTAP matrix because its assertions read pg_stat_all_tables scan counters, and those
+# flush at TRANSACTION END. pgTAP wraps each file in BEGIN/ROLLBACK, so the identical assertions written as
+# a pgTAP test would read 0 unconditionally and pass however badly the code regressed. The harness runs one
+# tick per transaction, which is also how maintain drives it in production.
+#
+# It asserts scan COUNTERS, not wall-clock, so there are no timing thresholds to flake on a shared runner:
+# the expected value is exactly zero.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pgpm_core/install.sql'
+      - 'bench/regrain_perf.sh'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/perf.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pgpm_core/install.sql'
+      - 'bench/regrain_perf.sh'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/perf.yml'
+  workflow_dispatch:
+
+jobs:
+  perf:
+    name: regrain data-coupled-work guard / PG17
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Run the perf track
+        run: ./test.sh perf
