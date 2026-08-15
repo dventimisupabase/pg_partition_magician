@@ -29,13 +29,13 @@ pgpm.transmute(
 ) returns regclass
 ```
 
-Converts `p_parent` into a partitioned table online and registers it. The control column's type selects
+Converts `p_parent` into a partitioned table and registers it. The control column's type selects
 the kind: a `uuid` column is treated as **uuidv7** (time-ordered; ULIDs stored as `uuid` included), and a
 `timestamptz`/`timestamp`/`date` column is **time**. Returns the new partitioned parent (same name as the
 original).
 
-The cutover moves no rows: it validates a bound on the live table (one online `SHARE UPDATE EXCLUSIVE`
-scan), then in a brief metadata-only step renames the original to a coarse-child name, creates the
+The cutover moves no rows: it validates a bound on the live table (one read-only scan), then in a
+metadata-only step renames the original to a coarse-child name, creates the
 partitioned parent, attaches the original as the bounded **monolith** child via the validated `CHECK`
 (scan-skipping), and creates a fresh empty `DEFAULT`. The table registers **paused**; nothing happens
 until you `resume` it and maintenance runs. An identity column is carried onto the parent and its sequence

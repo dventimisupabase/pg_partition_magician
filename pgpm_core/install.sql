@@ -2104,9 +2104,16 @@ begin
                     pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
   v_monolith   := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
 
-  -- 0b. VALIDATE the monolith bound online (SHARE UPDATE EXCLUSIVE, no writer block), BEFORE the rename,
-  -- so the ATTACH below is metadata-only and ACCESS EXCLUSIVE is never held across the scan. This is the
-  -- one O(rows) read; the old model deferred it into a perpetual row-rewriting drain instead.
+  -- 0b. Certify the monolith's bound BEFORE the rename, so the ATTACH below is metadata-only. This is the
+  -- one O(rows) read of the conversion.
+  --
+  -- NOTE (issue #275): the split below is currently DECORATIVE. `ADD ... NOT VALID` takes ACCESS EXCLUSIVE,
+  -- and because _transmute is a FUNCTION and pgpm_core has no COMMIT anywhere, that lock is held until the
+  -- whole conversion commits -- across the VALIDATE scan. So the table is fully locked (ACCESS EXCLUSIVE
+  -- conflicts with everything, reads included) for a duration that scales with row count: measured 30 ms at
+  -- 1M rows, 173 ms at 5M, 492 ms at 10M, cached. VALIDATE's own SHARE UPDATE EXCLUSIVE is the right lock
+  -- and would not block anyone; it just never gets to be the only one held. The fix is a real commit
+  -- between the two statements, which needs transmute to become a PROCEDURE.
   execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
                  p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
                  p_control, pgpm._encode(p_control_kind, v_hi_native));

@@ -16,7 +16,7 @@ rationale see [REDESIGN.md](../REDESIGN.md); for a visual overview see the
 - [Retain](#retain)
 - [Incoming foreign keys](#incoming-foreign-keys)
 - [Secondary indexes](#secondary-indexes)
-- [How the conversion stays online](#how-the-conversion-stays-online)
+- [How the conversion avoids a rewrite](#how-the-conversion-avoids-a-rewrite)
 - [Read consistency during a move](#read-consistency-during-a-move)
 - [WAL and checkpoint sizing](#wal-and-checkpoint-sizing)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
@@ -116,9 +116,10 @@ psql "$DATABASE_URL" -f pgpm_core/uninstall.sql
 
 ## Transmute a table
 
-Conversion is online and moves no data. It renames your table to a coarse-child name, creates a
-partitioned parent under the original name, attaches the old table as the bounded **monolith** child, and
-creates a fresh empty `DEFAULT`.
+Conversion moves no data. It renames your table to a coarse-child name, creates a partitioned parent
+under the original name, attaches the old table as the bounded **monolith** child, and creates a fresh
+empty `DEFAULT`. It does read the original once, and the table is locked while it does; see
+[The cutover moves no rows](#the-cutover-moves-no-rows).
 
 ### Pick the kind
 
@@ -143,13 +144,27 @@ Transmutation registers the table **paused** by default: it is converted, but sc
 nothing until you `resume` it (see [Run it](#run-it)). All parameters are in the
 [reference](reference.md#conversion).
 
-### The cutover is online, with no row movement
+### The cutover moves no rows
 
-The conversion never rewrites the primary key and never moves a row. It does do one **online, read-only
-scan** of the original (to certify the monolith's bound so the attach is metadata-only), under a gentle
-`SHARE UPDATE EXCLUSIVE` lock that does not block reads or writes; then a brief metadata-only
-`ACCESS EXCLUSIVE` step renames, creates the parent, attaches the monolith, and creates the `DEFAULT`. So
-the only `O(rows)` work is a single non-blocking read -- no index rebuild, no row rewrite, no downtime.
+The conversion never rewrites the primary key and never moves a row. Its only `O(rows)` work is a single
+read-only scan of the original, which certifies the monolith's bound so the later attach is metadata-only.
+Everything after that is a metadata flip: rename, create the parent, attach the monolith, create the
+`DEFAULT`. No index rebuild, no row rewrite.
+
+**The table is locked for the duration of that scan.** `transmute` runs in one transaction, and the
+`ALTER TABLE` that adds the bound takes an `ACCESS EXCLUSIVE` lock which is therefore held until the
+conversion commits, scan included. `ACCESS EXCLUSIVE` conflicts with everything, so reads and writes both
+wait. Size a maintenance window from the row count:
+
+| rows | table locked for |
+|---|---|
+| 1M | ~30 ms |
+| 5M | ~170 ms |
+| 10M | ~490 ms |
+
+Measured on PostgreSQL 17 with the table cached in memory. A table larger than RAM makes the scan
+I/O-bound, so treat these as a floor rather than an estimate, and measure on a restored copy of your own
+data before converting a large table.
 (Contrast the old model, which paid no scan up front but then rewrote every historical row through a
 perpetual drain.)
 
@@ -464,7 +479,7 @@ includes the partition key** (so global uniqueness is genuinely preserved). One 
 partition key cannot be a partitioned unique index, so `transmute` **refuses** rather than silently
 dropping the guarantee: add the partition key to that index, or drop it, then re-transmute.
 
-## How the conversion stays online
+## How the conversion avoids a rewrite
 
 Two facts about Postgres drive the design:
 
@@ -474,16 +489,20 @@ Two facts about Postgres drive the design:
 2. Attaching a partition whose rows are not certified in range forces a scan under `ACCESS EXCLUSIVE`,
    which would block the workload.
 
-pgpm sidesteps #2 with a scan-skip attach: certify the bound with a validated `CHECK` under the gentle,
-non-blocking `SHARE UPDATE EXCLUSIVE` lock *before* the attach, so the attach itself is metadata-only.
+pgpm sidesteps #2 with a scan-skip attach: certify the bound with a validated `CHECK` *before* the attach,
+so the attach itself is metadata-only. Certifying it is `VALIDATE CONSTRAINT`, whose own
+`SHARE UPDATE EXCLUSIVE` lock blocks nobody. Today it does not run alone, though: it shares a transaction
+with the `ALTER TABLE` that adds the constraint, so that statement's `ACCESS EXCLUSIVE` is still held while
+it scans, and the table is locked throughout. See
+[The cutover moves no rows](#the-cutover-moves-no-rows) for what to size.
 
 ```sql
-ADD CONSTRAINT b CHECK (control >= lo AND control < hi) NOT VALID  -- catalog only, instant
-VALIDATE CONSTRAINT b                                              -- the scan, under SHARE UPDATE EXCLUSIVE (non-blocking)
+ADD CONSTRAINT b CHECK (control >= lo AND control < hi) NOT VALID  -- catalog only, instant, ACCESS EXCLUSIVE
+VALIDATE CONSTRAINT b                                              -- the scan, wants only SHARE UPDATE EXCLUSIVE
 ATTACH PARTITION ...                                               -- scan skipped, metadata-only
 ```
 
-The monolith attaches this way at transmute (one online scan of the original). `obtain`'s forward
+The monolith attaches this way at transmute (one scan of the original). `obtain`'s forward
 partitions need no scan at all, because the `DEFAULT` they would be checked against is empty (this is why
 keeping the `DEFAULT` empty matters). Regrain's fine children are born with their bound `CHECK`, so they
 too attach metadata-only. The one rule that keeps it safe: never certify a range that is still receiving
@@ -588,8 +607,9 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the `DEFAULT` net absorb
   stragglers. Arbitrary backdated keys break it.
-- **The cutover is online but not instant:** one non-blocking, read-only scan of the original, then a
-  brief metadata cutover. No row movement, no PK rewrite, no index rebuild.
+- **The cutover locks the table for one read-only scan:** no row movement, no PK rewrite, no index
+  rebuild, but reads and writes both wait while the original is scanned once. The wait scales with row
+  count, so size a window from it (see [The cutover moves no rows](#the-cutover-moves-no-rows)).
 - **The history starts coarse.** It is one monolith partition until regrained; until then, pruning and
   fine-grained retention are suspended over its span. A coarse monolith is a valid permanent state.
 - **Regrain needs transient disk** (about 2x the span being regrained) and copies the rows; both the
