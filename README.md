@@ -10,10 +10,12 @@ by running one file. The only runtime dependency is **pg_cron**, and only to run
 It partitions on any **monotonic** key (time, integer/bigint ids including Snowflake, or **UUIDv7 / ULID**)
 and manages the whole lifecycle:
 
-- **`transmute`**: convert a live, unpartitioned table to partitioned **online, with no row movement**. The
+- **`transmute`**: convert a live, unpartitioned table to partitioned **with no row movement**. The
   original is renamed aside and attached intact as one bounded **monolith** child; a fresh `DEFAULT` is the
-  safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no downtime. Reversible
-  with **`untransmute`** until the history outgrows the monolith.
+  safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no row rewrite. The table
+  is **locked for the duration of that scan**, so size a maintenance window from its row count (see
+  [the guide](docs/guide.md#the-cutover-moves-no-rows)). Reversible with **`untransmute`** until the
+  history outgrows the monolith.
 - **`obtain`**: keep N partitions ahead of the write frontier.
 - **`regrain`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
@@ -62,7 +64,7 @@ and uninstall. `pg_cron` must be enabled for scheduled maintenance.
 ## Quickstart
 
 ```sql
--- 1. Convert online and register. Registers PAUSED: nothing moves until you resume.
+-- 1. Convert and register. Registers PAUSED: nothing moves until you resume.
 select pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',         -- the key to range-partition on (must be in the PK)
