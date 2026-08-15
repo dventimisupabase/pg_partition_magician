@@ -7,7 +7,7 @@
 -- only the trigger on the source child is per regrain. Lifecycle therefore reduces to rows, not relations.
 create extension if not exists pgtap;
 begin;
-select plan(12);
+select plan(15);
 
 create or replace function pg_temp.mk(p_rel text) returns void language plpgsql as $$
 begin
@@ -98,6 +98,31 @@ select is(
 
 select is((select count(*)::int from public.ca4), 251,
   'and the parent is untouched: the source still holds every row');
+
+-- ======================= one regrain per parent =======================
+-- config.regrain_cursor and the change-capture delta are both PER PARENT, so a second concurrent regrain
+-- would reset the first one's cursor and truncate its delta at prepare, discarding captured changes it had
+-- not applied yet. That is the same class of loss this apparatus exists to prevent, so it is refused.
+create table public.ca5 (id bigint primary key, payload text);
+insert into public.ca5 select g, 'x' from generate_series(1, 2500) g;
+select pgpm.transmute('public.ca5', 'id', 1000, p_obtain => 3);
+select pgpm.obtain('public.ca5');
+insert into public.ca5 values (900000, 'frontier');
+select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);
+select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);
+
+select throws_ok(
+  $$ select pgpm.regrain_step('public.ca5','ca5_p0000000000000003000','100',500) $$,
+  'P0001', NULL, 'a second regrain on another child of the same parent is refused');
+
+select ok(
+  exists(select 1 from pgpm.part
+          where parent_table = 'public.ca5'::regclass and child_name = 'ca5_p0000000000000003000'),
+  'and the refusal mutates nothing: the refused child is not even renamed');
+
+select ok(
+  pgpm._regrain_capture_active('public.ca5', 'ca5_p0000000000000000000_to_0000000000000003000'),
+  'the in-flight regrain keeps its capture: the refused one did not disturb it');
 
 select * from finish();
 rollback;
