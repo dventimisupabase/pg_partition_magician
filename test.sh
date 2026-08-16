@@ -351,7 +351,7 @@ run_archive() {
 }
 
 # ------------------------------------------------------------------------------------------------------
-# The `perf` track: guard regrain against data-coupled work (issue #267, PRs #271/#272).
+# The `perf` track: guard against data-coupled locks and data-coupled work (issues #267, #275).
 #
 # NOT part of the pgTAP suite, and deliberately so. Its assertions read pg_stat_all_tables scan counters,
 # which are flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports growth of 0 when read
@@ -362,8 +362,9 @@ run_perf() {
   local prof="pg17" svc="postgres17" c="pgpm_test-17"
   $DC --profile "$prof" up -d --wait "$svc"
   psql_run "$prof" "$svc" -q -f /repo/pgpm_core/install.sql >/dev/null
-  bash "$(dirname "$0")/bench/regrain_perf.sh" "$c" pgpm_perf /repo/pgpm_core/install.sql
-  local rc=$?
+  local rc=0
+  bash "$(dirname "$0")/bench/regrain_perf.sh"   "$c" pgpm_perf  /repo/pgpm_core/install.sql || rc=1
+  bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"

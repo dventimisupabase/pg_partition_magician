@@ -1849,7 +1849,7 @@ create or replace procedure pgpm._transmute(
 language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
-  v_lo_prev text; v_hi_prev text;
+  v_lo_prev text; v_hi_prev text; v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
@@ -2151,8 +2151,7 @@ begin
   if found then
     v_lo_native := v_lo_prev; v_hi_native := v_hi_prev;
     v_monolith  := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
-    insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (p_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reusing the recorded bound');
+    v_resumed := true;
   else
     -- Optional headroom: push hi further out so a fast writer cannot cross it while the scan runs. The
     -- bound rejects writes at or past hi for as long as it is in place, which with the split is the whole
@@ -2282,6 +2281,12 @@ begin
     drain_adaptive = excluded.drain_adaptive;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
+  -- keyed on v_parent, not p_parent: after the rename p_parent's oid is the monolith's, so an operator
+  -- looking the table up by name would never see it (#275).
+  if v_resumed then
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reused the recorded bound');
+  end if;
 
   -- record the original table, now the bounded MONOLITH coarse child, as an attached partition
   -- (REDESIGN.md section 7) so obtain's overlap check and status() see it.
