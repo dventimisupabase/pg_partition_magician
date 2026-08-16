@@ -7,7 +7,6 @@
 -- reltuples is the direct signal: ANALYZE sets it in place (visible immediately, even same-transaction),
 -- so a child with reltuples > 0 was analyzed and one left at -1/0 was not.
 create extension if not exists pgtap;
-begin;
 select plan(2);
 
 -- ----- drain: the drain evacuates a backdated stray into a freshly minted closed-interval child -----
@@ -44,4 +43,3 @@ select cmp_ok(
   'a regrained fine child carries real planner stats (regrain ANALYZEd it before the swap)');
 
 select * from finish();
-rollback;

@@ -6,7 +6,6 @@
 -- parent (stable -- naming from the child would break, since #266's fix renames the source mid-flight);
 -- only the trigger on the source child is per regrain. Lifecycle therefore reduces to rows, not relations.
 create extension if not exists pgtap;
-begin;
 select plan(15);
 
 create or replace function pg_temp.mk(p_rel text) returns void language plpgsql as $$
@@ -125,4 +124,3 @@ select ok(
   'the in-flight regrain keeps its capture: the refused one did not disturb it');
 
 select * from finish();
-rollback;

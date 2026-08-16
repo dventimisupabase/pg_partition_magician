@@ -3,7 +3,6 @@
 -- the FK immediately. maintain() also restores it on its own (idempotent). See REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(7);
 
 -- step 100 with ids 1..300 => intervals [0,100),[100,200),[200,300) are CLOSED (need draining),
@@ -49,4 +48,3 @@ select is(
   0, 'no preserved FK left pending after the auto-restore (record kept, marked live)');
 
 select * from finish();
-rollback;

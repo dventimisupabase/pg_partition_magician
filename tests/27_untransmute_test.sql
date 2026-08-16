@@ -7,7 +7,6 @@
 -- row lands OUTSIDE the monolith (past B, in a forward partition) or regraining splits the monolith.
 create extension if not exists pgtap;
 
-begin;
 select plan(21);
 
 -- (A) round trip: a live table with data, a composite PK, an identity column, and a secondary index
@@ -137,4 +136,3 @@ select throws_ok(
   'untransmute refuses a table pgpm does not manage');
 
 select * from finish();
-rollback;

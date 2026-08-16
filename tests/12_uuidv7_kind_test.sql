@@ -3,7 +3,6 @@
 -- Robust to seed size.
 create extension if not exists pgtap;
 
-begin;
 select plan(7);
 
 select is(
@@ -34,7 +33,7 @@ select cmp_ok(
   '>=', 2, 'at least 2 uuid partitions premade ahead of the frontier'
 );
 
-create temporary table _before_uuid on commit drop as select count(*) as n from public.events_uuid;
+create temporary table _before_uuid as select count(*) as n from public.events_uuid;
 select pgpm.drain_all('public.events_uuid', p_include_open => true);
 
 select is(
@@ -48,4 +47,3 @@ select is(
 );
 
 select * from finish();
-rollback;

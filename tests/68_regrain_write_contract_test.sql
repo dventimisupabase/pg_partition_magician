@@ -20,7 +20,6 @@
 -- Fixtures are sparse (ids 10,20,...,2500) so there are free slots inside an already-copied sub-range,
 -- and the monolith is COARSE ([0,3000), three grid steps) so #266 does not confound the result.
 create extension if not exists pgtap;
-begin;
 select plan(10);
 
 create or replace function pg_temp.mk(p_rel text) returns void language plpgsql as $$
@@ -131,4 +130,3 @@ select is((select payload from public.wc5 where id = 60), 'TWICE',
   'mixed DML: a key touched twice ends on its LAST committed value');
 
 select * from finish();
-rollback;

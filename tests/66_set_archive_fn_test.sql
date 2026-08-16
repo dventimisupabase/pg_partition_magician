@@ -3,7 +3,6 @@
 -- an operator should never need a raw `update pgpm.config set archive_fn = ...` for normal use.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create schema pgpm_test66;
@@ -44,4 +43,3 @@ select throws_ok(
   'a wrongly-signed archive_fn is refused at the regprocedure cast, before set_archive_fn ever runs');
 
 select * from finish();
-rollback;

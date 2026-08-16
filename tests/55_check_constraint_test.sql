@@ -4,7 +4,6 @@
 -- parent so it never constrains forward partitions.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 create table public.ck (
@@ -33,4 +32,3 @@ select throws_ok(
   'a new forward partition enforces the inherited CHECK constraint');
 
 select * from finish();
-rollback;

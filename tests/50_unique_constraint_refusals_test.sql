@@ -6,7 +6,6 @@
 -- ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX, consistent with pgpm's other operator-prep refusals).
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 -- (A) UNIQUE constraint includes control, but the control column is NULLABLE -> refuse
@@ -47,4 +46,3 @@ select is(
   'r', 'the bare-unique-index table is left intact');
 
 select * from finish();
-rollback;

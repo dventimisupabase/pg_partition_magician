@@ -4,7 +4,6 @@
 -- (pgpm does not partition it at all); we check that too. See REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- ---- a table whose PK excludes the control column is refused (so its FKs are never touched) -------
@@ -49,4 +48,3 @@ select is(
   2, 'both FKs reference the new parent again');
 
 select * from finish();
-rollback;

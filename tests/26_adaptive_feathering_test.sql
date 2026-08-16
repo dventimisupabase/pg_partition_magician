@@ -9,7 +9,6 @@
 -- default (mode 1, fixed rate; ambient signal off until drain_ambient_factor > 0).
 create extension if not exists pgtap;
 
-begin;
 select plan(48);
 
 -- ---- the pure controller: AIMD arithmetic, independent of any server state -------------------------
@@ -177,4 +176,3 @@ select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public
               '<=', 8000, 'budget never exceeds drain_batch: adaptive only throttles down (cannot worsen the tail)');
 
 select * from finish();
-rollback;

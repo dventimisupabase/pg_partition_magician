@@ -4,7 +4,6 @@
 -- temporary exclusion constraints linger on the DEFAULT afterward.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 create table public.am (
@@ -37,4 +36,3 @@ select is(
   'temporary exclusion CHECK constraints were dropped after attach');
 
 select * from finish();
-rollback;

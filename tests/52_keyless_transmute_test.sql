@@ -5,7 +5,6 @@
 -- control column on a keyless table is refused up front, leaving the table intact.
 create extension if not exists pgtap;
 
-begin;
 select plan(8);
 
 -- (A) keyless table (no PK, no unique constraint), control NOT NULL
@@ -44,4 +43,3 @@ select is(
   'r', 'the nullable-control keyless table is left intact');
 
 select * from finish();
-rollback;

@@ -3,7 +3,6 @@
 -- partitions on its own id primary key -- pgpm never rewrites the PK, so the FK is preservable.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- a fresh parent (partitioned on its own id PK) with an INCOMING foreign key from another table
@@ -54,4 +53,3 @@ select cmp_ok(
 );
 
 select * from finish();
-rollback;

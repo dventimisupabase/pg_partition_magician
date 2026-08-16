@@ -3,7 +3,6 @@
 -- to premade and drained partitions.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- helper predicate: does relation <rel> have an index on (tenant_id, created_at)?
@@ -64,4 +63,3 @@ select is(
 );
 
 select * from finish();
-rollback;

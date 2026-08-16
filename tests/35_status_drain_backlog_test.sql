@@ -4,7 +4,6 @@
 -- from a merely slow one. The backlog here is a closed STRAY interval in the otherwise-empty DEFAULT.
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 create table public.s_t (
@@ -59,4 +58,3 @@ select is(
   0::bigint, 'drain_skips resets to 0 once the drain makes progress');
 
 select * from finish();
-rollback;

@@ -5,7 +5,6 @@
 -- table) -- the same refuse-or-preserve contract as the PK and incoming-FK cases.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- (A) UNIQUE(email) excludes the partition key (created_at) -> cannot be preserved -> refuse up front
@@ -62,4 +61,3 @@ select throws_ok(
   'the carried unique index enforces global uniqueness on the materialized partition');
 
 select * from finish();
-rollback;

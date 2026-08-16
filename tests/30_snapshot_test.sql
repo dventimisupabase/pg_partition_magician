@@ -5,7 +5,6 @@
 -- parent with the in-flight child, giving a consistency-sensitive reader the complete set inline.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.snap (
@@ -41,4 +40,3 @@ select is(
   40, 'after the interval fully drains and attaches, the parent is whole again');
 
 select * from finish();
-rollback;

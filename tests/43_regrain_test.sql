@@ -2,7 +2,6 @@
 -- standalone children and swapping them in atomically, then DROPPING the vestigial source -- no DELETE,
 -- so no dead tuples or bloat (REDESIGN.md section 10). It refuses while the child is still active.
 create extension if not exists pgtap;
-begin;
 select plan(8);
 
 -- a table whose history spans 5 grid steps: 50000 ids over a step of 10000, so the monolith covers
@@ -52,4 +51,3 @@ select is(
   50000, 'the 50000 original rows are all present in the regrained [0, 60000) range');
 
 select * from finish();
-rollback;

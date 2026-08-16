@@ -3,7 +3,6 @@
 -- set_drain_adaptive() call. The default stays false (the predictable fixed-gentle rate).
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- (A) time overload, opt in: the flag lands in config.
@@ -44,4 +43,3 @@ select is(
   true, 'the id overload accepts p_drain_adaptive too');
 
 select * from finish();
-rollback;

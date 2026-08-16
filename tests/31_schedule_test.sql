@@ -4,7 +4,6 @@
 -- database. (The test image installs pg_cron, so the happy path is exercised here.)
 create extension if not exists pgtap;
 
-begin;
 select plan(10);
 
 select is(
@@ -36,4 +35,3 @@ select is(pgpm.unschedule(), 1, 'unschedule() removes the job');
 select is(pgpm.unschedule(), 0, 'unschedule() is idempotent (0 when nothing is scheduled)');
 
 select * from finish();
-rollback;

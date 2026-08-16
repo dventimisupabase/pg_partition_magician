@@ -5,7 +5,6 @@
 -- status(), instead of being discoverable only by scanning pg_class.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.inflight_t (
@@ -42,4 +41,3 @@ select is(
   0::bigint, 'status() shows no in-flight partitions after the drain completes');
 
 select * from finish();
-rollback;

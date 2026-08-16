@@ -7,7 +7,6 @@
 -- table is drained. The referencing table is never touched. See REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 -- id is the table's single-column PK; we partition by id -> the happy path
@@ -52,4 +51,3 @@ select is(
   0, 'no preserved FK left pending (the record is kept, marked live)');
 
 select * from finish();
-rollback;

@@ -80,20 +80,23 @@ if grep -nE '^\\' "$BUNDLE" "$DBDEV_PKG"; then
 fi
 
 psql_run() { $DC --profile "$1" exec -T "$2" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "${@:3}"; }
+# same, but against an arbitrary database: the pgTAP suite now runs one database PER FILE
+psql_db()  { $DC --profile "$1" exec -T "$2" psql -U postgres -d "$3" -v ON_ERROR_STOP=1 "${@:4}"; }
 
-install_channel() {  # <channel> <profile> <service>
+install_channel() {  # <channel> <profile> <service> [db]
+  local db="${4:-postgres}"
   case "$1" in
-    psql)   psql_run "$2" "$3" --single-transaction -f /repo/pgpm_core/install.sql >/dev/null ;;
-    bundle) psql_run "$2" "$3" -f "/repo/$BUNDLE" >/dev/null ;;
-    dbdev)  psql_run "$2" "$3" --single-transaction -f "/repo/$DBDEV_PKG" >/dev/null ;;
+    psql)   psql_db "$2" "$3" "$db" --single-transaction -f /repo/pgpm_core/install.sql >/dev/null ;;
+    bundle) psql_db "$2" "$3" "$db" -f "/repo/$BUNDLE" >/dev/null ;;
+    dbdev)  psql_db "$2" "$3" "$db" --single-transaction -f "/repo/$DBDEV_PKG" >/dev/null ;;
     *) echo "unknown channel $1"; exit 1 ;;
   esac
 }
 
-load_fixtures() {  # <profile> <service> -- build the demo tables for the pgTAP suite
-  local p="$1" s="$2"
-  psql_run "$p" "$s" -c "ALTER DATABASE postgres SET poc.seed_count = 8000; ALTER DATABASE postgres SET poc.events_count = 4000;" >/dev/null
-  psql_run "$p" "$s" -f /repo/fixtures/demo.sql >/dev/null
+load_fixtures() {  # <profile> <service> [db] -- build the demo tables for the pgTAP suite
+  local p="$1" s="$2" db="${3:-postgres}"
+  psql_db "$p" "$s" "$db" -c "ALTER DATABASE \"$db\" SET poc.seed_count = 8000; ALTER DATABASE \"$db\" SET poc.events_count = 4000;" >/dev/null
+  psql_db "$p" "$s" "$db" -f /repo/fixtures/demo.sql >/dev/null
 }
 
 uninstall_and_verify() {  # <profile> <service>
@@ -129,9 +132,44 @@ run_version() {  # <pg_version>
 
   for ch in "${CHANNELS[@]}"; do
     echo "--- channel: $ch ---"
+    # The pgTAP suite runs ONE DATABASE PER FILE. It used to run every file against `postgres`, isolated
+    # by wrapping each in BEGIN/ROLLBACK -- but a committing PROCEDURE cannot be called inside a
+    # transaction block ("invalid transaction termination"), and transmute/maintain/drain_all are
+    # procedures now. Isolation therefore has to come from the database, not from a transaction.
+    #
+    # Installing the channel and loading the fixtures per file would cost ~0.5 s each; building one
+    # template and cloning it costs ~0.1 s (measured), so the suite stays fast enough to keep running on
+    # every push.
+    psql_run "$p" "$s" -c "drop database if exists pgpm_tmpl" >/dev/null
+    psql_run "$p" "$s" -c "create database pgpm_tmpl" >/dev/null
+    psql_db "$p" "$s" pgpm_tmpl -c "create extension if not exists pgtap;" >/dev/null
+    install_channel "$ch" "$p" "$s" pgpm_tmpl
+    load_fixtures "$p" "$s" pgpm_tmpl
+
+    local n=0 failed=0
+    for f in tests/*.sql; do
+      local b db; b="$(basename "$f")"; n=$((n + 1)); db="pgpm_t$n"
+      if [ "$b" = "31_schedule_test.sql" ]; then
+        # pg_cron can only be created in the database named by cron.database_name (postgres on these
+        # images: "can only create extension in database postgres"), so this one file cannot run in a
+        # per-file clone. It gets `postgres`, which the uninstall check below installs into anyway.
+        db=postgres
+        install_channel "$ch" "$p" "$s"
+        load_fixtures "$p" "$s"
+      else
+        psql_run "$p" "$s" -c "drop database if exists $db" >/dev/null
+        psql_run "$p" "$s" -c "create database $db template pgpm_tmpl" >/dev/null
+      fi
+      if ! $DC --profile "$p" exec -T "$s" sh -c "pg_prove --timer -U postgres -d $db /repo/tests/$b"; then
+        failed=$((failed + 1))
+      fi
+      [ "$db" = postgres ] || psql_run "$p" "$s" -c "drop database if exists $db" >/dev/null
+    done
+    psql_run "$p" "$s" -c "drop database if exists pgpm_tmpl" >/dev/null
+    [ "$failed" -eq 0 ] || { echo "PG $v / $ch: FAIL ($failed file(s))"; return 1; }
+
+    # the uninstall check still needs a database with the channel installed
     install_channel "$ch" "$p" "$s"
-    load_fixtures "$p" "$s"
-    $DC --profile "$p" exec -T "$s" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/*.sql'
     uninstall_and_verify "$p" "$s"
     reset_demo "$p" "$s"
     echo "PG $v / $ch: PASS"

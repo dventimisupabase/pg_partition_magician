@@ -3,7 +3,6 @@
 -- pgpm.config. maintenance is a no-op while paused and acts once resumed.
 create extension if not exists pgtap;
 
-begin;
 select plan(10);
 
 create table public.pr (
@@ -56,4 +55,3 @@ select throws_ok(
   'resume refuses a table pgpm does not manage');
 
 select * from finish();
-rollback;

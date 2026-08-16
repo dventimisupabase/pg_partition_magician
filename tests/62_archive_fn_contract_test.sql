@@ -8,7 +8,6 @@
 -- finish the whole range in one call.
 create extension if not exists pgtap;
 
-begin;
 select plan(8);
 
 create schema pgpm_test62;
@@ -91,4 +90,3 @@ select throws_like(
   '_run_archive_strategy refuses an unmanaged relation, the same convention as every other pgpm entry point');
 
 select * from finish();
-rollback;

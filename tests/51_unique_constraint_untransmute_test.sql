@@ -4,7 +4,6 @@
 -- leaves its adopted unique constraint standing on the now-standalone table, so the reverse is clean.)
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.uq_rt (
@@ -32,4 +31,3 @@ select is(
 select is((select count(*)::int from public.uq_rt), 25, 'all rows conserved through the round trip');
 
 select * from finish();
-rollback;

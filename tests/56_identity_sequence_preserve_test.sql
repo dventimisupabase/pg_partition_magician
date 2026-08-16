@@ -5,7 +5,6 @@
 -- not reopen the gap) now seed to the greater of max(id)+1 and the source sequence's own next value.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- (A) transmute preserves a sequence sitting AHEAD of max(id)
@@ -57,4 +56,3 @@ select is(
   51::bigint, 'a sequence at its max is unchanged: the next id is max(id)+1 (51)');
 
 select * from finish();
-rollback;

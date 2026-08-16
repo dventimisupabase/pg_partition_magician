@@ -1,7 +1,6 @@
 -- Verifies the conversion produced the intended partitioned structure.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 select is(
@@ -40,4 +39,3 @@ select is(
 );
 
 select * from finish();
-rollback;

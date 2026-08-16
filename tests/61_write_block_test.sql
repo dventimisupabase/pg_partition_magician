@@ -13,7 +13,6 @@
 -- coupling -- retire() itself refusing to drop before archiving is covered -- is #238).
 create extension if not exists pgtap;
 
-begin;
 select plan(22);
 
 create schema pgpm_test61;
@@ -138,4 +137,3 @@ select lives_ok(
   'a write into the now-unblocked [60000,70000) succeeds');
 
 select * from finish();
-rollback;

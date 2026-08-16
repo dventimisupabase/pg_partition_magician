@@ -5,7 +5,6 @@
 -- batch of wide INCOMPRESSIBLE strays is still capped tightly.
 create extension if not exists pgtap;
 
-begin;
 select plan(2);
 
 create table public.blk_t (
@@ -43,4 +42,3 @@ select cmp_ok(
   'a 1-block budget caps the microbatch to a few wide rows even before ANALYZE');
 
 select * from finish();
-rollback;

@@ -14,7 +14,6 @@
 -- rendered on the TARGET grid, where it IS wider than one step and therefore always takes the explicit
 -- _to_ form. The fine sub-range names are then free, and the collision is structurally impossible.
 create extension if not exists pgtap;
-begin;
 select plan(14);
 
 -- ======================= the case that used to destroy rows =======================
@@ -106,4 +105,3 @@ select is((select count(*)::int from public.rnd), 401,
   'the rename tick moved no rows and lost none');
 
 select * from finish();
-rollback;

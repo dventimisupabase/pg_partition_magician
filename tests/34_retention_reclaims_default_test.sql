@@ -4,7 +4,6 @@
 -- partition that retain() would immediately drop. Within-horizon strays are materialized as normal.
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 create table public.ret_t (
@@ -49,4 +48,3 @@ select is(
   20, 'within-horizon rows survive (10 recent in the monolith + 10 within-horizon stray)');
 
 select * from finish();
-rollback;

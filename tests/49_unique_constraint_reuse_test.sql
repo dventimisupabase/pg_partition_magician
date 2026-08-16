@@ -6,7 +6,6 @@
 -- primary key is synthesized when the source had only a unique constraint.
 create extension if not exists pgtap;
 
-begin;
 select plan(10);
 
 -- (A) NO primary key, a UNIQUE CONSTRAINT whose key LEADS with the control column
@@ -74,4 +73,3 @@ select is(
 select is((select count(*)::int from public.uq_mid), 30, 'rows conserved (non-leading control)');
 
 select * from finish();
-rollback;

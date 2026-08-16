@@ -8,7 +8,6 @@
 -- existed.
 create extension if not exists pgtap;
 
-begin;
 select plan(8);
 
 create schema pgpm_test64;
@@ -97,4 +96,3 @@ select ok(
   'a none-strategy child drops on the very next eligible cycle, exactly as retain() always did before this stack');
 
 select * from finish();
-rollback;

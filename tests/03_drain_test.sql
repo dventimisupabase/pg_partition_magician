@@ -5,7 +5,6 @@
 -- partition. drain_all is synchronous (ignores pause), so this does not depend on pg_cron.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 create table public.dr (
@@ -35,4 +34,3 @@ select is(
   'the DEFAULT is empty again after the drain');
 
 select * from finish();
-rollback;

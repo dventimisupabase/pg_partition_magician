@@ -12,7 +12,6 @@
 -- without any real S3 code (#239).
 create extension if not exists pgtap;
 
-begin;
 select plan(14);
 
 create schema pgpm_test63;
@@ -131,4 +130,3 @@ select is(
   0, 'a none-strategy table never gets a ledger entry -- there is nothing to chunk');
 
 select * from finish();
-rollback;

@@ -2,7 +2,6 @@
 -- write frontier, while leaving the active (current) interval in the DEFAULT.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 select is(
@@ -38,4 +37,3 @@ select is(
 );
 
 select * from finish();
-rollback;

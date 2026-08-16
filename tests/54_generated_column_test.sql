@@ -5,7 +5,6 @@
 -- the generated value is recomputed correctly on the destination.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.gc (
@@ -36,4 +35,3 @@ select is(
   10000000::bigint, 'the generated column is recomputed correctly on the drained row');
 
 select * from finish();
-rollback;

@@ -4,7 +4,6 @@
 -- REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 -- ON DELETE CASCADE: preserved and still fires after restore
@@ -55,4 +54,3 @@ select is(
   true, 'DEFERRABLE is preserved');
 
 select * from finish();
-rollback;

@@ -7,7 +7,6 @@
 -- late-arriving data, retain on an ingestion timestamp or widen the window -- see docs/guide.md#retain.)
 create extension if not exists pgtap;
 
-begin;
 select plan(2);
 
 create table public.bd_t (
@@ -40,4 +39,3 @@ select is(
   0, 'a backdated row below the retention horizon is reclaimed by retention (a standing floor), as intended');
 
 select * from finish();
-rollback;

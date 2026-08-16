@@ -5,7 +5,6 @@
 -- is time-ordered can override with p_force_uuidv7 => true.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- (A) a random UUIDv4 column samples near zero and is refused
@@ -47,4 +46,3 @@ select lives_ok(
   'a genuine time-ordered uuid column is accepted without an override');
 
 select * from finish();
-rollback;

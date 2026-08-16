@@ -5,7 +5,6 @@
 -- a managed FK is live iff the closed tail is empty. See REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 -- explicit ids so we can stage a "late-arriving" closed-tail row deterministically; step 100
@@ -53,4 +52,3 @@ select throws_ok(
   '23503', NULL, 'the re-restored FK is enforced');
 
 select * from finish();
-rollback;

@@ -5,7 +5,6 @@
 -- consumer signal works under a plain, unprivileged role.
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 -- the lock-wait sensor reads pg_locks (visible to any role) and returns a non-negative count
@@ -30,4 +29,3 @@ select is(
   0, 'the pg_monitor-dependent _ambient_io_waiters() has been removed');
 
 select * from finish();
-rollback;

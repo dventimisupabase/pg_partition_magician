@@ -5,7 +5,6 @@
 -- queryable permanent state).
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- (A) regrain a UNIQUE-constraint (no primary key) coarse monolith
@@ -42,4 +41,3 @@ select is(
   1, 'the keyless monolith is left intact (still one coarse child)');
 
 select * from finish();
-rollback;

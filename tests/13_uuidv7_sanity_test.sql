@@ -2,7 +2,6 @@
 -- (v4) columns are flagged, and transmute REFUSES a column that samples as random (issue #96).
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- the seeded events_uuid column is genuinely time-ordered -> ~all plausible
@@ -30,4 +29,3 @@ select throws_like(
 );
 
 select * from finish();
-rollback;
