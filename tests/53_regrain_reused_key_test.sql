@@ -11,7 +11,7 @@ select plan(5);
 create table public.ruq (id bigint not null, batch bigint not null, body text,
                          constraint ruq_uq unique (id, batch));
 insert into public.ruq select g, 1, 'x' from generate_series(1, 5000) g;   -- spans [0,6000) at step 1000
-select pgpm.transmute('public.ruq', 'id', 1000::bigint, p_paused => true);
+call pgpm.transmute('public.ruq', 'id', 1000::bigint, p_paused => true);
 insert into public.ruq (id, batch, body) values (100000, 1, 'frontier');   -- push the frontier past the monolith
 
 select lives_ok(
@@ -27,7 +27,7 @@ select is(
 -- (B) a truly keyless coarse monolith: regrain refuses cleanly (no key to dedup a resumed copy)
 create table public.rkl (id bigint not null, body text);
 insert into public.rkl select g, 'x' from generate_series(1, 5000) g;
-select pgpm.transmute('public.rkl', 'id', 1000::bigint, p_paused => true);
+call pgpm.transmute('public.rkl', 'id', 1000::bigint, p_paused => true);
 insert into public.rkl (id, body) values (100000, 'frontier');
 
 select throws_like(

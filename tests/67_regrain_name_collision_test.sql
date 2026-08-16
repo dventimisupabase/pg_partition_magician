@@ -22,7 +22,7 @@ select plan(14);
 -- identically on the source grid.
 create table public.rnc (id bigint primary key, payload text);
 insert into public.rnc select g, 'x' from generate_series(1, 400) g;
-select pgpm.transmute('public.rnc', 'id', 1000);
+call pgpm.transmute('public.rnc', 'id', 1000);
 insert into public.rnc values (900000, 'frontier');   -- advance the frontier so the monolith freezes
 
 select is(
@@ -74,7 +74,7 @@ select cmp_ok(
 -- _to_<hi> and nothing needs renaming. This is the path regrain_history and auto-regrain always take.
 create table public.rcc (id bigint primary key, payload text);
 insert into public.rcc select g, 'x' from generate_series(1, 2500) g;
-select pgpm.transmute('public.rcc', 'id', 1000);
+call pgpm.transmute('public.rcc', 'id', 1000);
 insert into public.rcc values (900000, 'frontier');
 
 select is(
@@ -86,7 +86,7 @@ select is(
 -- rename has to be visible to the NEXT call. Drive it a step at a time and pin the hand-off.
 create table public.rnd (id bigint primary key, payload text);
 insert into public.rnd select g, 'x' from generate_series(1, 400) g;
-select pgpm.transmute('public.rnd', 'id', 1000);
+call pgpm.transmute('public.rnd', 'id', 1000);
 insert into public.rnd values (900000, 'frontier');
 
 select pgpm.regrain_step('public.rnd', 'rnd_p0000000000000000000', '100', 50);   -- first tick: renames

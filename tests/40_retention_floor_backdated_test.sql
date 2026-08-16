@@ -19,7 +19,7 @@ create table public.bd_t (
 insert into public.bd_t (created_at, body)
   select now() - (g || ' days')::interval, 'recent' from generate_series(1, 10) g;
 
-select pgpm.transmute('public.bd_t', 'created_at', interval '1 month',
+call pgpm.transmute('public.bd_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
 select pgpm.obtain('public.bd_t');
 

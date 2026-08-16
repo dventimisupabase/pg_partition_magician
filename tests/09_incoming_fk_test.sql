@@ -18,7 +18,7 @@ create table public.fk_child (
 
 -- (1) default: transmute refuses while the incoming FK exists (RAISE => SQLSTATE P0001)
 select throws_ok(
-  $$ select pgpm.transmute('public.fk_parent', 'id', 100000) $$,
+  $$ call pgpm.transmute('public.fk_parent', 'id', 100000) $$,
   'P0001', null,
   'transmute() refuses a table with incoming foreign keys by default'
 );
@@ -31,10 +31,8 @@ select ok(
 );
 
 -- (3) with p_incoming_fks => preserve: the conversion succeeds
-select lives_ok(
-  $$ select pgpm.transmute('public.fk_parent', 'id', 100000, p_incoming_fks => 'preserve') $$,
-  'transmute(..., p_incoming_fks => ''preserve'') succeeds'
-);
+call pgpm.transmute('public.fk_parent', 'id', 100000, p_incoming_fks => 'preserve');
+select pass('transmute(..., p_incoming_fks => ''preserve'') succeeds');
 
 -- (4) the incoming FK was dropped for the conversion
 select is(

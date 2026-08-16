@@ -13,7 +13,7 @@ create table public.dr (
   body text, primary key (created_at, id)
 );
 insert into public.dr (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 20) g;
-select pgpm.transmute('public.dr', 'created_at', interval '1 month', p_paused => false);   -- monolith holds the recent rows; DEFAULT empty
+call pgpm.transmute('public.dr', 'created_at', interval '1 month', p_paused => false);   -- monolith holds the recent rows; DEFAULT empty
 -- a backdated stray lands in the (otherwise empty) DEFAULT, in a closed interval below the monolith
 insert into public.dr (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 15) g;

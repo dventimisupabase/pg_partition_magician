@@ -13,7 +13,7 @@ create table public.ck (
   constraint ck_amount check (amount >= 0)
 );
 insert into public.ck select g, g from generate_series(1, 100) g;
-select pgpm.transmute('public.ck', 'id', 1000::bigint, p_paused => false);
+call pgpm.transmute('public.ck', 'id', 1000::bigint, p_paused => false);
 
 select is(
   (select count(*)::int from pg_constraint

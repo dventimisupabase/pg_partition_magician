@@ -14,7 +14,7 @@ create table public.gc (
   primary key (id)
 );
 insert into public.gc (id, amount) select g, g from generate_series(1, 5000) g;   -- [0,6000) at step 1000
-select pgpm.transmute('public.gc', 'id', 1000::bigint, p_paused => true);
+call pgpm.transmute('public.gc', 'id', 1000::bigint, p_paused => true);
 insert into public.gc (id, amount) values (100000, 100000);   -- past B: lands in the DEFAULT, freezes the monolith
 
 -- regrain copies the coarse monolith into fine children -- the copy must omit the generated column

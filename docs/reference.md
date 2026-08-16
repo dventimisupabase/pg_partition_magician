@@ -74,7 +74,7 @@ partition key (global uniqueness could not be enforced); an incoming FK exists a
 interrupted run).
 
 ```sql
-select pgpm.transmute('public.events', 'created_at', interval '1 month',
+call pgpm.transmute('public.events', 'created_at', interval '1 month',
                       p_obtain => 7, p_retain => interval '90 days');
 ```
 
@@ -95,7 +95,7 @@ time overload except the grid width is a `bigint` `p_step`, `p_retain` is a `big
 `p_anchor` is a `bigint`. There is no `p_force_uuidv7`.
 
 ```sql
-select pgpm.transmute('public.events', 'id', 10000000, p_obtain => 2);
+call pgpm.transmute('public.events', 'id', 10000000, p_obtain => 2);
 ```
 
 ### `untransmute`

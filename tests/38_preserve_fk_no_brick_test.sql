@@ -17,7 +17,7 @@ create table public.fk_ref (
 );
 insert into public.fk_ref (m_id) select 1 + floor(random() * 200)::int from generate_series(1, 50);
 
-select pgpm.transmute('public.fk_m', 'id', 100000000,
+call pgpm.transmute('public.fk_m', 'id', 100000000,
                   p_drain_batch => 50, p_incoming_fks => 'preserve', p_paused => false);
 
 -- the incoming FK is dropped for the conversion; status() surfaces RI as suspended (the P1 off-window)

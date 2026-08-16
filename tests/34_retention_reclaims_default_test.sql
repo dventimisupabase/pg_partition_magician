@@ -13,7 +13,7 @@ create table public.ret_t (
   primary key (created_at, id)
 );
 insert into public.ret_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 10) g;  -- recent -> monolith
-select pgpm.transmute('public.ret_t', 'created_at', interval '1 month',
+call pgpm.transmute('public.ret_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
 
 -- strays in the DEFAULT: 30 aged (months 3,4,5 ago, BELOW the 2-month horizon) and 10 within-horizon

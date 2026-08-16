@@ -14,7 +14,7 @@ create temporary table _pk_before as
   select i.indexrelid::oid as idx_oid
     from pg_index i where i.indrelid = 'public.reuse_pk'::regclass and i.indisprimary;
 
-select pgpm.transmute('public.reuse_pk', 'id', 100000);
+call pgpm.transmute('public.reuse_pk', 'id', 100000);
 
 select is(
   (select relkind::text from pg_class where oid = 'public.reuse_pk'::regclass),

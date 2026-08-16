@@ -13,7 +13,7 @@ create table public.s_t (
   primary key (created_at, id)
 );
 insert into public.s_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 5) g;  -- recent -> monolith
-select pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
 select pgpm.obtain('public.s_t');
 -- a closed stray backlog in the DEFAULT (two past months, 20 rows); the recent rows are in the monolith
 insert into public.s_t (created_at, body)

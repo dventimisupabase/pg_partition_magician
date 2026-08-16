@@ -12,7 +12,7 @@ create table public.am (
   body text, primary key (created_at, id)
 );
 insert into public.am (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 20) g;
-select pgpm.transmute('public.am', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.am', 'created_at', interval '1 month', p_paused => false);
 select pgpm.obtain('public.am');   -- forward partitions, plain-attached (empty DEFAULT, no scan)
 -- a backdated stray for the drain to evacuate via check_skip
 insert into public.am (created_at, body)

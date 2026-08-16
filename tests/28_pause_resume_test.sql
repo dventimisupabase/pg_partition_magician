@@ -15,9 +15,8 @@ insert into public.pr (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 30) g;
 
 -- transmute with no p_paused: the default is paused (cautious).
-select lives_ok(
-  $$ select pgpm.transmute('public.pr', 'created_at', interval '1 month') $$,
-  'transmute the table (paused by default)');
+call pgpm.transmute('public.pr', 'created_at', interval '1 month');
+select pass('transmute the table (paused by default)');
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'transmute registers the table paused by default');

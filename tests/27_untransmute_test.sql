@@ -21,9 +21,8 @@ create index rt_body_idx on public.rt (body);
 insert into public.rt (created_at, body)
   select now() - (g || ' minutes')::interval, 'b' || g from generate_series(1, 100) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.rt', 'created_at', interval '1 month') $$,
-  'transmute converts the table');
+call pgpm.transmute('public.rt', 'created_at', interval '1 month');
+select pass('transmute converts the table');
 select is(
   (select relkind::text from pg_class where oid = 'public.rt'::regclass),
   'p', 'rt is a partitioned table after transmute');
@@ -65,9 +64,8 @@ create table public.gated (
 );
 insert into public.gated (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 50) g;
-select lives_ok(
-  $$ select pgpm.transmute('public.gated', 'created_at', interval '1 month') $$,
-  'transmute the gated table');
+call pgpm.transmute('public.gated', 'created_at', interval '1 month');
+select pass('transmute the gated table');
 select lives_ok(
   $$ select pgpm.obtain('public.gated') $$,
   'obtain builds empty forward partitions ahead of the frontier');
@@ -88,9 +86,8 @@ create table public.gated2 (
 );
 insert into public.gated2 (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 50) g;
-select lives_ok(
-  $$ select pgpm.transmute('public.gated2', 'created_at', interval '1 month') $$,
-  'transmute the gated2 table');
+call pgpm.transmute('public.gated2', 'created_at', interval '1 month');
+select pass('transmute the gated2 table');
 select lives_ok(
   $$ select pgpm.obtain('public.gated2') $$,
   'obtain builds empty forward partitions');
@@ -116,9 +113,8 @@ create table public.cchild (
   ref_id      bigint,
   foreign key (ref_created, ref_id) references public.cparent (created_at, id)
 );
-select lives_ok(
-  $$ select pgpm.transmute('public.cparent', 'created_at', interval '1 month', p_incoming_fks => 'preserve') $$,
-  'transmute the FK-referenced parent, preserving the incoming FK');
+call pgpm.transmute('public.cparent', 'created_at', interval '1 month', p_incoming_fks => 'preserve');
+select pass('transmute the FK-referenced parent, preserving the incoming FK');
 select lives_ok(
   $$ select pgpm.untransmute('public.cparent') $$,
   'untransmute the FK-referenced parent');

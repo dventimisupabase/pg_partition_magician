@@ -364,7 +364,7 @@ rm -f "$RESULTS/pgb_convert".*
 N0=$(q "select count(*) from bench.events")   # history rows -- all land in the monolith at cutover (conservation anchor)
 echo "  firing pgpm.transmute('bench.events','id', step $BENCH_ID_STEP, paused=>false)..."
 transmute_t0=$(q "select extract(epoch from clock_timestamp())")
-q "select pgpm.transmute('bench.events','id', ${BENCH_ID_STEP}::bigint, $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+q "call pgpm.transmute('bench.events','id', ${BENCH_ID_STEP}::bigint, $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 transmute_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 

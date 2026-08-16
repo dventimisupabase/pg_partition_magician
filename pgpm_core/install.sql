@@ -163,6 +163,25 @@ create table if not exists pgpm.part (
 -- upgrade path for installs that predate this column
 alter table pgpm.part add column if not exists attached boolean not null default true;
 
+-- In-flight conversions (issue #275). transmute runs in three transactions -- add the bound, validate it,
+-- cut over -- so that the O(rows) validation scan is not held under the ACCESS EXCLUSIVE lock the ADD
+-- takes. The cost of that split is that a failure between phases leaves a live `pgpm_monolith_bound` CHECK
+-- on the operator's table, which REJECTS any write outside [lo, hi) (a NOT VALID check still enforces new
+-- rows). This table is what lets maintenance find and undo that: a half-converted table is not in
+-- pgpm.config yet, because registration happens in the cutover, so there is nothing else to look it up by.
+--
+-- lo/hi are recorded so a resumed transmute reuses the SAME bound rather than recomputing one against a
+-- frontier that has since moved.
+create table if not exists pgpm.transmute_inflight (
+  parent_table  regclass    not null primary key,
+  nsp           name        not null,
+  rel           name        not null,
+  control_kind  text        not null,
+  lo            text        not null,
+  hi            text        not null,
+  started_at    timestamptz not null default now()
+);
+
 create table if not exists pgpm.log (
   id           bigint generated always as identity primary key,
   parent_table regclass,
@@ -1815,15 +1834,22 @@ $$;
 
 -- ============================== transmute ==============================
 
-create or replace function pgpm._transmute(
+-- #275 turned these from FUNCTIONs into PROCEDUREs. CREATE OR REPLACE cannot change that, so the old
+-- forms have to go first; an existing install upgrades cleanly through this.
+drop function if exists pgpm._transmute(regclass, name, text, text, text, int, text, boolean, int, boolean, text, boolean, boolean);
+drop function if exists pgpm.transmute(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text, boolean, boolean);
+drop function if exists pgpm.transmute(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text, boolean);
+
+create or replace procedure pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text,
-  p_drain_adaptive boolean, p_force_uuidv7 boolean default false
+  p_drain_adaptive boolean, p_force_uuidv7 boolean default false, p_bound_headroom int default 0
 )
-returns regclass language plpgsql as $$
+language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
+  v_lo_prev text; v_hi_prev text;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
@@ -2104,20 +2130,60 @@ begin
                     pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
   v_monolith   := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
 
-  -- 0b. Certify the monolith's bound BEFORE the rename, so the ATTACH below is metadata-only. This is the
-  -- one O(rows) read of the conversion.
+  -- ============================ PHASE 1: add the bound (#275) ============================
   --
-  -- NOTE (issue #275): the split below is currently DECORATIVE. `ADD ... NOT VALID` takes ACCESS EXCLUSIVE,
-  -- and because _transmute is a FUNCTION and pgpm_core has no COMMIT anywhere, that lock is held until the
-  -- whole conversion commits -- across the VALIDATE scan. So the table is fully locked (ACCESS EXCLUSIVE
-  -- conflicts with everything, reads included) for a duration that scales with row count: measured 30 ms at
-  -- 1M rows, 173 ms at 5M, 492 ms at 10M, cached. VALIDATE's own SHARE UPDATE EXCLUSIVE is the right lock
-  -- and would not block anyone; it just never gets to be the only one held. The fix is a real commit
-  -- between the two statements, which needs transmute to become a PROCEDURE.
-  execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
-                 p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
-                 p_control, pgpm._encode(p_control_kind, v_hi_native));
-  execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
+  -- Certify the monolith's bound BEFORE the rename so the ATTACH below is metadata-only. This is the one
+  -- O(rows) read of the conversion, and it gets its own transaction so it is not held under the ACCESS
+  -- EXCLUSIVE lock the ADD takes. Measured before the split: the table was fully locked (ACCESS EXCLUSIVE
+  -- conflicts with everything, reads included) for 30 ms at 1M rows, 173 ms at 5M, 492 ms at 10M, cached.
+  --
+  -- A SESSION-level advisory lock is taken first and held across both commits. It is what lets the reaper
+  -- below tell "this conversion is still running" from "its session died mid-way", with no heartbeat and no
+  -- timeout guess: the lock is released automatically when the session ends, however it ends.
+  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+    raise exception 'pg_partition_magician: a transmute of % is already in progress in another session', p_parent;
+  end if;
+
+  -- Resume: a recorded conversion whose lock we just took means the previous attempt's session is gone.
+  -- Reuse its bound rather than recomputing one, because the frontier has moved on since but no row can
+  -- have landed outside the recorded range -- the CHECK was rejecting those the whole time.
+  select lo, hi into v_lo_prev, v_hi_prev from pgpm.transmute_inflight where parent_table = p_parent;
+  if found then
+    v_lo_native := v_lo_prev; v_hi_native := v_hi_prev;
+    v_monolith  := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (p_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reusing the recorded bound');
+  else
+    -- Optional headroom: push hi further out so a fast writer cannot cross it while the scan runs. The
+    -- bound rejects writes at or past hi for as long as it is in place, which with the split is the whole
+    -- conversion rather than a single locked statement.
+    for v_i in 1 .. greatest(coalesce(p_bound_headroom, 0), 0) loop
+      v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native);
+    end loop;
+    v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
+    insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi)
+      values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native);
+  end if;
+
+  if not exists (select 1 from pg_constraint
+                  where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
+    execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
+                   p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
+                   p_control, pgpm._encode(p_control_kind, v_hi_native));
+  end if;
+  commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; the advisory lock survives
+
+  -- ============================ PHASE 2: validate it (#275) ============================
+  -- VALIDATE takes only SHARE UPDATE EXCLUSIVE, which blocks nobody. Skipped when a previous attempt
+  -- already validated it.
+  if not (select convalidated from pg_constraint
+           where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
+    execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
+  end if;
+  commit;
+
+  -- ============================ PHASE 3: the cutover ============================
+  -- Metadata only, and atomic: a raise from here rolls the whole cutover back.
 
   -- 1. rename the live table to the MONOLITH (coarse child) name
   execute format('alter table %s rename to %I', p_parent::text, v_monolith);
@@ -2235,7 +2301,10 @@ begin
   -- Run pgpm.obtain(parent) (or pgpm.maintain, or the scheduled job) AFTER transmute to build the forward
   -- partitions; with an EMPTY default, obtain takes the cheap plain path (no scan). Until the frontier
   -- crosses B, live writes land in the monolith (the current interval lives there too).
-  return v_parent;
+
+  -- the conversion is complete: nothing is left for the reaper to undo, and the advisory lock can go.
+  delete from pgpm.transmute_inflight where parent_table = p_parent;
+  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
 end;
 $$;
 
@@ -2255,31 +2324,105 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- random (UUIDv4) is refused unless p_force_uuidv7 => true), anything else is time
 -- (timestamptz/timestamp/date; _transmute rejects a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
 -- callers cast: transmute(t, c, interval '1 month').
-create or replace function pgpm.transmute(
+create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false
-) returns regclass language sql as $$
-  select pgpm._transmute(p_parent, p_control,
-    case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
-                 where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
-         then 'uuidv7' else 'time' end,
+  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false,
+  p_bound_headroom int default 0
+) language plpgsql as $$
+declare v_kind text;
+begin
+  -- resolved into a variable first: a CALL argument may not contain a subquery
+  select case when t.typname = 'uuid' then 'uuidv7' else 'time' end into v_kind
+    from pg_attribute a join pg_type t on t.oid = a.atttypid
+   where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
+  call pgpm._transmute(p_parent, p_control, coalesce(v_kind, 'time'),
     p_interval::text, p_anchor::text, p_obtain,
-    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7);
+    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7,
+    p_bound_headroom);
+end;
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
-create or replace function pgpm.transmute(
+create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false
-) returns regclass language sql as $$
-  select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
-                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive);
+  p_drain_adaptive boolean default false, p_bound_headroom int default 0
+) language plpgsql as $$
+begin
+  -- plpgsql, not sql: a SQL-bodied routine cannot host a callee's transaction control
+  call pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
+                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive,
+                     false, p_bound_headroom);
+end;
+$$;
+
+-- Abandon a half-finished conversion (issue #275). transmute runs in three transactions, so a failure
+-- between them leaves a validated-or-not `pgpm_monolith_bound` CHECK on the operator's table, and that
+-- CHECK REJECTS every write outside [lo, hi) for as long as it is there. This puts the table back exactly
+-- as it was.
+--
+-- It ABANDONS, it does not resume: finishing someone's half-done conversion of a production table
+-- unattended is too large an action to take on their behalf. Re-run transmute to try again; it will resume
+-- from the recorded bound.
+create or replace function pgpm.transmute_abort(p_parent regclass)
+returns boolean language plpgsql as $$
+declare r pgpm.transmute_inflight%rowtype;
+begin
+  select * into r from pgpm.transmute_inflight where parent_table = p_parent;
+  if not found then return false; end if;
+  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is still running in another session', p_parent;
+  end if;
+  execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
+  delete from pgpm.transmute_inflight where parent_table = p_parent;
+  insert into pgpm.log (parent_table, action, lo, hi, method)
+    values (p_parent, 'transmute_abort', r.lo, r.hi, 'bound dropped, table restored');
+  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
+  return true;
+end;
+$$;
+
+-- The reaper (issue #275). A conversion whose session died leaves the bound behind, and the table goes on
+-- rejecting out-of-range writes until someone notices. Rather than leave that to the operator, every
+-- maintain_all tick sweeps for abandoned conversions and undoes them.
+--
+-- "Abandoned" is decided by the session advisory lock transmute holds for its whole run, not by a timeout:
+-- if the lock can be taken, the owning session is gone, whatever the reason. A long validation scan is
+-- therefore never mistaken for a dead one, and an operator whose session is still open keeps the right to
+-- retry -- the sweep waits until they disconnect.
+--
+-- Deliberately independent of pgpm.config: a half-converted table is not registered yet, because
+-- registration happens in the cutover. That is exactly why this lives in maintain_all rather than maintain.
+create or replace function pgpm._transmute_reap()
+returns int language plpgsql as $$
+declare r pgpm.transmute_inflight%rowtype; v_n int := 0;
+begin
+  for r in select * from pgpm.transmute_inflight loop
+    -- the relation itself is gone: nothing to undo, just forget it
+    if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                    where n.nspname = r.nsp and c.relname = r.rel) then
+      delete from pgpm.transmute_inflight where parent_table = r.parent_table;
+      v_n := v_n + 1;
+      continue;
+    end if;
+    if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0)) then
+      continue;   -- still running; leave it alone
+    end if;
+    execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
+    delete from pgpm.transmute_inflight where parent_table = r.parent_table;
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (r.parent_table, 'transmute_reap', r.lo, r.hi,
+              'abandoned conversion undone: the bound was rejecting out-of-range writes');
+    perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0));
+    v_n := v_n + 1;
+  end loop;
+  return v_n;
+end;
 $$;
 
 -- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and
@@ -2888,6 +3031,9 @@ create or replace procedure pgpm.maintain_all()
 language plpgsql as $$
 declare r record;
 begin
+  -- #275: undo any conversion whose session died mid-way, before anything else. Independent of
+  -- pgpm.config on purpose: a half-converted table is not registered yet.
+  perform pgpm._transmute_reap();
   for r in select parent_table from pgpm.config loop
     perform pgpm.maintain(r.parent_table);
   end loop;

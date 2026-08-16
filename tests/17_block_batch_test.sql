@@ -13,7 +13,7 @@ create table public.wide (created_at timestamptz not null, id bigint generated b
 alter table public.wide alter column pad set storage plain;
 insert into public.wide (created_at, pad)
   select now() - (g || ' minutes')::interval, repeat('x', 1800) from generate_series(1, 20) g;   -- recent -> monolith
-select pgpm.transmute('public.wide', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.wide', 'created_at', interval '1 month', p_paused => false);
 -- 3000 wide strays in one closed interval (3 months ago) land in the DEFAULT for the drain to drain
 insert into public.wide (created_at, pad)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', repeat('x', 1800)

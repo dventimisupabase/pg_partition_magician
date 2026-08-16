@@ -685,8 +685,11 @@ begin
 
   -- handoff: an ordinary plain table under the original name is exactly transmute's input.
   v_orig := format('%I.%I', v_nsp, v_rel)::regclass;
-  perform pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
-                         p_keep_default, p_drain_batch, p_anchor, p_paused);
+  -- transmute is a PROCEDURE since #275 (it commits between adding the monolith bound, validating it, and
+  -- the cutover, so the O(rows) scan is not held under ACCESS EXCLUSIVE). The commit above at :684 means
+  -- this runs in a fresh transaction, so its internal commits are legal here.
+  call pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
+                      p_keep_default, p_drain_batch, p_anchor, p_paused);
 
   -- preserve the source sequence's exact position. transmute moved identity to the new parent and seeded
   -- each sequence to max(id)+1; advance it to the source's captured next value when that is higher, so ids

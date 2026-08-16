@@ -18,7 +18,7 @@ insert into public.uq_nullable (ts, id)
   select now() - (g || ' days')::interval, g from generate_series(1, 10) g;
 
 select throws_like(
-  $$ select pgpm.transmute('public.uq_nullable', 'ts', interval '1 month') $$,
+  $$ call pgpm.transmute('public.uq_nullable', 'ts', interval '1 month') $$,
   'pg_partition_magician:%NOT NULL%',
   'refuses when the control column is nullable, naming the NOT NULL requirement');
 select is(
@@ -37,7 +37,7 @@ insert into public.uq_bare (ts, id)
   select now() - (g || ' days')::interval, g from generate_series(1, 10) g;
 
 select throws_like(
-  $$ select pgpm.transmute('public.uq_bare', 'ts', interval '1 month') $$,
+  $$ call pgpm.transmute('public.uq_bare', 'ts', interval '1 month') $$,
   'pg_partition_magician:%USING INDEX%',
   'refuses a bare unique index, guiding the operator to promote it to a constraint');
 select is(

@@ -15,9 +15,8 @@ create table public.uq_rt (
 insert into public.uq_rt (ts, id, body)
   select now() - (g || ' days')::interval, g, 'x' from generate_series(1, 25) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_rt', 'ts', interval '1 month') $$,
-  'transmute a no-PK unique-constraint table (paused, monolith holds all)');
+call pgpm.transmute('public.uq_rt', 'ts', interval '1 month');
+select pass('transmute a no-PK unique-constraint table (paused, monolith holds all)');
 select lives_ok(
   $$ select pgpm.untransmute('public.uq_rt') $$,
   'untransmute reverses it while the monolith still holds every row');

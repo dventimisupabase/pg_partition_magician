@@ -13,7 +13,7 @@ create table public.a_on (
 );
 insert into public.a_on (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 20) g;
-select pgpm.transmute('public.a_on', 'created_at', interval '1 month', p_drain_adaptive => true);
+call pgpm.transmute('public.a_on', 'created_at', interval '1 month', p_drain_adaptive => true);
 select is(
   (select drain_adaptive from pgpm.config where parent_table = 'public.a_on'::regclass),
   true, 'transmute(..., p_drain_adaptive => true) registers the table with adaptive on');
@@ -26,7 +26,7 @@ create table public.a_off (
 );
 insert into public.a_off (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 20) g;
-select pgpm.transmute('public.a_off', 'created_at', interval '1 month');
+call pgpm.transmute('public.a_off', 'created_at', interval '1 month');
 select is(
   (select drain_adaptive from pgpm.config where parent_table = 'public.a_off'::regclass),
   false, 'adaptive is off by default (the fixed-gentle rate)');
@@ -37,7 +37,7 @@ create table public.a_id (
   body text
 );
 insert into public.a_id (body) select 'x' from generate_series(1, 20);
-select pgpm.transmute('public.a_id', 'id', 100000, p_drain_adaptive => true);
+call pgpm.transmute('public.a_id', 'id', 100000, p_drain_adaptive => true);
 select is(
   (select drain_adaptive from pgpm.config where parent_table = 'public.a_id'::regclass),
   true, 'the id overload accepts p_drain_adaptive too');

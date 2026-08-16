@@ -67,7 +67,7 @@ Faster is not always better. At 40M rows, draining flat-out (a fixed rate) finis
 ```sql
 -- 1. Convert a live table online and register it. The cutover is metadata-only (no rows move here),
 --    and the table registers PAUSED: nothing drains until you resume.
-select pgpm.transmute(
+call pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',        -- the monotonic key to range-partition on
   p_interval => interval '1 month',  -- daily / weekly / monthly / yearly ...

@@ -23,7 +23,7 @@ select cmp_ok(
 -- refuse-by-default: range-partitioning a non-time-ordered key is meaningless, so transmute refuses
 -- a column that samples as random (the operator can override with p_force_uuidv7; see tests/39)
 select throws_like(
-  $$ select pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
+  $$ call pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
   'pg_partition_magician:%UUIDv4%',
   'transmute (uuid column treated as uuidv7) refuses a random-uuid column'
 );

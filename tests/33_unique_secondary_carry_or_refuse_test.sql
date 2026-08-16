@@ -19,7 +19,7 @@ insert into public.u_excl (created_at, email)
   select now() - (g || ' days')::interval, 'u' || g || '@x' from generate_series(1, 10) g;
 
 select throws_like(
-  $$ select pgpm.transmute('public.u_excl', 'created_at', interval '1 month') $$,
+  $$ call pgpm.transmute('public.u_excl', 'created_at', interval '1 month') $$,
   'pg_partition_magician:%UNIQUE%',
   'transmute refuses a unique secondary whose key excludes the partition key');
 select is(
@@ -41,9 +41,8 @@ insert into public.u_incl (created_at, sku)
   select date_trunc('month', now()) - interval '3 months' + (g || ' days')::interval, 'sku' || g
   from generate_series(1, 10) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.u_incl', 'created_at', interval '1 month', p_paused => false) $$,
-  'transmute carries a unique secondary whose key includes the partition key');
+call pgpm.transmute('public.u_incl', 'created_at', interval '1 month', p_paused => false);
+select pass('transmute carries a unique secondary whose key includes the partition key');
 
 -- the carried index exists on the partitioned parent as a (non-PK) partitioned unique index
 select is(

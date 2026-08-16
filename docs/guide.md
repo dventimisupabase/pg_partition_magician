@@ -131,13 +131,13 @@ cast.
 
 ```sql
 -- time (timestamp/timestamptz/date control column)
-select pgpm.transmute('public.events', 'created_at', interval '1 month');
+call pgpm.transmute('public.events', 'created_at', interval '1 month');
 
 -- id (bigint/numeric), 10M ids per partition
-select pgpm.transmute('public.events', 'id', 10000000);
+call pgpm.transmute('public.events', 'id', 10000000);
 
 -- uuidv7 / ULID-as-uuid (a uuid control column is treated as this kind)
-select pgpm.transmute('public.events', 'event_uuid', interval '1 day');
+call pgpm.transmute('public.events', 'event_uuid', interval '1 day');
 ```
 
 Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does
@@ -434,7 +434,7 @@ repeatedly. Because the monolith holds every referenced row attached from the mo
 closed tail to wait for, the FK is typically restorable immediately after transmute.
 
 ```sql
-select pgpm.transmute('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
+call pgpm.transmute('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
 select pgpm.restore_incoming_fks('public.events');   -- maintenance does this for you on the cron path
 ```
 

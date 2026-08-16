@@ -22,11 +22,12 @@
 create extension if not exists pgtap;
 select plan(10);
 
-create or replace function pg_temp.mk(p_rel text) returns void language plpgsql as $$
+-- a PROCEDURE, not a function: it calls transmute, which commits (#275)
+create or replace procedure pg_temp.mk(p_rel text) language plpgsql as $$
 begin
   execute format('create table public.%I (id bigint primary key, payload text)', p_rel);
   execute format('insert into public.%I select g*10, ''x'' from generate_series(1, 250) g', p_rel);
-  perform pgpm.transmute(format('public.%I', p_rel)::regclass, 'id', 1000);
+  call pgpm.transmute(format('public.%I', p_rel)::regclass, 'id', 1000);
   execute format('insert into public.%I values (900000, ''frontier'')', p_rel);   -- freeze the monolith
 end $$;
 
@@ -45,7 +46,7 @@ begin
 end $$;
 
 -- ============================ control: the happy path still works ============================
-select pg_temp.mk('wc0');
+call pg_temp.mk('wc0');
 select pgpm.regrain_step('public.wc0','wc0_p0000000000000000000_to_0000000000000003000','100',50);
 select pg_temp.finish_regrain('wc0', 50);
 
@@ -61,7 +62,7 @@ select is(
 -- ============================ INSERT into a COMPLETED sub-range ============================
 -- batch 50 finishes [0,100) (9 rows) on the first tick and advances the cursor, so the sub-range is
 -- never revisited. A row inserted into it afterwards is copied by nothing.
-select pg_temp.mk('wc1');
+call pg_temp.mk('wc1');
 select pgpm.regrain_step('public.wc1','wc1_p0000000000000000000_to_0000000000000003000','100',50);
 insert into public.wc1 values (55, 'inserted-into-completed-subrange');
 select pg_temp.finish_regrain('wc1', 50);
@@ -73,7 +74,7 @@ select ok(
 -- ============================ INSERT below the high-water mark ============================
 -- batch 5 leaves [0,100) mid-copy with max(dest.id) = 50, so the copy's `s.id >= 50` bound excludes
 -- anything inserted below it.
-select pg_temp.mk('wc2');
+call pg_temp.mk('wc2');
 select pgpm.regrain_step('public.wc2','wc2_p0000000000000000000_to_0000000000000003000','100',5);
 insert into public.wc2 values (15, 'inserted-below-high-water');
 select pg_temp.finish_regrain('wc2', 5);
@@ -83,7 +84,7 @@ select ok(
   'a committed INSERT below the destination''s high-water mark survives the swap');
 
 -- ============================ DELETE ============================
-select pg_temp.mk('wc3');
+call pg_temp.mk('wc3');
 select pgpm.regrain_step('public.wc3','wc3_p0000000000000000000_to_0000000000000003000','100',50);
 delete from public.wc3 where id = 50;
 select pg_temp.finish_regrain('wc3', 50);
@@ -93,7 +94,7 @@ select ok(
   'a committed DELETE stays deleted: the swap does not resurrect it');
 
 -- ============================ UPDATE ============================
-select pg_temp.mk('wc4');
+call pg_temp.mk('wc4');
 select pgpm.regrain_step('public.wc4','wc4_p0000000000000000000_to_0000000000000003000','100',50);
 update public.wc4 set payload = 'CORRECTED' where id = 60;
 select pg_temp.finish_regrain('wc4', 50);
@@ -109,7 +110,7 @@ select is(
 -- row count useless as an assertion: a lost INSERT and a resurrected DELETE cancel exactly, so count(*)
 -- comes out right while both rows are wrong. That is the same shape of blind assertion that let this bug
 -- live in tests/48 -- counts and read-side properties, never identity.
-select pg_temp.mk('wc5');
+call pg_temp.mk('wc5');
 select pgpm.regrain_step('public.wc5','wc5_p0000000000000000000_to_0000000000000003000','100',50);
 insert into public.wc5 values (55, 'new'), (65, 'new');
 delete from public.wc5 where id = 50;

@@ -19,9 +19,8 @@ insert into public.uq_lead (ts, id, body)
   select date_trunc('month', now()) - interval '3 months' + (g || ' days')::interval, g, 'x'
   from generate_series(1, 40) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_lead', 'ts', interval '1 month', p_paused => false) $$,
-  'transmute reuses a UNIQUE constraint that includes the control column (no PK required)');
+call pgpm.transmute('public.uq_lead', 'ts', interval '1 month', p_paused => false);
+select pass('transmute reuses a UNIQUE constraint that includes the control column (no PK required)');
 
 select is(
   (select relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
@@ -63,9 +62,8 @@ insert into public.uq_mid (device_id, ts, body)
   select g, date_trunc('month', now()) - interval '2 months' + (g || ' days')::interval, 'x'
   from generate_series(1, 30) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_mid', 'ts', interval '1 month', p_paused => false) $$,
-  'transmute reuses a composite UNIQUE constraint even when control is not the leading column');
+call pgpm.transmute('public.uq_mid', 'ts', interval '1 month', p_paused => false);
+select pass('transmute reuses a composite UNIQUE constraint even when control is not the leading column');
 select is(
   (select relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where n.nspname = 'public' and c.relname = 'uq_mid'),

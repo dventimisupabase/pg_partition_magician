@@ -17,7 +17,7 @@ create table public.blk_t (
 alter table public.blk_t alter column doc set storage external;
 insert into public.blk_t (created_at, doc)
   select now() - (g || ' minutes')::interval, repeat('x', 12000) from generate_series(1, 3) g;   -- recent -> monolith
-select pgpm.transmute('public.blk_t', 'created_at', interval '1 month', p_drain_batch => 5000, p_paused => false);
+call pgpm.transmute('public.blk_t', 'created_at', interval '1 month', p_drain_batch => 5000, p_paused => false);
 -- 40 wide strays in one CLOSED month land in the freshly created DEFAULT; do NOT analyze it
 insert into public.blk_t (created_at, doc)
   select date_trunc('month', now()) - interval '40 days', repeat('x', 12000) from generate_series(1, 40) g;
