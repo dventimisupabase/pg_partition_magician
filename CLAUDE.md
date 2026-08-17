@@ -33,6 +33,22 @@ and absence-of-setup look identical unless you separate them deliberately.
   sampled inside the transaction that produced them, so those assertions cannot live in
   pgTAP, which wraps each file in a transaction. They belong in a `bench/` shell harness.
 
+## `./test.sh all` is not what CI runs
+
+`all` means all four PostgreSQL **versions**, not all tracks. The `timescale`, `observe`,
+`archive`, `perf` and `discriminate` tracks each need their own image or service and are
+skipped, so a green `./test.sh all` does **not** predict a green CI.
+
+Use **`./test.sh ci`** before pushing anything that touches `pgpm_core/install.sql`, which
+every one of those tracks installs. It runs each track as a child invocation, so each gets
+its own `set -e` and behaves exactly as CI's separate jobs do, and it runs them all rather
+than stopping at the first failure.
+
+This has already cost a round trip: making `pgpm.transmute` a procedure broke
+`tests/archive/fixtures.sql`, whose `mk_archive_table` was a function calling it (a
+function cannot call a committing procedure at all). `./test.sh all` stayed green from end
+to end and only the PR's archive job caught it.
+
 ## Lint Markdown before pushing docs
 
 CI runs a `Markdown` job (`.github/workflows/lint.yml`,

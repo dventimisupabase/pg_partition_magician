@@ -11,6 +11,14 @@
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
 #   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
 #   ./test.sh discriminate               # prove each of those guards fails when its defect is present
+#   ./test.sh ci                         # EVERY track CI runs, in one go
+#
+# `all` means all four PostgreSQL VERSIONS, not all tracks. The timescale, observe, archive, perf and
+# discriminate tracks each need their own image or service, so `./test.sh all` deliberately skips them
+# and a green run of it does NOT mean CI will be green. That gap is real: a change to
+# pgpm_core/install.sql broke the archive track's fixture while `./test.sh all` stayed green from end
+# to end, and only the PR's archive job caught it. Use `./test.sh ci` before pushing anything that
+# touches pgpm_core, which every one of these tracks installs.
 #
 # Channels:
 #   psql    pgpm_core/install.sql via psql -f         (the source)
@@ -61,7 +69,8 @@ for arg in "$@"; do
     archive) TRACK="archive" ;;
     perf) TRACK="perf" ;;
     discriminate) TRACK="discriminate" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate"; exit 1 ;;
+    ci) TRACK="ci" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | ci"; exit 1 ;;
   esac
 done
 
@@ -442,6 +451,34 @@ if [ "$TRACK" = "archive" ]; then
   run_archive
   echo; echo "All requested tests passed."
   exit 0
+fi
+
+# `ci`: everything the CI workflows run, in one invocation, so "green locally" can mean the same thing
+# as "green in CI". Every track runs to completion rather than stopping at the first failure, because
+# when a core change breaks several you want the whole list.
+#
+# Each track is a CHILD INVOCATION of this script, not a direct call to its run_* function. Two reasons.
+# `cmd || handler` disables errexit for the whole of cmd, including inside a function it calls, and
+# several of these functions rely on `set -e` to abort on a failed install step -- so calling them
+# directly under `||` would let a broken install run on and report a worse failure, or none. A child
+# process re-runs `set -euo pipefail` for itself and keeps that intact. It is also exactly how CI
+# invokes them, one track per job, which is the behaviour this target exists to reproduce.
+if [ "$TRACK" = "ci" ]; then
+  # A string, not an array: macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
+  # "unbound variable" error -- so the all-passed path would be the one that broke.
+  ci_failed=""
+  for v in 15 16 17 18; do "$0" "$v" || ci_failed="$ci_failed pg$v"; done
+  for t in timescale observe archive perf discriminate; do
+    "$0" "$t" || ci_failed="$ci_failed $t"
+  done
+  echo; echo "========================================="
+  if [ -z "$ci_failed" ]; then
+    echo "ci: PASS (every track CI runs)"
+    echo; echo "All requested tests passed."
+    exit 0
+  fi
+  echo "ci: FAIL --$ci_failed"
+  exit 1
 fi
 
 if [ "$VERSION" = "all" ]; then
