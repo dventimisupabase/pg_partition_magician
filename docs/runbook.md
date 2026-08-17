@@ -517,7 +517,7 @@ loss. (At-scale figures and the structural note that the append-only backlog sta
    lock:
 
    ```sql
-   call pgpm.from_hypertable_cutover('public.events', 'created_at', interval '1 day', p_drain_batch => 200000, p_paused => false);
+   call pgpm.from_hypertable_cutover('public.events', 'created_at', interval '1 day', p_regrain_batch => 200000, p_paused => false);
    ```
 
    To skip the cutover's own pre-drain (e.g. you already drained by hand and want the lock taken
@@ -531,6 +531,6 @@ select * from pgpm.status() where parent = 'public.events'::regclass; -- registe
 ```
 
 **Prevent.** For update/delete-heavy workloads, drive the drain in the two-phase flow (copy, let it drain,
-then cutover) rather than relying on the one-shot, and size `p_drain_batch` to the write rate. Append-only
+then cutover) rather than relying on the one-shot, and size `p_regrain_batch` to the write rate. Append-only
 migrations rarely hit this (the backlog is structurally small -- the copy reads the current chunk last, so
 it captures appends as it goes). Migrate during a quieter write window when possible.

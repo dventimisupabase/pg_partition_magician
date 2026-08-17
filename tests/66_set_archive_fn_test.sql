@@ -1,5 +1,5 @@
 -- pgpm.set_archive_fn: the operator switch for config.archive_fn (issue #236's contract), matching
--- the same set_X(parent, ...) convention as set_regrain/set_drain_adaptive/set_drain_ambient --
+-- the same set_X(parent, ...) convention as set_regrain --
 -- an operator should never need a raw `update pgpm.config set archive_fn = ...` for normal use.
 create extension if not exists pgtap;
 
@@ -35,7 +35,7 @@ create table public.unmanaged66 (id int);
 select throws_like(
   $$ select pgpm.set_archive_fn('public.unmanaged66') $$,
   '%is not managed%',
-  'set_archive_fn refuses an unmanaged relation, the same convention as set_regrain/set_drain_adaptive');
+  'set_archive_fn refuses an unmanaged relation, the same convention as set_regrain');
 
 select throws_ok(
   $$ select pgpm.set_archive_fn('public.af66', 'pgpm_test66.stub_archiver(regclass,name,text)'::regprocedure) $$,
