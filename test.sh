@@ -326,11 +326,37 @@ run_archive() {
 
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
+  # One database PER FILE, cloned from a template, exactly as the main suite does. These tests used to
+  # isolate themselves with begin/rollback, which stopped being possible once the fixture's
+  # pgpm.transmute became a committing PROCEDURE (#275): transaction control is illegal inside an
+  # explicit transaction block. Cloning gives back the isolation the rollback provided, and gives it
+  # for real -- a rollback never undid anything the tests pushed to MinIO anyway.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database pgpm_arch_tmpl" >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
+
+  local an=0
+  for af in tests/archive/db/*.sql; do
+    local ab adb; ab="$(basename "$af")"; an=$((an + 1)); adb="pgpm_a$an"
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database $adb template pgpm_arch_tmpl" >/dev/null
+    $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab" \
+      || fail=1
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
+  done
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null
+
+  # The independent-reader verification below connects to `postgres`, so that database still needs the
+  # extensions and both installers.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
-  $DC --profile "$prof" exec -T "$svc" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/archive/db/*.sql' \
-    || fail=1
 
   # Independent-reader verification (pyarrow + DuckDB, scripts/verify_parquet*.py): runs on the
   # host against the archive service's published port (5520), not inside the container like the

@@ -4,10 +4,9 @@
 -- (pgpm.maintain()'s own schedule already drives archiving; see pgpm.set_archive_fn for the
 -- archive_fn switch, a separate call on purpose since archive.config serves both the archive_fn
 -- strategies and the synchronous functions, while archive_fn only matters for the former).
-begin;
 select plan(9);
 
-select mk_archive_table('c09', 100, 1000);
+call mk_archive_table('c09', 100, 1000);
 
 create table public.unmanaged09 (id int);
 
@@ -55,4 +54,3 @@ select lives_ok(
   'archive.unconfigure is idempotent -- calling it again on an already-unconfigured table is a no-op');
 
 select * from finish();
-rollback;
