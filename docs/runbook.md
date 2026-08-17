@@ -18,8 +18,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 
 - [Referential-integrity violations after a `preserve` drain](#referential-integrity-violations-after-a-preserve-drain)
 - [The history is not splitting into fine partitions](#the-history-is-not-splitting-into-fine-partitions)
-- [Monitoring a non-empty DEFAULT](#monitoring-a-non-empty-default)
-- [A stray is stuck in the DEFAULT (the drain is behind)](#a-stray-is-stuck-in-the-default-the-drain-is-behind)
+- [A write is refused: `no partition of relation ... found for row`](#a-write-is-refused-no-partition-of-relation--found-for-row)
 - [Disk is filling during a regrain](#disk-is-filling-during-a-regrain)
 - [Storage is not dropping despite a retention policy](#storage-is-not-dropping-despite-a-retention-policy)
 - [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
@@ -172,132 +171,59 @@ select coarse_partitions, history_unregrained from pgpm.status() where parent = 
 **Prevent.** Decide up front whether the table needs fine history. If it does, enable `set_regrain` after
 `transmute` (or regrain by hand in a maintenance window). If a coarse monolith is acceptable, leave it.
 
-## Monitoring a non-empty DEFAULT
+## A write is refused: `no partition of relation ... found for row`
 
-**Symptom.** Monitoring fires on a non-empty `DEFAULT`: `pgpm.check_default('public.events')` reports
-`default_rows > 0`, or `pgpm.status()` shows it. Even a brief, self-clearing occupancy counts.
+**Symptom.** The application sees
 
-**What it means.** In the monolith model the `DEFAULT` is the empty leading-edge net, so an **empty**
-`DEFAULT` is the healthy steady state: it means your partitioning matched reality (keys landed where you
-predicted, `obtain` stayed ahead of the frontier). Any occupancy means reality diverged from the model --
-worth knowing even when it self-heals, because a race lost briefly tends to be lost less briefly later.
-Landing in the `DEFAULT` *routinely* is an anti-pattern: a net you use every day is a hammock, and a
-load-bearing `DEFAULT` quietly signs you up for the drain and its
-[read-consistency window](guide.md#read-consistency-during-a-move). Keep it a **tripwire** -- alarmed and
-empty.
-
-**Steps.**
-
-1. Alarm on the level, the age, and the trend -- not just presence:
-
-   ```sql
-   select default_rows, closed_rows, oldest from pgpm.check_default('public.events');
-   select default_oldest, last_drained, drain_skips from pgpm.status() where parent = 'public.events'::regclass;
-   ```
-
-   Alert when `default_rows > 0`. The oldest `DEFAULT` key (`oldest` / `default_oldest`) is the sharpest
-   single number -- it is at once "how long has coverage been missed" and "how stale is the unsorted
-   data." A rising oldest-age alongside a flat `default_rows` is a **wedged** drain (see
-   [A stray is stuck in the DEFAULT](#a-stray-is-stuck-in-the-default-the-drain-is-behind)).
-
-2. Triage the cause by comparing the `DEFAULT`'s key range to the frontier (`now()` for `time`,
-   `max(control)` for `id`/`uuidv7`). The `oldest` value usually settles it; for the full spread, read the
-   `DEFAULT` partition directly (its name is `config.default_table`, conventionally `<table>_default`):
-
-   ```sql
-   select min(created_at), max(created_at), count(*) from public.events_default;
-   ```
-
-   - **Leading-edge lag** -- the keys sit at/near the frontier: `obtain` fell behind the writers. The
-     urgent case, since it recurs and grows into a write-availability risk. Confirm it is `obtain`
-     deferring (not just slow cadence): `pgpm.log` shows repeated `obtain_skip` rows, the maintain note
-     carries `obtain_backoff`, `config.obtain_retry_after` is set in the future, and no new future
-     partitions appear in `pgpm.partitions`. The cause is lock contention -- obtaining a future partition
-     briefly needs `ACCESS EXCLUSIVE` on the populated `DEFAULT`, so under sustained writes `obtain` keeps
-     losing that race and maintenance backs it off (it waits out `obtain_retry_after` rather than retrying
-     every tick). Keep more partitions ahead
-     (`update pgpm.config set obtain = <n> where parent_table = 'public.events'::regclass;`) and/or run the
-     cron more often; force one now in a brief write lull with `select pgpm.obtain('public.events');`, and
-     catch up the backlog with `call pgpm.drain_all('public.events');`. On a perpetually-hot table,
-     schedule the conversion/obtain during a quieter window.
-   - **Backdated / late-arriving** -- the keys sit well below the frontier: a producer is emitting old
-     timestamps/ids (clock skew, a replay or backfill), or your `retain` window is narrower than the real
-     late-arrival tail. Fix the producer, or widen retention. The drain homes these into a partition (or
-     reclaims them if they are already below the retention horizon).
-   - **A coverage gap** -- a key in a range you never provisioned (not ahead of the frontier, not in the
-     monolith). The drain homes it into a new partition for that interval like any stray; a *recurring* gap
-     points at a scheme assumption that does not hold (a key kind or range you did not expect), worth
-     chasing at the source.
-
-3. In every case the rows are safe in the `DEFAULT` and the drain will home them; the alarm
-   exists to fix the *cause* so the `DEFAULT` returns to empty, not to rescue the rows.
-
-**Verify.**
-
-```sql
-select default_rows from pgpm.check_default('public.events');   -- expect 0 once the cause is fixed and the drain has caught up
+```text
+ERROR:  no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (id) = (...).
 ```
 
-**Prevent.** Treat the `DEFAULT` as a tripwire, not a landing zone. Keep `obtain` comfortably ahead of the
-frontier so steady-state writes always have a real partition and never reach the net, and alarm on *any*
-occupancy so a momentary miss gets attention before it becomes a standing one. The empty `DEFAULT` is
-insurance you are glad to hold and alarmed to ever use.
+**What it means.** pgpm keeps **no `DEFAULT` partition**. `obtain` maintains a grid of real partitions
+running `config.obtain` steps ahead of the write frontier, and a row outside that grid has nowhere to go,
+so PostgreSQL refuses it. There are exactly two ways to be outside it.
 
-## A stray is stuck in the DEFAULT (the drain is behind)
-
-**Symptom.** `pgpm.status()` shows `closed_rows > 0` (or `pgpm.check_default()` does); optionally a stale
-`last_drained` and a climbing `drain_skips`.
-
-**What it means.** In the monolith model the `DEFAULT` is the empty leading-edge net; in steady state it
-holds nothing. A non-zero `closed_rows` means a stray landed there (obtain fell behind the frontier, a
-backdated row, or a gap) and the **drain** has not yet evacuated it into a proper partition. A
-falling `closed_rows` with `drain_skips ~ 0` is merely slow; a stuck `closed_rows` with a stale
-`last_drained` and a climbing `drain_skips` is a **wedged** drain. Since the monolith+regrain redesign a
-true wedge is rare: the bulk move is `regrain`, which copies and cannot strand a duplicate; the drain only
-relocates strays; and upserts to historical keys hit the attached monolith rather than an invisible child.
-So **merely slow** is the common case and **wedged** is a corner -- but both are worth recognizing.
-
-**Steps.**
-
-1. Quantify the backlog and the progress signal:
-
-   ```sql
-   select closed_rows, default_rows, oldest from pgpm.check_default('public.events');
-   select last_drained, drain_skips from pgpm.status() where parent = 'public.events'::regclass;
-   ```
-
-2. If it is merely behind, raise the pace or catch up by hand:
-
-   ```sql
-   update pgpm.config set drain_batch = 20000 where parent_table = 'public.events'::regclass;  -- bigger microbatch
-   call pgpm.drain_all('public.events');                                                       -- catch up now (synchronous)
-   ```
-
-3. If it is **wedged** (a stale `last_drained`, climbing `drain_skips`), look for the cause in the log:
-
-   ```sql
-   select at, action, method from pgpm.log
-    where parent_table = 'public.events'::regclass and action = 'skip_drain' order by id desc limit 10;
-   ```
-
-   A recurring duplicate-key error is the upsert-into-a-moved-row wedge (see the guide's
-   [read consistency](guide.md#read-consistency-during-a-move)): an `INSERT ... ON CONFLICT` targeted a
-   stray already moved into an unattached drain child and wrote a duplicate into the `DEFAULT`, which the
-   next batch then collides on. Post-redesign this is the narrow residual case -- it needs a concurrent
-   upsert to a *stray* mid-move, since historical keys live in the attached monolith and `regrain` never
-   moves through an invisible child. Remove the duplicate from the `DEFAULT` (keep the already-moved copy),
-   then let the drain continue.
-
-**Verify.**
+**Above the grid** -- the value is further ahead than the lookahead reaches. Check the ceiling:
 
 ```sql
-select closed_rows from pgpm.check_default('public.events');   -- expect 0
+select newest_bound from pgpm.status() where parent = 'public.events'::regclass;
 ```
 
-**Prevent.** Keep `obtain` comfortably ahead of the frontier (raise `config.obtain`, or run the cron more
-often) so the frontier never outruns the real partitions and writes never fall to the `DEFAULT`. For
-tables that upsert into historical ranges, prefer the synchronous `drain_all()` in a window over the paced
-drain.
+Either maintenance has stalled (see below) or the write is genuinely further ahead than
+`config.obtain x partition_step`. The latter is common on **id** grids, where the frontier is data-driven
+and can jump: a sequence restart, a Snowflake generator, a bulk import carrying its own ids. Time grids
+advance predictably and rarely hit this.
+
+**Below the grid** -- the value is older than the retention floor, so its partition was deliberately
+dropped. This is correct: retention reclaimed that range. Do not widen retention to make the write
+succeed unless you actually want that data kept.
+
+**What to do.**
+
+1. Confirm maintenance is running at all. If `pg_cron` is stopped or the table is `paused`, `obtain` is
+   not extending the grid and the ceiling is frozen where it stopped:
+
+   ```sql
+   select parent, paused, newest_bound from pgpm.status();
+   select jobname, active from cron.job where jobname like 'pgpm%';
+   ```
+
+2. If maintenance is healthy and you simply need more headroom, raise the lookahead. It is cheap:
+   partitions are empty and creating one is pure catalog work.
+
+   ```sql
+   update pgpm.config set obtain = 90 where parent_table = 'public.events'::regclass;
+   select pgpm.obtain('public.events');
+   ```
+
+3. For a one-off bulk load with known-high ids, extend before loading rather than raising the standing
+   lookahead.
+
+**Why there is no `DEFAULT` to catch these.** It used to exist, and a background **drain** evacuated it.
+That machine was removed deliberately: it was the only part of pgpm that opened a referential-integrity
+window, and it carried its own class of defects. A refused write is loud and immediate; a silent backlog
+in a `DEFAULT` was neither.
 
 ## Disk is filling during a regrain
 
@@ -356,12 +282,8 @@ or the below-horizon tail sits in the `DEFAULT` and never goes away.
 mechanisms reclaim aged data, both driven by `maintain` on pg_cron:
 
 - `retain()` drops whole materialized partitions older than the horizon (a `retain_drop` log row).
-- since #91, the drain also reclaims below-horizon rows still in the `DEFAULT` **in place**, instead of
-  materializing a partition only to drop it next tick (a `retain_reclaim` log row).
-
-So retention is **best-effort**: if the table is `paused`, if `maintain_all` is not scheduled, or if the
-drain is lagging (a large `closed_rows` backlog, so the aged tail never reaches a partition), aged data
-lingers and storage does not fall. It bounds storage only when maintenance runs and the drain keeps up.
+So retention is **best-effort**: if the table is `paused`, or if `maintain_all` is not scheduled, aged
+data lingers and storage does not fall. It bounds storage only when maintenance actually runs.
 (Watch the unit, too: `retain` is an **interval** for `time`/`uuidv7` and a **count of intervals** for
 `id` -- a misread makes the horizon far longer than intended.)
 
@@ -377,13 +299,12 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
 1. Confirm the policy is set and that maintenance can act on it:
 
    ```sql
-   select parent, paused, closed_rows, retain_backlog, retain_drop_failures
+   select parent, paused, retain_backlog, retain_drop_failures
      from pgpm.status() where parent = 'public.events'::regclass;
    select retain, retain_batch, archive_fn from pgpm.config where parent_table = 'public.events'::regclass;
    ```
 
-   `paused = true` means maintenance is doing nothing; a large `closed_rows` means the drain is behind, so
-   the aged tail has not been homed (or reclaimed) yet. A flat `retain_backlog` with `retain_drop_failures`
+   `paused = true` means maintenance is doing nothing. A flat `retain_backlog` with `retain_drop_failures`
    also flat at zero, and `archive_fn` set, means chunked archiving simply hasn't caught up yet for the
    partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
@@ -411,12 +332,11 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
 **Verify.**
 
 ```sql
--- aged partitions are gone and the closed tail has drained; storage falls once the drops are reclaimed
-select n_partitions, closed_rows from pgpm.status() where parent = 'public.events'::regclass;
+-- aged partitions are gone; storage falls once the drops are reclaimed
+select n_partitions, retain_backlog from pgpm.status() where parent = 'public.events'::regclass;
 ```
 
-**Prevent.** Keep `maintain_all` scheduled on pg_cron and the drain keeping pace (raise `drain_batch` / run
-the cron more often) so the aged tail always reaches a partition in time to be dropped, and do not leave a
+**Prevent.** Keep `maintain_all` scheduled on pg_cron so aged partitions are dropped in time, and do not leave a
 managed table `paused` if you rely on retention to bound storage. A lagging or paused drain turns retention
 into best-effort.
 
@@ -517,7 +437,7 @@ loss. (At-scale figures and the structural note that the append-only backlog sta
    lock:
 
    ```sql
-   call pgpm.from_hypertable_cutover('public.events', 'created_at', interval '1 day', p_regrain_batch => 200000, p_paused => false);
+   call pgpm.from_hypertable_cutover('public.events', 'created_at', interval '1 day', p_drain_batch => 200000, p_paused => false);
    ```
 
    To skip the cutover's own pre-drain (e.g. you already drained by hand and want the lock taken
@@ -531,6 +451,6 @@ select * from pgpm.status() where parent = 'public.events'::regclass; -- registe
 ```
 
 **Prevent.** For update/delete-heavy workloads, drive the drain in the two-phase flow (copy, let it drain,
-then cutover) rather than relying on the one-shot, and size `p_regrain_batch` to the write rate. Append-only
+then cutover) rather than relying on the one-shot, and size `p_drain_batch` to the write rate. Append-only
 migrations rarely hit this (the backlog is structurally small -- the copy reads the current chunk last, so
 it captures appends as it goes). Migrate during a quieter write window when possible.

@@ -7,7 +7,7 @@ authoritative surface; the [user guide](guide.md) explains the concepts and how 
 The mental model in one breath: `transmute` converts a live table into a native `RANGE`-partitioned one
 by renaming the original aside and attaching it, with **zero row movement**, as one bounded **monolith**
 child (covering `[grid_floor(min), B)`), under a fresh empty `DEFAULT`. Going forward, `obtain` keeps
-real partitions ahead of the write frontier, `retain` drops whole partitions past a policy, the **drain**
+real partitions ahead of the write frontier, `retain` drops whole partitions past a policy, the **regrain**
 keeps the `DEFAULT` empty by evacuating strays, and `regrain` splits the coarse
 monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
 
@@ -22,10 +22,10 @@ Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a n
 ```sql
 pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain interval default null,
   p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false
+  p_force_uuidv7 boolean default false
 ) returns regclass
 ```
 
@@ -44,7 +44,7 @@ The new parent also takes over everything `CREATE TABLE ... LIKE` does not carry
 **column-level grants**, **row level security** (both `ENABLE` and `FORCE`), every **policy**, table and
 column **comments**, and **row triggers**. All of it is captured before the rename and re-applied inside
 the same transaction as the cutover, so the parent is never reachable without its policies. Partitions
-minted later, by `obtain`, the drain or a regrain, are given the parent's owner too rather than being
+minted later, by `obtain` or a regrain, are given the parent's owner too rather than being
 owned by whichever role runs maintenance.
 
 Policies live on the parent, and only on the parent: a parent policy governs parent-routed reads into a
@@ -70,13 +70,11 @@ Parameters:
   `interval '1 month'` (it disambiguates from the `bigint` overload).
 - `p_obtain` -- how many partitions to keep ahead of the frontier.
 - `p_retain` -- drop partitions older than this `interval`; `null` keeps everything.
-- `p_keep_default` -- keep the `DEFAULT` safety net (the default; leave it on).
-- `p_regrain_batch` -- rows per drain/regrain microbatch.
+- `p_regrain_batch` -- rows per regrain COPY microbatch.
 - `p_anchor` -- the grid origin the boundaries align to.
 - `p_paused` -- register paused (the default); `false` goes live immediately.
 - `p_incoming_fks` -- `'error'` (refuse if any incoming FK exists), `'drop'` (drop them), or `'preserve'`
-  (drop for the conversion and re-add against the new parent once the drain is idle).
-- `p_drain_adaptive` -- enable closed-loop feathering for the drain (see `set_drain_adaptive`).
+  (drop for the conversion and re-add against the new parent once the table is quiescent).
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
 
 Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
@@ -98,10 +96,9 @@ call pgpm.transmute('public.events', 'created_at', interval '1 month',
 ```sql
 pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
-  p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain bigint default null,
   p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false
 ) returns regclass
 ```
 
@@ -171,15 +168,15 @@ Scope and caveats:
 ```sql
 pgpm.from_hypertable(
   p_hypertable regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_obtain int default 30, p_retain interval default null,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_track_changes boolean default false, p_predrain boolean default true
 )
 ```
 
 The one-shot driver: runs `from_hypertable_copy` then `from_hypertable_cutover` back to back. Use it when the
 migration does not need to interleave application writes between the phases. `p_interval` and the
-`p_obtain`/`p_retain`/`p_keep_default`/`p_regrain_batch`/`p_anchor`/`p_paused` parameters pass straight through
+`p_obtain`/`p_retain`/`p_anchor`/`p_paused` parameters pass straight through to `transmute`; `p_drain_batch` is this module's own
 to `transmute` (see there); `p_control` is the time column; `p_track_changes` and `p_predrain` are described
 under `from_hypertable_copy` and `from_hypertable_cutover`. When `p_retain` is left `null`, the source's
 `drop_chunks` policy interval (if any) is carried in.
@@ -275,14 +272,14 @@ as the under-lock catch-up does; use `p_track_changes` for update/delete workloa
 ```sql
 pgpm.from_hypertable_cutover(
   p_hypertable regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_obtain int default 30, p_retain interval default null,
+  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_predrain boolean default true
 )
 ```
 
 Phase 2: the cutover. When `p_predrain` is `true` (the default), it first **pre-drains the catch-up backlog
-online** (best-effort, using `p_regrain_batch` as the batch size and residual threshold) -- the change delta
+online** (best-effort, using `p_drain_batch` as the batch size and residual threshold) -- the change delta
 (`from_hypertable_drain_delta`) when tracking is on, else the appended-rows tail
 (`from_hypertable_drain_appends`) -- so only a tiny residual is left for the lock. Then it **pre-builds the
 destination's primary key and secondary indexes online** (on the private copy, before any lock -- this is the
@@ -404,35 +401,6 @@ concurrent `obtain` defers instead of interfering, and it reports failures throu
 than raising: `maintain` cannot wrap it in an exception handler, since transaction control is illegal
 below one.
 
-### `drain_step`
-
-```sql
-pgpm.drain_step(p_parent regclass, p_batch int default null, p_include_open boolean default false)
-  returns text
-```
-
-One microbatch of the **drain**: it takes the oldest closed interval still sitting in the
-`DEFAULT` (a stray) and moves up to `p_batch` rows (default `config.drain_batch`, capped by
-`drain_max_blocks`) into a proper child, attaching the child once the interval is fully moved. An interval
-entirely below the retention horizon is reclaimed by a direct `DELETE` instead of materialized. Returns a
-status: `idle`, `moved:N`, `attached:<name>:<plain|check_skip>`, or `reclaimed:N[:done]`. `p_include_open`
-also drains the current (open) interval.
-
-### `drain_all`
-
-```sql
-call pgpm.drain_all(p_parent regclass, p_batch int default null,
-                    p_include_open boolean default false, inout p_iterations int default null)
-```
-
-Loops `drain_step` to `idle` in one call (synchronous; ignores `paused`), reporting the number of
-microbatches in `p_iterations`. Suspends any live preserve-managed FK first.
-
-A procedure, and each microbatch is its own transaction, so a full drain of a large table is not one
-long-running transaction and an interrupted run keeps the batches it finished. A managed FK stays
-suspended across those commits: if a run is interrupted, referential integrity stays off (visible as
-`status().fks_suspended`) until maintenance next finds the table quiescent and restores it.
-
 ### `retain`
 
 ```sql
@@ -471,7 +439,7 @@ iff this call dropped the partition.
 `retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
 **when**. It refuses (raises) an unmanaged table, a table with no retention policy (`config.retain` is
 null), a partition whose range is not entirely at/below the retention horizon, and an in-flight
-(unattached) drain/regrain child.
+(unattached) regrain copy-child.
 
 It returns `false`, without side effects and without logging anything, in three normal, retryable
 situations: the `pgpm.part` row is absent (already retired by another actor), it's claimed by a
@@ -540,7 +508,7 @@ source stays whole and **attached** until that swap, so a read of the parent is 
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
 complete, K children attached), or a soft no-progress status: `active` (not frozen yet), `default_dirty`
 (a stray sits in the range), or `nosubdiv` (the step does not subdivide). This is the unit `maintain`
-paces across ticks; because it copies, the cross-tick path opens **no** read gap (unlike the drain). Its
+paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its
 one FK touch is the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that
 single transaction.
 
@@ -589,15 +557,15 @@ call pgpm.maintain(p_parent regclass, inout p_status text default null)
 ```
 
 The per-table tick: `obtain`, enforce write-blocks on every attached child against the retention
-boundary, one chunked-archiving step, `retain`, one drain step, restore any preserved FK whose tail
-has drained, and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the
+boundary, one chunked-archiving step, `retain`, restore any preserved FK once the table is quiescent,
+and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the
 oldest frozen coarse child. A no-op while paused. Every step is isolated in its own subtransaction
 under a short `lock_timeout`, so it never blocks or deadlocks the live workload; a step that loses a
 lock race is deferred and retried next tick.
 
 A procedure, and each step commits before the next begins, so no step's locks outlive it. This
 matters most for `obtain`, which takes `ACCESS EXCLUSIVE` on the parent when it creates a partition:
-in a single-transaction tick that lock was held across the drain as well, stalling the whole table
+in a single-transaction tick that lock was held across the rest of the tick as well, stalling the whole table
 (readers included) for as long as the drain batch took.
 
 `p_status` reports a one-line summary, for example
@@ -755,28 +723,6 @@ Flip `config.paused`. `transmute` registers a table paused; `resume` lets schedu
 obtaining, draining, retaining (and regraining, if enabled). `pause` stops it. `drain_all`/`drain_step`
 ignore the flag, so you can still drive the drain by hand while paused.
 
-### `set_drain_adaptive`
-
-```sql
-pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true) returns void
-```
-
-Toggle adaptive (closed-loop) drain feathering. When on, each tick rides the drain's per-tick row budget
-just under the WAL supply via AIMD (additive-increase when calm, halve on checkpoint pressure) instead of
-the fixed `drain_batch`. Resets the controller state so a toggle starts cleanly.
-
-### `set_drain_ambient`
-
-```sql
-pgpm.set_drain_ambient(p_parent regclass, p_factor numeric default 2.0,
-                       p_alpha numeric default 0.2, p_floor int default 2) returns void
-```
-
-Turn on the self-calibrating ambient-contention backoff (a second feathering signal that yields when the
-drain is crowding the live workload, sensed from lock waits and read-I/O latency). `p_factor` is the
-relative surge multiple over a learned EWMA baseline (`p_factor => 0` turns it off), `p_alpha` the
-baseline smoothing, `p_floor` the idle-box guard.
-
 ### `set_regrain`
 
 ```sql
@@ -796,8 +742,7 @@ toward that granularity; `null` turns it off (regrain stays operator-driven). En
 pgpm.status() returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
-  default_rows bigint, closed_rows bigint, default_oldest text, newest_bound text,
-  last_drained timestamptz, drain_skips bigint, fks_suspended bigint, fks_unvalidated bigint,
+  newest_bound text, fks_suspended bigint, fks_unvalidated bigint,
   history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint
 )
 ```
@@ -807,16 +752,14 @@ One row per managed table. Beyond the static config it surfaces:
 - `n_partitions` / `coarse_partitions` -- attached partitions, and how many of those are still coarse
   (wider than one step). `coarse_partitions > 0` (and `history_unregrained = true`) is the regraining
   backlog: pruning and fine retention are suspended over that span until it is regrained.
-- `inflight_partitions` -- children created but not yet attached (a drain or regrain in progress; their
-  rows are durable but not visible through the parent until attach -- use `snapshot()` for a complete
-  read).
-- `default_rows` / `closed_rows` -- total and drainable-now rows in the `DEFAULT` (normally near zero;
-  these are strays the drain evacuates). `default_oldest` / `newest_bound` bracket the data.
-- `last_drained` / `drain_skips` -- progress and stall signals: a non-zero `closed_rows` with a stale
-  `last_drained` and a climbing `drain_skips` is a wedged drain; falling `closed_rows` with
-  `drain_skips ~ 0` is merely slow.
+- `inflight_partitions` -- regrain copy-children created but not yet attached. Because regrain copies
+  rather than moves, the source stays attached throughout, so a read of the parent is never short and
+  these are purely informational.
+- `newest_bound` -- the top of the forward grid. This is the write-ahead ceiling: an insert past it is
+  refused, since there is no `DEFAULT` to catch it.
 - `fks_suspended` / `fks_unvalidated` -- preserve-managed incoming FKs currently dropped (RI off) versus
-  re-added `NOT VALID` but blocked from full validation by pre-existing orphans.
+  re-added `NOT VALID` but blocked from full validation by pre-existing orphans. `fks_suspended` is a
+  transient state inside a regrain swap now, so a standing non-zero value means a swap died mid-flight.
 - `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (issue #238; not a
   child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
   is genuinely stuck.
@@ -824,36 +767,6 @@ One row per managed table. Beyond the static config it surfaces:
   dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks, or while a write-blocked
   child's chunked archiving is still catching up -- either way it should fall tick over tick. A flat
   `retain_backlog` with climbing `retain_drop_failures` is retention genuinely wedged.
-
-### `snapshot`
-
-```sql
-pgpm.snapshot(p_rowtype anyelement) returns setof anyelement
-```
-
-A complete, consistent read during a paced **drain**. While the drain has rows mid-move they live in an
-unattached child, so a plain `select` from the parent **undercounts**; `snapshot` unions the parent with
-every in-flight drain child. (It deliberately skips a regrain's copy-children -- their rows are still in the
-attached monolith -- so it never double-counts; regrain, which copies, opens no gap to cover.) Pass the
-parent's row type as a typed `null` so it can infer the table:
-
-```sql
-select count(*) from pgpm.snapshot(null::public.events);
-```
-
-It is an optimization fence (it materializes the union, so a `WHERE` does not push down) and does nothing
-for writes (a write to an already-moved drain row no-ops until the interval attaches). Single-batch
-intervals and the synchronous `drain_all`/`regrain()` never open the gap.
-
-### `check_default`
-
-```sql
-pgpm.check_default(p_parent regclass)
-  returns table (default_rows bigint, closed_rows bigint, oldest text)
-```
-
-The `DEFAULT`'s backlog: total rows, rows in closed intervals (drainable now), and the oldest control
-value. `status()` surfaces the same numbers.
 
 ### `check_uuidv7`
 
@@ -1007,31 +920,19 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7, bigint count for id; null = keep) |
 | `retain_batch` | `int` | max partitions one `retain()` call attempts, oldest first (null = unbounded) |
-| `keep_default` | `boolean` | keep the `DEFAULT` safety net |
-| `drain_batch` | `int` | rows per drain/regrain microbatch |
-| `default_table` | `name` | the `DEFAULT` partition's table name |
+| `regrain_batch` | `int` | rows per regrain COPY microbatch |
 | `paused` | `boolean` | maintenance is idle while true |
 | `created_at` | `timestamptz` | when transmuted |
 | `obtain_retry_after` | `timestamptz` | back-off marker after an obtain lock-race deferral |
-| `drain_max_blocks` | `int` | optional block budget per microbatch (caps wide rows; null = row cap only) |
+| `regrain_max_blocks` | `int` | optional block budget per microbatch (caps wide rows; null = row cap only) |
 | `regrain_to` | `text` | auto-regrain target step (null = off; see `set_regrain`) |
-| `drain_adaptive` | `boolean` | adaptive feathering on (mode 2) |
-| `drain_budget` | `int` | the adaptive controller's current row budget |
-| `drain_ckpt_seen` | `bigint` | last forced-checkpoint counter (reactive backstop) |
-| `drain_wal_lsn` / `drain_wal_at` | `pg_lsn` / `timestamptz` | previous WAL position + time (for the WAL-rate signal) |
-| `drain_wal_high_water` | `numeric` | fraction of the sustainable WAL rate at which to back off |
-| `drain_ambient_max_waiters` | `int` | absolute lock-wait cap (0 = off) |
-| `drain_ambient_factor` | `numeric` | self-calibrating ambient surge multiple (0 = off) |
-| `drain_ambient_alpha` | `numeric` | ambient baseline EWMA smoothing |
-| `drain_ambient_floor` | `int` | minimum effective baseline (idle-box guard) |
-| `drain_ambient_baseline` / `drain_ambient_io_baseline` | `numeric` | learned EWMA baselines (lock waits, I/O latency) |
-| `drain_io_read_time` / `drain_io_blks_read` | `numeric` / `bigint` | previous cumulative `pg_stat_database` I/O sample |
+| `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining) |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 
 ### `pgpm.part`
 
-The registry of managed partitions (excludes the `DEFAULT`). `lo`/`hi` are native-grid values as text.
+The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 
 | Column | Type | Meaning |
 |---|---|---|
