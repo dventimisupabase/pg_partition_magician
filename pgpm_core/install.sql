@@ -410,6 +410,24 @@ begin
 end;
 $$;
 
+-- Give a freshly minted child the PARENT's owner (#277). A table belongs to whoever created it, and
+-- anything minted after the conversion is created by whatever role runs maintenance, so without this a
+-- table's partitions drift into being owned by the maintenance role while the parent keeps the real owner.
+--
+-- The no-op guard is not just an optimisation: when maintenance already runs AS the owner the roles match
+-- and no DDL is issued at all, so this never needs a privilege the caller lacks. When they differ, the
+-- caller necessarily owns the parent already (adding a partition requires it), so the ALTER is permitted.
+create or replace function pgpm._own_like_parent(p_parent regclass, p_child regclass)
+returns void language plpgsql as $$
+declare v_owner name;
+begin
+  select pg_get_userbyid(relowner) into v_owner from pg_class where oid = p_parent;
+  if v_owner is distinct from (select pg_get_userbyid(relowner) from pg_class where oid = p_child) then
+    execute format('alter table %s owner to %I', p_child::text, v_owner);
+  end if;
+end;
+$$;
+
 -- #280: _create_partition became a PROCEDURE so its phases can commit. Drop the old function first, or
 -- an upgrade fails with "cannot change routine kind".
 drop function if exists pgpm._create_partition(pgpm.config, name, name, regclass, name, text, text);
@@ -482,6 +500,9 @@ begin
     end;
     v_method := 'check_skip';
   end if;
+
+  perform pgpm._own_like_parent(format('%I.%I', p_nsp, p_rel)::regclass,
+                                format('%I.%I', p_nsp, p_name)::regclass);
 
   insert into pgpm.part (parent_table, child_name, lo, hi)
     values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi) on conflict do nothing;
@@ -697,6 +718,7 @@ begin
                    v_nsp, v_name, v_nsp, v_rel);
     execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                    v_nsp, v_name, (v_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
+    perform pgpm._own_like_parent(p_parent, format('%I.%I', v_nsp, v_name)::regclass);   -- #277
     -- record the child the moment it exists, marked in-flight (not yet attached) so it is tracked in
     -- pgpm's catalog across a multi-batch drain, not only at the final attach below (issue #94).
     insert into pgpm.part (parent_table, child_name, lo, hi, attached)
@@ -1859,6 +1881,7 @@ begin
       -- the fine child holds all its rows now and is still standalone (it is attached later, at the swap):
       -- ANALYZE it here, off the swap's exclusive-lock window, so the swap and any query that hits it after
       -- see real stats, not reltuples = -1 (#164).
+      perform pgpm._own_like_parent(p_parent, format('%I.%I', v_nsp, v_sub_name)::regclass);   -- #277
       perform pgpm._analyze(format('%I.%I', v_nsp, v_sub_name)::regclass);
     end if;
     update pgpm.config set regrain_cursor = v_cursor where parent_table = p_parent;
@@ -2003,6 +2026,11 @@ declare
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_monolith name; v_monreg regclass;
   v_frontier_native text; v_min_raw text; v_max_raw text; v_min_native text; v_lo_native text; v_hi_native text;
+  -- #277: everything CREATE TABLE ... LIKE does NOT carry, captured before the rename and replayed onto
+  -- the new parent inside the cutover transaction.
+  v_owner name; v_acl aclitem[]; v_rls boolean; v_rls_force boolean;
+  v_comment text; v_colcom record; v_pol record; v_trg record; v_bad_trg text;
+  v_trgdefs text[] := '{}'; v_grant text; v_g record;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -2212,6 +2240,21 @@ begin
       p_parent, v_uniq_bad, quote_ident(p_control), quote_ident(p_control), quote_ident(p_control);
   end if;
 
+  -- Refuse the one trigger shape a partitioned table cannot host (#277). Measured on PG 17.10: this is
+  -- the ONLY refusal needed. Constraint triggers, statement triggers, WHEN clauses, UPDATE OF, and even
+  -- statement triggers WITH transition tables all transfer to a partitioned parent; only a FOR EACH ROW
+  -- trigger with a transition table is rejected. Refusing beats converting and dropping it, which is the
+  -- silent-loss failure this whole issue is about.
+  select string_agg(tgname, ', ' order by tgname) into v_bad_trg
+    from pg_trigger
+   where tgrelid = p_parent and not tgisinternal
+     and (tgoldtable is not null or tgnewtable is not null)
+     and (tgtype & 1) = 1;   -- TRIGGER_TYPE_ROW
+  if v_bad_trg is not null then
+    raise exception 'pg_partition_magician: cannot transmute % -- the row trigger(s) (%) use a transition table (REFERENCING OLD/NEW TABLE), which PostgreSQL does not allow on a partitioned table. Rewrite them as statement triggers (those DO carry a transition table) or drop them, then re-run transmute. pgpm refuses rather than converting and leaving the trigger behind on one child.',
+      p_parent, v_bad_trg;
+  end if;
+
   -- 0. incoming FKs (capture before the rename; record after the new parent exists). pgpm never
   -- rewrites the PK, so the referenced unique key (the reused PK) always survives and an incoming FK
   -- can be re-pointed at the new parent verbatim once the drain is idle -- the 'preserve' lifecycle.
@@ -2328,6 +2371,21 @@ begin
   -- ============================ PHASE 3: the cutover ============================
   -- Metadata only, and atomic: a raise from here rolls the whole cutover back.
 
+  -- 0b. capture what CREATE TABLE ... LIKE will NOT carry (#277): owner, grants, RLS, policies, comments
+  -- and triggers. Captured HERE, before the rename, and replayed below in this same transaction. Both
+  -- halves have to be inside the cutover: a parent that is briefly reachable with RLS off is the same
+  -- security defect as one that never gets its policies, with a shorter fuse.
+  --
+  -- Trigger definitions get a free ride. pg_get_triggerdef emits "... ON public.<original name>", and
+  -- after the rename below that name IS the new parent, so the captured text replays verbatim with no
+  -- rewriting. Policies get no such help (there is no pg_get_policydef) and are rebuilt from pg_policy.
+  select pg_get_userbyid(relowner), relacl, relrowsecurity, relforcerowsecurity
+    into v_owner, v_acl, v_rls, v_rls_force
+    from pg_class where oid = p_parent;
+  v_comment := obj_description(p_parent, 'pg_class');
+  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
+    into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
+
   -- 1. rename the live table to the MONOLITH (coarse child) name
   execute format('alter table %s rename to %I', p_parent::text, v_monolith);
   v_monreg := format('%I.%I', v_nsp, v_monolith)::regclass;
@@ -2374,6 +2432,87 @@ begin
                  pgpm._encode(p_control_kind, v_lo_native), pgpm._encode(p_control_kind, v_hi_native));
   execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
 
+  -- 7b. replay everything captured at 0b onto the new parent (#277). Same transaction as the rename and
+  -- the attach, so the parent is never reachable without its policies.
+  execute format('alter table %s owner to %I', v_parent::text, v_owner);
+
+  -- Grants. aclexplode turns relacl into (grantor, grantee, privilege, grantable) rows; a NULL relacl
+  -- means the owner's implicit defaults, which the OWNER TO above already restores. grantee = 0 is
+  -- PUBLIC, which has no role name.
+  for v_g in
+    select a.grantee, a.privilege_type, a.is_grantable
+      from pg_class c, aclexplode(c.relacl) a where c.oid = v_monreg and c.relacl is not null
+  loop
+    execute format('grant %s on %s to %s%s', v_g.privilege_type, v_parent::text,
+                   case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
+                   case when v_g.is_grantable then ' with grant option' else '' end);
+  end loop;
+  -- COLUMN-level grants, which relacl does not carry at all: they live in pg_attribute.attacl.
+  for v_g in
+    select att.attname, a.grantee, a.privilege_type, a.is_grantable
+      from pg_attribute att, aclexplode(att.attacl) a
+     where att.attrelid = v_monreg and att.attnum > 0 and not att.attisdropped and att.attacl is not null
+  loop
+    execute format('grant %s (%I) on %s to %s%s', v_g.privilege_type, v_g.attname, v_parent::text,
+                   case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
+                   case when v_g.is_grantable then ' with grant option' else '' end);
+  end loop;
+
+  -- RLS. FORCE matters as much as ENABLE: without it the table owner bypasses every policy, so an
+  -- owner-run query would see all rows and the isolation would be silently absent for exactly the role
+  -- most likely to be running reports.
+  if v_rls then
+    execute format('alter table %s enable row level security', v_parent::text);
+  end if;
+  if v_rls_force then
+    execute format('alter table %s force row level security', v_parent::text);
+  end if;
+  -- Policies live on the PARENT and only on the parent (measured: a parent policy governs parent-routed
+  -- reads into a partition, with no policy on the partition at all). Do not "fix" the apparent gap by
+  -- scattering copies onto children; direct partition access needs grants that live on the parent anyway.
+  for v_pol in
+    select polname, polcmd, polpermissive,
+           case when polroles = '{0}'::oid[] then 'public'
+                else (select string_agg(quote_ident(rolname), ', ' order by rolname)
+                        from pg_roles where oid = any(polroles)) end as roles,
+           pg_get_expr(polqual, polrelid)      as qual,
+           pg_get_expr(polwithcheck, polrelid) as withcheck
+      from pg_policy where polrelid = v_monreg
+  loop
+    execute format('create policy %I on %s as %s for %s to %s%s%s',
+      v_pol.polname, v_parent::text,
+      case when v_pol.polpermissive then 'permissive' else 'restrictive' end,
+      case v_pol.polcmd when 'r' then 'select' when 'a' then 'insert' when 'w' then 'update'
+                        when 'd' then 'delete' else 'all' end,
+      v_pol.roles,
+      case when v_pol.qual is not null then ' using (' || v_pol.qual || ')' else '' end,
+      case when v_pol.withcheck is not null then ' with check (' || v_pol.withcheck || ')' else '' end);
+  end loop;
+
+  if v_comment is not null then
+    execute format('comment on table %s is %L', v_parent::text, v_comment);
+  end if;
+  for v_colcom in
+    select a.attname, col_description(v_monreg, a.attnum) as c
+      from pg_attribute a
+     where a.attrelid = v_monreg and a.attnum > 0 and not a.attisdropped
+       and col_description(v_monreg, a.attnum) is not null
+  loop
+    execute format('comment on column %s.%I is %L', v_parent::text, v_colcom.attname, v_colcom.c);
+  end loop;
+
+  -- Triggers LAST, and the monolith's own originals are dropped FIRST. Creating on the parent clones the
+  -- trigger onto every partition including the monolith, so leaving the original in place would give the
+  -- monolith two and fire it twice for every row routed there. Order is the whole correctness argument.
+  if array_length(v_trgdefs, 1) > 0 then
+    for v_trg in select tgname from pg_trigger where tgrelid = v_monreg and not tgisinternal loop
+      execute format('drop trigger %I on %s', v_trg.tgname, v_monreg::text);
+    end loop;
+    foreach v_grant in array v_trgdefs loop
+      execute v_grant;   -- names the ORIGINAL table, which is now the parent: replays verbatim
+    end loop;
+  end if;
+
   -- 8. parent key -- adopts the monolith's kept constraint index (metadata-only, no rebuild): a PRIMARY
   -- KEY when the reused key was the PK, a UNIQUE constraint when it was a unique constraint.
   if v_add_pk then
@@ -2410,6 +2549,7 @@ begin
   -- after the parent's PK and secondary indexes exist, it auto-inherits matching (empty) indexes. Kept
   -- empty, it keeps obtain on its cheap plain path; the drain evacuates any stray that lands here.
   execute format('create table %I.%I partition of %I.%I default', v_nsp, v_default, v_nsp, v_rel);
+  perform pgpm._own_like_parent(v_parent, format('%I.%I', v_nsp, v_default)::regclass);   -- #277
   v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
 
   -- 10. register
@@ -2596,6 +2736,7 @@ declare
   v_mon name; v_mon_lo text; v_mon_hi text; v_ncast text; v_outside boolean;
   v_idcols name[]; v_idmax bigint[]; v_col name; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   r pgpm.dropped_fk%rowtype; v_cdelta name; v_cfn name;
+  v_trgdefs text[] := '{}'; v_tdef text;   -- #277
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then
@@ -2657,6 +2798,14 @@ begin
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);
   end loop;
 
+  -- Capture the parent's triggers before it is dropped (#277). transmute dropped the monolith's own
+  -- originals in favour of the parent's, which clone down to every partition, and DETACH strips those
+  -- clones -- so without this the reversal silently returns a table with no triggers at all. As in
+  -- transmute, pg_get_triggerdef names the PARENT, and the restored table takes that name back below, so
+  -- the definitions replay verbatim.
+  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
+    into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
+
   -- detach the MONOLITH (the original table, holding everything; PK + secondary indexes intact), then
   -- drop the childless parent -- which cascades the empty DEFAULT and any empty forward partitions, and
   -- takes the parent PK, the partitioned _pgpm indexes, and the parent's identity sequence with it.
@@ -2680,6 +2829,11 @@ begin
   -- secondary indexes, so those names are already the originals.)
   execute format('alter table %s rename to %I', v_monreg::text, v_rel);
   v_restored := format('%I.%I', v_nsp, v_rel)::regclass;
+
+  -- Replay the captured triggers onto the restored table, now that it carries the original name again.
+  foreach v_tdef in array v_trgdefs loop
+    execute v_tdef;
+  end loop;
 
   -- re-add every preserved incoming FK against the restored table. The recorded definition names the
   -- parent, whose name the restored table now carries again. Mirror restore_incoming_fks: a
