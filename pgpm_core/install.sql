@@ -227,6 +227,9 @@ create table if not exists pgpm.dropped_fk (
 -- upgrade path for installs that predate these columns
 alter table pgpm.dropped_fk add column if not exists restored_at timestamptz;
 alter table pgpm.dropped_fk add column if not exists validated_at timestamptz;
+-- #265: when a VALIDATE fails on a pre-existing orphan, do not retry it on the very next tick -- the
+-- attempt re-scans the whole referencing table each time. Set a window instead, like config.obtain_retry_after.
+alter table pgpm.dropped_fk add column if not exists validate_retry_after timestamptz;
 -- backfill validated_at for FKs already re-added by an older pgpm (which validated in one step): mark
 -- them validated iff the actual constraint is currently convalidated. Keyed off pg_constraint, not a
 -- blanket update, so a genuinely re-added-NOT-VALID FK (convalidated = false) is never wrongly marked.
@@ -3118,7 +3121,7 @@ language plpgsql as $$
 declare
   cfg pgpm.config;
   v_made int := 0; v_archived int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
-  v_regrain text := 'skipped'; v_regrain_child name;
+  v_regrain text := 'skipped'; v_regrain_child name; v_validated int := 0;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int; v_deferred boolean;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
@@ -3385,6 +3388,25 @@ begin
   exception when others then
     v_note := v_note || ' restore_fk_deferred';
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_restore_fk', left(sqlerrm, 200));
+  end;
+
+  -- BOUNDARY (#265). The restore above re-adds the FK NOT VALID and stops, which takes SHARE ROW
+  -- EXCLUSIVE on the managed parent -- briefly, since NOT VALID scans nothing. This drops that lock
+  -- BEFORE the validation scan below, which is the entire point: the two used to share a transaction and
+  -- the scan ran under the ADD's lock, blocking writes on the parent for O(referencing table).
+  commit;
+  perform set_config('lock_timeout', '3s', true);
+
+  -- Finish the validation, in its own transaction, where the VALIDATE holds only SHARE UPDATE EXCLUSIVE
+  -- on the referencing table and ROW SHARE on the parent -- neither of which blocks writes. Usually the
+  -- tick after the restore. p_respect_backoff so an FK blocked by a pre-existing orphan parks for five
+  -- minutes rather than re-scanning the referencing table every tick to learn the same thing.
+  begin
+    v_validated := pgpm.validate_incoming_fks(p_parent, p_respect_backoff => true);
+    if v_validated > 0 then v_note := v_note || format(' validated_fk[%s]', v_validated); end if;
+  exception when others then
+    v_note := v_note || ' validate_fk_deferred';
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_validate_fk', left(sqlerrm, 200));
   end;
 
   p_status := format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
@@ -4006,17 +4028,20 @@ begin
       insert into pgpm.log (parent_table, action, method)
         values (p_parent, 'fail_restore_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;
-    -- validate the just-re-added NOT VALID FK once; a pre-existing orphan keeps it NOT VALID (still
-    -- enforcing new writes) and is surfaced, NOT rolled back into the dropped state.
-    if v_readded and not v_is_part then
-      begin
-        execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
-        update pgpm.dropped_fk set validated_at = now() where id = r.id;
-      exception when others then
-        insert into pgpm.log (parent_table, action, method)
-          values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
-      end;
-    end if;
+    -- The VALIDATE deliberately does NOT happen here (#265). It used to, in its own subtransaction, which
+    -- isolated its errors but not its locks: the ADD above takes SHARE ROW EXCLUSIVE on BOTH the
+    -- referencing table and the MANAGED PARENT, and a subtransaction releases nothing, so that lock was
+    -- held across an O(referencing table) scan. SHARE ROW EXCLUSIVE conflicts with ROW EXCLUSIVE, so
+    -- writes to the parent -- the table pgpm exists to keep online -- blocked for the whole scan.
+    -- Measured at 224 ms against 4M referencing rows, and linear.
+    --
+    -- Splitting them by COMMITting here is not available: this function is also called by regrain_step
+    -- mid-swap, and regrain_step is a FUNCTION whose driver regrain() loops it in ONE transaction,
+    -- atomic and gap-free. Converting this to a committing procedure would cascade into breaking that.
+    --
+    -- So the FK is left NOT VALID, which already enforces every NEW write, and maintain() validates it on
+    -- a later tick in its own transaction -- where the VALIDATE holds only SHARE UPDATE EXCLUSIVE on the
+    -- referencing table and ROW SHARE on the parent, neither of which blocks writes.
   end loop;
   return v_n;
 end;
@@ -4025,21 +4050,37 @@ $$;
 -- validate_incoming_fks(): finish validating any preserve-managed FK that was re-added NOT VALID but
 -- not yet validated (its pre-existing orphans blocked it). Run after clearing the orphans
 -- (pgpm.incoming_fk_orphans() lists the counts). Each VALIDATE is isolated, so one still-blocked FK
--- does not stop the others; returns the number newly validated. maintenance does NOT auto-retry the
--- VALIDATE every tick (it would re-scan the referencing table each time), so this is the deliberate
--- operator step to fully validate once the data is clean.
-create or replace function pgpm.validate_incoming_fks(p_parent regclass)
+-- does not stop the others; returns the number newly validated.
+--
+-- maintain() calls this on a later tick with p_respect_backoff => true, which is what completes the
+-- validation without operator action now that restore_incoming_fks deliberately stops at NOT VALID
+-- (#265). The back-off is what makes that safe: a FAILING validate re-scans the referencing table to
+-- discover it still cannot succeed, so a failure parks it for five minutes instead of burning that scan
+-- every tick. A successful one sets validated_at and is never revisited.
+--
+-- Called directly by an operator it ignores the back-off, since the point of running it by hand is that
+-- the orphans have just been cleared and the answer should be immediate.
+create or replace function pgpm.validate_incoming_fks(
+  p_parent regclass, p_respect_backoff boolean default false
+)
 returns int language plpgsql as $$
 declare r pgpm.dropped_fk%rowtype; v_n int := 0;
 begin
   for r in select * from pgpm.dropped_fk
-            where parent_table = p_parent and restored_at is not null and validated_at is null order by id loop
+            where parent_table = p_parent and restored_at is not null and validated_at is null
+              and (not p_respect_backoff
+                   or coalesce(validate_retry_after, '-infinity'::timestamptz) <= clock_timestamp())
+            order by id loop
     begin
       execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
-      update pgpm.dropped_fk set validated_at = now() where id = r.id;
+      update pgpm.dropped_fk set validated_at = now(), validate_retry_after = null where id = r.id;
       insert into pgpm.log (parent_table, action, method) values (p_parent, 'validate_incoming_fk', r.constraint_name);
       v_n := v_n + 1;
     exception when others then
+      -- A failed VALIDATE re-scanned the referencing table to get here. Wait before doing that again
+      -- (#265); the orphans blocking it are cleared by hand, so a tight retry only burns I/O.
+      update pgpm.dropped_fk set validate_retry_after = clock_timestamp() + interval '5 minutes'
+        where id = r.id;
       insert into pgpm.log (parent_table, action, method)
         values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;

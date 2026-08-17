@@ -930,20 +930,33 @@ pgpm.restore_incoming_fks(p_parent regclass) returns int
 ```
 
 Re-adds each dropped preserve-managed FK against the new parent, returning the number re-added. Self-gates
-on quiescence: a no-op unless the closed tail is drained and no in-flight child remains. Each FK is re-added
-`NOT VALID` then validated in a separate subtransaction, so an orphan blocking one validation leaves that
-FK enforcing new writes (surfaced as `fks_unvalidated`) without rolling back the re-add or blocking others.
+on quiescence: a no-op unless the closed tail is drained and no in-flight child remains.
+
+It re-adds each FK `NOT VALID` and **stops there**. `NOT VALID` already enforces every *new* write, so
+referential integrity is live the moment this returns; only pre-existing rows are unverified, which
+`status().fks_unvalidated` reports. `maintain` finishes the validation on a later tick.
+
+That split is deliberate. `ADD CONSTRAINT` takes `SHARE ROW EXCLUSIVE` on **both** the referencing table
+and the managed parent, and `SHARE ROW EXCLUSIVE` conflicts with `ROW EXCLUSIVE`. Validating inline held
+that lock across a scan of the referencing table, so writes to the parent blocked for a time proportional
+to a table pgpm does not own: 224 ms at 4M referencing rows, and linear.
 
 ### `validate_incoming_fks`
 
 ```sql
-pgpm.validate_incoming_fks(p_parent regclass) returns int
+pgpm.validate_incoming_fks(p_parent regclass, p_respect_backoff boolean default false) returns int
 ```
 
-Finishes validating any preserve-managed FK that was re-added `NOT VALID` but is not yet validated (its
-orphans blocked it). Run after clearing the orphans. Returns the number newly validated; each is isolated,
-so one still-blocked FK does not stop the others. (Maintenance does not auto-retry validation, since it
-would re-scan the referencing table every tick.)
+Finishes validating any preserve-managed FK that was re-added `NOT VALID` but is not yet validated.
+Returns the number newly validated; each is isolated, so one still-blocked FK does not stop the others.
+In its own transaction the `VALIDATE` holds only `SHARE UPDATE EXCLUSIVE` on the referencing table and
+`ROW SHARE` on the parent, neither of which blocks writes.
+
+`maintain` calls this every tick with `p_respect_backoff => true`, which is what completes the validation
+without operator action. A *failed* validation re-scans the referencing table to discover it still cannot
+succeed, so a failure parks that FK for five minutes (`dropped_fk.validate_retry_after`) rather than
+burning that scan every tick. Called by hand it ignores the back-off, since the point of running it
+yourself is that you have just cleared the orphans and want the answer now.
 
 ### `incoming_fk_orphans`
 
