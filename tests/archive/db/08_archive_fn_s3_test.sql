@@ -34,7 +34,7 @@ select pgpm.set_archive_fn('public.a8', 'pgpm.archive_to_s3_ndjson(regclass,name
 -- eligibility math is already proven). One maintain() tick both write-blocks every eligible
 -- child (#235) and archives each of them in a single chunk (the default 8 MiB byte budget
 -- comfortably covers each one).
-select pgpm.maintain('public.a8');
+call pgpm.maintain('public.a8');
 
 select is(
   (select count(*)::int from pgpm.archive_ledger where parent_table = 'public.a8'::regclass),
@@ -90,7 +90,7 @@ select mk_archive_config('a8p', false);
 update pgpm.config set retain_batch = 0 where parent_table = 'public.a8p'::regclass;
 select pgpm.set_archive_fn('public.a8p', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 
-select pgpm.maintain('public.a8p');
+call pgpm.maintain('public.a8p');
 
 select is(
   (select count(*)::int from pgpm.archive_ledger where parent_table = 'public.a8p'::regclass),

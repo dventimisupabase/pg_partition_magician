@@ -39,9 +39,8 @@ select is(
       and c.relname in (select child_name from pgpm.part where parent_table = 'public.wb61'::regclass)),
   0, 'before any maintain() tick, no child has the write-block trigger');
 
-select lives_ok(
-  $$ select pgpm.maintain('public.wb61') $$,
-  'a maintain() tick runs (retain_batch=0, so retain() attempts nothing this tick)');
+call pgpm.maintain('public.wb61');
+select pass('a maintain() tick runs (retain_batch=0, so retain() attempts nothing this tick)');
 
 select ok(
   exists (select 1 from pg_trigger where tgname = 'pgpm_write_block'
@@ -106,9 +105,8 @@ select lives_ok(
        (select child_name from pgpm_test61.names where lo = '80000')) $$,
   '_remove_write_block is a no-op (not an error) on a child that was never blocked');
 
-select lives_ok(
-  $$ select pgpm.maintain('public.wb61') $$,
-  're-running maintain() is idempotent: no duplicate-trigger error');
+call pgpm.maintain('public.wb61');
+select pass('re-running maintain() is idempotent: no duplicate-trigger error');
 
 select is(
   (select count(*)::int from pg_trigger
@@ -119,9 +117,8 @@ select is(
 -- loosen retention: boundary becomes grid_floor(110000 - 500000) -- far below every partition's lo,
 -- so nothing stays eligible and every write block installed above should come back off.
 update pgpm.config set retain = 500000 where parent_table = 'public.wb61'::regclass;
-select lives_ok(
-  $$ select pgpm.maintain('public.wb61') $$,
-  'maintain() runs after config.retain is loosened');
+call pgpm.maintain('public.wb61');
+select pass('maintain() runs after config.retain is loosened');
 
 select ok(
   not exists (select 1 from pg_trigger where tgname = 'pgpm_write_block'

@@ -46,11 +46,11 @@ select is(
 -- many ticks it actually took.
 create table pgpm_test63.progress (n int);
 do $$
-declare i int := 0; v_child name;
+declare i int := 0; v_child name; v_status text;
 begin
   select child_name into v_child from pgpm_test63.bounds where lo = '0';
   while not pgpm._archive_fully_covered('public.ac63', v_child) and i < 100 loop
-    perform pgpm.maintain('public.ac63');
+    call pgpm.maintain('public.ac63', v_status);
     i := i + 1;
   end loop;
   insert into pgpm_test63.progress values (i);
@@ -121,9 +121,8 @@ select ok(
   pgpm._archive_fully_covered('public.ac63n', (select child_name from pgpm.part where parent_table = 'public.ac63n'::regclass limit 1)),
   'a partition with archive_fn null (strategy ''none'') is immediately fully covered, with no maintain() tick needed');
 
-select lives_ok(
-  $$ select pgpm.maintain('public.ac63n') $$,
-  'maintain() runs fine on a none-strategy table');
+call pgpm.maintain('public.ac63n');
+select pass('maintain() runs fine on a none-strategy table');
 
 select is(
   (select count(*)::int from pgpm.archive_ledger where parent_table = 'public.ac63n'::regclass),

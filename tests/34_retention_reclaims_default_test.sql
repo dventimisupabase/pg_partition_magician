@@ -30,7 +30,7 @@ select is(
      where created_at < date_trunc('month', now()) - interval '2 months'),
   30, 'setup: 30 aged strays (below the horizon) sit in the DEFAULT');
 
-select pgpm.drain_all('public.ret_t');
+call pgpm.drain_all('public.ret_t');
 
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.ret_t)

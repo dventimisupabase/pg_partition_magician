@@ -30,7 +30,7 @@ select is(
   1, 'restore fires immediately: the monolith holds all referenced rows, so no closed tail blocks it');
 
 -- the scheduled path is idempotent: a handful of maintenance ticks leave the FK live, default empty
-do $$ begin for i in 1..12 loop perform pgpm.maintain('public.m'); end loop; end $$;
+do $$ declare v_status text; begin for i in 1..12 loop call pgpm.maintain('public.m', v_status); end loop; end $$;
 
 select is(
   (select closed_rows from pgpm.check_default('public.m')),

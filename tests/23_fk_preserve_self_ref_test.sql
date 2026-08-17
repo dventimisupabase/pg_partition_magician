@@ -21,7 +21,7 @@ select is(
   (select count(*)::int from pgpm.dropped_fk where parent_table = 'public.emp'::regclass),
   1, 'the self-referential FK is recorded for restoration');
 
-select pgpm.drain_all('public.emp', p_include_open => true);
+call pgpm.drain_all('public.emp', p_include_open => true);
 
 select is(
   (select pgpm.restore_incoming_fks('public.emp')),

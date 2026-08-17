@@ -23,9 +23,8 @@ select cmp_ok(
   '>', 0,
   'a backdated stray lands in the otherwise-empty DEFAULT as a closed interval');
 
-select cmp_ok(
-  pgpm.drain_all('public.dr', p_include_open => true),
-  '>', 0,
+call pgpm.drain_all('public.dr', p_include_open => true) \gset
+select cmp_ok(:p_iterations, '>', 0,
   'the drain performs at least one batch evacuating the stray');
 
 select is(

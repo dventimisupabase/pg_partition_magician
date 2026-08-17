@@ -26,7 +26,7 @@ select pgpm.set_regrain('public.arf', '100');                       -- enable fe
 
 -- one maintain tick feathers a COPY microbatch. Because regrain copies (it never moves referenced rows out of
 -- the parent), the live FK must be left ALONE -- not suspended the way the drain suspends it.
-select pgpm.maintain('public.arf');
+call pgpm.maintain('public.arf');
 select is(
   (select count(*)::int from pg_constraint
      where conrelid = 'public.arf_ref'::regclass and contype = 'f' and confrelid = 'public.arf'::regclass),
@@ -42,7 +42,7 @@ select lives_ok(
   'mid-regrain: a referencing insert to an in-range key succeeds (the key never left the parent)');
 
 -- drive the regrain to completion across ticks; the atomic swap runs with the FK live the whole time
-do $$ begin for i in 1..60 loop perform pgpm.maintain('public.arf'); end loop; end $$;
+do $$ declare v_status text; begin for i in 1..60 loop call pgpm.maintain('public.arf', v_status); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.arf'::regclass),

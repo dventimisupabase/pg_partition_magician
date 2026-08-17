@@ -45,7 +45,7 @@ select cmp_ok(
   '>', 0::bigint, 'status() counts drain deferrals since the last progress (a wedge is visible)');
 
 -- drain to completion: backlog clears and progress is recorded
-select pgpm.drain_all('public.s_t', p_include_open => true);
+call pgpm.drain_all('public.s_t', p_include_open => true);
 
 -- (5) caught up: closed_rows back to 0
 select is(

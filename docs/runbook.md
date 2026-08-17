@@ -218,7 +218,7 @@ empty.
      every tick). Keep more partitions ahead
      (`update pgpm.config set obtain = <n> where parent_table = 'public.events'::regclass;`) and/or run the
      cron more often; force one now in a brief write lull with `select pgpm.obtain('public.events');`, and
-     catch up the backlog with `select pgpm.drain_all('public.events');`. On a perpetually-hot table,
+     catch up the backlog with `call pgpm.drain_all('public.events');`. On a perpetually-hot table,
      schedule the conversion/obtain during a quieter window.
    - **Backdated / late-arriving** -- the keys sit well below the frontier: a producer is emitting old
      timestamps/ids (clock skew, a replay or backfill), or your `retain` window is narrower than the real
@@ -270,7 +270,7 @@ So **merely slow** is the common case and **wedged** is a corner -- but both are
 
    ```sql
    update pgpm.config set drain_batch = 20000 where parent_table = 'public.events'::regclass;  -- bigger microbatch
-   select pgpm.drain_all('public.events');                                                     -- catch up now (synchronous)
+   call pgpm.drain_all('public.events');                                                       -- catch up now (synchronous)
    ```
 
 3. If it is **wedged** (a stale `last_drained`, climbing `drain_skips`), look for the cause in the log:
@@ -393,9 +393,9 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
 2. Run a maintenance pass, or force the reclaim by hand:
 
    ```sql
-   select pgpm.maintain('public.events');     -- one pass: obtain, retain, drain (and auto-regrain)
+   call pgpm.maintain('public.events');       -- one pass: obtain, retain, drain (and auto-regrain)
    -- or catch up now, synchronously:
-   select pgpm.drain_all('public.events');    -- evacuate / reclaim the closed tail
+   call pgpm.drain_all('public.events');      -- evacuate / reclaim the closed tail
    select pgpm.retain('public.events');       -- drop aged partitions now
    select pgpm.retire('public.events', 'events_p...');  -- or surgically: drop ONE eligible partition
    ```

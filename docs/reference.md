@@ -389,12 +389,17 @@ also drains the current (open) interval.
 ### `drain_all`
 
 ```sql
-pgpm.drain_all(p_parent regclass, p_batch int default null, p_include_open boolean default false)
-  returns int
+call pgpm.drain_all(p_parent regclass, p_batch int default null,
+                    p_include_open boolean default false, inout p_iterations int default null)
 ```
 
-Loops `drain_step` to `idle` in one call (synchronous; ignores `paused`), returning the number of
-microbatches. Suspends any live preserve-managed FK first.
+Loops `drain_step` to `idle` in one call (synchronous; ignores `paused`), reporting the number of
+microbatches in `p_iterations`. Suspends any live preserve-managed FK first.
+
+A procedure, and each microbatch is its own transaction, so a full drain of a large table is not one
+long-running transaction and an interrupted run keeps the batches it finished. A managed FK stays
+suspended across those commits: if a run is interrupted, referential integrity stays off (visible as
+`status().fks_suspended`) until maintenance next finds the table quiescent and restores it.
 
 ### `retain`
 
@@ -539,7 +544,7 @@ chosen steps.
 ### `maintain`
 
 ```sql
-pgpm.maintain(p_parent regclass) returns text
+call pgpm.maintain(p_parent regclass, inout p_status text default null)
 ```
 
 The per-table tick: `obtain`, enforce write-blocks on every attached child against the retention
@@ -547,8 +552,17 @@ boundary, one chunked-archiving step, `retain`, one drain step, restore any pres
 has drained, and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the
 oldest frozen coarse child. A no-op while paused. Every step is isolated in its own subtransaction
 under a short `lock_timeout`, so it never blocks or deadlocks the live workload; a step that loses a
-lock race is deferred and retried next tick. Returns a one-line summary, for example
-`obtained=2 archived=1 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`.
+lock race is deferred and retried next tick.
+
+A procedure, and each step commits before the next begins, so no step's locks outlive it. This
+matters most for `obtain`, which takes `ACCESS EXCLUSIVE` on the parent when it creates a partition:
+in a single-transaction tick that lock was held across the drain as well, stalling the whole table
+(readers included) for as long as the drain batch took.
+
+`p_status` reports a one-line summary, for example
+`obtained=2 archived=1 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`. Call
+it as `call pgpm.maintain('public.events')` and the summary comes back as a result row; from
+PL/pgSQL, pass a variable to receive it.
 
 Write-blocking (issue #235): a child whose whole range sits at/below the retention horizon
 (`_retain_boundary`, the same one `retain` itself uses) gets a `BEFORE INSERT OR UPDATE OR DELETE`

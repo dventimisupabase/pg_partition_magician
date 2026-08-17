@@ -32,7 +32,7 @@ select cmp_ok(
   (select inflight_partitions from pgpm.status() where parent = 'public.inflight_t'::regclass),
   '>', 0::bigint, 'status() surfaces the in-flight (unattached) partition count');
 
-select pgpm.drain_all('public.inflight_t', p_include_open => true);
+call pgpm.drain_all('public.inflight_t', p_include_open => true);
 select is(
   (select count(*)::int from pgpm.part where parent_table = 'public.inflight_t'::regclass and not attached),
   0, 'once attached, the child is no longer marked in-flight');

@@ -34,7 +34,7 @@ select cmp_ok(
 );
 
 create temporary table _before_uuid as select count(*) as n from public.events_uuid;
-select pgpm.drain_all('public.events_uuid', p_include_open => true);
+call pgpm.drain_all('public.events_uuid', p_include_open => true);
 
 select is(
   (select count(*) from public.events_uuid_default)::int,

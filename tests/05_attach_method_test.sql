@@ -17,7 +17,7 @@ select pgpm.obtain('public.am');   -- forward partitions, plain-attached (empty 
 -- a backdated stray for the drain to evacuate via check_skip
 insert into public.am (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 10) g;
-select pgpm.drain_all('public.am', p_include_open => true);
+call pgpm.drain_all('public.am', p_include_open => true);
 
 select cmp_ok(
   (select count(*) from pgpm.log where parent_table = 'public.am'::regclass and action = 'obtain' and method = 'plain')::int,

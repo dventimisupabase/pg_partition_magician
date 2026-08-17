@@ -34,7 +34,7 @@ select is(
   (select count(*)::int from pgpm.snapshot(null::public.snap)),
   40, 'snapshot() restores the complete row set during the drain');
 
-select pgpm.drain_all('public.snap');
+call pgpm.drain_all('public.snap');
 select is(
   (select count(*)::int from public.snap),
   40, 'after the interval fully drains and attaches, the parent is whole again');

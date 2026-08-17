@@ -30,7 +30,7 @@ select is(
   1, 'the dropped FK was recorded for restoration');
 
 -- convert to completion (synchronous path), then restore
-select pgpm.drain_all('public.m', p_include_open => true);
+call pgpm.drain_all('public.m', p_include_open => true);
 
 select is(
   (select pgpm.restore_incoming_fks('public.m')),

@@ -123,7 +123,8 @@ select is((select drain_ambient_floor from pgpm.config where parent_table = 'pub
           2, 'ambient surge floor defaults to 2 (no false fire on a couple of transient waiters)');
 select is((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
           NULL::numeric, 'ambient baseline starts unlearned (NULL until the first adaptive tick)');
-select lives_ok($$ select pgpm.maintain('public.evt') $$, 'a fixed-mode maintenance tick runs');
+call pgpm.maintain('public.evt');
+select pass('a fixed-mode maintenance tick runs');
 select is((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
           NULL, 'fixed mode never populates the adaptive budget');
 
@@ -140,7 +141,7 @@ select is((select drain_ambient_factor from pgpm.config where parent_table = 'pu
 select is((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
           NULL::numeric, 'set_drain_ambient resets the learned baseline so it re-learns from scratch');
 -- a draining adaptive tick with the signal on must LEARN a baseline (EWMA seeds from the first sample)
-select pgpm.maintain('public.evt');
+call pgpm.maintain('public.evt');
 select isnt((select drain_ambient_baseline from pgpm.config where parent_table = 'public.evt'::regclass),
             NULL::numeric, 'a draining adaptive tick with the ambient signal on learns a baseline');
 -- back to the WAL-only regime so the calm/congested ticks below stay deterministic
@@ -154,19 +155,19 @@ update pgpm.config set drain_ambient_factor = 0 where parent_table = 'public.evt
 update pgpm.config set drain_budget = 4000, drain_ckpt_seen = pgpm._forced_checkpoints(),
                        drain_wal_lsn = null, drain_wal_at = null
   where parent_table = 'public.evt'::regclass;
-select pgpm.maintain('public.evt');
+call pgpm.maintain('public.evt');
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
               '>', 4000, 'calm tick: the controller recovers the budget upward toward the ceiling');
 
 -- ---- a congested tick (baseline below current counter => +delta) backs the budget OFF (halves) -----
 update pgpm.config set drain_budget = 8000, drain_ckpt_seen = pgpm._forced_checkpoints() - 1
   where parent_table = 'public.evt'::regclass;
-select pgpm.maintain('public.evt');
+call pgpm.maintain('public.evt');
 select cmp_ok((select drain_budget from pgpm.config where parent_table = 'public.evt'::regclass),
               '<', 8000, 'congested tick: the controller backs the budget off (forced checkpoint sensed)');
 
 -- ---- correctness is preserved: adaptive still drains the closed tail to zero -----------------------
-do $$ begin for i in 1..40 loop perform pgpm.maintain('public.evt'); end loop; end $$;
+do $$ declare v_status text; begin for i in 1..40 loop call pgpm.maintain('public.evt', v_status); end loop; end $$;
 select is((select closed_rows from pgpm.check_default('public.evt')),
           0::bigint, 'adaptive mode still drains the closed tail to zero');
 

@@ -34,7 +34,7 @@ select lives_ok(
   'an orphan reference is accepted while the preserved FK is suspended (RI off)');
 
 -- drain to completion, then restore: re-adds NOT VALID, does NOT brick on the pre-existing orphan
-select pgpm.drain_all('public.fk_m', p_include_open => true);
+call pgpm.drain_all('public.fk_m', p_include_open => true);
 select cmp_ok(
   (select pgpm.restore_incoming_fks('public.fk_m')), '>=', 1,
   'restore re-adds the FK (does not brick on the pre-existing orphan)');

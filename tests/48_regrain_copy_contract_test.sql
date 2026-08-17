@@ -18,8 +18,8 @@ select pgpm.set_regrain('public.cc', '50');                        -- enable fea
 -- Two maintain ticks: the first installs change capture and returns 'prepared' without copying (#267 --
 -- CREATE TRIGGER takes SHARE ROW EXCLUSIVE, so it gets its own tick to keep that hold O(1)), the second
 -- does a partial COPY of one budget microbatch. The regrain is NOT finished and copies are in flight.
-select pgpm.maintain('public.cc');
-select pgpm.maintain('public.cc');
+call pgpm.maintain('public.cc');
+call pgpm.maintain('public.cc');
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.cc'::regclass),
@@ -60,7 +60,7 @@ select is(
   300, 'mid-regrain: snapshot() returns 300 history rows, not 300 + the in-flight copies');
 
 -- drive the regrain to completion across ticks
-do $$ begin for i in 1..60 loop perform pgpm.maintain('public.cc'); end loop; end $$;
+do $$ declare v_status text; begin for i in 1..60 loop call pgpm.maintain('public.cc', v_status); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.cc'::regclass),

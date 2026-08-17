@@ -20,7 +20,7 @@ call pgpm.transmute('public.an', 'created_at', interval '1 month', p_paused => f
 -- a backdated stray (3 months back) lands in the empty DEFAULT, in a closed interval below the monolith
 insert into public.an (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 50) g;
-select pgpm.drain_all('public.an', p_include_open => true);
+call pgpm.drain_all('public.an', p_include_open => true);
 
 select cmp_ok(
   (select c.reltuples::int from pg_class c

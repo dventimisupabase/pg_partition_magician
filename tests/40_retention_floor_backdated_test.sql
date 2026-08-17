@@ -32,7 +32,7 @@ select is(
 
 -- a maintenance cycle: the retention-aware drain reclaims the below-horizon row, by policy. snapshot()
 -- gives the complete read (ruling out the drain visibility gap as the cause).
-select pgpm.drain_all('public.bd_t', p_include_open => true);
+call pgpm.drain_all('public.bd_t', p_include_open => true);
 select pgpm.retain('public.bd_t');
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.bd_t) where body = 'backdated'),

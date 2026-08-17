@@ -28,7 +28,7 @@ update pgpm.config set archive_fn = 'pgpm._archive_noop(regclass,name,text,text)
   where parent_table = 'public.rg64a'::regclass;
 
 -- one tick: write-blocked immediately, but archiving has only made partial (bounded) progress.
-select pgpm.maintain('public.rg64a');
+call pgpm.maintain('public.rg64a');
 
 select ok(
   pgpm._is_write_blocked('public.rg64a', (select child_name from pgpm_test64.bounds_a)),
@@ -50,13 +50,13 @@ select throws_like(
 -- raise (it is no longer a tracked partition) rather than return true -- loop on existence instead.
 create table pgpm_test64.progress_a (n int);
 do $$
-declare i int := 0; v_child name;
+declare i int := 0; v_child name; v_status text;
 begin
   select child_name into v_child from pgpm_test64.bounds_a;
   while exists (select 1 from pgpm.part where parent_table = 'public.rg64a'::regclass and child_name = v_child)
         and i < 100
   loop
-    perform pgpm.maintain('public.rg64a');
+    call pgpm.maintain('public.rg64a', v_status);
     i := i + 1;
   end loop;
   insert into pgpm_test64.progress_a values (i);
@@ -88,7 +88,7 @@ select is(
   (select archive_fn from pgpm.config where parent_table = 'public.rg64b'::regclass),
   null::regprocedure, 'no archive strategy is configured for this table');
 
-select pgpm.maintain('public.rg64b');   -- ONE tick: write-block, "archive" (trivially covered), retain -- all in it
+call pgpm.maintain('public.rg64b');   -- ONE tick: write-block, "archive" (trivially covered), retain -- all in it
 
 select ok(
   not exists (select 1 from pgpm.part where parent_table = 'public.rg64b'::regclass

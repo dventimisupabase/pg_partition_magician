@@ -20,9 +20,8 @@ select pass('transmute the table (paused by default)');
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'transmute registers the table paused by default');
-select is(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance is a no-op while paused');
+call pgpm.maintain('public.pr') \gset
+select is(:'p_status'::text, 'paused', 'maintenance is a no-op while paused');
 
 -- resume: scheduled maintenance acts.
 select lives_ok(
@@ -31,9 +30,8 @@ select lives_ok(
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   false, 'resume clears the paused flag');
-select isnt(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance acts once resumed');
+call pgpm.maintain('public.pr') \gset
+select isnt(:'p_status'::text, 'paused', 'maintenance acts once resumed');
 
 -- pause: back to a no-op.
 select lives_ok(
@@ -42,9 +40,8 @@ select lives_ok(
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'pause sets the paused flag');
-select is(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance is a no-op again while paused');
+call pgpm.maintain('public.pr') \gset
+select is(:'p_status'::text, 'paused', 'maintenance is a no-op again while paused');
 
 -- a table pgpm does not manage cannot be paused/resumed.
 create table public.pr_unmanaged (id bigint primary key, body text);

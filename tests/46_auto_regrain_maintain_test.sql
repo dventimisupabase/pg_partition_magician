@@ -20,8 +20,8 @@ select is(
 -- The FIRST tick installs change capture and returns 'prepared' without copying (#267): CREATE TRIGGER
 -- takes SHARE ROW EXCLUSIVE, and giving it its own tick keeps that hold O(1) instead of spanning a copy
 -- batch. So the first copy microbatch lands on the second tick.
-select pgpm.maintain('public.ar');
-select pgpm.maintain('public.ar');
+call pgpm.maintain('public.ar');
+call pgpm.maintain('public.ar');
 select cmp_ok(
   (select count(*) from pgpm.log where parent_table = 'public.ar'::regclass and action = 'regrain_copy'),
   '>', 0::bigint, 'maintain ticks feather regrain copy microbatches (cross-tick pacing)');
@@ -30,7 +30,7 @@ select is(
   1::bigint, 'after a single tick the coarse child is still mid-regrain (not finished in one tick)');
 
 -- drive ticks to completion
-do $$ begin for i in 1..40 loop perform pgpm.maintain('public.ar'); end loop; end $$;
+do $$ declare v_status text; begin for i in 1..40 loop call pgpm.maintain('public.ar', v_status); end loop; end $$;
 
 select is(
   (select coarse_partitions from pgpm.status() where parent = 'public.ar'::regclass),

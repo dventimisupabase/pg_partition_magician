@@ -27,9 +27,8 @@ select is(
   5001, 'the generated column is correct on every row after regrain');
 
 -- drain moves the open stray out of the DEFAULT -- the move must omit the generated column too
-select lives_ok(
-  $$ select pgpm.drain_all('public.gc', p_include_open => true) $$,
-  'drain moves a row of a generated-column table without an insert-into-generated error');
+call pgpm.drain_all('public.gc', p_include_open => true);
+select pass('drain moves a row of a generated-column table without an insert-into-generated error');
 select is(
   (select cents from public.gc where id = 100000),
   10000000::bigint, 'the generated column is recomputed correctly on the drained row');
