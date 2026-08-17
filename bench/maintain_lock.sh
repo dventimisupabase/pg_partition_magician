@@ -15,9 +15,11 @@
 # drain_batch is set so the pre-fix hold (~2.3 s) is over the reader's 1 s timeout by a wide margin while
 # obtain's own window (~80 ms) is comfortably under it, so neither verdict rides on a close call.
 #
-# Usage: maintain_lock.sh <container> <db>
+# Usage: maintain_lock.sh <container> <db> [install.sql]
+# The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
+# prove this guard actually fails when the defect is present.
 set -uo pipefail
-C="${1:?container}"; DB="${2:?db}"
+C="${1:?container}"; DB="${2:?db}"; INSTALL="${3:-/repo/pgpm_core/install.sql}"
 MONO=${MONO:-6000000}       # rows loaded before the conversion; the monolith covers them
 TAIL=${TAIL:-3000000}       # rows written past the monolith, which land in the DEFAULT
 BATCH=${BATCH:-1000000}
@@ -31,7 +33,7 @@ check() { # <label> <actual> <expected>
 
 docker exec "$C" psql -U postgres -q -c "drop database if exists $DB" >/dev/null 2>&1
 docker exec "$C" psql -U postgres -q -c "create database $DB" >/dev/null 2>&1
-docker exec "$C" psql -U postgres -d "$DB" -q -f /repo/pgpm_core/install.sql >/dev/null 2>&1
+docker exec "$C" psql -U postgres -d "$DB" -q -f "$INSTALL" >/dev/null 2>&1
 
 q "create table public.ml (id bigint primary key, v text)" >/dev/null
 q "insert into public.ml select g, repeat('x',60) from generate_series(1,$MONO) g" >/dev/null

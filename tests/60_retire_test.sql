@@ -131,7 +131,7 @@ select ok(
 
 select is(
   (select count(*)::int from pgpm.log
-    where parent_table = 'public.rt60c'::regclass and action in ('retain_drop', 'retain_drop_fail')),
+    where parent_table = 'public.rt60c'::regclass and action in ('retain_drop', 'fail_retain_drop')),
   0, 'nothing drop-related is logged for a not-yet-covered partition -- a normal, retryable state, not a failure');
 
 select pgpm._archive_step('public.rt60c'::regclass);   -- the archiving catches up

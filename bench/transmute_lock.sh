@@ -13,9 +13,11 @@
 # It asserts LOCK MODES and whether a concurrent reader survives, not wall-clock, so there is nothing to
 # flake on a shared runner.
 #
-# Usage: transmute_lock.sh <container> <db>
+# Usage: transmute_lock.sh <container> <db> [install.sql]
+# The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
+# prove this guard actually fails when the defect is present.
 set -uo pipefail
-C="${1:?container}"; DB="${2:?db}"
+C="${1:?container}"; DB="${2:?db}"; INSTALL="${3:-/repo/pgpm_core/install.sql}"
 ROWS=${ROWS:-8000000}
 fail=0
 
@@ -27,7 +29,7 @@ check() { # <label> <actual> <expected>
 
 docker exec "$C" psql -U postgres -q -c "drop database if exists $DB" >/dev/null 2>&1
 docker exec "$C" psql -U postgres -q -c "create database $DB" >/dev/null 2>&1
-docker exec "$C" psql -U postgres -d "$DB" -q -f /repo/pgpm_core/install.sql >/dev/null 2>&1
+docker exec "$C" psql -U postgres -d "$DB" -q -f "$INSTALL" >/dev/null 2>&1
 
 q "create table public.tl (id bigint primary key, v text)" >/dev/null
 q "insert into public.tl select g, repeat('x',80) from generate_series(1,$ROWS) g" >/dev/null

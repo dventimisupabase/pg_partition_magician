@@ -9,7 +9,8 @@
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #   ./test.sh observe                    # the pg_flight_recorder observability track (PG15)
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
-#   ./test.sh perf                       # regrain's data-coupled-work guard (PG17, scan counters)
+#   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
+#   ./test.sh discriminate               # prove each of those guards fails when its defect is present
 #
 # Channels:
 #   psql    pgpm_core/install.sql via psql -f         (the source)
@@ -59,7 +60,8 @@ for arg in "$@"; do
     observe) TRACK="observe" ;;
     archive) TRACK="archive" ;;
     perf) TRACK="perf" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf"; exit 1 ;;
+    discriminate) TRACK="discriminate" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate"; exit 1 ;;
   esac
 done
 
@@ -371,8 +373,29 @@ run_perf() {
   echo "perf track: PASS"
 }
 
+# The `discriminate` track: prove the guards above actually catch what they exist for.
+#
+# A green guard is not evidence -- it is green when the defect is absent, and just as green when the
+# guard never observed anything. This repo has shipped the second kind six times. bench/discriminate.sh
+# rebuilds install.sql with each defect put back and requires the matching guard to FAIL. It is a
+# separate track because it runs every guard a second time and so costs about double the perf track.
+run_discriminate() {
+  local prof="pg17" svc="postgres17" c="pgpm_test-17"
+  $DC --profile "$prof" up -d --wait "$svc"
+  local rc=0
+  bash "$(dirname "$0")/bench/discriminate.sh" "$c" || rc=1
+  $DC --profile "$prof" down -v
+  return "$rc"
+}
+
 if [ "$TRACK" = "perf" ]; then
   run_perf
+  echo; echo "All requested tests passed."
+  exit 0
+fi
+
+if [ "$TRACK" = "discriminate" ]; then
+  run_discriminate
   echo; echo "All requested tests passed."
   exit 0
 fi

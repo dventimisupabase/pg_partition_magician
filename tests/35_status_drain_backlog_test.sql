@@ -37,7 +37,7 @@ select ok(
   'last_drained is null before any drain progress');
 
 -- a wedged drain logs drain_skip without making progress; simulate one deferral
-insert into pgpm.log (parent_table, action, method) values ('public.s_t'::regclass, 'drain_skip', 'simulated');
+insert into pgpm.log (parent_table, action, method) values ('public.s_t'::regclass, 'skip_drain', 'simulated');
 
 -- (4) the deferral is visible: closed_rows > 0 (above) + drain_skips > 0 + last_drained null = WEDGED
 select cmp_ok(

@@ -994,6 +994,13 @@ only; an in-flight child may transiently sit inside a still-attached coarse chil
 
 An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text detail, `rows` a count.
 
+**Non-success events are prefixed, never suffixed.** A step that was deferred logs `skip_<mechanism>`
+and one that failed logs `fail_<mechanism>`, so no non-success action is ever a prefix-extension of the
+success it corresponds to. That makes both ways of querying safe: `action = 'obtain'` and
+`action like 'drain%'` match successes only, and `action like 'skip_%'` gives every deferral across all
+mechanisms without having to enumerate them. Suffixing (`drain_skip`) would make `drain%` quietly match
+the failures too, which is exactly how a guard once reported a starved tick as a successful one.
+
 `action` vocabulary:
 
 | Action | When |
@@ -1005,9 +1012,9 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
-| `obtain_skip` / `retain_skip` / `drain_skip` / `regrain_skip` / `restore_fk_skip` | a step deferred (lock race or transient error; `method` carries the reason) |
-| `restore_incoming_fk_failed` / `validate_incoming_fk_blocked` | a preserve-FK re-add failed / a validation was blocked by an orphan |
-| `retain_drop_fail` | an unexpected `DROP` failure; the partition was not dropped (`method` carries the error) |
+| `skip_obtain` / `skip_retain` / `skip_drain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
+| `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
+| `fail_retain_drop` | an unexpected `DROP` failure; the partition was not dropped (`method` carries the error) |
 
 ### `pgpm.dropped_fk`
 

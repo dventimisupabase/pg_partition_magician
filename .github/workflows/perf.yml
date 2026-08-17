@@ -18,6 +18,8 @@ on:
       - 'bench/regrain_perf.sh'
       - 'bench/transmute_lock.sh'
       - 'bench/maintain_lock.sh'
+      - 'bench/discriminate.sh'
+      - 'bench/mutations/**'
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -29,6 +31,8 @@ on:
       - 'bench/regrain_perf.sh'
       - 'bench/transmute_lock.sh'
       - 'bench/maintain_lock.sh'
+      - 'bench/discriminate.sh'
+      - 'bench/mutations/**'
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -44,3 +48,9 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Run the perf track
         run: ./test.sh perf
+
+      # Every guard above is green on correct code. That alone does not show any of them would notice
+      # a regression, and this repo has repeatedly produced guards that pass while observing nothing.
+      # This rebuilds install.sql with each defect put back and requires the matching guard to FAIL.
+      - name: Prove the guards discriminate
+        run: ./test.sh discriminate

@@ -182,6 +182,15 @@ create table if not exists pgpm.transmute_inflight (
   started_at    timestamptz not null default now()
 );
 
+-- The audit trail. NAMING RULE for `action`: non-success events are PREFIXED, never suffixed --
+-- `skip_<mechanism>` for a deferral, `fail_<mechanism>` for a failure. So no non-success action is ever
+-- a prefix-extension of the success it corresponds to, and both query styles are safe: `action =
+-- 'obtain'` and `action like 'drain%'` match successes only, while `action like 'skip_%'` collects every
+-- deferral across all mechanisms without enumerating them.
+--
+-- This was the other way round (`drain_skip`) and it bit: a guard asserting a tick had drained matched
+-- `drain%`, which also matched `drain_skip` -- the exact row a tick writes when it was starved of its
+-- locks and did nothing. The guard passed on a tick that had done no work. Do not reintroduce a suffix.
 create table if not exists pgpm.log (
   id           bigint generated always as identity primary key,
   parent_table regclass,
@@ -755,7 +764,7 @@ begin
     return true;
   exception when others then
     insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (p_parent, 'retain_drop_fail', r.lo, r.hi, left(sqlerrm, 200));
+      values (p_parent, 'fail_retain_drop', r.lo, r.hi, left(sqlerrm, 200));
     return false;
   end;
 end;
@@ -2877,7 +2886,7 @@ begin
       v_note := v_note || ' obtain_deferred';
       update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'obtain_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
     end;
   else
     v_note := v_note || ' obtain_backoff';
@@ -2897,7 +2906,7 @@ begin
     perform pgpm._enforce_regrain_capture(p_parent);   -- #267: reap capture left by an abandoned regrain
   exception when others then
     v_note := v_note || ' write_block_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'write_block_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_write_block', left(sqlerrm, 200));
   end;
 
   -- BOUNDARY (#279). Installing a write-block trigger takes ACCESS EXCLUSIVE on the child. The archive
@@ -2914,7 +2923,7 @@ begin
     v_archived := pgpm._archive_step(p_parent);
   exception when others then
     v_note := v_note || ' archive_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'archive_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_archive', left(sqlerrm, 200));
   end;
 
   -- BOUNDARY (#279): make a whole tick's archived bytes durable before anything else runs. Chunked
@@ -2927,7 +2936,7 @@ begin
     v_dropped := pgpm.retain(p_parent);
   exception when others then
     v_note := v_note || ' retain_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retain_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_retain', left(sqlerrm, 200));
   end;
 
   -- BOUNDARY (#279). retain DROPs partitions, which takes ACCESS EXCLUSIVE on the parent. Also releases
@@ -3042,7 +3051,7 @@ begin
   exception when others then
     v_drain := 'deferred';
     v_note := v_note || ' drain_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_drain', left(sqlerrm, 200));
   end;
 
   -- Commit the adaptive step ONLY when the drain did work (moved/reclaimed rows or attached). A
@@ -3080,7 +3089,7 @@ begin
     exception when others then
       v_regrain := 'deferred';
       v_note := v_note || ' regrain_deferred';
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'regrain_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_regrain', left(sqlerrm, 200));
     end;
   elsif cfg.regrain_to is not null then
     v_regrain := 'none';   -- auto-regrain on, but no frozen coarse child to work
@@ -3100,7 +3109,7 @@ begin
     v_restored := pgpm.restore_incoming_fks(p_parent);
   exception when others then
     v_note := v_note || ' restore_fk_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_restore_fk', left(sqlerrm, 200));
   end;
 
   p_status := format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
@@ -3296,7 +3305,7 @@ begin
     select max(at), max(id) into v_last_drained, v_last_progress_id from pgpm.log
       where parent_table = r.parent_table and action in ('drain_move', 'drain_attach', 'retain_reclaim');
     select count(*) into v_skips from pgpm.log
-      where parent_table = r.parent_table and action = 'drain_skip' and id > coalesce(v_last_progress_id, 0);
+      where parent_table = r.parent_table and action = 'skip_drain' and id > coalesce(v_last_progress_id, 0);
     -- preserve-managed incoming FK state: dropped (RI off) vs re-added-but-not-validated (orphan-blocked)
     select count(*) filter (where restored_at is null),
            count(*) filter (where restored_at is not null and validated_at is null)
@@ -3310,7 +3319,7 @@ begin
     select max(id) into v_last_retain_id from pgpm.log
       where parent_table = r.parent_table and action = 'retain_drop';
     select count(*) into v_drop_fails from pgpm.log
-      where parent_table = r.parent_table and action = 'retain_drop_fail'
+      where parent_table = r.parent_table and action = 'fail_retain_drop'
         and id > coalesce(v_last_retain_id, 0);
     -- retain_backlog: eligible-but-undropped partitions (whole range at/below the retention horizon,
     -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks, or while
@@ -3720,7 +3729,7 @@ begin
       insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
     exception when others then
       insert into pgpm.log (parent_table, action, method)
-        values (p_parent, 'restore_incoming_fk_failed', left(r.constraint_name || ': ' || sqlerrm, 200));
+        values (p_parent, 'fail_restore_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;
     -- validate the just-re-added NOT VALID FK once; a pre-existing orphan keeps it NOT VALID (still
     -- enforcing new writes) and is surfaced, NOT rolled back into the dropped state.
@@ -3730,7 +3739,7 @@ begin
         update pgpm.dropped_fk set validated_at = now() where id = r.id;
       exception when others then
         insert into pgpm.log (parent_table, action, method)
-          values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+          values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
       end;
     end if;
   end loop;
@@ -3757,7 +3766,7 @@ begin
       v_n := v_n + 1;
     exception when others then
       insert into pgpm.log (parent_table, action, method)
-        values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+        values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;
   end loop;
   return v_n;

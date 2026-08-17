@@ -28,7 +28,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 ## Referential-integrity violations after a `preserve` drain
 
 **Symptom.** Any of: an incoming foreign key on a table that points at a pgpm-managed parent shows as
-`NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `validate_incoming_fk_blocked`
+`NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `fail_validate_incoming_fk`
 rows; or a periodic RI audit (or an application error) flags dangling references into the parent.
 
 **What it means.** You converted with `p_incoming_fks => 'preserve'`. While the **drain** moved
@@ -148,7 +148,7 @@ cannot make progress yet.
 
    ```sql
    select at, action, method from pgpm.log
-    where parent_table = 'public.events'::regclass and action in ('regrain_skip', 'regrain')
+    where parent_table = 'public.events'::regclass and action in ('skip_regrain', 'regrain')
     order by id desc limit 10;
    ```
 
@@ -277,7 +277,7 @@ So **merely slow** is the common case and **wedged** is a corner -- but both are
 
    ```sql
    select at, action, method from pgpm.log
-    where parent_table = 'public.events'::regclass and action = 'drain_skip' order by id desc limit 10;
+    where parent_table = 'public.events'::regclass and action = 'skip_drain' order by id desc limit 10;
    ```
 
    A recurring duplicate-key error is the upsert-into-a-moved-row wedge (see the guide's
