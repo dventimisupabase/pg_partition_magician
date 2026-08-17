@@ -37,6 +37,18 @@ OBTAIN_LOOP_COMMIT = """    exit when v_defer is not null;
     commit;
 """
 
+# Put the inline VALIDATE back where #265 removed it. Anchored on the comment block that replaced it, so
+# a stale pattern fails loudly rather than yielding an unmutated copy.
+RESTORE_MARKER = "    -- The VALIDATE deliberately does NOT happen here (#265)."
+RESTORE_INLINE = """    if v_readded and not v_is_part then
+      begin
+        execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
+        update pgpm.dropped_fk set validated_at = now() where id = r.id;
+      exception when others then null;
+      end;
+    end if;
+    -- The VALIDATE deliberately does NOT happen here (#265)."""
+
 # name -> (guard it must break, why this is the right defect, [(find, replace, expected_count)])
 MUTATIONS = {
     "transmute_no_commits": (
@@ -64,6 +76,12 @@ MUTATIONS = {
         "Pre-#280 obtain: the constraint dance in one transaction, so the ADD's ACCESS EXCLUSIVE is "
         "held over the O(rows) VALIDATE scan of the DEFAULT.",
         [(OBTAIN_BOUNDARY_RE, "", 2)],
+    ),
+    "restore_fk_inline_validate": (
+        "bench/restore_fk_lock.sh",
+        "Pre-#265 restore_incoming_fks: the VALIDATE runs inline, in the same transaction as the ADD, so "
+        "the ADD's SHARE ROW EXCLUSIVE on the managed parent is held across an O(referencing table) scan.",
+        [(RESTORE_MARKER, RESTORE_INLINE, 1)],
     ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",
