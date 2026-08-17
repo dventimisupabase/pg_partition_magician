@@ -44,7 +44,6 @@ select is(
 select is((select count(*)::int from public.uq_lead), 40, 'all rows conserved through the parent');
 
 -- uniqueness is enforced across partitions once they are materialized
-call pgpm.drain_all('public.uq_lead', p_include_open => true);
 select throws_ok(
   $$ insert into public.uq_lead (ts, id, body)
        values (date_trunc('month', now()) - interval '3 months' + interval '1 day', 1, 'dup') $$,

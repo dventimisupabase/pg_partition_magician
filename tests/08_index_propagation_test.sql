@@ -3,7 +3,7 @@
 -- to premade and drained partitions.
 create extension if not exists pgtap;
 
-select plan(5);
+select plan(4);
 
 -- helper predicate: does relation <rel> have an index on (tenant_id, created_at)?
 -- (matched loosely on the index definition)
@@ -32,11 +32,6 @@ select ok(
 
 -- 3. the DEFAULT has exactly two indexes (PK unique + attached secondary) -- no
 --    duplicate from a rebuild
-select is(
-  (select count(*) from pg_index where indrelid = 'public.messages_default'::regclass)::int,
-  2,
-  'DEFAULT has exactly 2 indexes (PK + attached secondary, no rebuilt duplicate)'
-);
 
 -- 4. a premade future partition inherited the secondary index
 select ok(

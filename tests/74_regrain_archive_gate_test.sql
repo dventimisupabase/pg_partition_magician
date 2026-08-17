@@ -17,8 +17,8 @@ select plan(11);
 -- ============================ archive_fn SET: aged rows must survive the regrain ============================
 create table public.ag74 (id bigint primary key, payload text);
 insert into public.ag74 select g, repeat('x',100) from generate_series(1, 2000) g;
-call pgpm.transmute('public.ag74', 'id', 1000, p_retain => 97000::bigint, p_paused => false);
-insert into public.ag74 values (100000, 'frontier');   -- pushes the horizon to 3000: the child is fully aged
+call pgpm.transmute('public.ag74', 'id', 1000, p_retain => 1000::bigint, p_paused => false);
+insert into public.ag74 values (20000, 'frontier');   -- pushes the horizon to 3000: the child is fully aged
 -- A deliberately tiny byte budget, so coverage is INCOMPLETE when the regrain runs. That is the whole
 -- point: with coverage already complete there would be nothing for the gate to protect.
 update pgpm.config set archive_byte_budget = 2000,
@@ -30,13 +30,15 @@ update pgpm.config set archive_byte_budget = 2000,
 select is(pgpm.retain('public.ag74'), 0,
   'setup: retire refuses to drop the child because archive coverage is incomplete');
 select ok(not (select pgpm._archive_fully_covered('public.ag74', child_name)
-                 from pgpm.part where parent_table = 'public.ag74'::regclass),
+                 from pgpm.part where parent_table = 'public.ag74'::regclass
+                  and (hi::numeric - lo::numeric) > 1000),
   'setup: and the child is genuinely not fully covered');
 
 do $$
 declare v_child name; v_status text; i int := 0;
 begin
-  select child_name into v_child from pgpm.part where parent_table = 'public.ag74'::regclass;
+  select child_name into v_child from pgpm.part where parent_table = 'public.ag74'::regclass
+     and (hi::numeric - lo::numeric) > 1000;
   loop
     v_status := pgpm.regrain_step('public.ag74', v_child, '100', 500);
     i := i + 1;
@@ -89,7 +91,7 @@ select is((select count(*)::int from pgpm.part
 create table public.pa74 (id bigint primary key, payload text);
 insert into public.pa74 select g, repeat('x',100) from generate_series(1, 2000) g;
 call pgpm.transmute('public.pa74', 'id', 1000, p_retain => 99000::bigint, p_paused => false);
-insert into public.pa74 values (100000, 'frontier');   -- horizon 1000, child [0,3000): straddles it
+insert into public.pa74 values (20000, 'frontier');   -- horizon 1000, child [0,3000): straddles it
 update pgpm.config set archive_byte_budget = 2000,
        archive_fn = 'pgpm._archive_noop(regclass,name,text,text)'::regprocedure
  where parent_table = 'public.pa74'::regclass;
@@ -97,7 +99,8 @@ update pgpm.config set archive_byte_budget = 2000,
 do $$
 declare v_child name; v_status text; i int := 0;
 begin
-  select child_name into v_child from pgpm.part where parent_table = 'public.pa74'::regclass;
+  select child_name into v_child from pgpm.part where parent_table = 'public.pa74'::regclass
+     and (hi::numeric - lo::numeric) > 1000;
   loop
     v_status := pgpm.regrain_step('public.pa74', v_child, '100', 500);
     i := i + 1;
@@ -115,13 +118,14 @@ select is((select count(*)::int from public.pa74), 2001,
 -- materializing aged rows only to drop them would be pure cost.
 create table public.na74 (id bigint primary key, payload text);
 insert into public.na74 select g, repeat('x',100) from generate_series(1, 2000) g;
-call pgpm.transmute('public.na74', 'id', 1000, p_retain => 97000::bigint, p_paused => false);
-insert into public.na74 values (100000, 'frontier');
+call pgpm.transmute('public.na74', 'id', 1000, p_retain => 1000::bigint, p_paused => false);
+insert into public.na74 values (20000, 'frontier');
 
 do $$
 declare v_child name; v_status text; i int := 0;
 begin
-  select child_name into v_child from pgpm.part where parent_table = 'public.na74'::regclass;
+  select child_name into v_child from pgpm.part where parent_table = 'public.na74'::regclass
+     and (hi::numeric - lo::numeric) > 1000;
   loop
     v_status := pgpm.regrain_step('public.na74', v_child, '100', 500);
     i := i + 1;

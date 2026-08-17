@@ -18,7 +18,6 @@ on:
       - 'bench/regrain_perf.sh'
       - 'bench/transmute_lock.sh'
       - 'bench/maintain_lock.sh'
-      - 'bench/obtain_lock.sh'
       - 'bench/restore_fk_lock.sh'
       - 'bench/discriminate.sh'
       - 'bench/mutations/**'

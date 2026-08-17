@@ -28,7 +28,7 @@ begin
   execute format('create table public.%I (id bigint primary key, payload text)', p_rel);
   execute format('insert into public.%I select g*10, ''x'' from generate_series(1, 250) g', p_rel);
   call pgpm.transmute(format('public.%I', p_rel)::regclass, 'id', 1000);
-  execute format('insert into public.%I values (900000, ''frontier'')', p_rel);   -- freeze the monolith
+  execute format('insert into public.%I values (20000, ''frontier'')', p_rel);   -- freeze the monolith
 end $$;
 
 -- drive regrain_step to the swap, one tick at a time

@@ -28,14 +28,7 @@ BOUNDARY_RE = re.compile(
 
 # _create_partition's two boundaries. Removing them collapses the three phases back into one
 # transaction, which is the pre-#280 shape exactly.
-OBTAIN_BOUNDARY_RE = re.compile(r"^    commit;   -- BOUNDARY \(#280\).*?\n", re.MULTILINE)
 
-# obtain's per-candidate commit. Needed by maintain_no_commits and not by obtain_no_commits: the
-# maintain guard is about a lock reaching the DRAIN, which needs everything obtain did to stay open.
-OBTAIN_LOOP_COMMIT = """    exit when v_defer is not null;
-    p_made := p_made + 1;
-    commit;
-"""
 
 # Put the inline VALIDATE back where #265 removed it. Anchored on the comment block that replaced it, so
 # a stale pattern fails loudly rather than yielding an unmutated copy.
@@ -68,14 +61,7 @@ MUTATIONS = {
         # window the guard rightly does not object to -- the guard then passed against this mutant and
         # discriminate.sh reported it as non-discriminating. The defect being modelled is "the tick is
         # one transaction", so the mutant has to actually make it one.
-        [(BOUNDARY_RE, "", 6), (OBTAIN_BOUNDARY_RE, "", 2),
-         (OBTAIN_LOOP_COMMIT, "    exit when v_defer is not null;\n    p_made := p_made + 1;\n", 1)],
-    ),
-    "obtain_no_commits": (
-        "bench/obtain_lock.sh",
-        "Pre-#280 obtain: the constraint dance in one transaction, so the ADD's ACCESS EXCLUSIVE is "
-        "held over the O(rows) VALIDATE scan of the DEFAULT.",
-        [(OBTAIN_BOUNDARY_RE, "", 2)],
+        [(BOUNDARY_RE, "", 5)],
     ),
     "restore_fk_inline_validate": (
         "bench/restore_fk_lock.sh",

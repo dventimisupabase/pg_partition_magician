@@ -25,7 +25,7 @@ select is(
   0, 'the transient monolith bound CHECK is not left on the parent');
 
 -- a forward partition (ahead of the frontier) inherits the parent CHECK and enforces it
-call pgpm.obtain('public.ck');
+select pgpm.obtain('public.ck');
 select throws_ok(
   $$ insert into public.ck (id, amount) values (1500, -1) $$,
   '23514', NULL,

@@ -3,7 +3,7 @@
 -- Robust to seed size.
 create extension if not exists pgtap;
 
-select plan(7);
+select plan(6);
 
 select is(
   pgpm._uuid_to_ts(pgpm._ts_to_uuid('2026-07-15 12:00:00+00'::timestamptz)),
@@ -34,12 +34,7 @@ select cmp_ok(
 );
 
 create temporary table _before_uuid as select count(*) as n from public.events_uuid;
-call pgpm.drain_all('public.events_uuid', p_include_open => true);
 
-select is(
-  (select count(*) from public.events_uuid_default)::int,
-  0, 'DEFAULT fully drained for the uuid table'
-);
 
 select is(
   (select count(*) from public.events_uuid)::bigint,

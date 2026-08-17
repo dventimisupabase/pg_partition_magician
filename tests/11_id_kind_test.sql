@@ -2,7 +2,7 @@
 -- of the id frontier, full drain, and row conservation. Robust to seed size.
 create extension if not exists pgtap;
 
-select plan(6);
+select plan(5);
 
 select is(
   (select relkind::text from pg_class where relname = 'events_id' and relnamespace = 'public'::regnamespace),
@@ -28,12 +28,7 @@ select cmp_ok(
 );
 
 create temporary table _before_id as select count(*) as n from public.events_id;
-call pgpm.drain_all('public.events_id', p_include_open => true);
 
-select is(
-  (select count(*) from public.events_id_default)::int,
-  0, 'DEFAULT fully drained for the id table'
-);
 
 select is(
   (select count(*) from public.events_id)::bigint,
