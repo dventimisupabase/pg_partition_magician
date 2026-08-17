@@ -19,19 +19,19 @@ and manages the whole lifecycle:
 - **`obtain`**: keep N partitions ahead of the write frontier.
 - **`regrain`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
-- **`drain`**: keep the `DEFAULT` empty by evacuating the occasional stray into its partition. Optionally
-  self-tuning against checkpoint pressure (`set_drain_adaptive`).
 - **`retain`**: drop partitions past a policy. Set `config.archive_fn` to a resumable archive
   strategy -- e.g. archive to long-term storage, see the optional [`pgpm_archive`](#archiving-optional)
   add-on for ready-made ones -- and a partition only drops once it's fully archived, never before.
-- **`maintain`**: the one procedure `pg_cron` calls (`obtain`, `drain`, `retain`, optional auto-`regrain`).
+- **`maintain`**: the one procedure `pg_cron` calls (`obtain`, `retain`, optional auto-`regrain`).
 
 The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."
 
-Two caveats, both covered in the [guide](docs/guide.md): the scheduled **`drain`** moves rows through an
-unattached child, so a mid-move read briefly undercounts the in-flight range (`regrain`, `drain_all`, and
-`pgpm.snapshot` don't). And **incoming foreign keys** are preserved, not ignored (`transmute` never rewrites
-your key; `p_incoming_fks => 'preserve'` re-adds each one once the move is idle).
+Two caveats, both covered in the [guide](docs/guide.md). There is **no `DEFAULT` partition**: `obtain`
+keeps a grid of real partitions ahead of the write frontier, and a write beyond that grid is *refused*
+rather than parked somewhere. `config.obtain x partition_step` is therefore both your slack if maintenance
+stalls and a ceiling on how far ahead you may write. And **incoming foreign keys** are preserved, not
+ignored (`transmute` never rewrites your key; `p_incoming_fks => 'preserve'` re-adds each one once the
+table is quiescent).
 
 ## Why it exists
 
@@ -47,7 +47,7 @@ subset in any order is fine.
 
 | Directory | What it's for | When you need it |
 |---|---|---|
-| **`pgpm_core`** | The product itself: `transmute`/`obtain`/`drain`/`retain`/`maintain`. | Always. |
+| **`pgpm_core`** | The product itself: `transmute`/`obtain`/`retain`/`regrain`/`maintain`. | Always. |
 | **`pgpm_hypertable`** | A one-time [migration tool](#migrating-from-timescaledb) (`from_hypertable`) that converts a TimescaleDB hypertable to a pgpm-managed table, then hands off to `transmute`. Not something you keep using afterward. | Only if migrating off TimescaleDB (Apache edition). |
 | **`pgpm_archive`** | Ready-made S3 [archive strategies](#archiving-optional) for `config.archive_fn` (see `retain` above). | Only if you want `retain` to archive a partition's data before dropping it; without it, `archive_fn` stays `null` and partitions just drop. |
 
