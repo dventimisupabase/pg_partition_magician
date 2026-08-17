@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+- **Retention now reclaims a partition an incoming foreign key references (issue #268).** `p_incoming_fks
+  => 'preserve'` and a `retain` policy were both supported and both documented, and the combination never
+  reclaimed anything: every `retain()` failed on the oldest eligible partition and returned 0, forever,
+  while `retire()` had already installed the write block. The partition ended up frozen **and**
+  unreclaimable -- no writes in, no storage back -- for the life of the table.
+  - `DROP TABLE <partition>` is refused on a pure **catalog** dependency, and the refusal is
+    data-independent: identical whether one row references it, zero rows do, or the referencing table is
+    empty. `retire()` now DETACHes first, which severs the per-partition constraint and leaves the drop
+    unguarded. The referencing table's own foreign key survives and still enforces. **Do not** take
+    PostgreSQL's `HINT: Use DROP ... CASCADE` here: that drops the constraint and keeps the data,
+    silently removing referential integrity across the whole referencing table.
+  - The detach must be `CONCURRENTLY`. Measured on PG 17.10 against an 8M-row referencing table, plain
+    `DETACH` holds `AccessExclusiveLock` on the **managed parent** for ~1.5 s and a concurrent read of it
+    dies with `55P03`; `CONCURRENTLY` holds only `ShareUpdateExclusive` and the parent stays readable and
+    writable. Retention must not block the table pgpm exists to keep online, for a duration set by a
+    table pgpm does not own.
+  - PostgreSQL refuses `DETACH CONCURRENTLY` from a function, a procedure that has already committed, a
+    `DO` block, and dynamic `EXECUTE` -- it is a check on execution context, and pgpm is pure SQL. So
+    `retire()` **dispatches** it: `pgpm.schedule()` now also creates a standing, idle `pgpm_detach`
+    cron job, `retire()` rewrites its command in place (a cron command runs as a top-level statement in
+    its own session, where the statement is legal), and a later call completes the `DROP` and returns the
+    job to idle. **Retiring a referenced partition therefore requires `pgpm.schedule()`**; if you
+    scheduled pgpm before this change, re-run it once to create the second job.
+  - **The crossing** -- a live row genuinely referencing a doomed one -- is executed, not decided. pgpm
+    issues `DELETE FROM <parent> WHERE <crossing keys>` and lets PostgreSQL apply whatever the operator
+    declared in the foreign key: `CASCADE`, `SET NULL` and `SET DEFAULT` proceed, `NO ACTION` and
+    `RESTRICT` refuse and block retention with the constraint's own error (`fail_retain_crossing`). There
+    is no new knob, because the foreign key already is the policy. Identifying the crossing runs first
+    and unconditionally: measured at 0.7 ms indexed and 141.9 ms unindexed, against a *failing* detach's
+    1176 ms unindexed -- a near-full scan under `ShareLock` paid only to learn it cannot proceed.
+  - **`pgpm._detach_reap()`**, called from `maintain_all` before the per-parent loop alongside
+    `_transmute_reap`. A backend killed during a concurrent detach's *wait* phase leaves the partition
+    flagged `pg_inherits.inhdetachpending` with its rows **already invisible through the parent**
+    (measured: a 2,000,000-row parent read 1,000,000) -- rows vanishing from the user's table, which is
+    strictly worse than the wedge this fixes. It `FINALIZE`s unconditionally but drops nothing:
+    `retire()` completes pgpm's own retirements (it can tell from the new `pgpm.part.retiring_at`), and an
+    operator's interrupted hand-run detach is finished and then left alone.
+  - **At most one detach is in flight database-wide.** There is a single standing job, so a second
+    dispatch would overwrite the first and abandon it. `retain()`'s batch loop walks every eligible
+    partition and `maintain_all` walks every managed parent, so this is the ordinary path, not a race:
+    without the guard one `retain()` call marked a whole three-partition backlog as retiring while only
+    the last dispatch was real. A retirement stops holding the job the moment its partition is detached,
+    so this yields rather than blocks -- the next tick takes the next partition. It yields only to a
+    strictly **older** in-flight retirement, on a total order: "yield to any other" deadlocks, because
+    two concurrent `retire()` calls can both pass the check before either marks, after which each sees
+    the other and neither proceeds again. `retiring_at` is therefore set with `coalesce` and never
+    refreshed by a retry -- re-stamping would make the winner perpetually the newest marker and collapse
+    the order back to nothing.
+  - New: `pgpm.part.retiring_at`, `status().retain_detaching`, log actions `retain_detach` /
+    `retain_crossing` / `detach_reap` and failures `fail_retain_detach` / `fail_retain_crossing` (both
+    counted in `status().retain_drop_failures`, since both wedge retention the same way).
+  - `retire()` and `retain()` stay **functions**. `cron.alter_job` called from a non-committing function
+    inside a transaction takes effect at commit, so no transaction boundary is required -- and the marker
+    and the dispatch then commit atomically, leaving no window where a detach is in flight unrecorded.
+  - Guarded by `bench/retire_detach_lock.sh` (the managed parent stays readable *and* writable across a
+    referenced partition's retirement) with a `retire_inline_detach` mutation that swaps the dispatch for
+    an in-process plain `DETACH`; `./test.sh discriminate` requires the guard to fail against it. The
+    mutant is functionally identical -- the partition still ends up detached and dropped, and every
+    behavioural test still passes -- so nothing but a lock probe distinguishes them.
+  - Tests: `tests/77_retain_incoming_fk_test.sql` (the state machine, the crossing under both `CASCADE`
+    and `NO ACTION`, the FK still enforcing afterwards, the reaper against a genuinely interrupted
+    detach) and `tests/78_retain_detach_dispatch_test.sql` (the cron handoff; runs against `postgres`
+    like `tests/31`, since `pg_cron` only installs there).
+
 - **Parquet writer: add `uuid`, `json`/`jsonb`, and `numeric(p,s)`.** Six supported types
   becomes nine. `uuid` encodes as `FIXED_LEN_BYTE_ARRAY(16)` (the raw bytes `uuid_send()` already
   gives, no logical-type annotation -- readers get fixed-size binary, not a typed UUID).

@@ -334,7 +334,7 @@ update pgpm.config set retain = '90 days' where parent_table = 'public.events'::
 ```
 
 Retain drops a partition only when its **whole range** is older than the horizon, using plain `DROP` (a
-brief lock). Two consequences in the monolith model:
+brief lock) when nothing references the table. Two consequences in the monolith model:
 
 - **Retention is suspended over un-regrained coarse history.** A coarse monolith spanning the horizon is
   not dropped (it still holds within-horizon data), so its aged span is not reclaimed until you regrain
@@ -342,9 +342,10 @@ brief lock). Two consequences in the monolith model:
   discarded with the source at the swap) instead of materializing partitions only to drop them. So on a
   table you want aggressively retained, enable
   auto-regrain (or regrain by hand) to let retention reach the history.
-- **The drain reclaims aged strays in place.** If a stray ages past the horizon while still in
-  the `DEFAULT`, the drain `DELETE`s it straight out (logged `retain_reclaim`) rather than materializing a
-  doomed partition.
+- **A referenced partition is retired in two steps, not one.** If any foreign key points at the managed
+  table, a plain `DROP` cannot reclaim the partition at all, so retention detaches it first. That path is
+  asynchronous and needs `pgpm.schedule()`; see [Retention with an incoming foreign
+  key](#retention-with-an-incoming-foreign-key).
 
 **Retention is a standing floor, not just an aging process.** The policy is "no data with a control value
 below the horizon persists" -- aging is just the usual way rows cross that line. A row inserted with a
@@ -455,6 +456,52 @@ monolith and is never outside the parent. The single exception is the swap's `DE
 to detach a partition whose rows are still referenced -- so the swap transiently drops the incoming FK(s)
 and re-adds them *within that one atomic transaction*. No other session ever observes RI off; there is no
 multi-tick suspension window the way the drain has, and the synchronous `regrain()` is atomic end to end.
+
+### Retention with an incoming foreign key
+
+A foreign key pointing at the managed table changes how [retention](#retain) reclaims a partition, whether
+or not it was `preserve`-managed, and whether or not anything actually references the aged rows.
+
+`DROP TABLE <partition>` is refused on a pure **catalog** dependency: an FK against a partitioned parent
+puts one constraint row per referenced partition on the referencing table, and the refusal is identical
+whether one row references, zero rows reference, or the referencing table is empty. So retention detaches
+first, which severs that per-partition constraint and leaves the drop unguarded. The referencing table's
+own foreign key survives and keeps enforcing.
+
+The detach has to be `CONCURRENTLY` -- the plain form holds `ACCESS EXCLUSIVE` on your managed table for
+as long as it takes to scan the *referencing* table -- and PostgreSQL will not run that from a function.
+So pgpm dispatches it to a standing `pgpm_detach` cron job and completes the drop on a later tick. Three
+things follow, and none of them are optional:
+
+- **`pgpm.schedule()` is required to retire a referenced partition.** Without the `pgpm_detach` job there
+  is nowhere to dispatch to, and `retire` logs `fail_retain_detach` rather than reclaiming. If you
+  scheduled pgpm before upgrading, re-run `pgpm.schedule()` once to create the second job.
+- **Retirement spans at least one extra tick.** `status().retain_detaching` counts partitions whose
+  detach is in flight. Retention was already eventual, so this lengthens a delay rather than adding one.
+- **Writes to the *referencing* table are blocked while the detach runs**, once per retirement, for a
+  duration set by that table's size. Reads of it, and your managed table entirely, are unaffected. This is
+  irreducible: it is PostgreSQL proving the foreign key still holds. An index on the referencing column is
+  ordinary good practice but does not reduce it.
+
+**When a live row genuinely references an aged one**, pgpm executes the policy you already declared in the
+foreign key's `ON DELETE` clause, rather than inventing one:
+
+| `ON DELETE` | what happens to the referencing row | retention |
+|---|---|---|
+| `CASCADE` | deleted | proceeds |
+| `SET NULL` / `SET DEFAULT` | kept, reference severed | proceeds |
+| `NO ACTION` (the default) / `RESTRICT` | untouched | **blocked**, with PostgreSQL's own error |
+
+pgpm issues a `DELETE` for exactly the crossing keys and lets PostgreSQL apply whatever was declared;
+the work is bounded by the crossing, not by the partition or the referencing table. A blocked retirement
+logs `fail_retain_crossing` carrying the constraint's own error, counts in `status().retain_drop_failures`,
+and leaves the partition whole. That is not a pgpm limitation to work around: a `NO ACTION` foreign key is
+a statement that these rows must not disappear while something points at them, and retention honouring it
+is the constraint doing its job. Change the referential action, or remove the referencing rows, if you
+meant otherwise.
+
+Successful crossings are logged `retain_crossing` with the key and row counts, because this is the one
+point where retiring a partition writes to a table you did not hand to pgpm.
 
 ## Secondary indexes
 

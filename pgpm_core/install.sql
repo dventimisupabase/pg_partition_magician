@@ -119,10 +119,22 @@ create table if not exists pgpm.part (
   -- scanning pg_class for the name pattern. obtain creates partitions already attached, so the default
   -- is true; only the drain inserts a row with attached=false. (issue #94)
   attached     boolean     not null default true,
+  -- When retirement of this child BEGAN -- set as retire() dispatches a CONCURRENT DETACH for it, never
+  -- refreshed by a retry, and cleared with the row when the drop completes (issue #268). It doubles as
+  -- the tiebreak that keeps exactly one detach in flight, which is why it must not move. Retiring a REFERENCED partition cannot happen in one step: a bare
+  -- DROP is refused on the referencing table's per-partition constraint, and the DETACH that severs
+  -- it must be CONCURRENT (a plain one holds ACCESS EXCLUSIVE on the managed parent for the whole
+  -- O(referencing table) scan) -- which PostgreSQL refuses to run from a function, so pgpm dispatches
+  -- it to pg_cron and finishes on a later tick. This marker is what makes that recoverable: a detach
+  -- left pending by a dead backend is finalized by _detach_reap, and this says whether the retirement
+  -- behind it was pgpm's to complete or an operator's to keep. null for every unreferenced partition,
+  -- which never leaves the one-step bare-DROP path at all.
+  retiring_at  timestamptz,
   primary key (parent_table, child_name)
 );
--- upgrade path for installs that predate this column
+-- upgrade path for installs that predate these columns
 alter table pgpm.part add column if not exists attached boolean not null default true;
+alter table pgpm.part add column if not exists retiring_at timestamptz;
 
 -- In-flight conversions (issue #275). transmute runs in three transactions -- add the bound, validate it,
 -- cut over -- so that the O(rows) validation scan is not held under the ACCESS EXCLUSIVE lock the ADD
@@ -494,6 +506,150 @@ begin
 end;
 $$;
 
+-- ==================== retiring a REFERENCED partition (issue #268) ====================
+--
+-- `p_incoming_fks => 'preserve'` and a `retain` policy were both supported and both documented, and
+-- the combination never reclaimed anything: every retain() failed on the oldest eligible partition and
+-- returned 0, forever, while the write block was already installed. Frozen AND unreclaimable.
+--
+-- `DROP TABLE <partition>` is refused on a pure CATALOG dependency. An FK against a partitioned parent
+-- puts one pg_constraint row per referenced partition ON the referencing table, and the refusal is
+-- data-INDEPENDENT: identical whether one row references, zero rows reference, or the referencing
+-- table is empty. DETACH is the only phase that consults data, and a successful one severs the
+-- per-partition constraint, after which the DROP is completely unguarded. So: detach, then drop. The
+-- referencing table's own FK survives and still enforces.
+--
+-- The detach must be CONCURRENT. Measured on PG 17.10, 8M-row referencing table:
+--
+--   ALTER TABLE ... DETACH PARTITION               AccessExclusiveLock on the MANAGED PARENT, ~1.5 s;
+--                                                  a concurrent read of the parent dies with 55P03
+--   ALTER TABLE ... DETACH PARTITION CONCURRENTLY  ShareUpdateExclusiveLock; the parent stays readable
+--                                                  and writable throughout
+--
+-- Plain DETACH would make retention block the table pgpm exists to keep online, for a duration set by
+-- the size of a table pgpm does not own. That is exactly the shape the project's acceptance rule
+-- forbids. And PostgreSQL refuses to run the concurrent form from any of the contexts pgpm has:
+--
+--   ERROR:  ALTER TABLE ... DETACH CONCURRENTLY cannot be executed from a function
+--
+-- not from a procedure that has already committed, not from a DO block, and not via dynamic EXECUTE:
+-- it is a check on execution CONTEXT, and pgpm is pure SQL. So pgpm DISPATCHES it. pg_cron is already
+-- pgpm's one runtime dependency, and a cron job's command runs as a top-level statement in its own
+-- session, where the statement is legal. retire() repoints a single standing job at the specific
+-- detach and completes the DROP on a later tick.
+--
+-- ONE STANDING JOB, rewritten in place, not one job per retirement: pg_cron has no one-shot schedule,
+-- so a per-retirement job would keep firing after it succeeded and log `is not a partition` failures
+-- until something unscheduled it. pgpm.schedule() creates `pgpm_detach` idle (`select 1`); retire()
+-- points it at a detach when it needs one and returns it to idle once the drop lands. At most one
+-- detach is in flight, which retention's existing retain_batch pacing already assumes.
+--
+-- What this costs, stated plainly: retirement of a REFERENCED partition is asynchronous, spanning at
+-- least one cron tick, and it requires pgpm.schedule() to have been run. Retention was already
+-- eventual, so this lengthens a delay rather than introducing one. Writes to the REFERENCING table are
+-- blocked for O(that table) by the detach's ShareLock, once per retirement -- readers of it, and the
+-- managed parent entirely, are unaffected. That part is irreducible: it is PostgreSQL proving the FK
+-- still holds. An index on the referencing FK column does NOT reduce it (measured: 1368 ms without,
+-- 1634 ms with).
+
+-- _crossing_keys: the control-column values inside [p_lo, p_hi) that some incoming foreign key still
+-- references -- the rows where the operator's two promises, the FK and the retention horizon,
+-- genuinely contradict.
+--
+-- Identification runs FIRST and unconditionally, rather than attempting the detach and catching its
+-- error, because a FAILING detach is only cheap when the referencing FK column happens to be indexed.
+-- Measured, 8M-row referencing table: identifying costs 0.7 ms indexed and 141.9 ms unindexed, against
+-- a failing DETACH's 1.9 ms indexed but 1176 ms unindexed -- a near-full scan under ShareLock paid
+-- purely to discover the operation cannot proceed, with the locks already taken. Pre-identifying also
+-- reports every crossing key at once, where PostgreSQL names one at a time.
+create or replace function pgpm._crossing_keys(p_parent regclass, p_lo text, p_hi text)
+returns text[] language plpgsql as $$
+declare
+  cfg pgpm.config; r record;
+  v_ctrl_attnum smallint; v_refcol name; v_pos int;
+  v_lo_lit text; v_hi_lit text; v_vals text[] := '{}'; v_more text[];
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+
+  select a.attnum into v_ctrl_attnum from pg_attribute a
+   where a.attrelid = p_parent and a.attname = cfg.control_column and not a.attisdropped;
+
+  v_lo_lit := pgpm._encode(cfg.control_kind, p_lo);
+  v_hi_lit := pgpm._encode(cfg.control_kind, p_hi);
+
+  -- conparentid = 0 picks the top-level constraint. An FK referencing a PARTITIONED table also gets
+  -- one pg_constraint row per partition of the referenced side, so an unfiltered scan would visit the
+  -- same foreign key once per partition.
+  for r in
+    select c.conname, c.conrelid::regclass as referencing, c.conkey, c.confkey
+      from pg_constraint c
+     where c.confrelid = p_parent and c.contype = 'f' and c.conparentid = 0
+  loop
+    -- Which referencing column maps to the CONTROL column? A foreign key can only reference a unique
+    -- constraint, and every unique constraint on a partitioned table must include the partition key,
+    -- so this position always exists in pgpm's shape. Say so loudly if it ever does not, rather than
+    -- silently reporting no crossing and going on to a detach that will refuse.
+    v_pos := array_position(r.confkey, v_ctrl_attnum);
+    if v_pos is null then
+      raise exception 'pg_partition_magician: foreign key % on % references % without its control column %, so pgpm cannot tell which rows cross the retention horizon',
+        r.conname, r.referencing, p_parent, cfg.control_column;
+    end if;
+    select a.attname into v_refcol from pg_attribute a
+     where a.attrelid = r.referencing and a.attnum = (r.conkey)[v_pos];
+
+    -- A plain range predicate: a row whose key falls in [lo, hi) references a row in THIS partition,
+    -- by the definition of range partitioning, whatever else the key carries.
+    execute format(
+      'select coalesce(array_agg(distinct %I::text), ''{}''::text[]) from %s where %I >= %L and %I < %L',
+      v_refcol, r.referencing::text, v_refcol, v_lo_lit, v_refcol, v_hi_lit)
+      into v_more;
+    v_vals := v_vals || v_more;
+  end loop;
+  return v_vals;
+end;
+$$;
+
+-- _dispatch_detach: point the standing `pgpm_detach` job at this partition's concurrent detach.
+-- Returns null on success, or the REASON it could not dispatch -- pg_cron not installed, pgpm.schedule()
+-- never run, no privilege on cron.job. All three are configuration problems the operator has to see and
+-- fix, so the reason is carried back verbatim to be logged rather than flattened into a bare false.
+--
+-- Dynamic EXECUTE because the `cron` schema is only resolved at call time, so this file still installs
+-- cleanly where pg_cron is not enabled. Both relations are schema-qualified in the command: the cron
+-- job runs in its own session, with its own search_path.
+create or replace function pgpm._dispatch_detach(p_parent regclass, p_child name)
+returns text language plpgsql as $$
+declare v_nsp name; v_rel name; v_cmd text; v_n int;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_cmd := format('alter table %I.%I detach partition %I.%I concurrently', v_nsp, v_rel, v_nsp, p_child);
+  begin
+    execute format(
+      'select count(*)::int from (select cron.alter_job(jobid, command => %L) from cron.job'
+      || ' where jobname = ''pgpm_detach'' and database = current_database()) s', v_cmd)
+      into v_n;
+  exception when others then
+    return left(sqlerrm, 160);
+  end;
+  if v_n > 0 then return null; end if;
+  return 'no pgpm_detach cron job in this database; run pgpm.schedule()';
+end;
+$$;
+
+-- the reverse: put the standing job back to idle once a retirement completes, so it is not left
+-- re-running a detach that has already happened (which logs `is not a partition` every tick).
+create or replace function pgpm._idle_detach_job()
+returns void language plpgsql as $$
+begin
+  execute 'select cron.alter_job(jobid, command => ''select 1'') from cron.job'
+       || ' where jobname = ''pgpm_detach'' and database = current_database()';
+exception when others then
+  null;   -- no pg_cron, or no such job: there is nothing to quiesce
+end;
+$$;
+
 -- retire(): the sanctioned single-partition drop (issue #195) -- retain()'s per-partition body,
 -- public and claim-guarded, so an external assistant (e.g. an archive-then-drop scanner) or several
 -- cooperating ones can drive retirement themselves through the same protocol retain() uses: claim,
@@ -525,6 +681,8 @@ create or replace function pgpm.retire(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_boundary text; r record;
+  v_referenced boolean; v_still_attached boolean;
+  v_cross text[]; v_coltype text; v_lo_lit text; v_hi_lit text; v_deleted int; v_reason text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -533,13 +691,13 @@ begin
   end if;
 
   -- the claim: one owner per partition at a time
-  select p.lo, p.hi, p.attached into r
+  select p.lo, p.hi, p.attached, p.retiring_at into r
     from pgpm.part p
    where p.parent_table = p_parent and p.child_name = p_child
      for update skip locked;
   if not found then return false; end if;
   if not r.attached then
-    raise exception 'pg_partition_magician: %.% is not an attached partition (an in-flight drain/regrain child is not retirable)', p_parent, p_child;
+    raise exception 'pg_partition_magician: %.% is not an attached partition (an in-flight regrain child is not retirable)', p_parent, p_child;
   end if;
 
   v_boundary := pgpm._retain_boundary(cfg);
@@ -555,10 +713,124 @@ begin
 
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
+  -- Is anything pointing at this parent at all (issue #268)? Without an incoming FK the bare DROP
+  -- below works and costs nothing, so the overwhelmingly common path stays byte-identical: no marker,
+  -- no cron round trip, no waiting a tick. Gating here also confines the concurrent detach, and the
+  -- reaper hazard that comes with it, to the tables that actually need them.
+  v_referenced := exists (select 1 from pg_constraint
+                           where confrelid = p_parent and contype = 'f' and conparentid = 0);
+
+  if v_referenced then
+    v_still_attached := exists (
+      select 1 from pg_inherits i join pg_class c on c.oid = i.inhrelid
+       where i.inhparent = p_parent and c.relname = p_child);
+
+    if v_still_attached then
+      -- ONE DETACH IN FLIGHT AT A TIME, database-wide. There is a single standing cron job, so a
+      -- second dispatch would overwrite the first and silently abandon it -- leaving a partition
+      -- marked retiring_at that nothing is detaching. retain()'s batch loop walks every eligible
+      -- partition, and maintain_all walks every managed parent, so this is the common case, not an
+      -- exotic race: without this guard one retain() call marks the whole backlog and only the last
+      -- one is real. A retirement stops holding the job the moment its partition is detached, so this
+      -- yields rather than blocks: the next tick takes the next partition. Silent and retryable, like
+      -- the archive-coverage gate above.
+      -- Yield only to a STRICTLY OLDER in-flight retirement, on a total order. "Yield to any other" is
+      -- the obvious formulation and it deadlocks: two concurrent retire() calls can both pass the check
+      -- and both mark, after which each sees the other in flight and neither ever proceeds again. With a
+      -- total order the oldest marker always wins, so there is always exactly one partition able to make
+      -- progress and the loser simply retries. An unmarked candidate sorts last (`infinity`), so a fresh
+      -- retirement always yields to one already under way.
+      if exists (
+        select 1 from pgpm.part p
+         where p.retiring_at is not null
+           and not (p.parent_table = p_parent and p.child_name = p_child)
+           and (p.retiring_at, p.parent_table::text, p.child_name)
+             < (coalesce(r.retiring_at, 'infinity'::timestamptz), p_parent::text, p_child)
+           and exists (select 1 from pg_inherits i join pg_class c on c.oid = i.inhrelid
+                        where i.inhparent = p.parent_table and c.relname = p.child_name))
+      then
+        return false;
+      end if;
+
+      -- THE CROSSING. A live row genuinely referencing a doomed row is the one case where retention
+      -- and referential integrity contradict, and pgpm has NO policy decision to make here: the
+      -- operator already chose, per constraint, in the FK's ON DELETE clause. DELETE lets PostgreSQL
+      -- apply whatever was declared, with no branching -- CASCADE clears the referencing rows, SET
+      -- NULL and SET DEFAULT sever them in place, NO ACTION and RESTRICT refuse and therefore block
+      -- retention exactly as specified, surfacing the operator's own error rather than a pgpm one.
+      -- (DETACH cannot be left to do this: it is structural, so no action triggers fire, and it
+      -- unilaterally refuses for every constraint -- correct by coincidence for NO ACTION, an override
+      -- of an explicit instruction for CASCADE.)
+      v_cross := pgpm._crossing_keys(p_parent, r.lo, r.hi);
+      if coalesce(array_length(v_cross, 1), 0) > 0 then
+        select format_type(a.atttypid, a.atttypmod) into v_coltype
+          from pg_attribute a where a.attrelid = p_parent and a.attname = cfg.control_column;
+        v_lo_lit := pgpm._encode(cfg.control_kind, r.lo);
+        v_hi_lit := pgpm._encode(cfg.control_kind, r.hi);
+        begin
+          -- The write block installed above is a BEFORE ROW trigger on this child covering DELETE
+          -- too, so it would refuse this. Lift it for the delete and put it straight back: DDL is
+          -- transactional and retire() does not commit, so no other session ever observes the child
+          -- unblocked. Disabling triggers wholesale is NOT an option -- that would switch off the RI
+          -- triggers whose actions are the entire point of doing this as a DELETE.
+          perform pgpm._remove_write_block(p_parent, p_child);
+          execute format(
+            'delete from %s where %I >= %L and %I < %L and %I = any (%L::text[]::%s[])',
+            p_parent::text, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit,
+            cfg.control_column, v_cross, v_coltype);
+          get diagnostics v_deleted = row_count;
+          perform pgpm._install_write_block(p_parent, p_child);
+          -- Logged loudly and separately: this fires referential actions on tables pgpm was not
+          -- handed, which is the one thing retirement does beyond its own partition.
+          insert into pgpm.log (parent_table, action, lo, hi, method)
+            values (p_parent, 'retain_crossing', r.lo, r.hi,
+                    format('%s referenced key(s), %s row(s) deleted to honour the declared ON DELETE',
+                           array_length(v_cross, 1), v_deleted));
+        exception when others then
+          insert into pgpm.log (parent_table, action, lo, hi, method)
+            values (p_parent, 'fail_retain_crossing', r.lo, r.hi, left(sqlerrm, 200));
+          return false;
+        end;
+      end if;
+
+      -- Mark, then dispatch, in one transaction: the marker and the job's new command become visible
+      -- together, so there is never a detach in flight that recovery cannot attribute.
+      -- coalesce, NOT an unconditional stamp: retiring_at is when this retirement BEGAN, and a retry
+      -- must not refresh it. Re-stamping makes the winner perpetually the newest marker, so it stops
+      -- being the winner, and the total order above degenerates into no order at all -- two partitions
+      -- then dispatch in the same tick and one clobbers the other's job.
+      update pgpm.part set retiring_at = coalesce(retiring_at, clock_timestamp())
+       where parent_table = p_parent and child_name = p_child;
+
+      v_reason := pgpm._dispatch_detach(p_parent, p_child);
+      if v_reason is null then
+        insert into pgpm.log (parent_table, action, lo, hi, method)
+          values (p_parent, 'retain_detach', r.lo, r.hi,
+                  'concurrent detach dispatched; the drop completes on a later tick');
+      else
+        insert into pgpm.log (parent_table, action, lo, hi, method)
+          values (p_parent, 'fail_retain_detach', r.lo, r.hi,
+                  format('%s -- a referenced partition cannot be retired without it', v_reason));
+      end if;
+      return false;   -- retirement is under way, not done
+    end if;
+
+    -- Detached but not yet dropped. Complete it only if this was pgpm's retirement: an operator's own
+    -- interrupted DETACH CONCURRENTLY gets finalized by _detach_reap and then left alone, rather than
+    -- having pgpm drop a table it was never asked to drop.
+    if r.retiring_at is null then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_retain_drop', r.lo, r.hi,
+                'detached from the parent by something other than retirement; not dropping it');
+      return false;
+    end if;
+  end if;
+
   begin
     execute format('drop table %I.%I', v_nsp, p_child);
     delete from pgpm.part where parent_table = p_parent and child_name = p_child;
     insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
+    if v_referenced then perform pgpm._idle_detach_job(); end if;
     return true;
   exception when others then
     insert into pgpm.log (parent_table, action, lo, hi, method)
@@ -2396,6 +2668,56 @@ begin
 end;
 $$;
 
+-- _detach_reap(): finish any concurrent detach whose session died part-way (issue #268).
+--
+-- Retiring a referenced partition dispatches `DETACH PARTITION ... CONCURRENTLY` to pg_cron, so the
+-- detach genuinely runs in another session, and that session can die. Measured: a backend killed
+-- during the detach's SCAN phase rolls back cleanly and leaves nothing behind, but one killed during
+-- its WAIT phase -- reachable whenever any concurrent transaction still holds a snapshot on the parent
+-- -- leaves the partition flagged `pg_inherits.inhdetachpending` AND its rows already invisible
+-- through the parent (a 2,000,000-row parent read 1,000,000). The partition is then neither detached
+-- nor dropped, and rows have silently vanished from the user's table: strictly worse than the wedge
+-- this all exists to fix. `DETACH ... FINALIZE` completes it and clears the flag.
+--
+-- So this runs BEFORE the per-parent loop in maintain_all, like _transmute_reap: it is the most urgent
+-- thing in a tick. It FINALIZES unconditionally, because a pending detach is never a state to leave
+-- sitting, but it DROPS nothing -- retire() completes its own retirements on the normal path (it can
+-- tell, from pgpm.part.retiring_at, which detach was its own), and an operator's hand-run detach that
+-- was interrupted is finished and then left alone.
+create or replace function pgpm._detach_reap()
+returns int language plpgsql as $$
+declare r record; v_n int := 0;
+begin
+  for r in
+    select pn.nspname as pnsp, pc.relname as prel,
+           cn.nspname as cnsp, cc.relname as crel,
+           i.inhparent::regclass as parent
+      from pg_inherits i
+      join pg_class cc on cc.oid = i.inhrelid
+      join pg_namespace cn on cn.oid = cc.relnamespace
+      join pg_class pc on pc.oid = i.inhparent
+      join pg_namespace pn on pn.oid = pc.relnamespace
+     where i.inhdetachpending
+       and i.inhparent in (select parent_table from pgpm.config)
+  loop
+    begin
+      execute format('alter table %I.%I detach partition %I.%I finalize',
+                     r.pnsp, r.prel, r.cnsp, r.crel);
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        select r.parent, 'detach_reap', p.lo, p.hi,
+               'an abandoned concurrent detach was finalized; its rows were already invisible through the parent'
+          from pgpm.part p
+         where p.parent_table = r.parent and p.child_name = r.crel;
+      v_n := v_n + 1;
+    exception when others then
+      insert into pgpm.log (parent_table, action, method)
+        values (r.parent, 'fail_detach_reap', left(sqlerrm, 200));
+    end;
+  end loop;
+  return v_n;
+end;
+$$;
+
 -- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and
 -- creates no real partitions (obtain does that, later -- see the NOTE in _transmute), so until
 -- maintenance/obtain has run the DEFAULT partition still holds 100% of the rows and the original
@@ -2953,6 +3275,9 @@ begin
   -- #275: undo any conversion whose session died mid-way, before anything else. Independent of
   -- pgpm.config on purpose: a half-converted table is not registered yet.
   perform pgpm._transmute_reap();
+  -- #268: and any concurrent detach whose session died mid-way, for the same reason and with more
+  -- urgency -- a partition left pending has its rows already invisible through the parent.
+  perform pgpm._detach_reap();
   commit;
 
   -- One transaction per parent, not one for the whole sweep (#279). Two reasons. Locks: without it,
@@ -2974,12 +3299,14 @@ begin
 end;
 $$;
 
--- schedule()/unschedule(): a thin convenience wrapper around pg_cron for the one job pgpm needs, so the
+-- schedule()/unschedule(): a thin convenience wrapper around pg_cron for the two jobs pgpm needs, so the
 -- operator does not hand-write the cron incantation. pgpm never schedules on its own (transmute stays
--- pg_cron-free, and the drain can be driven by hand with drain_all/maintain); this is the deliberate,
+-- pg_cron-free, and a tick can be driven by hand with maintain/maintain_all); this is the deliberate,
 -- discoverable way to turn the scheduled lifecycle on. One canonical job named 'pgpm' calls
 -- maintain_all() for ALL managed tables, so it is scheduled once, not per table, and re-scheduling
--- updates the interval rather than duplicating. It targets current_database() via schedule_in_database,
+-- updates the interval rather than duplicating. The second, 'pgpm_detach', is idle machinery for
+-- issue #268 and is described at its creation below; it is required only for retiring a partition
+-- that an incoming foreign key references. It targets current_database() via schedule_in_database,
 -- so the job runs against the database pgpm lives in whether or not that is the cron database. The cron
 -- calls are dynamic (EXECUTE) on purpose: the cron schema is only resolved at call time, so this file
 -- still installs cleanly where pg_cron is not enabled yet. Run it FROM the database where pg_cron is
@@ -2997,6 +3324,14 @@ begin
   execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
                  'pgpm', p_every, 'call pgpm.maintain_all()', current_database())
     into v_jobid;
+  -- The second job exists solely as a place for retire() to put a `DETACH PARTITION ... CONCURRENTLY`
+  -- (issue #268), which PostgreSQL refuses to execute from a function but a cron job runs as a
+  -- top-level statement. It is created IDLE and stays idle until a REFERENCED partition needs
+  -- retiring, at which point retire() rewrites its command in place and returns it to `select 1` once
+  -- the drop lands. One standing job, rewritten, rather than one per retirement: pg_cron has no
+  -- one-shot schedule, so a per-retirement job would keep firing after it succeeded.
+  execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
+                 'pgpm_detach', p_every, 'select 1', current_database());
   return v_jobid;
 end;
 $$;
@@ -3009,7 +3344,7 @@ begin
     return 0;   -- nothing scheduled if pg_cron is not here
   end if;
   execute 'select count(*)::int from (select cron.unschedule(jobid) from cron.job '
-       || 'where jobname = ''pgpm'' and database = current_database()) s' into v_n;
+       || 'where jobname in (''pgpm'', ''pgpm_detach'') and database = current_database()) s' into v_n;
   return v_n;
 end;
 $$;
@@ -3079,14 +3414,14 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text,
   fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_drop_failures bigint,
-  retain_backlog bigint
+  retain_backlog bigint, retain_detaching bigint
 )
 language plpgsql as $$
 declare
   r pgpm.config; v_nsp name; v_np bigint; v_coarse bigint; v_inflight bigint; v_new text;
 
   v_fks_susp bigint; v_fks_unval bigint;
-  v_last_retain_id bigint; v_drop_fails bigint;
+  v_last_retain_id bigint; v_drop_fails bigint; v_detaching bigint;
   v_retain_boundary text; v_retain_backlog bigint;
 begin
   for r in select * from pgpm.config loop
@@ -3114,9 +3449,19 @@ begin
     -- stays non-zero while chunked archiving catches up (see retain_backlog below).
     select max(id) into v_last_retain_id from pgpm.log
       where parent_table = r.parent_table and action = 'retain_drop';
+    -- Exact action values, never a prefix match: `fail_retain_crossing` (issue #268, a live row
+    -- references a doomed one and the FK's own ON DELETE refused the delete) and `fail_retain_detach`
+    -- (no pgpm_detach cron job to dispatch to) wedge retention exactly as a failed drop does, so they
+    -- belong in the same since-last-progress count.
     select count(*) into v_drop_fails from pgpm.log
-      where parent_table = r.parent_table and action = 'fail_retain_drop'
+      where parent_table = r.parent_table
+        and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach')
         and id > coalesce(v_last_retain_id, 0);
+    -- Partitions whose concurrent detach has been dispatched and not yet completed (issue #268).
+    -- Non-zero is normal for a tick or two while cron performs the detach; persistently non-zero with
+    -- retain_drop_failures climbing means the dispatch has nowhere to go.
+    select count(*) into v_detaching from pgpm.part
+      where parent_table = r.parent_table and retiring_at is not null;
     -- retain_backlog: eligible-but-undropped partitions (whole range at/below the retention horizon,
     -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks, or while
     -- chunked archiving is still catching up on a write-blocked child -- it should fall tick over
@@ -3134,7 +3479,7 @@ begin
     coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
     newest_bound := v_new;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_drop_failures := v_drop_fails;
-    retain_backlog := v_retain_backlog;
+    retain_backlog := v_retain_backlog; retain_detaching := v_detaching;
     return next;
   end loop;
 end;

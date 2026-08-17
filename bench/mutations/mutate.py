@@ -69,6 +69,19 @@ MUTATIONS = {
         "the ADD's SHARE ROW EXCLUSIVE on the managed parent is held across an O(referencing table) scan.",
         [(RESTORE_MARKER, RESTORE_INLINE, 1)],
     ),
+    "retire_inline_detach": (
+        "bench/retire_detach_lock.sh",
+        "The tempting wrong fix for #268: retire() detaches the referenced partition ITSELF, with a "
+        "plain (non-concurrent) DETACH. Functionally identical -- the partition ends up detached and "
+        "then dropped, and every behavioural test still passes -- but it holds ACCESS EXCLUSIVE on the "
+        "MANAGED PARENT for the whole O(referencing table) scan, so reads of the parent die with "
+        "55P03. This is the defect the dispatch-to-cron machinery exists to avoid, and nothing but a "
+        "lock probe can tell the two apart.",
+        [("      v_reason := pgpm._dispatch_detach(p_parent, p_child);\n",
+          "      execute format('alter table %s detach partition %I.%I',\n"
+          "                     p_parent::text, v_nsp, p_child);\n"
+          "      v_reason := null;\n", 1)],
+    ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",
         "Pre-#272 regrain: the trigger-populated delta carries no row estimate, so the planner "
