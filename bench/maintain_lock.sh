@@ -4,16 +4,18 @@
 # THE BAR (issue #263's acceptance rule): a blocking lock may last milliseconds, but it must never last a
 # duration coupled to data size.
 #
-# pgpm.obtain takes ACCESS EXCLUSIVE on the PARENT (CREATE TABLE ... PARTITION OF) and on the DEFAULT
-# (ADD CONSTRAINT ... NOT VALID). Locks release at transaction end, so while a tick is one transaction
-# those are held across everything that follows -- including the drain, whose duration is proportional to
-# drain_batch. On the parent, that blocks readers too: the whole table stalls for the length of a drain
-# batch, on every tick where obtain happens to create a partition.
+# pgpm.obtain takes ACCESS EXCLUSIVE on the PARENT (CREATE TABLE ... PARTITION OF). Locks release at
+# transaction end, so while a tick is one transaction that lock is held across everything that follows.
+# On the parent it blocks readers too, so the whole table stalls for as long as the rest of the tick takes.
+#
+# The long step in a tick used to be the drain; #288 removed it and the DEFAULT with it, so the long step
+# is now a REGRAIN copy microbatch. This guard drives a regrain rather than a drain: same shape, same
+# assertion, and it protects the same five boundaries in maintain().
 #
 # The assertion is the consequence an operator would actually see, not the lock mode: a plain SELECT
-# against the parent, with a lock_timeout far shorter than the drain, must never time out during a tick.
-# drain_batch is set so the pre-fix hold (~2.3 s) is over the reader's 1 s timeout by a wide margin while
-# obtain's own window (~80 ms) is comfortably under it, so neither verdict rides on a close call.
+# against the parent, with a lock_timeout far shorter than the regrain batch, must never time out during a
+# tick. obtain's own window is ~1 ms (pure metadata now), far under the reader's 1 s timeout, so neither
+# verdict rides on a close call.
 #
 # Usage: maintain_lock.sh <container> <db> [install.sql]
 # The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
@@ -21,8 +23,7 @@
 set -uo pipefail
 C="${1:?container}"; DB="${2:?db}"; INSTALL="${3:-/repo/pgpm_core/install.sql}"
 MONO=${MONO:-6000000}       # rows loaded before the conversion; the monolith covers them
-TAIL=${TAIL:-3000000}       # rows written past the monolith, which land in the DEFAULT
-BATCH=${BATCH:-1000000}
+BATCH=${BATCH:-2000000}
 fail=0
 
 q() { docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$1"; }
@@ -38,16 +39,35 @@ docker exec "$C" psql -U postgres -d "$DB" -q -f "$INSTALL" >/dev/null 2>&1
 q "create table public.ml (id bigint primary key, v text)" >/dev/null
 q "insert into public.ml select g, repeat('x',60) from generate_series(1,$MONO) g" >/dev/null
 q "call pgpm.transmute('public.ml','id', $MONO::bigint, p_paused => false)" >/dev/null
-# Rows PAST the monolith pile up in the DEFAULT: they give obtain a non-empty default to scan and the
-# drain a closed tail to work, which is what puts both in the same tick. The monolith's upper bound is
-# read back rather than assumed -- transmute rounds it up to the next grid step, so it sits above the
-# data, and rows written to a hardcoded MONO+1 would land inside the monolith and never reach the default.
+# Advance the frontier to the TOP of the grid so the next obtain has a partition to create. Without that
+# the tick takes no ACCESS EXCLUSIVE at all and the guard would pass having observed nothing. The grid's
+# ceiling is read back rather than assumed, since transmute now builds it during the cutover.
 HI=$(q "select max(hi::bigint) from pgpm.part where parent_table='public.ml'::regclass")
-q "insert into public.ml select g, repeat('x',60) from generate_series($((HI+1)), $((HI+TAIL))) g" >/dev/null
+q "insert into public.ml values ($((HI-1)), 'advances the frontier to the grid ceiling')" >/dev/null
 q "vacuum analyze public.ml" >/dev/null
-# A step well under the data range leaves a closed tail for the drain AND an empty future cell for obtain.
-q "update pgpm.config set partition_step='1000000', obtain=1, drain_adaptive=false, drain_batch=$BATCH
-     where parent_table='public.ml'::regclass" >/dev/null
+# Auto-regrain of the coarse monolith into fine children is the long step in a tick now. A small target
+# step means many copy microbatches, so the tick is long enough to span if a boundary goes missing.
+q "update pgpm.config set drain_batch=$BATCH where parent_table='public.ml'::regclass" >/dev/null
+# Sub-range width chosen from measurement, not guessed: at 2,000,000 a copy tick runs 2.1-2.4 s, which
+# comfortably outlasts the ~150 ms it takes the probe's own psql session to start. At 100k and at 500k the
+# tick finished before the probe could read, and the guard reported nothing observed.
+q "select pgpm.set_regrain('public.ml', '2000000')" >/dev/null
+
+# One warm-up tick. A regrain's FIRST tick returns 'prepared': it installs change capture and copies
+# nothing, so it takes ~26 ms and there is no long step for obtain's lock to span. Measuring that tick
+# would pass while observing nothing, which is exactly the failure this guard exists to avoid.
+q "call pgpm.maintain_all()" >/dev/null
+
+# That warm-up tick also consumed obtain's work, so the MEASURED tick would have no partition to create
+# and take no ACCESS EXCLUSIVE at all. Advance the frontier again, to the grid's new ceiling, so obtain
+# has work in the same tick as the long regrain copy -- which is the whole point of the guard.
+CEIL=$(q "select max(hi::bigint) from pgpm.part where parent_table='public.ml'::regclass")
+q "insert into public.ml values ($((CEIL-1)), 'advances the frontier again')" >/dev/null
+
+# Clear the log so every assertion below is about the MEASURED tick alone. Without this, the warm-up
+# tick's own obtain entries satisfy the "did the work that takes the lock" check and it passes on stale
+# evidence -- the same vacuous-pass shape the liveness witnesses exist to catch.
+q "delete from pgpm.log where parent_table='public.ml'::regclass" >/dev/null
 
 q "create table public.probe (attempts int, timeouts int, saw_tick boolean)" >/dev/null
 q "create table public.done (x int)" >/dev/null
@@ -102,8 +122,8 @@ check "at least one read landed inside the tick" \
 check "the tick did the work that takes the lock" \
       "$(q "select (count(*) > 0)::text from pgpm.log
              where parent_table='public.ml'::regclass and action = 'obtain'")" "true"
-check "and drained in the same tick" \
+check "and regrained in the same tick" \
       "$(q "select (count(*) > 0)::text from pgpm.log
-             where parent_table='public.ml'::regclass and action in ('drain_move','drain_attach')")" "true"
+             where parent_table='public.ml'::regclass and action in ('regrain_copy','regrain_attach','regrain')")" "true"
 
 exit "$fail"

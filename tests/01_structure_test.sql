@@ -1,7 +1,7 @@
 -- Verifies the conversion produced the intended partitioned structure.
 create extension if not exists pgtap;
 
-select plan(5);
+select plan(3);
 
 select is(
   (select relkind::text from pg_class
@@ -10,17 +10,7 @@ select is(
   'public.messages is a partitioned table'
 );
 
-select ok(
-  (select relispartition from pg_class
-    where relname = 'messages_default' and relnamespace = 'public'::regnamespace),
-  'messages_default is a partition'
-);
 
-select is(
-  (select partdefid from pg_partitioned_table where partrelid = 'public.messages'::regclass),
-  'public.messages_default'::regclass::oid,
-  'messages_default is the DEFAULT partition'
-);
 
 select is(
   pg_get_partkeydef('public.messages'::regclass),

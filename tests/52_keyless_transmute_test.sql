@@ -26,9 +26,11 @@ select is(
   true, 'the control column is NOT NULL');
 select is((select count(*)::int from public.kl), 40, 'all rows conserved through the parent');
 -- the monolith holds the history as one coarse child, queryable through the parent
+-- status().coarse_partitions rather than a width predicate on lo/hi: this table is TIME-kind, so those
+-- are timestamps and will not subtract as numerics. status() already knows the control kind.
 select is(
-  (select count(*)::int from pgpm.part where parent_table = 'public.kl'::regclass and attached),
-  1, 'the history is attached as a single monolith child');
+  (select coarse_partitions::int from pgpm.status() where parent = 'public.kl'::regclass),
+  1, 'the history is attached as a single COARSE monolith child (the forward grid is one-step children)');
 
 -- (B) keyless table with a NULLABLE control column -> refuse (NOT NULL required, never a scan)
 create table public.kl_null (ts timestamptz, v int);   -- nullable control

@@ -34,11 +34,11 @@ create table if not exists pgpm.config (
                    check (control_kind in ('time', 'id', 'uuidv7')),
   partition_step   text        not null,    -- '1 month' (time/uuidv7) | '10000000' (id)
   partition_anchor text        not null,    -- '2000-01-01...' (time/uuidv7) | '0' (id)
-  obtain          int         not null default 4,
+  obtain          int         not null default 30,
   retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
   keep_default     boolean     not null default true,
   drain_batch      int         not null default 5000,
-  default_table    name        not null,
+  default_table    name       ,
   paused           boolean     not null default true,
   created_at       timestamptz not null default now(),
   -- when maintenance may next attempt obtain for this parent. Under sustained write contention
@@ -431,159 +431,55 @@ begin
 end;
 $$;
 
--- #280: _create_partition became a PROCEDURE so its phases can commit. Drop the old function first, or
--- an upgrade fails with "cannot change routine kind".
-drop function if exists pgpm._create_partition(pgpm.config, name, name, regclass, name, text, text);
-
--- create an EMPTY partition for native [p_lo, p_hi).
+-- Create an EMPTY partition for native [p_lo, p_hi).
 --
--- Beside a NON-EMPTY default, someone has to prove the default holds no row in the new range, or the
--- CREATE scans it. pgpm proves it with a NOT VALID exclusion CHECK plus VALIDATE, which lets the CREATE
--- skip the scan. That much is unchanged.
---
--- What changed for #280 is that the three statements no longer share a transaction. They did, and since
--- locks release only at transaction end, the ADD's ACCESS EXCLUSIVE was held over the VALIDATE's
--- O(rows) scan -- so the DEFAULT, which is where the live workload writes, was locked for the whole of
--- it. Measured against a 947 MB default on PG17: 157 ms, and unbounded, since a larger or colder
--- default makes it seconds.
---
---   phase 1  ADD ... NOT VALID                  ACCESS EXCLUSIVE, 0.6 ms
---   phase 2  VALIDATE                           SHARE UPDATE EXCLUSIVE, 164 ms  <- does not block writes
---   phase 3  CREATE (scan skipped) + DROP       ACCESS EXCLUSIVE, ~1 ms
---
--- Phase 3 keeps the CREATE and the DROP together on purpose: both are sub-millisecond ACCESS EXCLUSIVE,
--- so merging them costs one short window instead of two.
---
--- The constraint has ONE FIXED NAME per default, not one derived from the partition. Deriving it was the
--- obvious choice and it is wrong: `(p_name || '_excl')::name` SILENTLY TRUNCATES at 63 bytes, and a
--- coarse child's name is already 46 characters, so two candidates can collide on one constraint. A fixed
--- name also means a leftover is unambiguous to clear, which is what obtain does with it.
-create or replace procedure pgpm._create_partition(
-  p_cfg pgpm.config, p_nsp name, p_rel name, p_default regclass, p_name name, p_lo text, p_hi text,
-  inout p_defer text default null
+-- One statement. With the DEFAULT gone (#288) there is nothing to prove empty, so the whole
+-- NOT VALID/VALIDATE exclusion dance is gone with it, along with the phase commits, the fixed
+-- pgpm_obtain_excl name and the restart-on-leftover logic that #280 needed. CREATE TABLE ... PARTITION OF
+-- against a parent with no default partition is pure catalog work: it takes a brief ACCESS EXCLUSIVE on
+-- the parent and scans nothing.
+create or replace function pgpm._create_partition(
+  p_cfg pgpm.config, p_nsp name, p_rel name, p_default regclass, p_name name, p_lo text, p_hi text
 )
-language plpgsql as $$
-declare v_empty boolean; v_method text; v_lo_lit text; v_hi_lit text;
+returns void language plpgsql as $$
+declare v_lo_lit text; v_hi_lit text;
 begin
-  p_defer := null;
   v_lo_lit := pgpm._encode(p_cfg.control_kind, p_lo);
   v_hi_lit := pgpm._encode(p_cfg.control_kind, p_hi);
-  if p_cfg.keep_default then
-    execute format('select not exists (select 1 from %s)', p_default::text) into v_empty;
-  else v_empty := true; end if;
-
-  if v_empty then
-    -- Nothing to prove against an empty default, so no dance and no boundary: one statement, one short
-    -- lock. Every keep_default = false table takes this path too.
-    begin
-      execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
-                     p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
-    exception when others then p_defer := sqlerrm; return;
-    end;
-    v_method := 'plain';
-  else
-    begin
-      execute format('alter table %s add constraint pgpm_obtain_excl check (%I < %L or %I >= %L) not valid',
-                     p_default::text, p_cfg.control_column, v_lo_lit, p_cfg.control_column, v_hi_lit);
-    exception when others then p_defer := sqlerrm; return;
-    end;
-    commit;   -- BOUNDARY (#280): drop the ADD's ACCESS EXCLUSIVE before the scan, which is the point
-
-    begin
-      execute format('alter table %s validate constraint pgpm_obtain_excl', p_default::text);
-    exception when others then p_defer := sqlerrm; return;
-    end;
-    commit;   -- BOUNDARY (#280): the scan is done and durable; the CREATE below can now skip it
-
-    begin
-      execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
-                     p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
-      execute format('alter table %s drop constraint pgpm_obtain_excl', p_default::text);
-    exception when others then p_defer := sqlerrm; return;
-    end;
-    v_method := 'check_skip';
-  end if;
-
+  execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
+                 p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
   perform pgpm._own_like_parent(format('%I.%I', p_nsp, p_rel)::regclass,
                                 format('%I.%I', p_nsp, p_name)::regclass);
-
   insert into pgpm.part (parent_table, child_name, lo, hi)
     values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi) on conflict do nothing;
   insert into pgpm.log (parent_table, action, lo, hi, method)
-    values (format('%I.%I', p_nsp, p_rel)::regclass, 'obtain', p_lo, p_hi, v_method);
+    values (format('%I.%I', p_nsp, p_rel)::regclass, 'obtain', p_lo, p_hi, 'plain');
 end;
 $$;
 
 -- #280: obtain became a PROCEDURE because _create_partition commits. Drop the old function first.
-drop function if exists pgpm.obtain(regclass);
+-- #288: obtain is a plain FUNCTION again. It became a procedure for #280 only so _create_partition could
+-- commit between the phases of its exclusion-constraint dance; with the DEFAULT gone there is no dance,
+-- nothing to prove empty, and nothing to recover from. The advisory lock, the stranded-constraint sweep
+-- and the deferral reporting all went with it.
+drop procedure if exists pgpm.obtain(regclass, int, boolean);
 
 -- obtain(): build the empty forward partitions ahead of the frontier.
 --
--- A PROCEDURE, because _create_partition now commits between its phases (#280). Three consequences,
--- all of them here rather than in maintain:
---
--- IT CATCHES ITS OWN ERRORS. maintain used to wrap the call in BEGIN ... EXCEPTION, which is no longer
--- possible: transaction control is illegal anywhere below an exception handler, so that wrapper would
--- turn every COMMIT below into "invalid transaction termination". It catches WHEN OTHERS, not just the
--- lock-race SQLSTATEs, because that wrapper caught everything -- and now that maintain_all has no
--- per-parent handler either, a narrower catch here would let one odd error abort a whole sweep.
--- Every handler only sets a variable; every COMMIT is at the top level, outside all of them.
---
--- IT TAKES AN ADVISORY LOCK. It never needed one while it was a single transaction. With commits, a
--- second session entering obtain would drop the first's in-flight constraint mid-VALIDATE.
---
--- IT RESTARTS RATHER THAN RESUMES. A leftover pgpm_obtain_excl is dropped, not adopted. Adopting it
--- would mean matching it back to a candidate, and it cannot be matched safely: the name is fixed, and
--- the range it covers may be one the current partition_step no longer produces, so a resume could
--- validate one range and create another. Restarting costs one scan, and only after a crash.
---
--- p_deferred tells maintain whether to start its back-off. The back-off CHECK stays in maintain: an
--- operator calling obtain by hand wants it to try, not to honour a window maintenance set.
-create or replace procedure pgpm.obtain(
-  p_parent regclass, inout p_made int default null, inout p_deferred boolean default null
-)
-language plpgsql as $$
+-- This is now pgpm's ONLY defence against a write with nowhere to go, since there is no DEFAULT to catch
+-- one. config.obtain x partition_step is therefore both the slack for maintenance falling behind and a
+-- hard ceiling on how far ahead an application may write. The default is 30 steps for that reason.
+create or replace function pgpm.obtain(p_parent regclass)
+returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_default regclass;
-  v_frontier text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text; v_name name;
-  v_has boolean; k int; v_defer text; v_key bigint;
+  cfg pgpm.config; v_nsp name; v_rel name;
+  v_frontier text; v_lo text; v_hi text; v_name name;
+  v_made int := 0; k int;
 begin
-  p_made := 0; p_deferred := false;
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_default  := format('%I.%I', v_nsp, cfg.default_table)::regclass;
-
-  v_key := hashtextextended('pgpm_obtain:' || p_parent::oid::text, 0);
-  if not pg_try_advisory_lock(v_key) then
-    p_deferred := true;
-    insert into pgpm.log (parent_table, action, method)
-      values (p_parent, 'skip_obtain', 'another session is already obtaining for this table');
-    return;
-  end if;
-
-  -- Clear anything a previous call left stranded, BEFORE reading the frontier: while that constraint
-  -- is in place the default rejects writes in its range, so it must go whether or not this call ends
-  -- up building anything.
-  if exists (select 1 from pg_constraint
-              where conrelid = v_default and conname = 'pgpm_obtain_excl') then
-    begin
-      execute format('alter table %s drop constraint pgpm_obtain_excl', v_default::text);
-    exception when others then
-      v_defer := sqlerrm;
-    end;
-    if v_defer is not null then
-      p_deferred := true;
-      insert into pgpm.log (parent_table, action, method)
-        values (p_parent, 'skip_obtain', left(v_defer, 200));
-      perform pg_advisory_unlock(v_key);
-      return;
-    end if;
-    commit;
-    insert into pgpm.log (parent_table, action, method)
-      values (p_parent, 'obtain_reap', 'dropped a stranded pgpm_obtain_excl left by an earlier call');
-  end if;
 
   v_frontier := pgpm._frontier_native(p_parent);
   v_lo       := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
@@ -602,226 +498,23 @@ begin
        where p.parent_table = p_parent and p.attached
          and pgpm._native_gt(cfg.control_kind, p.hi, v_lo)
          and pgpm._native_gt(cfg.control_kind, v_hi, p.lo));
-    v_lo_lit := pgpm._encode(cfg.control_kind, v_lo);
-    v_hi_lit := pgpm._encode(cfg.control_kind, v_hi);
-    -- skip a range the DEFAULT still holds data for (only the active interval)
-    execute format('select exists (select 1 from %s where %I >= %L and %I < %L)',
-                   v_default::text, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_has;
-    continue when v_has;
 
-    -- NOT wrapped in BEGIN ... EXCEPTION, and that is load-bearing: transaction control is illegal
-    -- anywhere below a handler, so wrapping this would turn _create_partition's own COMMITs into
-    -- "invalid transaction termination" and defer every single build. _create_partition therefore
-    -- reports through p_defer instead of raising.
-    --
-    -- A deferral EXITS rather than trying the next candidate: under lock contention the next one meets
-    -- the same wall, and stopping is what the old maintain-side handler did.
-    call pgpm._create_partition(cfg, v_nsp, v_rel, v_default, v_name, v_lo, v_hi, v_defer);
-    exit when v_defer is not null;
-    p_made := p_made + 1;
-    commit;
+    perform pgpm._create_partition(cfg, v_nsp, v_rel, null, v_name, v_lo, v_hi);
+    v_made := v_made + 1;
   end loop;
-
-  if v_defer is not null then
-    p_deferred := true;
-    insert into pgpm.log (parent_table, action, method)
-      values (p_parent, 'skip_obtain', left(v_defer, 200));
-  end if;
-  perform pg_advisory_unlock(v_key);
+  return v_made;
 end;
 $$;
 
-create or replace function pgpm.drain_step(
-  p_parent regclass, p_batch int default null, p_include_open boolean default false
-)
-returns text language plpgsql as $$
-declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_def text; v_cols text; v_batch int;
-  v_min text; v_min_native text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text;
-  v_name name; v_open boolean; v_frontier text; v_moved bigint; v_more boolean;
-  v_excl name; v_method text; v_reltuples real; v_avg numeric; v_blk_limit int;
-  v_retain_boundary text;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_def   := format('%I.%I', v_nsp, cfg.default_table);
-  v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
+-- drain_step / drain_all removed with the DEFAULT partition (#288). With a complete forward grid there
+-- is nothing for a row to land in except a real partition, so there is nothing to evacuate.
 
-  -- Block budget (REDESIGN.md): bound the microbatch by heap+TOAST blocks, not just rows, so a
-  -- wide-row table (large jsonb/bytea) can't make one batch tens of GB. Translate the budget to a row
-  -- cap via the default's average bytes/row and take the smaller of the two. When row stats exist that
-  -- average is pg_table_size / reltuples. When they DON'T (a freshly transmuted / never-analyzed
-  -- default -- exactly the early-drain window when the default is largest and widest), do NOT silently
-  -- disable the budget (issue #93): estimate the average by sampling pg_column_size, which reads each
-  -- toasted value's stored (post-compression) external size from its TOAST pointer WITHOUT fetching it,
-  -- so the sample is cheap and TOAST-aware -- it scores a compressible column small (correctly, since
-  -- it is cheap to move) and an incompressible wide one near its full width.
-  if cfg.drain_max_blocks is not null then
-    select c.reltuples into v_reltuples from pg_class c where c.oid = v_def::regclass;
-    if coalesce(v_reltuples, 0) > 0 then
-      v_avg := pg_table_size(v_def::regclass)::numeric / v_reltuples;   -- avg heap+TOAST bytes/row
-    else
-      execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_def)
-        into v_avg;
-    end if;
-    if coalesce(v_avg, 0) > 0 then
-      v_blk_limit := greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int;
-      v_batch := least(v_batch, v_blk_limit);
-    end if;
-  end if;
+-- #288: both drain routines are gone; drop whichever form a prior version left behind.
+drop function  if exists pgpm.drain_all(regclass, int, boolean);
+drop procedure if exists pgpm.drain_all(regclass, int, boolean, int);
+drop function  if exists pgpm.drain_step(regclass, int, boolean);
 
-  execute format('select t.%I::text from %s t order by t.%I asc limit 1',
-                 cfg.control_column, v_def, cfg.control_column) into v_min;
-  if v_min is null then return 'idle'; end if;
 
-  v_min_native := pgpm._decode(cfg.control_kind, v_min);
-  v_lo := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_min_native);
-  v_hi := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
-  v_frontier := pgpm._frontier_native(p_parent);
-  v_open := pgpm._native_gt(cfg.control_kind, v_hi, v_frontier);
-  if v_open and not p_include_open then return 'idle'; end if;
-
-  v_name   := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo);
-  v_lo_lit := pgpm._encode(cfg.control_kind, v_lo);
-  v_hi_lit := pgpm._encode(cfg.control_kind, v_hi);
-
-  -- Retention-aware reclaim (issue #91): if this oldest closed interval is entirely below the
-  -- retention horizon, retain() would DROP it the instant it became a partition -- so skip the
-  -- materialize+attach and DELETE the batch straight out of the DEFAULT, paced exactly like a normal
-  -- microbatch (and cheaper: no INSERT, no child, no attach). This reclaims the aged tail even when it
-  -- never made it out of the DEFAULT, so retention bounds storage on a lagging drain too, and spares
-  -- the wasted I/O of materializing a partition only to drop it next tick. The horizon matches
-  -- retain()'s exactly: an interval is below it iff hi <= boundary (id: floor(frontier - retain);
-  -- time/uuidv7: floor(now() - retain)).
-  if cfg.retain is not null then
-    if cfg.control_kind = 'id'
-      then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                  (v_frontier::numeric - cfg.retain::numeric)::text);
-      else v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                  (now() - cfg.retain::interval)::text);
-    end if;
-    if not pgpm._native_gt(cfg.control_kind, v_hi, v_retain_boundary) then
-      execute format($f$
-        delete from %1$s where ctid in (select ctid from %1$s
-                         where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
-      $f$, v_def, cfg.control_column, v_lo_lit, v_hi_lit, v_batch);
-      get diagnostics v_moved = row_count;
-      insert into pgpm.log (parent_table, action, lo, hi, rows)
-        values (p_parent, 'retain_reclaim', v_lo, v_hi, v_moved);
-      execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
-                     v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
-      return case when v_more then 'reclaimed:' || v_moved else 'reclaimed:' || v_moved || ':done' end;
-    end if;
-  end if;
-
-  if to_regclass(format('%I.%I', v_nsp, v_name)) is null then
-    execute format('create table %I.%I (like %I.%I including defaults including generated including storage including indexes including constraints excluding identity)',
-                   v_nsp, v_name, v_nsp, v_rel);
-    execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
-                   v_nsp, v_name, (v_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
-    perform pgpm._own_like_parent(p_parent, format('%I.%I', v_nsp, v_name)::regclass);   -- #277
-    -- record the child the moment it exists, marked in-flight (not yet attached) so it is tracked in
-    -- pgpm's catalog across a multi-batch drain, not only at the final attach below (issue #94).
-    insert into pgpm.part (parent_table, child_name, lo, hi, attached)
-      values (p_parent, v_name, v_lo, v_hi, false) on conflict (parent_table, child_name) do nothing;
-  end if;
-
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
-    from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped
-      and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
-
-  -- ORDER BY the control column: the default's PK leads with the control column (transmute builds
-  -- it that way), so this makes the batch select an INDEX SCAN that reads exactly p_batch rows
-  -- in order. Without it the planner SEQ-SCANs the (large) default to find a batch -- every
-  -- drain_step re-scanning the whole default, a SEQUENTIAL_SCAN_STORM at scale. The index scan
-  -- also needs no sort. (The per-batch temp spill is the data-modifying CTE below materializing
-  -- the moved rows -- it is independent of this ORDER BY.)
-  execute format($f$
-    with b as (
-      delete from %1$s where ctid in (select ctid from %1$s
-                       where %2$I >= %3$L and %2$I < %4$L order by %2$I limit %5$s)
-      returning %6$s
-    )
-    insert into %7$I.%8$I (%6$s) select %6$s from b
-  $f$, v_def, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols, v_nsp, v_name);
-  get diagnostics v_moved = row_count;
-  insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'drain_move', v_lo, v_hi, v_moved);
-
-  -- Does ANY row remain in [lo,hi)? Use EXISTS (index scan, stops at the first row), NOT
-  -- count(*), which re-scans the whole range every microbatch -- O(rows^2/batch), and while
-  -- the default isn't all-visible mid-drain it seq-scans the range each step (a
-  -- SEQUENTIAL_SCAN_STORM at scale). We only need to know whether to keep draining or attach.
-  execute format('select exists(select 1 from %s where %I >= %L and %I < %L)',
-                 v_def, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_more;
-  if v_more then return 'moved:' || v_moved; end if;
-
-  -- the interval is fully drained and the child is still private (not yet attached): ANALYZE it now, off
-  -- the attach's exclusive lock, so the planner has real stats before the attach exposes it to user queries
-  -- and subsequent ticks. Without this it sits at reltuples = -1 until autovacuum, and anything touching it
-  -- misplans (#164).
-  perform pgpm._analyze(format('%I.%I', v_nsp, v_name)::regclass);
-
-  if v_open or not cfg.keep_default then
-    execute format('alter table %I.%I attach partition %I.%I for values from (%L) to (%L)',
-                   v_nsp, v_rel, v_nsp, v_name, v_lo_lit, v_hi_lit);
-    v_method := 'plain';
-  else
-    v_excl := (v_name || '_excl')::name;
-    execute format('alter table %s add constraint %I check (%I < %L or %I >= %L) not valid',
-                   v_def, v_excl, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
-    execute format('alter table %s validate constraint %I', v_def, v_excl);
-    execute format('alter table %I.%I attach partition %I.%I for values from (%L) to (%L)',
-                   v_nsp, v_rel, v_nsp, v_name, v_lo_lit, v_hi_lit);
-    execute format('alter table %s drop constraint %I', v_def, v_excl);
-    v_method := 'check_skip';
-  end if;
-  -- the interval is fully drained and the child is now attached: record it (or flip the in-flight row
-  -- from the create step above to attached). Idempotent via the upsert.
-  insert into pgpm.part (parent_table, child_name, lo, hi, attached) values (p_parent, v_name, v_lo, v_hi, true)
-    on conflict (parent_table, child_name) do update set attached = true;
-  insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'drain_attach', v_lo, v_hi, v_method);
-  return 'attached:' || v_name || ':' || v_method;
-end;
-$$;
-
--- #279: drain_all became a PROCEDURE; the old function must be dropped before it can be recreated.
-drop function if exists pgpm.drain_all(regclass, int, boolean);
-
--- drain_all(): drive the drain to completion in one call, for a migration run rather than a background
--- tick. A PROCEDURE so each step commits (#279): a full drain of a large table is an unbounded number of
--- batches, and holding them all open would make one transaction whose duration, WAL footprint and lock
--- set all scale with the table. Committing per step also means an interrupted drain keeps the batches it
--- finished, which is the whole point of a drain being resumable.
-create or replace procedure pgpm.drain_all(
-  p_parent regclass, p_batch int default null, p_include_open boolean default false,
-  inout p_iterations int default null
-)
-language plpgsql as $$
-declare v_status text; v_iter int := 0;
-begin
-  -- Suspend any live preserve-managed FK before draining: moving referenced rows past a live
-  -- CASCADE/SET NULL FK would silently mutate the referencing side (a NO ACTION FK would block). A
-  -- no-op unless a managed FK is live with closed-tail work. drain_all stays a pure drainer otherwise;
-  -- restoration is left to maintenance or an explicit restore_incoming_fks call.
-  perform pgpm.suspend_incoming_fks(p_parent);
-  commit;
-  loop
-    v_status := pgpm.drain_step(p_parent, p_batch, p_include_open);
-    exit when v_status = 'idle';
-    v_iter := v_iter + 1;
-    if v_iter > 1000000 then raise exception 'pg_partition_magician: drain_all safety limit'; end if;
-    -- One transaction per batch. A managed FK stays suspended across these commits, which is the
-    -- designed steady state, not a regression: maintain() already suspends on one tick and restores on a
-    -- later one, status() surfaces it as fks_suspended, and restore_incoming_fks re-adds it once the
-    -- table is quiescent. An interrupted drain therefore leaves RI off until maintenance next runs,
-    -- exactly as an interrupted multi-tick drain always has.
-    commit;
-  end loop;
-  p_iterations := v_iter;
-end;
-$$;
 
 -- the retention horizon on the native grid: the grid-floored boundary at/below which a partition's
 -- whole range has aged out. null = no retention policy. Shared by retain() (what to drop now) and
@@ -1752,12 +1445,9 @@ begin
       values (p_parent, 'regrain_rename', v_lo, v_hi, v_child_name || ' -> ' || v_src_name);
     v_child_name := v_src_name;
   end if;
-  -- the DEFAULT must hold no rows inside the range (else a fine-child ATTACH at the swap would fail) --
-  -- a stray there is the drain's job first
-  execute format('select exists (select 1 from %I.%I where %I >= %L and %I < %L)',
-                 v_nsp, cfg.default_table, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, v_hi)) into v_has;
-  if v_has then return 'default_dirty'; end if;
+  -- The 'default_dirty' gate is gone with the DEFAULT (#288). It guarded against a stray sitting in the
+  -- range, which would make a fine-child ATTACH fail at the swap; with a complete forward grid there is
+  -- nowhere for a stray to sit except a real partition of the range being regrained.
 
   -- #267: change capture must be installed AND COMMITTED before any copy reads the source, or every change
   -- made during the first batch is lost. Its own tick, so CREATE TRIGGER's SHARE ROW EXCLUSIVE is an O(1)
@@ -2038,7 +1728,7 @@ create or replace procedure pgpm._transmute(
 )
 language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
+  v_nsp name; v_rel name; v_default name; v_parent regclass;
   v_lo_prev text; v_hi_prev text; v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
@@ -2568,18 +2258,16 @@ begin
     end loop;
   end if;
 
-  -- 9c. create a fresh EMPTY default LAST as the leading-edge safety net (REDESIGN.md section 3). Created
-  -- after the parent's PK and secondary indexes exist, it auto-inherits matching (empty) indexes. Kept
-  -- empty, it keeps obtain on its cheap plain path; the drain evacuates any stray that lands here.
-  execute format('create table %I.%I partition of %I.%I default', v_nsp, v_default, v_nsp, v_rel);
-  perform pgpm._own_like_parent(v_parent, format('%I.%I', v_nsp, v_default)::regclass);   -- #277
-  v_defreg := format('%I.%I', v_nsp, v_default)::regclass;
+  -- 9c. NO default partition (#288). It used to sit here as the leading-edge safety net, and the drain
+  -- existed to evacuate it. Instead the forward grid is built below, after registration, so a write past
+  -- the monolith lands in a real bounded partition. A write past the GRID now fails outright, which is
+  -- the accepted cost: obtain x partition_step is both the slack and a hard write-ahead ceiling.
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
                            obtain, retain, keep_default, drain_batch, default_table, paused, drain_adaptive)
   values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_obtain, p_retain,
-          p_keep_default, p_drain_batch, v_default, p_paused, p_drain_adaptive)
+          p_keep_default, p_drain_batch, null, p_paused, p_drain_adaptive)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
@@ -2614,6 +2302,12 @@ begin
   -- partitions; with an EMPTY default, obtain takes the cheap plain path (no scan). Until the frontier
   -- crosses B, live writes land in the monolith (the current interval lives there too).
 
+  -- Build the forward grid (#288). With no DEFAULT, a write past the monolith has nowhere to go until
+  -- these exist, so they are created here rather than waiting for the first maintenance tick. obtain needs
+  -- no special casing: the frontier sits inside the monolith, so its k=0 candidate overlaps and is skipped,
+  -- and k=1 onward lays down [B, B + obtain x step) flush against the monolith's upper bound.
+  perform pgpm.obtain(v_parent);
+
   -- the conversion is complete: nothing is left for the reaper to undo, and the advisory lock can go.
   delete from pgpm.transmute_inflight where parent_table = p_parent;
   perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
@@ -2638,7 +2332,7 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- callers cast: transmute(t, c, interval '1 month').
 create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false,
@@ -2660,7 +2354,7 @@ $$;
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
 create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
-  p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_drain_adaptive boolean default false, p_bound_headroom int default 0
@@ -2970,21 +2664,8 @@ returns boolean language sql immutable as $$
   select coalesce(p_max, 0) > 0 and coalesce(p_waiters, 0) > p_max;
 $$;
 
--- The SELF-CALIBRATING baseline (pure, unit-tested): one EWMA step toward the latest sample. This is
--- the learned "normal" the relative surge triggers compare against; it serves BOTH ambient terms (the
--- lock-wait count and the I/O latency), so p_observed is numeric (a count auto-casts). A null baseline
--- (first observation) initialises to that observation; otherwise the standard exponential moving average
--- alpha*observed + (1-alpha)*baseline. The caller damps alpha during a surge so a transient spike barely
--- moves the baseline (clean detection), while a sustained regime shift is still relearned over many
--- ticks (the AIMD floor guarantees forward progress meanwhile).
-drop function if exists pgpm._ambient_baseline_next(numeric, integer, numeric);
-create or replace function pgpm._ambient_baseline_next(p_baseline numeric, p_observed numeric, p_alpha numeric)
-returns numeric language sql immutable as $$
-  select case
-           when p_baseline is null then p_observed
-           else coalesce(p_alpha, 0) * p_observed + (1 - coalesce(p_alpha, 0)) * p_baseline
-         end;
-$$;
+-- Adaptive feathering removed with the drain (#288): it existed to pace the drain's microbatches
+-- against WAL supply and ambient I/O. Nothing else in pgpm is paced by row volume.
 
 -- The SELF-CALIBRATING surge decision (pure, unit-tested): congested if the current waiter count exceeds
 -- p_factor times the learned baseline. A fixed threshold is the wrong shape (normal is box-dependent), so
@@ -3140,7 +2821,7 @@ create or replace procedure pgpm.maintain(p_parent regclass, inout p_status text
 language plpgsql as $$
 declare
   cfg pgpm.config;
-  v_made int := 0; v_archived int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
+  v_made int := 0; v_archived int := 0; v_dropped int := 0; v_restored int := 0;
   v_regrain text := 'skipped'; v_regrain_child name; v_validated int := 0;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int; v_deferred boolean;
@@ -3173,19 +2854,21 @@ begin
   -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
   -- them), so deferring obtain is harmless. A successful obtain clears the back-off.
   if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
-    -- NO exception handler here, unlike every other step in this tick, and that is deliberate (#280).
-    -- obtain COMMITs between its phases now, and transaction control is illegal anywhere below a
-    -- handler, so a wrapper here would turn those commits into "invalid transaction termination" and
-    -- defer every build. obtain catches WHEN OTHERS itself and reports through p_deferred, so this step
-    -- is no less isolated than it was: the tick still carries on after any failure inside obtain.
-    call pgpm.obtain(p_parent, v_made, v_deferred);
-    if v_deferred then
+    -- Back inside a handler (#288). obtain no longer commits -- with no DEFAULT there is no
+    -- exclusion-constraint dance and no phases -- so the wrapper is legal again, and a lock race here is
+    -- deferred like any other step. This is now the ONLY thing standing between the workload and a write
+    -- with nowhere to go, so a deferral also starts the back-off rather than retrying every tick.
+    begin
+      v_made := pgpm.obtain(p_parent);
+      if cfg.obtain_retry_after is not null then
+        update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
+      end if;
+    exception when others then
       v_note := v_note || ' obtain_deferred';
       update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-    elsif cfg.obtain_retry_after is not null then
-      update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
-    end if;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
+    end;
   else
     v_note := v_note || ' obtain_backoff';
   end if;
@@ -3242,85 +2925,14 @@ begin
   -- be held against other retirement actors for the rest of the tick.
   commit;
 
-  -- Adaptive feathering (mode 2, REDESIGN.md): ride the per-tick drain budget just under the WAL
-  -- supply. Measure the WAL generation rate since the last tick and compare it to the sustainable rate
-  -- (max_wal_size/checkpoint_timeout); if we are outrunning a fraction (drain_wal_high_water) of that, a
-  -- forced checkpoint and its I/O storm are coming -- so back off NOW, before the storm (the LEADING
-  -- signal). A forced checkpoint that slips through anyway is a reactive backstop. Then take one AIMD
-  -- step and drain that many rows this tick instead of the fixed drain_batch.
-  --   ceiling = drain_batch. CRITICAL: the budget never exceeds the operator's tuned rate. A bigger
-  --     per-tick budget means a bigger single DELETE+INSERT, hence a bigger WAL spike per tick -- i.e.
-  --     MORE checkpoint pressure, the very thing we are throttling. So adaptive only ever feathers DOWN
-  --     from drain_batch; it can never drive harder than fixed mode, so it cannot worsen the tail.
-  --     "Faster when there's slack" is delivered by the operator setting drain_batch to their optimistic
-  --     slack rate -- adaptive then automatically backs off from it under pressure.
-  --   floor = drain_batch/16: the gentlest sustained rate that still makes forward progress.
-  --   recovery = drain_batch/8 per calm tick: a few ticks to climb back to the ceiling after a halve.
-  -- Off => v_batch stays null => drain_step uses the fixed drain_batch exactly as before. drain_max_blocks
-  -- (if set) still caps wide rows on top. Computed here; committed below only if the drain does work.
-  if cfg.drain_adaptive then
-    v_now_lsn := pg_current_wal_lsn();
-    v_now_ts  := clock_timestamp();
-    v_obs_bps := null;                                   -- first tick (no prior sample) => no rate yet
-    if cfg.drain_wal_lsn is not null and cfg.drain_wal_at is not null then
-      v_secs := extract(epoch from (v_now_ts - cfg.drain_wal_at));
-      if v_secs > 0 then
-        v_obs_bps := pg_wal_lsn_diff(v_now_lsn, cfg.drain_wal_lsn)::numeric / v_secs;
-      end if;
-    end if;
-    v_ckpt      := pgpm._forced_checkpoints();
-    -- Backoff signals, OR'd (see DESIGN sec 8): the WAL-rate signal (producer self-limit against
-    -- checkpoint storms) and the ambient signal (consumer priority -- yield when the drain is crowding
-    -- the workload, which the WAL rate cannot see). Any fires => halve. The ambient signal has two
-    -- role-independent terms (no pg_monitor): a lock-wait surge (pg_locks) and an I/O-latency surge
-    -- (pg_stat_database), each self-calibrating against its own learned EWMA baseline, OR'd with the
-    -- optional absolute lock-wait cap. A surge damps that baseline's smoothing 10x so a transient spike
-    -- barely moves it (keeps the surge visible) while a sustained shift is still relearned. Baselines
-    -- only advance when the signal is enabled (drain_ambient_factor > 0).
-    v_wal_cong := pgpm._feather_congested(
-                    v_obs_bps, pgpm._wal_sustainable_bps(), cfg.drain_wal_high_water,
-                    cfg.drain_ckpt_seen is not null and v_ckpt > cfg.drain_ckpt_seen);
-    -- term 1: lock-wait pressure (role-independent count from pg_locks)
-    v_waiters  := pgpm._ambient_lock_waiters();
-    v_lock_surge := pgpm._ambient_surge(v_waiters, cfg.drain_ambient_baseline,
-                                        cfg.drain_ambient_factor, cfg.drain_ambient_floor);
-    v_lock_abs   := pgpm._ambient_congested(v_waiters, cfg.drain_ambient_max_waiters);
-    -- term 2: read-I/O latency (ms/block) over the interval since the last tick (inert if track_io_timing off)
-    select s.blk_read_time::numeric, s.blks_read
-      into v_io_time, v_io_blks
-      from pg_stat_database s where s.datname = current_database();
-    v_io_lat   := pgpm._ambient_io_latency(cfg.drain_io_read_time, cfg.drain_io_blks_read, v_io_time, v_io_blks);
-    v_io_surge := pgpm._ambient_io_surge(v_io_lat, cfg.drain_ambient_io_baseline, cfg.drain_ambient_factor, 1.0);
-    v_amb_cong := v_lock_surge or v_lock_abs or v_io_surge;
-    v_amb_baseline := cfg.drain_ambient_baseline;
-    v_io_baseline  := cfg.drain_ambient_io_baseline;
-    if cfg.drain_ambient_factor > 0 then
-      v_amb_baseline := pgpm._ambient_baseline_next(
-        cfg.drain_ambient_baseline, v_waiters,
-        case when v_lock_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
-      if v_io_lat is not null then
-        v_io_baseline := pgpm._ambient_baseline_next(
-          cfg.drain_ambient_io_baseline, v_io_lat,
-          case when v_io_surge then cfg.drain_ambient_alpha / 10 else cfg.drain_ambient_alpha end);
-      end if;
-    end if;
-    v_congested := v_wal_cong or v_amb_cong;
-    v_reason   := coalesce(nullif(concat_ws('+',
-                    case when v_wal_cong then 'wal' end,
-                    case when v_lock_surge or v_lock_abs then 'lock' end,
-                    case when v_io_surge then 'io' end), ''), 'probe');
-    v_budget    := pgpm._aimd_next(
-                     coalesce(cfg.drain_budget, cfg.drain_batch),       -- start optimistic at the ceiling
-                     v_congested,
-                     greatest(1, cfg.drain_batch / 16),                 -- floor: minimum forward progress
-                     cfg.drain_batch,                                   -- ceiling: never exceed the tuned rate
-                     greatest(1, cfg.drain_batch / 8));                 -- additive recovery step
-    v_batch := v_budget;
-  end if;
+  -- Adaptive feathering, the drain step, and the FK suspension that guarded it are all gone (#288).
+  -- They existed to pace and protect the evacuation of the DEFAULT partition; with a complete forward
+  -- grid there is nothing to evacuate. What remains of a tick is obtain, archive, retain, regrain and the
+  -- FK restore -- none of which is paced by row volume.
 
   -- Auto-regrain target: the oldest FROZEN coarse child (if auto-regrain is on). A coarse child (hi > one
   -- step past lo) is frozen once its whole range is at/below the current grid floor (no live write still
-  -- lands in it). Found here, before the drain, only so the auto-regrain block below can use it.
+  -- lands in it). Found here so the auto-regrain block below can use it.
   if cfg.regrain_to is not null then
     execute format(
       'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
@@ -3331,49 +2943,8 @@ begin
       pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, pgpm._frontier_native(p_parent)),
       pgpm._native_type(cfg.control_kind))
       into v_regrain_child;
+    v_batch := cfg.drain_batch;   -- regrain's own microbatch size; no longer contended for by a drain
   end if;
-
-  -- The drain IS the conversion: give its (infrequent) partition attach room to win its lock,
-  -- so progress isn't starved. Its scans run under SHARE UPDATE EXCLUSIVE (non-blocking to the
-  -- workload); only the brief final ATTACH needs a stronger lock.
-  perform set_config('lock_timeout', '3s', true);
-  begin
-    -- Suspend (re-drop) any preserve-managed FK that is currently live BEFORE the DRAIN moves referenced
-    -- rows: the drain deletes a closed-tail row out of the DEFAULT and re-inserts it through an unattached
-    -- child, so the row is briefly outside the parent and a live NO ACTION FK would reject the move (a
-    -- CASCADE/SET NULL would silently honour it). Gated on a non-empty closed tail. Auto-regrain does NOT
-    -- need this: it COPIES without deleting, so referenced rows never leave the visible parent -- so the
-    -- suspend is no longer forced for a pending regrain. Shares the drain's subtransaction.
-    v_suspended := pgpm.suspend_incoming_fks(p_parent);
-    v_drain := pgpm.drain_step(p_parent, v_batch);
-  exception when others then
-    v_drain := 'deferred';
-    v_note := v_note || ' drain_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_drain', left(sqlerrm, 200));
-  end;
-
-  -- Commit the adaptive step ONLY when the drain did work (moved/reclaimed rows or attached). A
-  -- fully-drained, idle table must not churn config or log a budget row every tick (a standing steward
-  -- ticks forever). Leaving the ckpt baseline stale across an idle gap just makes the next active tick
-  -- treat any idle-period checkpoints as congestion and back off once -- the safe direction.
-  if cfg.drain_adaptive and (v_drain like 'moved:%' or v_drain like 'attached:%' or v_drain like 'reclaimed:%') then
-    update pgpm.config set drain_budget = v_budget, drain_ckpt_seen = v_ckpt,
-                           drain_wal_lsn = v_now_lsn, drain_wal_at = v_now_ts,
-                           drain_ambient_baseline = v_amb_baseline,
-                           drain_ambient_io_baseline = v_io_baseline,
-                           drain_io_read_time = v_io_time, drain_io_blks_read = v_io_blks
-      where parent_table = p_parent;
-    v_note := v_note || format(' adaptive[%s %s]', v_budget, v_reason);
-    insert into pgpm.log (parent_table, action, rows, method)
-      values (p_parent, 'drain_budget', v_budget, v_reason);
-  end if;
-
-  -- BOUNDARY (#279), placed AFTER the adaptive bookkeeping and not between it and the drain: the budget
-  -- row records what this drain actually cost, so it has to land in the same transaction as the drain it
-  -- describes. The drain's own ATTACH takes a brief strong lock on the parent; this releases it, and the
-  -- regrain microbatch below is another O(batch) piece of work that must not run underneath it.
-  commit;
-  perform set_config('lock_timeout', '3s', true);
 
   -- Auto-regrain (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
   -- v_regrain_child) one budget-sized COPY microbatch toward regrain_to per tick, under the same adaptive
@@ -3429,8 +3000,8 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_validate_fk', left(sqlerrm, 200));
   end;
 
-  p_status := format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
-                     v_made, v_archived, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
+  p_status := format('obtained=%s archived=%s dropped=%s restored_fk=%s regrain=%s%s',
+                     v_made, v_archived, v_dropped, v_restored, v_regrain, v_note);
 end;
 $$;
 
@@ -3505,23 +3076,7 @@ begin
 end;
 $$;
 
-create or replace function pgpm.check_default(p_parent regclass)
-returns table (default_rows bigint, closed_rows bigint, oldest text)
-language plpgsql as $$
-declare cfg pgpm.config; v_nsp name; v_def text; v_cur_lit text;
-begin
-  select * into cfg from pgpm.config where parent_table = p_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_def     := format('%I.%I', v_nsp, cfg.default_table);
-  v_cur_lit := pgpm._encode(cfg.control_kind,
-                 pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                  pgpm._frontier_native(p_parent)));
-  return query execute format(
-    'select count(*)::bigint, count(*) filter (where %I < %L)::bigint, (select t.%I::text from %s t order by t.%I limit 1) from %s',
-    cfg.control_column, v_cur_lit, cfg.control_column, v_def, cfg.control_column, v_def);
-end;
-$$;
+-- check_default removed with the DEFAULT partition (#288).
 
 -- check_uuidv7(): sanity-sample a uuid column. Genuine UUIDv7/ULID values decode
 -- (via their leading 48-bit ms prefix) to plausible recent timestamps and score
@@ -3603,9 +3158,9 @@ declare
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
-    -- backlog via the canonical check_default: default_rows (total), closed_rows (drainable now), oldest
-    select cd.default_rows, cd.closed_rows, cd.oldest into v_drows, v_closed, v_old
-      from pgpm.check_default(r.parent_table) cd;
+    -- #288: no DEFAULT, so no drain backlog to report. These stay in the result shape for now and are
+    -- reported as zero; PR 2 removes the columns along with the drain_* config.
+    v_drows := 0; v_closed := 0; v_old := null;
     -- n_partitions = attached (real) partitions; coarse_partitions = the un-regrained coarse children (a
     -- wider-than-one-step range, REDESIGN.md section 14) -- the regraining backlog; inflight = the
     -- not-yet-attached drain/regrain children.
@@ -3988,12 +3543,8 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  -- gate 1: the closed tail must be fully drained (open-interval rows in the DEFAULT are fine, they
-  -- are still in the parent and the drain will not touch them).
-  select closed_rows into v_closed from pgpm.check_default(p_parent);
-  if coalesce(v_closed, 0) > 0 then return 0; end if;
-
-  -- gate 2: no in-flight (un-attached) DRAIN child mid-drain (same shape as transmute's orphan guard). A
+  -- gate 1 (the drained-closed-tail gate) is gone with the DEFAULT (#288): there is no tail to drain.
+  -- gate 2: no in-flight (un-attached) child mid-regrain (same shape as transmute's orphan guard). A
   -- regrain copy-child is EXCLUDED (its range is contained in an attached partition): regrain copies without
   -- deleting, so the referenced rows never leave the visible parent, and a copy-regrain never needs the FK
   -- suspended -- so it must not hold a drain-suspended FK off either (that would reopen the RI window the
@@ -4137,6 +3688,10 @@ begin
 end;
 $$;
 
+-- KEPT, with a much narrower remit after #288. It used to be called by maintain before every drain,
+-- dropping the FK for the whole span of a multi-tick drain campaign -- an RI window other sessions could
+-- observe, and pgpm's only one. That caller is gone with the drain. The remaining caller is regrain's
+-- SWAP, which suspends and restores INSIDE its own transaction, so no session ever observes RI off.
 -- suspend_incoming_fks(): the inverse of restore. When the closed tail has drain work pending, re-drop
 -- any preserve-managed FK that is currently live, so the drain never moves a referenced row past a
 -- live FK. That matters beyond a mere stall: a live ON DELETE CASCADE / SET NULL FK would silently
@@ -4152,13 +3707,9 @@ begin
                   where parent_table = p_parent and restored_at is not null) then
     return 0;
   end if;
-  -- Normally gated on drain work (closed tail rows): no work => leave live FKs in place. p_force overrides
-  -- the gate, for the caller (maintain's auto-regrain) that is about to move referenced rows out of a
-  -- frozen coarse child even though the closed tail is empty.
-  if not p_force then
-    select closed_rows into v_closed from pgpm.check_default(p_parent);
-    if coalesce(v_closed, 0) = 0 then return 0; end if;
-  end if;
+  -- The drain-work gate is gone with the DEFAULT (#288). regrain's swap is the only caller left and it
+  -- always passes p_force, so a call with p_force false has no work to justify it and does nothing.
+  if not p_force then return 0; end if;
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is not null order by id loop
     execute format('alter table %s drop constraint %I', r.referencing_table::text, r.constraint_name);

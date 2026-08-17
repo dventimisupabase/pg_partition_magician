@@ -14,7 +14,7 @@ begin
   execute format('create table public.%I (id bigint primary key, payload text)', p_rel);
   execute format('insert into public.%I select g*10, ''x'' from generate_series(1, 250) g', p_rel);
   call pgpm.transmute(format('public.%I', p_rel)::regclass, 'id', 1000);
-  execute format('insert into public.%I values (900000, ''frontier'')', p_rel);
+  execute format('insert into public.%I values (20000, ''frontier'')', p_rel);
 end $$;
 
 -- ======================= the prepare tick =======================
@@ -106,8 +106,8 @@ select is((select count(*)::int from public.ca4), 251,
 create table public.ca5 (id bigint primary key, payload text);
 insert into public.ca5 select g, 'x' from generate_series(1, 2500) g;
 call pgpm.transmute('public.ca5', 'id', 1000, p_obtain => 3);
-call pgpm.obtain('public.ca5');
-insert into public.ca5 values (900000, 'frontier');
+select pgpm.obtain('public.ca5');
+insert into public.ca5 values (5000, 'frontier');
 select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);
 select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);
 

@@ -52,7 +52,6 @@ select is(
 
 -- materialize the months as real partitions, then a duplicate of (created_at, sku) is rejected by the
 -- carried index on the materialized partition (it propagated to the new child on attach)
-call pgpm.drain_all('public.u_incl', p_include_open => true);
 select throws_ok(
   $$ insert into public.u_incl (created_at, sku)
        values (date_trunc('month', now()) - interval '2 months' + interval '5 days', 'DUP') $$,

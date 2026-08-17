@@ -26,7 +26,7 @@ select is(
   'r', 'the refusal is up front: v4_t is left a plain table, untouched');
 
 -- (B) the operator can override when certain the column is time-ordered
-call pgpm.transmute('public.v4_t', 'id', interval '1 month', p_force_uuidv7 => true);
+call pgpm.transmute('public.v4_t', 'id', interval '1 month', p_force_uuidv7 => true, p_obtain => 2);
 select pass('p_force_uuidv7 => true overrides the refusal');
 
 -- (C) a genuine UUIDv7/ULID-shaped column (48-bit ms prefix) is accepted with no override

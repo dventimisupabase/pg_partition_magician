@@ -21,7 +21,7 @@ select is(
      where conrelid = 'public.arf_ref'::regclass and contype = 'f' and confrelid = 'public.arf'::regclass),
   1, 'precondition: the preserve FK is live before auto-regrain');
 
-insert into public.arf (id, payload) values (10000, 'frontier');   -- advance frontier past B -> monolith frozen
+insert into public.arf (id, payload) values (2000, 'frontier');   -- advance frontier past B -> monolith frozen
 select pgpm.set_regrain('public.arf', '100');                       -- enable feathered auto-regrain
 
 -- one maintain tick feathers a COPY microbatch. Because regrain copies (it never moves referenced rows out of

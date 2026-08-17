@@ -30,7 +30,7 @@ select ok(
 );
 
 -- obtain is idempotent: everything ahead already exists, current still skipped
-call pgpm.obtain('public.messages') \gset
-select is(:p_made, 0, 'obtain is idempotent (creates nothing on a second call)');
+select is(pgpm.obtain('public.messages'), 0,
+  'obtain is idempotent (creates nothing on a second call)');
 
 select * from finish();

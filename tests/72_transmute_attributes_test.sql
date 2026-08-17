@@ -99,7 +99,7 @@ select is((select count(*)::int from public.ev72_fired where id = 2500), 1,
 
 -- Routed to a partition minted AFTER the conversion. This is the assertion that fails under the bug:
 -- the trigger lives on the monolith, so anything routed elsewhere fires nothing.
-call pgpm.obtain('public.ev72');
+select pgpm.obtain('public.ev72');
 insert into public.ev72 values (3500, 1, 'forward-bound');
 select is((select count(*)::int from public.ev72_fired where id = 3500), 1,
   'and so does a row routed to a partition minted AFTER the conversion');

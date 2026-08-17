@@ -23,7 +23,7 @@ select plan(14);
 create table public.rnc (id bigint primary key, payload text);
 insert into public.rnc select g, 'x' from generate_series(1, 400) g;
 call pgpm.transmute('public.rnc', 'id', 1000);
-insert into public.rnc values (900000, 'frontier');   -- advance the frontier so the monolith freezes
+insert into public.rnc values (20000, 'frontier');   -- advance the frontier so the monolith freezes
 
 select is(
   pgpm._part_name('rnc', 'id', '1000', '0', '1000'),
@@ -75,7 +75,7 @@ select cmp_ok(
 create table public.rcc (id bigint primary key, payload text);
 insert into public.rcc select g, 'x' from generate_series(1, 2500) g;
 call pgpm.transmute('public.rcc', 'id', 1000);
-insert into public.rcc values (900000, 'frontier');
+insert into public.rcc values (20000, 'frontier');
 
 select is(
   (select pgpm.regrain('public.rcc', 'rcc_p0000000000000000000_to_0000000000000003000', '100'))::int,
@@ -87,7 +87,7 @@ select is(
 create table public.rnd (id bigint primary key, payload text);
 insert into public.rnd select g, 'x' from generate_series(1, 400) g;
 call pgpm.transmute('public.rnd', 'id', 1000);
-insert into public.rnd values (900000, 'frontier');
+insert into public.rnd values (20000, 'frontier');
 
 select pgpm.regrain_step('public.rnd', 'rnd_p0000000000000000000', '100', 50);   -- first tick: renames
 
