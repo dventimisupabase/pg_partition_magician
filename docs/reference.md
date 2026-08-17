@@ -524,8 +524,17 @@ pgpm.regrain_step(p_parent regclass, p_child name, p_target_step text default nu
 ```
 
 One resumable microbatch of `regrain`: it **copies** (never deletes) a within-horizon sub-range's next
-budget-sized batch into its fine child, skips a below-horizon sub-range (discarded with the source at the
-swap), and performs the atomic swap once the cursor (`config.regrain_cursor`) reaches the coarse `hi`. The
+budget-sized batch into its fine child, and performs the atomic swap once the cursor
+(`config.regrain_cursor`) reaches the coarse `hi`.
+
+A **below-horizon** sub-range is handled one of two ways, depending on whether the table archives. With
+`config.archive_fn` unset it is skipped, logged as `regrain_aged`, and discarded with the source at the
+swap, since `retain` would drop those rows unconditionally the moment they became partitions. With
+`archive_fn` set it is **materialized like any other sub-range**, because `retire` will not drop a
+partition until archiving has fully covered it, so discarding it would destroy exactly the rows that gate
+is protecting (issue #278). Once materialized, the ordinary pipeline applies: `maintain` write-blocks it,
+archives it, and `retire` drops it once covered. The cost is copying rows that are about to be dropped,
+which is paid only on tables that archive. The
 source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
 `prepared` (the first tick, which installs change capture and copies nothing), `reconciled:N`,
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
@@ -1054,7 +1063,7 @@ the failures too, which is exactly how a guard once reported a starved tick as a
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
 | `retain_drop` / `retain_reclaim` | a partition dropped by retention (via `retain()` or `retire()`) / aged rows deleted from the `DEFAULT` |
-| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
+| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `skip_obtain` / `skip_retain` / `skip_drain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` | a step deferred (lock race or transient error; `method` carries the reason) |

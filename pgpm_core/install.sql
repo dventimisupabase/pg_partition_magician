@@ -1828,17 +1828,37 @@ begin
   v_rec := pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_cursor, v_batch);
   if v_rec > 0 then return 'reconciled:' || v_rec; end if;
 
-  -- advance over any aged (below-horizon) sub-ranges without copying them: they would be dropped by retain()
+  -- Advance over any aged (below-horizon) sub-ranges without copying them: they would be dropped by retain()
   -- the instant they became partitions, so they are simply discarded with the source at the swap (never
   -- materialized, and never deleted out of the source either). Aged ranges are the lowest in control order, a
-  -- contiguous prefix, so this loop only runs at the bottom of the child. One regrain_skip per skipped range.
+  -- contiguous prefix, so this loop only runs at the bottom of the child. One regrain_aged per skipped range.
+  --
+  -- ONLY when there is nothing to archive (#278). That "they would be dropped by retain() anyway" reasoning
+  -- was written before #238 gave retire a coverage gate, and stopped being true then: with archive_fn set,
+  -- retire refuses to drop a partition until archiving has fully covered it, so discarding these rows
+  -- destroys exactly what the gate is holding back, unarchived. Measured: 2000 rows gone, archive ledger
+  -- empty.
+  --
+  -- So with archive_fn set the sub-range is materialized like any other, and the EXISTING pipeline takes it
+  -- from there in the right order: _enforce_write_blocks blocks it (its whole range is below the horizon
+  -- now that it is a partition), _archive_step archives it, retire drops it once covered. That also closes
+  -- the write-block asymmetry, since a late backdated write lands in a partition that gets archived.
+  --
+  -- Not "wait for coverage before skipping", which cannot work: a PARTIALLY aged child straddles the
+  -- horizon, so it is never write-blocked and therefore never archived, and the regrain would wait forever
+  -- for coverage nothing produces.
+  --
+  -- The cost when archive_fn is set is copying rows that are about to be dropped. They have to be read to
+  -- archive them regardless, so it is one extra write of doomed data, and only on tables that archive.
   loop
     exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_cursor);   -- cursor >= hi: nothing left to copy
     v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_cursor);
     v_sub_lo  := case when pgpm._native_gt(cfg.control_kind, v_lo, v_grid_lo) then v_lo else v_grid_lo end;
     v_sub_hi  := pgpm._grid_next(cfg.control_kind, v_step, v_grid_lo);
     if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
-    v_aged := v_retain_boundary is not null and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
+    v_aged := v_retain_boundary is not null
+              and cfg.archive_fn is null                                  -- #278: see above
+              and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
     exit when not v_aged;                                             -- found a sub-range to copy
     insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'regrain_aged', v_sub_lo, v_sub_hi, 0);
     v_cursor := v_sub_hi;                                             -- skip the aged sub-range (no copy, no delete)
