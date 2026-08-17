@@ -49,7 +49,7 @@ select public.generate_messages(coalesce(current_setting('poc.seed_count', true)
 analyze public.messages;
 
 call pgpm.transmute('public.messages', 'created_at', interval '1 month',
-                  p_obtain => 4, p_retain => null, p_drain_batch => 5000, p_paused => true);
+                  p_obtain => 4, p_retain => null, p_regrain_batch => 5000, p_paused => true);
 -- transmute() does the cutover only; obtain the future partitions separately (online)
 select pgpm.obtain('public.messages');
 
@@ -61,7 +61,7 @@ create table public.events_id (
 insert into public.events_id (payload)
   select 'evt ' || g from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g;
 analyze public.events_id;
-call pgpm.transmute('public.events_id', 'id', 10000, p_obtain => 2, p_drain_batch => 5000);
+call pgpm.transmute('public.events_id', 'id', 10000, p_obtain => 2, p_regrain_batch => 5000);
 select pgpm.obtain('public.events_id');
 
 -- ---- uuidv7 dimension: events_uuid -----------------------------------------
@@ -85,5 +85,5 @@ from (
   from generate_series(1, coalesce(current_setting('poc.events_count', true)::int, 45000)) g
 ) s;
 analyze public.events_uuid;
-call pgpm.transmute('public.events_uuid', 'id', interval '1 month', p_obtain => 2, p_drain_batch => 5000);
+call pgpm.transmute('public.events_uuid', 'id', interval '1 month', p_obtain => 2, p_regrain_batch => 5000);
 select pgpm.obtain('public.events_uuid');

@@ -39,11 +39,10 @@ select is(
 -- would error on an overlapping CREATE) and start creating forward at the coarse hi (5000).
 create table public.ovl (id bigint not null, payload text, primary key (id)) partition by range (id);
 create table public.ovl_p0_to_5000 partition of public.ovl for values from (0) to (5000);
-create table public.ovl_default partition of public.ovl default;
-insert into public.ovl (id) values (100), (4999);   -- both route into the coarse child; DEFAULT stays empty
+insert into public.ovl (id) values (100), (4999);   -- both route into the coarse child
 insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
-                         obtain, default_table, paused)
-  values ('public.ovl'::regclass, 'id', 'id', '1000', '0', 4, 'ovl_default', false);
+                         obtain, paused)
+  values ('public.ovl'::regclass, 'id', 'id', '1000', '0', 4, false);
 insert into pgpm.part (parent_table, child_name, lo, hi, attached)
   values ('public.ovl'::regclass, 'ovl_p0_to_5000', '0', '5000', true);
 

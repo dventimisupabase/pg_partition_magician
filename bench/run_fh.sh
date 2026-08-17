@@ -284,7 +284,7 @@ SQL
 fi
 echo "  firing from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_predrain => $PREDRAIN, p_paused => false)..."
 cut_t0=$(q "select extract(epoch from clock_timestamp())")
-q "call pgpm.from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_obtain => $BENCH_OBTAIN, p_drain_batch => $BENCH_DRAIN_BATCH, p_paused => false, p_predrain => $PREDRAIN)" >/dev/null
+q "call pgpm.from_hypertable_cutover('bench.events','created_at', interval '$BENCH_FH_INTERVAL', p_obtain => $BENCH_OBTAIN, p_regrain_batch => $BENCH_DRAIN_BATCH, p_paused => false, p_predrain => $PREDRAIN)" >/dev/null
 cut_secs=$(awk -v a="$cut_t0" -v b="$(q "select extract(epoch from clock_timestamp())")" 'BEGIN{printf "%.1f", b-a}')
 echo "  cutover complete in ${cut_secs}s -- bench.events is now relkind '$(q "select relkind from pg_class where oid='bench.events'::regclass")' (p=partitioned)"
 if [ -n "$probe_pid" ]; then
@@ -332,7 +332,6 @@ if [ "$BENCH_REGRAIN" = "1" ]; then
   echo "  INSTRUMENT that lets pgpm act on the genuinely-quiescent historical monolith as if frozen. Never in prod."
   q "select pgpm.obtain('bench.events')" >/dev/null
   q "select pgpm.set_regrain('bench.events', '$BENCH_FH_INTERVAL')" >/dev/null
-  q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
   # ongoing load on forward partitions (keeps the monolith quiescent during the skewed regrain)
   regrain_args=( -n -c "$BENCH_CLIENTS" -j "$BENCH_JOBS" -T "$(( BENCH_DRAIN_MAX_SECS + 120 ))" -P 5
                 -D "ops=$BENCH_OPS" -D "clock_secs=$CLK" -f "$BENCH_DIR/workload_fh.pgbench" --log "--log-prefix=$RESULTS/pgb_regrain" )

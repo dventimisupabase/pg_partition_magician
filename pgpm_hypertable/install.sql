@@ -497,7 +497,7 @@ end $$;
 drop procedure if exists pgpm.from_hypertable_cutover(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean);
 create or replace procedure pgpm.from_hypertable_cutover(
   p_hypertable regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain interval default null,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_predrain boolean default true
 ) language plpgsql as $$
@@ -688,8 +688,10 @@ begin
   -- transmute is a PROCEDURE since #275 (it commits between adding the monolith bound, validating it, and
   -- the cutover, so the O(rows) scan is not held under ACCESS EXCLUSIVE). The commit above at :684 means
   -- this runs in a fresh transaction, so its internal commits are legal here.
+  -- p_drain_batch sizes THIS module's migration-delta drain, which still exists; transmute's own batch
+  -- knob is regrain's now (#288), so the handoff names it explicitly rather than relying on position.
   call pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
-                      p_keep_default, p_drain_batch, p_anchor, p_paused);
+                      p_regrain_batch => p_drain_batch, p_anchor => p_anchor, p_paused => p_paused);
 
   -- preserve the source sequence's exact position. transmute moved identity to the new parent and seeded
   -- each sequence to max(id)+1; advance it to the source's captured next value when that is higher, so ids
@@ -715,14 +717,17 @@ end $$;
 -- The one-shot driver: copy then cut over, back to back. Use the two phases directly instead when writes
 -- must keep arriving during the migration (copy, let the workload run, then cutover catches up the appends).
 drop procedure if exists pgpm.from_hypertable(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, boolean);
+-- #288 dropped p_keep_default, so the previous form must go or both overloads survive and every call
+-- becomes ambiguous.
+drop procedure if exists pgpm.from_hypertable(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, boolean, boolean);
 create or replace procedure pgpm.from_hypertable(
   p_hypertable regclass, p_control name, p_interval interval,
-  p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
+  p_obtain int default 30, p_retain interval default null,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_track_changes boolean default false, p_predrain boolean default true
 ) language plpgsql as $$
 begin
   call pgpm.from_hypertable_copy(p_hypertable, p_control, p_track_changes);
   call pgpm.from_hypertable_cutover(p_hypertable, p_control, p_interval, p_obtain, p_retain,
-                                    p_keep_default, p_drain_batch, p_anchor, p_paused, p_predrain);
+                                    p_drain_batch, p_anchor, p_paused, p_predrain);
 end $$;

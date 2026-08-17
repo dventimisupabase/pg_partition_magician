@@ -364,7 +364,7 @@ rm -f "$RESULTS/pgb_convert".*
 N0=$(q "select count(*) from bench.events")   # history rows -- all land in the monolith at cutover (conservation anchor)
 echo "  firing pgpm.transmute('bench.events','id', step $BENCH_ID_STEP, paused=>false)..."
 transmute_t0=$(q "select extract(epoch from clock_timestamp())")
-q "call pgpm.transmute('bench.events','id', ${BENCH_ID_STEP}::bigint, $BENCH_OBTAIN, p_paused => false, p_drain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
+q "call pgpm.transmute('bench.events','id', ${BENCH_ID_STEP}::bigint, $BENCH_OBTAIN, p_paused => false, p_regrain_batch => $BENCH_DRAIN_BATCH)" >/dev/null
 transmute_t1=$(q "select extract(epoch from clock_timestamp())")
 awk -v a="$transmute_t0" -v b="$transmute_t1" 'BEGIN{printf "  transmute() returned in %.1fs (metadata cutover)\n", b-a}'
 
@@ -387,27 +387,8 @@ else
   echo "  BENCH_REGRAIN=0: transmute-only run (no frozen monolith, no bulk move to observe)"
 fi
 
-# 4b. adaptive feathering (REDESIGN.md, mode 2): the per-tick budget rides checkpoint/ambient pressure via
-#     AIMD and feathers BOTH the drain and the regrain COPY. BENCH_DRAIN_ADAPTIVE=0 keeps mode 1 (fixed).
-if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
-  q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
-  echo "  adaptive feathering ENABLED (budget self-tunes around batch=$BENCH_DRAIN_BATCH; feathers drain + regrain)"
-  # Optionally arm the SELF-CALIBRATING ambient signal: learn the recent waiter baseline (EWMA) and
-  # back off on a relative surge above it. BENCH_DRAIN_AMBIENT_FACTOR>0 turns it on (e.g. 2.0 = back off
-  # when live waiters exceed 2x the learned normal). This is the box-independent successor to the fixed
-  # threshold and is what isolates a write surge from steady-state contention.
-  if [ -n "${BENCH_DRAIN_AMBIENT_FACTOR:-}" ] && awk -v f="$BENCH_DRAIN_AMBIENT_FACTOR" 'BEGIN{exit !(f>0)}'; then
-    q "select pgpm.set_drain_ambient('bench.events', ${BENCH_DRAIN_AMBIENT_FACTOR}, ${BENCH_DRAIN_AMBIENT_ALPHA:-0.2}, ${BENCH_DRAIN_AMBIENT_FLOOR:-2})" >/dev/null
-    echo "  self-calibrating ambient signal ENABLED (back off when waiters > ${BENCH_DRAIN_AMBIENT_FACTOR}x the learned baseline, floor ${BENCH_DRAIN_AMBIENT_FLOOR:-2})"
-  fi
-  # Optionally arm the legacy absolute cap too: back off when > N non-pgpm backends are IO/lock-stuck.
-  if [ "${BENCH_DRAIN_AMBIENT_WAITERS:-0}" -gt 0 ]; then
-    q "update pgpm.config set drain_ambient_max_waiters = $BENCH_DRAIN_AMBIENT_WAITERS where parent_table='bench.events'::regclass" >/dev/null
-    echo "  ambient absolute cap ENABLED (yield when > $BENCH_DRAIN_AMBIENT_WAITERS workload backends are IO/lock-stuck)"
-  fi
-else
-  echo "  adaptive feathering off (mode 1: fixed batch=$BENCH_DRAIN_BATCH)"
-fi
+# 4b. adaptive feathering is gone (#288). It rode checkpoint and ambient pressure via AIMD to pace the
+#     DRAIN's microbatches; with no DEFAULT there is no drain, and regrain uses a fixed batch.
 
 # 4c. start the continuous ambient workload NOW -- AFTER the freeze, so every workload insert gets an id
 # above the sentinel (a forward partition), never inside the frozen monolith. Background pgbench DIRECTLY

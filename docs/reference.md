@@ -23,7 +23,7 @@ Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a n
 pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false
 ) returns regclass
@@ -71,7 +71,7 @@ Parameters:
 - `p_obtain` -- how many partitions to keep ahead of the frontier.
 - `p_retain` -- drop partitions older than this `interval`; `null` keeps everything.
 - `p_keep_default` -- keep the `DEFAULT` safety net (the default; leave it on).
-- `p_drain_batch` -- rows per drain/regrain microbatch.
+- `p_regrain_batch` -- rows per drain/regrain microbatch.
 - `p_anchor` -- the grid origin the boundaries align to.
 - `p_paused` -- register paused (the default); `false` goes live immediately.
 - `p_incoming_fks` -- `'error'` (refuse if any incoming FK exists), `'drop'` (drop them), or `'preserve'`
@@ -99,7 +99,7 @@ call pgpm.transmute('public.events', 'created_at', interval '1 month',
 pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor bigint default 0,
+  p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_drain_adaptive boolean default false
 ) returns regclass
@@ -172,14 +172,14 @@ Scope and caveats:
 pgpm.from_hypertable(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_track_changes boolean default false, p_predrain boolean default true
 )
 ```
 
 The one-shot driver: runs `from_hypertable_copy` then `from_hypertable_cutover` back to back. Use it when the
 migration does not need to interleave application writes between the phases. `p_interval` and the
-`p_obtain`/`p_retain`/`p_keep_default`/`p_drain_batch`/`p_anchor`/`p_paused` parameters pass straight through
+`p_obtain`/`p_retain`/`p_keep_default`/`p_regrain_batch`/`p_anchor`/`p_paused` parameters pass straight through
 to `transmute` (see there); `p_control` is the time column; `p_track_changes` and `p_predrain` are described
 under `from_hypertable_copy` and `from_hypertable_cutover`. When `p_retain` is left `null`, the source's
 `drop_chunks` policy interval (if any) is carried in.
@@ -276,13 +276,13 @@ as the under-lock catch-up does; use `p_track_changes` for update/delete workloa
 pgpm.from_hypertable_cutover(
   p_hypertable regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_predrain boolean default true
 )
 ```
 
 Phase 2: the cutover. When `p_predrain` is `true` (the default), it first **pre-drains the catch-up backlog
-online** (best-effort, using `p_drain_batch` as the batch size and residual threshold) -- the change delta
+online** (best-effort, using `p_regrain_batch` as the batch size and residual threshold) -- the change delta
 (`from_hypertable_drain_delta`) when tracking is on, else the appended-rows tail
 (`from_hypertable_drain_appends`) -- so only a tiny residual is left for the lock. Then it **pre-builds the
 destination's primary key and secondary indexes online** (on the private copy, before any lock -- this is the

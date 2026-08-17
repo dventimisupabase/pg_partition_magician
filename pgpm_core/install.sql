@@ -36,80 +36,41 @@ create table if not exists pgpm.config (
   partition_anchor text        not null,    -- '2000-01-01...' (time/uuidv7) | '0' (id)
   obtain          int         not null default 30,
   retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
-  keep_default     boolean     not null default true,
-  drain_batch      int         not null default 5000,
-  default_table    name       ,
+  regrain_batch    int         not null default 5000,   -- rows per regrain COPY microbatch
   paused           boolean     not null default true,
   created_at       timestamptz not null default now(),
-  -- when maintenance may next attempt obtain for this parent. Under sustained write contention
-  -- obtain keeps losing the ACCESS EXCLUSIVE race, so on a deferral maintenance backs it off
-  -- instead of retrying (and risking a wasted default scan) every tick. null = attempt now.
+  -- when maintenance may next attempt obtain for this parent. Under sustained write contention obtain
+  -- keeps losing the ACCESS EXCLUSIVE race on the parent, so on a deferral maintenance backs it off
+  -- instead of retrying every tick. null = attempt now.
   obtain_retry_after timestamptz,
-  -- optional block budget for the drain: cap each microbatch at ~this many heap+TOAST blocks
-  -- (translated to a row limit via the default's average bytes/row), so wide rows can't make a
-  -- single batch huge. null = cap by drain_batch rows only (default). See REDESIGN.md.
-  drain_max_blocks int,
-  -- adaptive closed-loop feathering (REDESIGN.md, mode 2). When on, maintenance senses
-  -- checkpoint pressure each tick and rides the per-tick drain budget just under supply via AIMD
-  -- (additive-increase when calm, halve on a forced checkpoint), instead of the fixed drain_batch.
-  -- off = mode 1 (today's fixed gentle rate). drain_budget is the controller's current row budget
-  -- (null until the first adaptive tick seeds it from drain_batch). The controller's signal is the WAL
-  -- generation rate vs the sustainable rate (max_wal_size/checkpoint_timeout): drain_wal_lsn/drain_wal_at
-  -- are the previous tick's WAL position + time (to compute the rate), drain_wal_high_water is the
-  -- fraction of the sustainable rate at which to start backing off (leading), and drain_ckpt_seen is the
-  -- last forced-checkpoint counter (a reactive backstop). All null = uninitialized (first tick is calm).
-  drain_adaptive       boolean not null default false,
-  drain_budget         int,
-  drain_ckpt_seen      bigint,
-  drain_wal_lsn        pg_lsn,
-  drain_wal_at         timestamptz,
-  drain_wal_high_water numeric not null default 1.0,
-  -- ambient-contention signal (consumer priority): back off when the drain is crowding the live
-  -- workload. Built only on catalogs a plain (non-superuser, non-pg_monitor) role can fully read, so
-  -- pgpm's only runtime dependency stays pg_cron. Two role-independent terms feed the same
-  -- self-calibrating controller, OR'd with an optional absolute cap:
-  --   * LOCK-WAIT pressure (drain_ambient_baseline): how many non-pgpm backends are blocked on an
-  --     ungranted lock (pg_locks, fully visible to any role -- unlike pg_stat_activity.wait_event, which
-  --     pg_monitor masks for other roles). The drain's brief ATTACH (ACCESS EXCLUSIVE on the parent) and
-  --     row/page locks show up here. SELF-CALIBRATING: a fixed threshold is the wrong shape ("normal" is
-  --     box/workload-dependent), so learn the recent normal as an EWMA (smoothing drain_ambient_alpha)
-  --     and back off on a RELATIVE surge: current > drain_ambient_factor * baseline, floored at
-  --     drain_ambient_floor so an idle box does not fire on a couple of transient waiters.
-  --     drain_ambient_factor = 0 disables BOTH self-calibrating terms (the default).
-  --   * I/O LATENCY (drain_ambient_io_baseline): average ms per block read from disk, from
-  --     pg_stat_database (blk_read_time / blks_read deltas; drain_io_read_time / drain_io_blks_read hold
-  --     the previous cumulative sample). Captures the read-I/O starvation the lock signal misses.
-  --     Self-calibrating the same way (EWMA baseline, surge at drain_ambient_factor * baseline). Inert
-  --     when track_io_timing is off (no read time accrues, so the latency is 0 and never surges).
-  --   * ABSOLUTE cap (optional backstop): back off when more than drain_ambient_max_waiters backends are
-  --     lock-blocked, regardless of baseline. 0 = disabled.
-  -- factor 0 + cap 0 = ambient signal fully off (pure WAL behaviour). See REDESIGN.md.
-  drain_ambient_max_waiters int     not null default 0,
-  drain_ambient_factor      numeric not null default 0,
-  drain_ambient_alpha       numeric not null default 0.2,
-  drain_ambient_floor       int     not null default 2,
-  drain_ambient_baseline    numeric,        -- EWMA of the lock-wait count
-  drain_ambient_io_baseline numeric,        -- EWMA of the I/O read latency (ms/block)
-  drain_io_read_time        numeric,        -- previous cumulative pg_stat_database.blk_read_time
-  drain_io_blks_read        bigint          -- previous cumulative pg_stat_database.blks_read
+  -- optional block budget for a regrain microbatch: cap it at ~this many heap+TOAST blocks (translated
+  -- to a row limit via the coarse child's average bytes/row), so wide rows cannot make a single batch
+  -- huge. null = cap by regrain_batch rows only (default).
+  regrain_max_blocks int
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists obtain_retry_after timestamptz;
-alter table pgpm.config add column if not exists drain_max_blocks int;
-alter table pgpm.config add column if not exists drain_adaptive boolean not null default false;
-alter table pgpm.config add column if not exists drain_budget int;
-alter table pgpm.config add column if not exists drain_ckpt_seen bigint;
-alter table pgpm.config add column if not exists drain_wal_lsn pg_lsn;
-alter table pgpm.config add column if not exists drain_wal_at timestamptz;
-alter table pgpm.config add column if not exists drain_wal_high_water numeric not null default 1.0;
-alter table pgpm.config add column if not exists drain_ambient_max_waiters int not null default 0;
-alter table pgpm.config add column if not exists drain_ambient_factor numeric not null default 0;
-alter table pgpm.config add column if not exists drain_ambient_alpha numeric not null default 0.2;
-alter table pgpm.config add column if not exists drain_ambient_floor int not null default 2;
-alter table pgpm.config add column if not exists drain_ambient_baseline numeric;
-alter table pgpm.config add column if not exists drain_ambient_io_baseline numeric;
-alter table pgpm.config add column if not exists drain_io_read_time numeric;
-alter table pgpm.config add column if not exists drain_io_blks_read bigint;
+-- #288: the fourteen adaptive-feathering columns are gone with the closed loop they fed, and so are
+-- keep_default and default_table. drain_batch/drain_max_blocks survive under regrain_* names: they are
+-- regrain's microbatch knobs now, and the old names described a machine that no longer exists.
+alter table pgpm.config drop column if exists drain_adaptive;
+alter table pgpm.config drop column if exists drain_budget;
+alter table pgpm.config drop column if exists drain_ckpt_seen;
+alter table pgpm.config drop column if exists drain_wal_lsn;
+alter table pgpm.config drop column if exists drain_wal_at;
+alter table pgpm.config drop column if exists drain_wal_high_water;
+alter table pgpm.config drop column if exists drain_ambient_max_waiters;
+alter table pgpm.config drop column if exists drain_ambient_factor;
+alter table pgpm.config drop column if exists drain_ambient_alpha;
+alter table pgpm.config drop column if exists drain_ambient_floor;
+alter table pgpm.config drop column if exists drain_ambient_baseline;
+alter table pgpm.config drop column if exists drain_ambient_io_baseline;
+alter table pgpm.config drop column if exists drain_io_read_time;
+alter table pgpm.config drop column if exists drain_io_blks_read;
+alter table pgpm.config drop column if exists keep_default;
+alter table pgpm.config drop column if exists default_table;
+alter table pgpm.config add column if not exists regrain_batch int not null default 5000;
+alter table pgpm.config add column if not exists regrain_max_blocks int;
 -- auto-regrain (REDESIGN.md section 12): when set, maintenance feathers the oldest frozen coarse child
 -- toward this target step, one budget-sized microbatch per tick. null = off (regrain is operator-driven).
 alter table pgpm.config add column if not exists regrain_to text;
@@ -1489,15 +1450,15 @@ begin
     end if;
   end if;
 
-  -- budget (rows per microbatch): drain_batch, capped by drain_max_blocks via the coarse child's stats
-  v_batch := coalesce(p_batch, cfg.drain_batch, 5000);
-  if cfg.drain_max_blocks is not null then
+  -- budget (rows per microbatch): regrain_batch, capped by regrain_max_blocks via the coarse child's stats
+  v_batch := coalesce(p_batch, cfg.regrain_batch, 5000);
+  if cfg.regrain_max_blocks is not null then
     select c.reltuples into v_reltuples from pg_class c where c.oid = v_child;
     if coalesce(v_reltuples, 0) > 0 then v_avg := pg_table_size(v_child)::numeric / v_reltuples;
     else execute format('select avg(pg_column_size(t))::numeric from (select * from %s limit 1000) t', v_child::text) into v_avg;
     end if;
     if coalesce(v_avg, 0) > 0 then
-      v_batch := least(v_batch, greatest(1, floor(cfg.drain_max_blocks::numeric * 8192 / v_avg))::int);
+      v_batch := least(v_batch, greatest(1, floor(cfg.regrain_max_blocks::numeric * 8192 / v_avg))::int);
     end if;
   end if;
   v_batch := greatest(1, v_batch);   -- a copied:0 batch must advance the cursor (0 < batch), never stall
@@ -1717,14 +1678,19 @@ $$;
 -- #275 turned these from FUNCTIONs into PROCEDUREs. CREATE OR REPLACE cannot change that, so the old
 -- forms have to go first; an existing install upgrades cleanly through this.
 drop function if exists pgpm._transmute(regclass, name, text, text, text, int, text, boolean, int, boolean, text, boolean, boolean);
-drop function if exists pgpm.transmute(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text, boolean, boolean);
-drop function if exists pgpm.transmute(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text, boolean);
+drop function  if exists pgpm.transmute(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text, boolean, boolean);
+drop function  if exists pgpm.transmute(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text, boolean);
+-- #288 dropped p_keep_default and p_drain_adaptive and renamed p_drain_batch, so the previous PROCEDURE
+-- forms must go as well or an upgrade leaves two overloads and every call becomes ambiguous.
+drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text, boolean, boolean, int);
+drop procedure if exists pgpm.transmute(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text, boolean, int);
+drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, boolean, int, boolean, text, boolean, boolean, int);
 
 create or replace procedure pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
-  p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text,
-  p_drain_adaptive boolean, p_force_uuidv7 boolean default false, p_bound_headroom int default 0
+  p_regrain_batch int, p_paused boolean, p_incoming_fks text,
+  p_force_uuidv7 boolean default false, p_bound_headroom int default 0
 )
 language plpgsql as $$
 declare
@@ -2265,15 +2231,14 @@ begin
 
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
-                           obtain, retain, keep_default, drain_batch, default_table, paused, drain_adaptive)
+                           obtain, retain, regrain_batch, paused)
   values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_obtain, p_retain,
-          p_keep_default, p_drain_batch, null, p_paused, p_drain_adaptive)
+          p_regrain_batch, p_paused)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
-    obtain = excluded.obtain, retain = excluded.retain, keep_default = excluded.keep_default,
-    drain_batch = excluded.drain_batch, default_table = excluded.default_table, paused = excluded.paused,
-    drain_adaptive = excluded.drain_adaptive;
+    obtain = excluded.obtain, retain = excluded.retain,
+    regrain_batch = excluded.regrain_batch, paused = excluded.paused;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
   -- keyed on v_parent, not p_parent: after the rename p_parent's oid is the monolith's, so an operator
@@ -2332,10 +2297,10 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- callers cast: transmute(t, c, interval '1 month').
 create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
-  p_obtain int default 30, p_retain interval default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
+  p_obtain int default 30, p_retain interval default null,
+  p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false,
+  p_force_uuidv7 boolean default false,
   p_bound_headroom int default 0
 ) language plpgsql as $$
 declare v_kind text;
@@ -2346,7 +2311,7 @@ begin
    where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
   call pgpm._transmute(p_parent, p_control, coalesce(v_kind, 'time'),
     p_interval::text, p_anchor::text, p_obtain,
-    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7,
+    p_retain::text, p_regrain_batch, p_paused, p_incoming_fks, p_force_uuidv7,
     p_bound_headroom);
 end;
 $$;
@@ -2354,15 +2319,15 @@ $$;
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
 create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
-  p_obtain int default 30, p_retain bigint default null, p_keep_default boolean default true,
-  p_drain_batch int default 5000, p_anchor bigint default 0,
+  p_obtain int default 30, p_retain bigint default null,
+  p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false, p_bound_headroom int default 0
+  p_bound_headroom int default 0
 ) language plpgsql as $$
 begin
   -- plpgsql, not sql: a SQL-bodied routine cannot host a callee's transaction control
   call pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
-                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive,
+                     p_retain::text, p_regrain_batch, p_paused, p_incoming_fks,
                      false, p_bound_headroom);
 end;
 $$;
@@ -2706,37 +2671,10 @@ create or replace function pgpm._aimd_next(
     case when p_congested then floor(p_current / 2.0)::int
          else p_current + p_increment end));
 $$;
+-- set_drain_adaptive / set_drain_ambient removed with adaptive feathering (#288). They tuned the closed
+-- loop that paced the drain's microbatches against WAL supply and ambient I/O. Nothing left in pgpm is
+-- paced by row volume: regrain has its own fixed batch, and obtain is pure metadata.
 
--- Operator switch for mode 2. Off (default) keeps today's fixed gentle rate (drain_batch); on lets the
--- controller ride the budget under the WAL supply (leading signal above). Resets all controller state so
--- a toggle starts cleanly from drain_batch with no stale rate/checkpoint baseline.
-create or replace function pgpm.set_drain_adaptive(p_parent regclass, p_enabled boolean default true)
-returns void language plpgsql as $$
-begin
-  update pgpm.config
-     set drain_adaptive = p_enabled, drain_budget = null, drain_ckpt_seen = null,
-         drain_wal_lsn = null, drain_wal_at = null, drain_ambient_baseline = null
-   where parent_table = p_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-end;
-$$;
-
--- Operator switch for the self-calibrating ambient signal (REDESIGN.md). p_factor > 0 turns it on:
--- the drain backs off when live waiters exceed p_factor times the learned baseline (relative surge),
--- p_alpha is the baseline's EWMA smoothing, p_floor the minimum effective baseline (idle-box guard).
--- p_factor = 0 turns it off. Resets the learned baseline so it re-learns cleanly from the next tick.
-create or replace function pgpm.set_drain_ambient(
-  p_parent regclass, p_factor numeric default 2.0, p_alpha numeric default 0.2, p_floor int default 2)
-returns void language plpgsql as $$
-begin
-  update pgpm.config
-     set drain_ambient_factor = p_factor, drain_ambient_alpha = p_alpha,
-         drain_ambient_floor = p_floor, drain_ambient_baseline = null,
-         drain_ambient_io_baseline = null
-   where parent_table = p_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-end;
-$$;
 
 -- Operator switch for auto-regrain (REDESIGN.md sec 12). p_target_step (an interval for time/uuidv7, a
 -- bigint step as text for id) turns it on: each maintenance tick feathers the oldest frozen coarse child
@@ -2943,7 +2881,7 @@ begin
       pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, pgpm._frontier_native(p_parent)),
       pgpm._native_type(cfg.control_kind))
       into v_regrain_child;
-    v_batch := cfg.drain_batch;   -- regrain's own microbatch size; no longer contended for by a drain
+    v_batch := cfg.regrain_batch;   -- regrain's own microbatch size
   end if;
 
   -- Auto-regrain (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
@@ -3120,20 +3058,17 @@ begin
 end;
 $$;
 
--- status(): the operator's at-a-glance view. Beyond the static config it surfaces two things that let
--- a WEDGED drain be told apart from a merely slow one (issue #92): closed_rows, the drainable backlog
--- (rows in the DEFAULT below the open interval, via check_default), and a stall signal --
--- last_drained (when the drain last made progress) plus drain_skips (deferrals logged SINCE that
--- progress). A non-zero closed_rows with a stale/null last_drained and a climbing drain_skips is a
--- wedged drain (e.g. the upsert/duplicate-key wedge); a slow-but-healthy drain shows closed_rows
--- falling and drain_skips ~0. default_rows stays the total (open + closed) for contrast.
--- inflight_partitions is the count of drain children created but not yet attached (issue #94): a
--- standing non-zero value alongside a stale last_drained means an attach is stalled (its rows are
--- durable but not visible through the parent until it attaches; use snapshot() for a complete read).
+-- status(): the operator's at-a-glance view.
+--
+-- The drain-wedge columns are gone with the drain (#288): default_rows, closed_rows, default_oldest,
+-- last_drained and drain_skips all described a backlog in a DEFAULT partition that no longer exists.
+-- inflight_partitions stays, but now counts only REGRAIN copy-children not yet attached.
+--
 -- fks_suspended / fks_unvalidated surface preserve-managed incoming FK state (issue #95):
--- fks_suspended = incoming FKs currently DROPPED (RI off on the referencing table -- expected during a
--- drain, a standing value if the drain never finishes); fks_unvalidated = FKs re-added NOT VALID
--- (enforcing new writes) but blocked from full validation by pre-existing orphans (see
+-- fks_suspended = incoming FKs currently DROPPED (RI off on the referencing table). That is now a
+-- transient, sub-transaction state inside regrain's swap rather than something spanning a drain
+-- campaign, so a standing non-zero value means a swap died mid-flight. fks_unvalidated = FKs re-added
+-- NOT VALID (enforcing new writes) but blocked from full validation by pre-existing orphans (see
 -- incoming_fk_orphans() / validate_incoming_fks()).
 -- dropped/recreated (not CREATE OR REPLACE) because the redesign widens the return shape with
 -- coarse_partitions + history_unregrained (REDESIGN.md section 14).
@@ -3142,25 +3077,21 @@ create or replace function pgpm.status()
 returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
-  default_rows bigint, closed_rows bigint,
-  default_oldest text, newest_bound text, last_drained timestamptz, drain_skips bigint,
+  newest_bound text,
   fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_drop_failures bigint,
   retain_backlog bigint
 )
 language plpgsql as $$
 declare
   r pgpm.config; v_nsp name; v_np bigint; v_coarse bigint; v_inflight bigint; v_new text;
-  v_drows bigint; v_closed bigint; v_old text;
-  v_last_drained timestamptz; v_last_progress_id bigint; v_skips bigint;
+
   v_fks_susp bigint; v_fks_unval bigint;
   v_last_retain_id bigint; v_drop_fails bigint;
   v_retain_boundary text; v_retain_backlog bigint;
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
-    -- #288: no DEFAULT, so no drain backlog to report. These stay in the result shape for now and are
-    -- reported as zero; PR 2 removes the columns along with the drain_* config.
-    v_drows := 0; v_closed := 0; v_old := null;
+
     -- n_partitions = attached (real) partitions; coarse_partitions = the un-regrained coarse children (a
     -- wider-than-one-step range, REDESIGN.md section 14) -- the regraining backlog; inflight = the
     -- not-yet-attached drain/regrain children.
@@ -3171,13 +3102,6 @@ begin
       into v_np, v_coarse, v_inflight from pgpm.part where parent_table = r.parent_table;
     execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
                    pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
-    -- drain progress vs stall, from the append-only log. drain_skips counts deferrals logged AFTER the
-    -- last progress, ordered by the log's monotonic id (robust even when many rows share one tick's
-    -- now()). retain_reclaim counts as progress (issue #91), like drain_move/drain_attach.
-    select max(at), max(id) into v_last_drained, v_last_progress_id from pgpm.log
-      where parent_table = r.parent_table and action in ('drain_move', 'drain_attach', 'retain_reclaim');
-    select count(*) into v_skips from pgpm.log
-      where parent_table = r.parent_table and action = 'skip_drain' and id > coalesce(v_last_progress_id, 0);
     -- preserve-managed incoming FK state: dropped (RI off) vs re-added-but-not-validated (orphan-blocked)
     select count(*) filter (where restored_at is null),
            count(*) filter (where restored_at is not null and validated_at is null)
@@ -3208,86 +3132,19 @@ begin
     parent := r.parent_table; control_kind := r.control_kind; partition_step := r.partition_step;
     obtain := r.obtain; retain := r.retain; paused := r.paused; n_partitions := v_np;
     coarse_partitions := v_coarse; inflight_partitions := v_inflight; history_unregrained := v_coarse > 0;
-    default_rows := v_drows; closed_rows := v_closed; default_oldest := v_old; newest_bound := v_new;
-    last_drained := v_last_drained; drain_skips := v_skips;
+    newest_bound := v_new;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_drop_failures := v_drop_fails;
     retain_backlog := v_retain_backlog;
     return next;
   end loop;
 end;
 $$;
+-- snapshot() removed with the drain (#288). It existed to paper over the drain's VISIBILITY GAP: during a
+-- multi-batch drain the already-moved rows lived in an unattached child, so a plain read of the parent
+-- undercounted the interval being drained, and snapshot() UNIONed those children back in. regrain never
+-- opened that gap (it copies and swaps atomically) and there is no drain, so a read of the parent is
+-- never short and there is nothing to union.
 
--- snapshot(): a read-consistency escape hatch for the drain visibility gap. THE GAP: the drain moves a
--- closed interval out of the DEFAULT into a brand-new child that is created STANDALONE and only ATTACHed
--- once the whole interval has moved (see drain_step). Between the first microbatch and that attach, the
--- already-moved rows are durable but live in an UNATTACHED table, so they are NOT reachable through the
--- parent: a plain `select ... from parent` mid-drain UNDERCOUNTS the interval being drained (by however
--- many rows have moved so far). This is inherent -- Postgres has no way to make an unattached relation
--- visible through the parent, and will not attach a partition while the DEFAULT still holds rows in its
--- range (chicken-and-egg). snapshot() returns the COMPLETE set during a drain -- the parent UNION every
--- in-flight, not-yet-attached child -- so a consistency-sensitive reader (a COUNT, a logical backup, a
--- reconciliation) sees the moved rows too:
---
---   select count(*) from pgpm.snapshot(null::public.events);
---
--- It is a set-returning function whose row type is the parent's: the regclass cannot be inferred from a
--- runtime value (return shape is fixed at plan time), so the caller passes the rowtype as a typed-NULL
--- anchor, and snapshot() derives the table from it (pg_typeof -> pg_type.typrelid -> the table). Two
--- honest costs, both inherent and documented: (1) it is an OPTIMIZATION FENCE -- the in-flight child set
--- is dynamic so the body is dynamic SQL in an SRF, meaning a WHERE on top does NOT push down into the
--- union arms or use the child's CHECK-constraint exclusion; it materializes the union, then filters.
--- Fine for COUNT/full reads; for heavily-filtered reads on a large table a manual `select ... from
--- parent union all select ... from <child>` plans better. (2) It does NOTHING for writes: an
--- INSERT/UPDATE/DELETE through the parent that targets an already-moved row is a 0-row no-op until the
--- interval attaches -- there is no fix, by design. Upside vs a stored view: it is ALWAYS FRESH (it
--- rediscovers the in-flight child on every call, so it can neither double-count an attached child nor
--- miss a newly-started one) and leaves no object behind. Single-batch intervals and drain_all (one
--- transaction) never open the gap.
-create or replace function pgpm.snapshot(p_rowtype anyelement)
-returns setof anyelement language plpgsql as $$
-declare cfg pgpm.config; v_parent regclass; v_nsp name; v_rel name; v_arms text; v_child name;
-begin
-  -- derive the parent table from the rowtype anchor: a table's composite rowtype links 1:1 back to it.
-  select c.oid into v_parent
-    from pg_type t join pg_class c on c.oid = t.typrelid
-   where t.oid = pg_typeof(p_rowtype)::oid and c.relkind in ('r', 'p');
-  if v_parent is null then
-    raise exception 'pg_partition_magician: snapshot() needs a table rowtype anchor, e.g. pgpm.snapshot(null::public.events)';
-  end if;
-  select * into cfg from pgpm.config where parent_table = v_parent;
-  if not found then raise exception 'pg_partition_magician: % is not managed', v_parent; end if;
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = v_parent;
-
-  -- the parent already covers the DEFAULT and every attached partition; add every in-flight DRAIN child:
-  -- a standalone table matching the parent's child-partition naming that is NOT yet attached (same shape as
-  -- the orphan guard). Crucially, EXCLUDE a regrain copy-child -- an unattached child whose range is contained
-  -- in an attached partition (the coarse source it is being copied out of). Its rows are still present in
-  -- that attached source, so unioning the copy would DOUBLE-COUNT (regrain copies, never moves -- so unlike a
-  -- drain child its rows are not absent from the parent). A true drain child sits in no attached partition's
-  -- range, so it is kept; a true orphan (not in pgpm.part) is also kept, conservatively.
-  v_arms := format('select * from %s', v_parent::text);
-  for v_child in
-    select c.relname from pg_class c
-     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
-       and c.relkind = 'r' and starts_with(c.relname, v_rel || '_p')
-       and case when cfg.control_kind = 'id'
-                then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
-                else substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{4}(_[0-9]+)*$' end
-       and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
-       and not exists (                                            -- skip regrain copies (rows still in the source)
-             select 1 from pgpm.part cp
-              join pgpm.part ap on ap.parent_table = cp.parent_table and ap.attached
-             where cp.parent_table = v_parent and cp.child_name = c.relname
-               and not pgpm._native_gt(cfg.control_kind, ap.lo, cp.lo)   -- ap.lo <= cp.lo
-               and not pgpm._native_gt(cfg.control_kind, cp.hi, ap.hi))  -- cp.hi <= ap.hi
-  loop
-    v_arms := v_arms || format(' union all select * from %I.%I', v_nsp, v_child);
-  end loop;
-
-  return query execute v_arms;
-end;
-$$;
 
 -- ===================== observability: pg_flight_recorder correlation =====================
 --

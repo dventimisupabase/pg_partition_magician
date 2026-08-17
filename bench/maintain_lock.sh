@@ -47,7 +47,7 @@ q "insert into public.ml values ($((HI-1)), 'advances the frontier to the grid c
 q "vacuum analyze public.ml" >/dev/null
 # Auto-regrain of the coarse monolith into fine children is the long step in a tick now. A small target
 # step means many copy microbatches, so the tick is long enough to span if a boundary goes missing.
-q "update pgpm.config set drain_batch=$BATCH where parent_table='public.ml'::regclass" >/dev/null
+q "update pgpm.config set regrain_batch=$BATCH where parent_table='public.ml'::regclass" >/dev/null
 # Sub-range width chosen from measurement, not guessed: at 2,000,000 a copy tick runs 2.1-2.4 s, which
 # comfortably outlasts the ~150 ms it takes the probe's own psql session to start. At 100k and at 500k the
 # tick finished before the probe could read, and the guard reported nothing observed.
