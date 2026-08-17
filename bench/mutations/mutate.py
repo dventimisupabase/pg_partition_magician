@@ -26,6 +26,17 @@ BOUNDARY_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+# _create_partition's two boundaries. Removing them collapses the three phases back into one
+# transaction, which is the pre-#280 shape exactly.
+OBTAIN_BOUNDARY_RE = re.compile(r"^    commit;   -- BOUNDARY \(#280\).*?\n", re.MULTILINE)
+
+# obtain's per-candidate commit. Needed by maintain_no_commits and not by obtain_no_commits: the
+# maintain guard is about a lock reaching the DRAIN, which needs everything obtain did to stay open.
+OBTAIN_LOOP_COMMIT = """    exit when v_defer is not null;
+    p_made := p_made + 1;
+    commit;
+"""
+
 # name -> (guard it must break, why this is the right defect, [(find, replace, expected_count)])
 MUTATIONS = {
     "transmute_no_commits": (
@@ -38,13 +49,21 @@ MUTATIONS = {
     "maintain_no_commits": (
         "bench/maintain_lock.sh",
         "Pre-#279 maintain: one transaction per tick, so obtain's ACCESS EXCLUSIVE on the parent is "
-        "held across the drain.",
+        "held across the drain. Also strips the #280 boundaries inside obtain, because after #280 "
+        "obtain commits on its own and maintain's boundaries alone no longer decide this.",
         # EVERY boundary inside maintain(), not just the one before the drain. Removing only the first
         # leaves obtain's lock released at the SECOND boundary a few statements later, which is a short
         # window the guard rightly does not object to -- the guard then passed against this mutant and
         # discriminate.sh reported it as non-discriminating. The defect being modelled is "the tick is
         # one transaction", so the mutant has to actually make it one.
-        [(BOUNDARY_RE, "", 6)],
+        [(BOUNDARY_RE, "", 6), (OBTAIN_BOUNDARY_RE, "", 2),
+         (OBTAIN_LOOP_COMMIT, "    exit when v_defer is not null;\n    p_made := p_made + 1;\n", 1)],
+    ),
+    "obtain_no_commits": (
+        "bench/obtain_lock.sh",
+        "Pre-#280 obtain: the constraint dance in one transaction, so the ADD's ACCESS EXCLUSIVE is "
+        "held over the O(rows) VALIDATE scan of the DEFAULT.",
+        [(OBTAIN_BOUNDARY_RE, "", 2)],
     ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",

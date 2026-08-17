@@ -21,7 +21,7 @@ insert into public.bd_t (created_at, body)
 
 call pgpm.transmute('public.bd_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
-select pgpm.obtain('public.bd_t');
+call pgpm.obtain('public.bd_t');
 
 -- a backdated insert well below the retention horizon: the INSERT itself succeeds
 insert into public.bd_t (created_at, body)

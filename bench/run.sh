@@ -377,7 +377,7 @@ if [ "$BENCH_REGRAIN" = "1" ]; then
   # advance the id frontier past B with a single sentinel row, and bump the identity sequence past the
   # sentinel so the live workload's inserts land ABOVE the monolith (in forward partitions) -- never back
   # into the frozen range being copied (which the copy's resume-anti-join would miss => lost rows at swap).
-  q "select pgpm.obtain('bench.events')" >/dev/null
+  q "call pgpm.obtain('bench.events')" >/dev/null
   SENTINEL=$(( MONO_HI + BENCH_ID_STEP ))
   q "insert into bench.events (id, created_at, user_id, kind, payload) values ($SENTINEL, now(), 1, 0, 'pgpm-bench-frontier')" >/dev/null
   q "select setval(pg_get_serial_sequence('bench.events','id'), $((SENTINEL + 1)), false)" >/dev/null

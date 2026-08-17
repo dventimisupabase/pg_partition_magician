@@ -403,6 +403,7 @@ run_perf() {
   bash "$(dirname "$0")/bench/regrain_perf.sh"   "$c" pgpm_perf  /repo/pgpm_core/install.sql || rc=1
   bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
   bash "$(dirname "$0")/bench/maintain_lock.sh" "$c" pgpm_perf3                              || rc=1
+  bash "$(dirname "$0")/bench/obtain_lock.sh"   "$c" pgpm_perf4                              || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"
