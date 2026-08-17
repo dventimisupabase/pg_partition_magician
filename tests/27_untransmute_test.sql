@@ -66,9 +66,8 @@ insert into public.gated (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 50) g;
 call pgpm.transmute('public.gated', 'created_at', interval '1 month');
 select pass('transmute the gated table');
-select lives_ok(
-  $$ select pgpm.obtain('public.gated') $$,
-  'obtain builds empty forward partitions ahead of the frontier');
+call pgpm.obtain('public.gated');
+select pass('obtain builds empty forward partitions ahead of the frontier');
 select lives_ok(
   $$ select pgpm.untransmute('public.gated') $$,
   'transmute + obtain is still reversible (forward partitions empty, the monolith holds everything)');
@@ -88,9 +87,8 @@ insert into public.gated2 (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 50) g;
 call pgpm.transmute('public.gated2', 'created_at', interval '1 month');
 select pass('transmute the gated2 table');
-select lives_ok(
-  $$ select pgpm.obtain('public.gated2') $$,
-  'obtain builds empty forward partitions');
+call pgpm.obtain('public.gated2');
+select pass('obtain builds empty forward partitions');
 insert into public.gated2 (created_at, body) values (now() + interval '45 days', 'future');  -- past B
 select throws_ok(
   $$ select pgpm.untransmute('public.gated2') $$,

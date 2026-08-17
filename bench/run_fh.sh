@@ -330,7 +330,7 @@ if [ "$BENCH_REGRAIN" = "1" ]; then
   echo "  would. The ambient load runs at an effective clock +${CLK}s (forward partitions, past the monolith),"
   echo "  so the monolith range receives NO writes; regrain is then driven in a now()-shadowed session -- a BENCH"
   echo "  INSTRUMENT that lets pgpm act on the genuinely-quiescent historical monolith as if frozen. Never in prod."
-  q "select pgpm.obtain('bench.events')" >/dev/null
+  q "call pgpm.obtain('bench.events')" >/dev/null
   q "select pgpm.set_regrain('bench.events', '$BENCH_FH_INTERVAL')" >/dev/null
   q "select pgpm.set_drain_adaptive('bench.events', true)" >/dev/null
   # ongoing load on forward partitions (keeps the monolith quiescent during the skewed regrain)

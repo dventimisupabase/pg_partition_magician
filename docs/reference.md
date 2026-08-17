@@ -363,14 +363,31 @@ the delta catch-up.
 ### `obtain`
 
 ```sql
-pgpm.obtain(p_parent regclass) returns int
+call pgpm.obtain(p_parent regclass, inout p_made int default null,
+                 inout p_deferred boolean default null)
 ```
 
 Creates empty partitions ahead of the frontier so live writes always land in a real partition, keeping
-`config.obtain` of them ready. Returns how many it created. With the `DEFAULT` empty (the normal state)
-it uses a plain, scan-free attach. It skips any candidate range that overlaps an existing attached
+`config.obtain` of them ready. `p_made` is how many it created. With the `DEFAULT` empty (the normal
+state) it uses a plain, scan-free attach. It skips any candidate range that overlaps an existing attached
 partition (for example the monolith, which covers the current interval) or that the `DEFAULT` still holds
 rows for.
+
+Beside a non-empty `DEFAULT` it must prove the `DEFAULT` holds no row in the new range, which it does
+with a `NOT VALID` exclusion `CHECK` plus `VALIDATE` so the `CREATE` can skip its own scan. Those run in
+three transactions, so the O(rows) scan runs under `SHARE UPDATE EXCLUSIVE` and does not block writes;
+the only `ACCESS EXCLUSIVE` windows are sub-millisecond DDL.
+
+The cost of committing between them is a window where the constraint is in place and the partition is
+not, so the `DEFAULT` rejects writes in that range. The range is always empty and ahead of the frontier,
+and the next `obtain` drops any leftover constraint and starts again, so an interrupted build clears
+itself on the next maintenance tick. A leftover is dropped rather than resumed, and logged as
+`obtain_reap`.
+
+A procedure, not a function, because of those commits. It takes an advisory lock per parent, so a second
+concurrent `obtain` defers instead of interfering, and it reports failures through `p_deferred` rather
+than raising: `maintain` cannot wrap it in an exception handler, since transaction control is illegal
+below one.
 
 ### `drain_step`
 

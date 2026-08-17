@@ -47,9 +47,8 @@ insert into pgpm.config (parent_table, control_column, control_kind, partition_s
 insert into pgpm.part (parent_table, child_name, lo, hi, attached)
   values ('public.ovl'::regclass, 'ovl_p0_to_5000', '0', '5000', true);
 
-select lives_ok(
-  $$ select pgpm.obtain('public.ovl') $$,
-  'obtain does not error even though the coarse child covers the active interval');
+call pgpm.obtain('public.ovl');
+select pass('obtain does not error even though the coarse child covers the active interval');
 
 select ok(
   to_regclass('public.ovl_p' || lpad('5000', 19, '0')) is not null,

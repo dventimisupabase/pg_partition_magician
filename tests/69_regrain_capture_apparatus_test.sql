@@ -106,7 +106,7 @@ select is((select count(*)::int from public.ca4), 251,
 create table public.ca5 (id bigint primary key, payload text);
 insert into public.ca5 select g, 'x' from generate_series(1, 2500) g;
 call pgpm.transmute('public.ca5', 'id', 1000, p_obtain => 3);
-select pgpm.obtain('public.ca5');
+call pgpm.obtain('public.ca5');
 insert into public.ca5 values (900000, 'frontier');
 select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);
 select pgpm.regrain_step('public.ca5','ca5_p0000000000000000000_to_0000000000000003000','100',500);

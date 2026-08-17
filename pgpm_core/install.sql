@@ -410,14 +410,41 @@ begin
 end;
 $$;
 
--- create an EMPTY partition for native [p_lo, p_hi); skips the DEFAULT scan when
--- the default is non-empty (NOT VALID exclusion CHECK + VALIDATE).
-create or replace function pgpm._create_partition(
-  p_cfg pgpm.config, p_nsp name, p_rel name, p_default regclass, p_name name, p_lo text, p_hi text
+-- #280: _create_partition became a PROCEDURE so its phases can commit. Drop the old function first, or
+-- an upgrade fails with "cannot change routine kind".
+drop function if exists pgpm._create_partition(pgpm.config, name, name, regclass, name, text, text);
+
+-- create an EMPTY partition for native [p_lo, p_hi).
+--
+-- Beside a NON-EMPTY default, someone has to prove the default holds no row in the new range, or the
+-- CREATE scans it. pgpm proves it with a NOT VALID exclusion CHECK plus VALIDATE, which lets the CREATE
+-- skip the scan. That much is unchanged.
+--
+-- What changed for #280 is that the three statements no longer share a transaction. They did, and since
+-- locks release only at transaction end, the ADD's ACCESS EXCLUSIVE was held over the VALIDATE's
+-- O(rows) scan -- so the DEFAULT, which is where the live workload writes, was locked for the whole of
+-- it. Measured against a 947 MB default on PG17: 157 ms, and unbounded, since a larger or colder
+-- default makes it seconds.
+--
+--   phase 1  ADD ... NOT VALID                  ACCESS EXCLUSIVE, 0.6 ms
+--   phase 2  VALIDATE                           SHARE UPDATE EXCLUSIVE, 164 ms  <- does not block writes
+--   phase 3  CREATE (scan skipped) + DROP       ACCESS EXCLUSIVE, ~1 ms
+--
+-- Phase 3 keeps the CREATE and the DROP together on purpose: both are sub-millisecond ACCESS EXCLUSIVE,
+-- so merging them costs one short window instead of two.
+--
+-- The constraint has ONE FIXED NAME per default, not one derived from the partition. Deriving it was the
+-- obvious choice and it is wrong: `(p_name || '_excl')::name` SILENTLY TRUNCATES at 63 bytes, and a
+-- coarse child's name is already 46 characters, so two candidates can collide on one constraint. A fixed
+-- name also means a leftover is unambiguous to clear, which is what obtain does with it.
+create or replace procedure pgpm._create_partition(
+  p_cfg pgpm.config, p_nsp name, p_rel name, p_default regclass, p_name name, p_lo text, p_hi text,
+  inout p_defer text default null
 )
-returns void language plpgsql as $$
-declare v_empty boolean; v_excl name; v_method text; v_lo_lit text; v_hi_lit text;
+language plpgsql as $$
+declare v_empty boolean; v_method text; v_lo_lit text; v_hi_lit text;
 begin
+  p_defer := null;
   v_lo_lit := pgpm._encode(p_cfg.control_kind, p_lo);
   v_hi_lit := pgpm._encode(p_cfg.control_kind, p_hi);
   if p_cfg.keep_default then
@@ -425,17 +452,34 @@ begin
   else v_empty := true; end if;
 
   if v_empty then
-    execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
-                   p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
+    -- Nothing to prove against an empty default, so no dance and no boundary: one statement, one short
+    -- lock. Every keep_default = false table takes this path too.
+    begin
+      execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
+                     p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
+    exception when others then p_defer := sqlerrm; return;
+    end;
     v_method := 'plain';
   else
-    v_excl := (p_name || '_excl')::name;
-    execute format('alter table %s add constraint %I check (%I < %L or %I >= %L) not valid',
-                   p_default::text, v_excl, p_cfg.control_column, v_lo_lit, p_cfg.control_column, v_hi_lit);
-    execute format('alter table %s validate constraint %I', p_default::text, v_excl);
-    execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
-                   p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
-    execute format('alter table %s drop constraint %I', p_default::text, v_excl);
+    begin
+      execute format('alter table %s add constraint pgpm_obtain_excl check (%I < %L or %I >= %L) not valid',
+                     p_default::text, p_cfg.control_column, v_lo_lit, p_cfg.control_column, v_hi_lit);
+    exception when others then p_defer := sqlerrm; return;
+    end;
+    commit;   -- BOUNDARY (#280): drop the ADD's ACCESS EXCLUSIVE before the scan, which is the point
+
+    begin
+      execute format('alter table %s validate constraint pgpm_obtain_excl', p_default::text);
+    exception when others then p_defer := sqlerrm; return;
+    end;
+    commit;   -- BOUNDARY (#280): the scan is done and durable; the CREATE below can now skip it
+
+    begin
+      execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
+                     p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
+      execute format('alter table %s drop constraint pgpm_obtain_excl', p_default::text);
+    exception when others then p_defer := sqlerrm; return;
+    end;
     v_method := 'check_skip';
   end if;
 
@@ -446,18 +490,77 @@ begin
 end;
 $$;
 
-create or replace function pgpm.obtain(p_parent regclass)
-returns int language plpgsql as $$
+-- #280: obtain became a PROCEDURE because _create_partition commits. Drop the old function first.
+drop function if exists pgpm.obtain(regclass);
+
+-- obtain(): build the empty forward partitions ahead of the frontier.
+--
+-- A PROCEDURE, because _create_partition now commits between its phases (#280). Three consequences,
+-- all of them here rather than in maintain:
+--
+-- IT CATCHES ITS OWN ERRORS. maintain used to wrap the call in BEGIN ... EXCEPTION, which is no longer
+-- possible: transaction control is illegal anywhere below an exception handler, so that wrapper would
+-- turn every COMMIT below into "invalid transaction termination". It catches WHEN OTHERS, not just the
+-- lock-race SQLSTATEs, because that wrapper caught everything -- and now that maintain_all has no
+-- per-parent handler either, a narrower catch here would let one odd error abort a whole sweep.
+-- Every handler only sets a variable; every COMMIT is at the top level, outside all of them.
+--
+-- IT TAKES AN ADVISORY LOCK. It never needed one while it was a single transaction. With commits, a
+-- second session entering obtain would drop the first's in-flight constraint mid-VALIDATE.
+--
+-- IT RESTARTS RATHER THAN RESUMES. A leftover pgpm_obtain_excl is dropped, not adopted. Adopting it
+-- would mean matching it back to a candidate, and it cannot be matched safely: the name is fixed, and
+-- the range it covers may be one the current partition_step no longer produces, so a resume could
+-- validate one range and create another. Restarting costs one scan, and only after a crash.
+--
+-- p_deferred tells maintain whether to start its back-off. The back-off CHECK stays in maintain: an
+-- operator calling obtain by hand wants it to try, not to honour a window maintenance set.
+create or replace procedure pgpm.obtain(
+  p_parent regclass, inout p_made int default null, inout p_deferred boolean default null
+)
+language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_default regclass;
   v_frontier text; v_lo text; v_hi text; v_lo_lit text; v_hi_lit text; v_name name;
-  v_has boolean; v_made int := 0; k int;
+  v_has boolean; k int; v_defer text; v_key bigint;
 begin
+  p_made := 0; p_deferred := false;
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_default  := format('%I.%I', v_nsp, cfg.default_table)::regclass;
+
+  v_key := hashtextextended('pgpm_obtain:' || p_parent::oid::text, 0);
+  if not pg_try_advisory_lock(v_key) then
+    p_deferred := true;
+    insert into pgpm.log (parent_table, action, method)
+      values (p_parent, 'skip_obtain', 'another session is already obtaining for this table');
+    return;
+  end if;
+
+  -- Clear anything a previous call left stranded, BEFORE reading the frontier: while that constraint
+  -- is in place the default rejects writes in its range, so it must go whether or not this call ends
+  -- up building anything.
+  if exists (select 1 from pg_constraint
+              where conrelid = v_default and conname = 'pgpm_obtain_excl') then
+    begin
+      execute format('alter table %s drop constraint pgpm_obtain_excl', v_default::text);
+    exception when others then
+      v_defer := sqlerrm;
+    end;
+    if v_defer is not null then
+      p_deferred := true;
+      insert into pgpm.log (parent_table, action, method)
+        values (p_parent, 'skip_obtain', left(v_defer, 200));
+      perform pg_advisory_unlock(v_key);
+      return;
+    end if;
+    commit;
+    insert into pgpm.log (parent_table, action, method)
+      values (p_parent, 'obtain_reap', 'dropped a stranded pgpm_obtain_excl left by an earlier call');
+  end if;
+
   v_frontier := pgpm._frontier_native(p_parent);
   v_lo       := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
 
@@ -481,10 +584,26 @@ begin
     execute format('select exists (select 1 from %s where %I >= %L and %I < %L)',
                    v_default::text, cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit) into v_has;
     continue when v_has;
-    perform pgpm._create_partition(cfg, v_nsp, v_rel, v_default, v_name, v_lo, v_hi);
-    v_made := v_made + 1;
+
+    -- NOT wrapped in BEGIN ... EXCEPTION, and that is load-bearing: transaction control is illegal
+    -- anywhere below a handler, so wrapping this would turn _create_partition's own COMMITs into
+    -- "invalid transaction termination" and defer every single build. _create_partition therefore
+    -- reports through p_defer instead of raising.
+    --
+    -- A deferral EXITS rather than trying the next candidate: under lock contention the next one meets
+    -- the same wall, and stopping is what the old maintain-side handler did.
+    call pgpm._create_partition(cfg, v_nsp, v_rel, v_default, v_name, v_lo, v_hi, v_defer);
+    exit when v_defer is not null;
+    p_made := p_made + 1;
+    commit;
   end loop;
-  return v_made;
+
+  if v_defer is not null then
+    p_deferred := true;
+    insert into pgpm.log (parent_table, action, method)
+      values (p_parent, 'skip_obtain', left(v_defer, 200));
+  end if;
+  perform pg_advisory_unlock(v_key);
 end;
 $$;
 
@@ -2847,7 +2966,7 @@ declare
   v_made int := 0; v_archived int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
   v_regrain text := 'skipped'; v_regrain_child name;
   v_note text := '';
-  v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int;
+  v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int; v_deferred boolean;
   v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
   v_waiters int; v_wal_cong boolean; v_amb_cong boolean; v_reason text;
   v_lock_surge boolean; v_lock_abs boolean; v_amb_baseline numeric;
@@ -2877,17 +2996,19 @@ begin
   -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
   -- them), so deferring obtain is harmless. A successful obtain clears the back-off.
   if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
-    begin
-      v_made := pgpm.obtain(p_parent);
-      if cfg.obtain_retry_after is not null then
-        update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
-      end if;
-    exception when others then
+    -- NO exception handler here, unlike every other step in this tick, and that is deliberate (#280).
+    -- obtain COMMITs between its phases now, and transaction control is illegal anywhere below a
+    -- handler, so a wrapper here would turn those commits into "invalid transaction termination" and
+    -- defer every build. obtain catches WHEN OTHERS itself and reports through p_deferred, so this step
+    -- is no less isolated than it was: the tick still carries on after any failure inside obtain.
+    call pgpm.obtain(p_parent, v_made, v_deferred);
+    if v_deferred then
       v_note := v_note || ' obtain_deferred';
       update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
-    end;
+    elsif cfg.obtain_retry_after is not null then
+      update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
+    end if;
   else
     v_note := v_note || ' obtain_backoff';
   end if;
