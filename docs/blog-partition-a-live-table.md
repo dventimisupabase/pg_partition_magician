@@ -44,7 +44,7 @@ That is the headline: the workload's p50 and p95 latency sit on the baseline for
 
 ### It self-tunes to stay out of the way
 
-A drain that is too eager floods the write-ahead log and triggers checkpoint storms, which hurts everyone. With adaptive feathering on (`pgpm.set_drain_adaptive`), the per-tick drain budget rides an AIMD controller, the same additive-increase / multiplicative-decrease law TCP uses to sit just under a link's capacity: it probes upward when the database is calm and halves the moment it senses WAL or checkpoint pressure.
+Bulk work that is too eager floods the write-ahead log and triggers checkpoint storms, which hurts everyone. pgpm's only bulk mover is `regrain`, and it is paced by a fixed `regrain_batch` of rows per microbatch, spread across maintenance ticks, so the cost is bounded by the coarse child rather than by your write rate.
 
 ![The adaptive drain budget feathering between its ceiling and floor: throttled under pressure, opening back up as it clears.](../bench/figures/03-adaptive-feathering.svg)
 

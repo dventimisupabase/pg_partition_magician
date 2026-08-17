@@ -17,7 +17,7 @@ rationale see [REDESIGN.md](../REDESIGN.md); for a visual overview see the
 - [Incoming foreign keys](#incoming-foreign-keys)
 - [Secondary indexes](#secondary-indexes)
 - [How the conversion avoids a rewrite](#how-the-conversion-avoids-a-rewrite)
-- [Read consistency during a move](#read-consistency-during-a-move)
+- [Read consistency](#read-consistency)
 - [WAL and checkpoint sizing](#wal-and-checkpoint-sizing)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Caveats and v1 scope](#caveats-and-v1-scope)
@@ -57,19 +57,27 @@ the grid boundary just above the frontier. So immediately after transmute the wh
 correct, fully-queryable partition, and the table is partitioned in form. The monolith doubles as the
 current partition until the frontier crosses `B`, then it freezes.
 
-**The DEFAULT is an empty safety net.** Alongside the monolith, transmute creates a fresh, empty
-`DEFAULT` partition. It is the leading-edge net: if a write ever arrives that no real partition covers
-(obtain fell behind, a backdated row, a gap), it lands here instead of erroring. In steady state obtain
-keeps the frontier covered, so the `DEFAULT` stays empty. Keeping it empty is what keeps obtain cheap;
-`check_default()` tells you if anything is stuck there.
+**There is no DEFAULT partition.** Alongside the monolith, transmute builds a *forward grid*: real,
+bounded partitions running `config.obtain` steps ahead of the write frontier. A write that no partition
+covers is **refused**, not parked:
+
+```text
+ERROR:  no partition of relation "events" found for row
+```
+
+That is deliberate. A `DEFAULT` would absorb such a write silently and need a background process to file
+it away later, which is precisely the machinery, and the referential-integrity window, that pgpm removed.
+The trade is that `config.obtain x partition_step` is both your slack if maintenance stalls and a ceiling
+on how far ahead you may write, so size it for your grid: 30 steps is a month on a daily one.
 
 **The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives these
 per table:
 
 - **obtain**: create up to N partitions ahead of the frontier, so live writes always land in a real
-  partition. With the `DEFAULT` empty this is a cheap, scan-free attach.
-- **drain**: keep the `DEFAULT` empty by evacuating the occasional stray into
-  its proper partition. This is no longer the bulk mover -- it is housekeeping for the leading-edge net.
+  partition. Pure catalog work: there is no `DEFAULT` to scan, so nothing is proven and nothing is moved.
+  This is also pgpm's *only* protection against a write with nowhere to go, since a row outside the grid
+  is refused rather than parked. `config.obtain x partition_step` is therefore both your slack if
+  maintenance stalls and a ceiling on how far ahead you may write.
 - **retain**: drop partitions older than your policy.
 - **regrain** (optional): split the coarse monolith into finer partitions, on demand or paced across ticks.
 
@@ -165,8 +173,7 @@ wait. Size a maintenance window from the row count:
 Measured on PostgreSQL 17 with the table cached in memory. A table larger than RAM makes the scan
 I/O-bound, so treat these as a floor rather than an estimate, and measure on a restored copy of your own
 data before converting a large table.
-(Contrast the old model, which paid no scan up front but then rewrote every historical row through a
-perpetual drain.)
+(Contrast a model that pays no scan up front but then rewrites every historical row.)
 
 The one hard requirement is that the **control column be `NOT NULL`** (a partition key cannot be null, and
 `transmute` never scans to enforce it). A key is *not* required: if the table has a **primary key** or a
@@ -219,27 +226,11 @@ To convert and split a table synchronously (tests, one-shot migrations) instead 
 cron, drive it by hand: `obtain` the forward partitions, then `regrain` the monolith once it has frozen
 (see [Regrain the history](#regrain-the-history)).
 
-### Adaptive feathering (let the work tune itself)
-
-Instead of fixing the rate by hand, turn on adaptive mode and let pgpm ride the per-tick budget just under
-the system's spare capacity:
-
-```sql
-select pgpm.set_drain_adaptive('public.events', true);
-```
-
-Or choose it up front: `pgpm.transmute(..., p_drain_adaptive => true)`. Each maintenance tick then
-measures how fast it is generating WAL and compares it to the rate the database can absorb between
-checkpoints (`max_wal_size` / `checkpoint_timeout`); if it is outrunning that, a forced checkpoint and its
-I/O storm are on the way, so pgpm eases the budget down *before* the storm and recovers gently once there
-is slack again -- the additive-increase / halve-on-congestion idea TCP uses. Your `drain_batch` is the
-ceiling; it only feathers *down* from there, as far as one-sixteenth of `drain_batch` under sustained
-pressure. The same budget paces both the drain and regrain's microbatches.
-
-A second, complementary signal yields to *ambient query load* (which the WAL signal misses, since a
-starved workload makes little WAL). Turn it on with `pgpm.set_drain_ambient('public.events', 2.0)`: it
-counts your own backends stuck on IO/lock waits, learns the recent normal (an EWMA baseline), and backs
-off only on a *relative surge* above it. Off by default; the WAL and ambient signals are OR'd.
+Regrain's pace is set by `config.regrain_batch`, the rows copied per microbatch, with an optional
+`regrain_max_blocks` cap so wide rows cannot make one batch huge. It is a fixed rate: pgpm used to run a
+closed-loop controller that rode the budget against WAL and ambient I/O pressure, but that existed to pace
+the *drain*, and the drain is gone. Regrain copies old, frozen data at whatever rate you choose, and the
+work is bounded by the coarse child rather than by the write rate.
 
 ## Regrain the history
 
@@ -301,17 +292,12 @@ select * from pgpm.status();        -- one row per managed table: partitions, ba
 - **`coarse_partitions` and `history_unregrained`** -- how many attached partitions are still coarse
   (wider than one step), and whether any remain. `history_unregrained = true` is the regraining backlog:
   pruning and fine retention are suspended over that coarse span until it is regrained.
-- **`closed_rows` / `default_rows`** -- the drain's backlog: rows in the `DEFAULT` that should
-  have a real partition. In steady state this is **zero** (the monolith holds the history; the `DEFAULT`
-  is the empty net). A non-zero `closed_rows` means a stray landed there and has not yet been evacuated.
-- **`last_drained` / `drain_skips`** -- progress versus stall: a non-zero `closed_rows` with a stale
-  `last_drained` and a climbing `drain_skips` is a wedged drain; falling `closed_rows` with
-  `drain_skips ~ 0` is merely slow.
-- **`inflight_partitions`** -- children created but not yet attached: a drain mid-move, or a regrain's
-  in-progress copies. A *drain* child holds rows not yet visible through the parent (use
-  [`snapshot()`](#read-consistency-during-a-move) for a complete read); a *regrain* copy-child holds
-  duplicates of rows still in the monolith, so the parent count is already complete -- it is a
-  transient-disk signal, not a read gap.
+- **`newest_bound`** -- the top of the forward grid, and therefore the write-ahead ceiling. An insert
+  past it is refused. If this stops advancing, maintenance has stalled and you are burning through your
+  slack.
+- **`inflight_partitions`** -- regrain copy-children created but not yet attached. These hold duplicates
+  of rows still in the monolith, so the parent's count is already complete: it is a transient-disk
+  signal, not a read gap.
 - **`fks_suspended` / `fks_unvalidated`** -- preserve-managed incoming FKs currently dropped (RI off)
   versus re-added `NOT VALID` but blocked from validation by pre-existing orphans.
 
@@ -509,48 +495,20 @@ too attach metadata-only. The one rule that keeps it safe: never certify a range
 writes -- the monolith covers up to `B` (a boundary above the frontier) precisely so the current interval
 lives inside it, and regrain only touches frozen children.
 
-## Read consistency during a move
+## Read consistency
 
-This is the one correctness caveat worth understanding. We would rather state it plainly than bury it,
-and in this model it is much narrower than it used to be.
+There is no read gap. A `SELECT` against the parent always sees every row.
 
-**The gap belongs to the drain alone.** When the paced drain evacuates a stray it `DELETE`s the
-row out of the `DEFAULT` and re-`INSERT`s it into a standalone, not-yet-attached child across separate
-transactions. A query against the parent only scans attached partitions, so a plain `SELECT ... FROM parent`
-issued mid-move **undercounts** the range being moved. The rows are never lost; they are temporarily not
-reachable through the parent.
+This used to be the one correctness caveat worth understanding. The paced **drain** evacuated a stray by
+`DELETE`ing it from the `DEFAULT` and re-`INSERT`ing it into a not-yet-attached child across separate
+transactions, and since a query against the parent only scans attached partitions, a read issued mid-move
+undercounted the range being moved. `pgpm.snapshot()` existed to paper over exactly that, by unioning the
+in-flight children back into a read of the parent.
 
-**Regrain never opens this gap.** Regrain *copies*; it never deletes from the source. The coarse child stays
-whole and attached until one atomic swap, so every row is visible through the parent the entire time --
-paced auto-regrain included. (Its in-flight copies are duplicates of rows still in the monolith, which is why
-`snapshot()` must *not* union them, and does not.) The synchronous paths are also gap-free: `regrain()` /
-`regrain_history()` and `drain_all()` each run in one transaction. So the gap is specific to the *paced
-drain*, only for the single range in flight, only while it moves. Reads of recent data are never affected:
-the drain only ever moves old, closed ranges.
-
-**Reads: the `snapshot()` escape hatch.** If a consistency-sensitive reader (a `COUNT(*)`, a logical
-backup, a reconciliation) needs the complete set during a move, query it inline:
-
-```sql
-select count(*) from pgpm.snapshot(null::public.events);  -- the parent UNION every in-flight child
-```
-
-`snapshot()` is a read-only set-returning function that `UNION`s the parent with every in-flight *drain*
-child (it deliberately skips a regrain's copy-children, whose rows are already in the attached monolith, so
-it never double-counts). You pass the table as a typed-`NULL` anchor (`null::public.events`) because a
-function's row shape is fixed at plan time and cannot be inferred from a `regclass` value. It is always
-fresh and leaves nothing behind. One honest cost: it is an **optimization fence** (the in-flight child set
-is dynamic, so a `WHERE` on top does not push down); fine for a `COUNT` or full read, but for a
-heavily-filtered read on a large table a hand-written `parent UNION ALL <child>` plans better.
-
-**Writes: there is no fix for the paced drain.** A write through the parent that targets a row the drain has
-*already moved* into an unattached child finds no row and is a silent no-op until the interval attaches; an
-`INSERT ... ON CONFLICT` (upsert) on such a key can write a duplicate that later wedges the drain on a
-duplicate-key error. A fresh `INSERT` is never affected (it routes to the `DEFAULT` and the next batch
-sweeps it). Regrain does not have this problem -- it never removes a row from the parent -- so mutating old
-rows during a regrain is safe. If you mutate rows a drain may be moving (a ledger with backdated
-adjustments, a document store editing years-old rows), prefer the synchronous `drain_all()` (one
-transaction, no gap) and `pause` the table while you do, or partition on a different axis.
+Both are gone. The drain and the `DEFAULT` were removed, and **regrain never opened the gap**: it *copies*
+and never deletes from the source, so the coarse child stays whole and attached until one atomic swap and
+every row is visible through the parent the entire time. Its in-flight copies are duplicates of rows still
+in the monolith, so the parent's count is already complete.
 
 ## WAL and checkpoint sizing
 
@@ -589,13 +547,14 @@ A meaningful and growing `num_requested` means `max_wal_size` is too small for y
 For step-by-step procedures when an alert fires, see the [runbook](runbook.md). Quick reference:
 
 - **Pause / resume.** `select pgpm.pause('public.events');` / `select pgpm.resume('public.events');`. A
-  paused table is registered but untouched by `maintain` (you can still drive `drain_*`/`regrain` by hand).
-- **A stray is stuck in the `DEFAULT`.** `check_default()` shows `closed_rows > 0`: the table is unpaused
-  but the drain has not evacuated it. Raise `drain_batch`, run the cron more often, or
-  `drain_all()` once.
+  paused table is registered but untouched by `maintain` (you can still drive `obtain`/`regrain` by hand).
+- **A write is refused with `no partition of relation ... found for row`.** The value is outside the
+  forward grid. Check `status().newest_bound`: if it has stopped advancing, maintenance has stalled;
+  otherwise the write is further ahead than `config.obtain x partition_step` reaches. See the
+  [runbook](runbook.md) for both cases.
 - **History is not being split.** `status().history_unregrained` is true and you want fine partitions:
   enable auto-regrain (`set_regrain`) or run `regrain_history` by hand once the monolith has frozen.
-- **Re-transmuting a table fails with an "orphan" error.** A drain or interrupted regrain creates child
+- **Re-transmuting a table fails with an "orphan" error.** An interrupted regrain creates child
   partitions as standalone tables before attaching them; an un-attached child survives a `DROP TABLE
   <parent> CASCADE`. `transmute` detects a leftover and refuses up front; drop the named orphan and retry.
 
@@ -614,9 +573,8 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   fine-grained retention are suspended over its span. A coarse monolith is a valid permanent state.
 - **Regrain needs transient disk** (about 2x the span being regrained) and copies the rows; both the
   synchronous and the paced auto-regrain path are gap-free (the source stays whole and attached until the
-  atomic swap, which transiently drops and re-adds any incoming FK within one transaction). The
-  read-consistency gap below is the *drain's*, not regrain's.
-- **The empty `DEFAULT` is the safety net** (`keep_default`); `check_default()` flags any stray.
+  atomic swap, which transiently drops and re-adds any incoming FK within one transaction).
+- **There is no `DEFAULT`**: a write outside the forward grid is refused rather than parked.
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on regrain.
 - **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.
 - **The key is never rewritten;** a primary key or unique constraint that includes the control column is
@@ -624,6 +582,6 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Incoming foreign keys** are refused by default, or preserved (dropped for the conversion, re-added
   against the new parent) with `p_incoming_fks => 'preserve'`.
 - **Mid-move reads undercount on the paced paths; writes to moved rows no-op.** Inherent to an online
-  move; see [Read consistency during a move](#read-consistency-during-a-move). The synchronous paths avoid
+  move; see [Read consistency](#read-consistency). The synchronous paths avoid
   it entirely.
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by default).
