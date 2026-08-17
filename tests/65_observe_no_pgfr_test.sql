@@ -5,7 +5,6 @@
 -- ./test.sh observe).
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 create table public.t (id bigint);
@@ -38,4 +37,3 @@ select throws_ok( $$ select * from pgpm.feathering_validation('public.t'::regcla
                   null, 'feathering_validation refuses without PGFR' );
 
 select * from finish();
-rollback;

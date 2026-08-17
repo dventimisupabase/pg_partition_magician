@@ -5,7 +5,6 @@
 -- unchanged. Here the rows being drained are wide backdated STRAYS in the DEFAULT. See REDESIGN.md.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- ~1.8 KB/row, forced inline (storage plain) so the on-disk size is deterministic. ~4 rows/block.
@@ -14,7 +13,7 @@ create table public.wide (created_at timestamptz not null, id bigint generated b
 alter table public.wide alter column pad set storage plain;
 insert into public.wide (created_at, pad)
   select now() - (g || ' minutes')::interval, repeat('x', 1800) from generate_series(1, 20) g;   -- recent -> monolith
-select pgpm.transmute('public.wide', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.wide', 'created_at', interval '1 month', p_paused => false);
 -- 3000 wide strays in one closed interval (3 months ago) land in the DEFAULT for the drain to drain
 insert into public.wide (created_at, pad)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', repeat('x', 1800)
@@ -23,7 +22,7 @@ analyze public.wide_default;                               -- fresh reltuples fo
 
 -- (1) block budget binds: 20 blocks, but a huge 100000-row cap
 update pgpm.config set drain_batch = 100000, drain_max_blocks = 20 where parent_table = 'public.wide'::regclass;
-create temp table _c1 on commit drop as select count(*)::int n from public.wide_default;
+create temp table _c1 as select count(*)::int n from public.wide_default;
 select pgpm.drain_step('public.wide', p_include_open => true);
 select cmp_ok((select n from _c1) - (select count(*)::int from public.wide_default), '<', 500,
   'block budget (20 blocks) bounds the batch far below the 100000-row cap');
@@ -32,10 +31,9 @@ select cmp_ok((select n from _c1) - (select count(*)::int from public.wide_defau
 
 -- (2) block budget off: the row cap binds exactly (backward compatible with today's behavior)
 update pgpm.config set drain_batch = 250, drain_max_blocks = null where parent_table = 'public.wide'::regclass;
-create temp table _c2 on commit drop as select count(*)::int n from public.wide_default;
+create temp table _c2 as select count(*)::int n from public.wide_default;
 select pgpm.drain_step('public.wide', p_include_open => true);
 select is((select n from _c2) - (select count(*)::int from public.wide_default), 250,
   'with no block budget, a step moves exactly drain_batch rows (unchanged)');
 
 select * from finish();
-rollback;

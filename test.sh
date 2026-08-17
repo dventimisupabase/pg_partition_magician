@@ -9,7 +9,8 @@
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #   ./test.sh observe                    # the pg_flight_recorder observability track (PG15)
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
-#   ./test.sh perf                       # regrain's data-coupled-work guard (PG17, scan counters)
+#   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
+#   ./test.sh discriminate               # prove each of those guards fails when its defect is present
 #
 # Channels:
 #   psql    pgpm_core/install.sql via psql -f         (the source)
@@ -59,7 +60,8 @@ for arg in "$@"; do
     observe) TRACK="observe" ;;
     archive) TRACK="archive" ;;
     perf) TRACK="perf" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf"; exit 1 ;;
+    discriminate) TRACK="discriminate" ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate"; exit 1 ;;
   esac
 done
 
@@ -80,20 +82,23 @@ if grep -nE '^\\' "$BUNDLE" "$DBDEV_PKG"; then
 fi
 
 psql_run() { $DC --profile "$1" exec -T "$2" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "${@:3}"; }
+# same, but against an arbitrary database: the pgTAP suite now runs one database PER FILE
+psql_db()  { $DC --profile "$1" exec -T "$2" psql -U postgres -d "$3" -v ON_ERROR_STOP=1 "${@:4}"; }
 
-install_channel() {  # <channel> <profile> <service>
+install_channel() {  # <channel> <profile> <service> [db]
+  local db="${4:-postgres}"
   case "$1" in
-    psql)   psql_run "$2" "$3" --single-transaction -f /repo/pgpm_core/install.sql >/dev/null ;;
-    bundle) psql_run "$2" "$3" -f "/repo/$BUNDLE" >/dev/null ;;
-    dbdev)  psql_run "$2" "$3" --single-transaction -f "/repo/$DBDEV_PKG" >/dev/null ;;
+    psql)   psql_db "$2" "$3" "$db" --single-transaction -f /repo/pgpm_core/install.sql >/dev/null ;;
+    bundle) psql_db "$2" "$3" "$db" -f "/repo/$BUNDLE" >/dev/null ;;
+    dbdev)  psql_db "$2" "$3" "$db" --single-transaction -f "/repo/$DBDEV_PKG" >/dev/null ;;
     *) echo "unknown channel $1"; exit 1 ;;
   esac
 }
 
-load_fixtures() {  # <profile> <service> -- build the demo tables for the pgTAP suite
-  local p="$1" s="$2"
-  psql_run "$p" "$s" -c "ALTER DATABASE postgres SET poc.seed_count = 8000; ALTER DATABASE postgres SET poc.events_count = 4000;" >/dev/null
-  psql_run "$p" "$s" -f /repo/fixtures/demo.sql >/dev/null
+load_fixtures() {  # <profile> <service> [db] -- build the demo tables for the pgTAP suite
+  local p="$1" s="$2" db="${3:-postgres}"
+  psql_db "$p" "$s" "$db" -c "ALTER DATABASE \"$db\" SET poc.seed_count = 8000; ALTER DATABASE \"$db\" SET poc.events_count = 4000;" >/dev/null
+  psql_db "$p" "$s" "$db" -f /repo/fixtures/demo.sql >/dev/null
 }
 
 uninstall_and_verify() {  # <profile> <service>
@@ -129,9 +134,44 @@ run_version() {  # <pg_version>
 
   for ch in "${CHANNELS[@]}"; do
     echo "--- channel: $ch ---"
+    # The pgTAP suite runs ONE DATABASE PER FILE. It used to run every file against `postgres`, isolated
+    # by wrapping each in BEGIN/ROLLBACK -- but a committing PROCEDURE cannot be called inside a
+    # transaction block ("invalid transaction termination"), and transmute/maintain/drain_all are
+    # procedures now. Isolation therefore has to come from the database, not from a transaction.
+    #
+    # Installing the channel and loading the fixtures per file would cost ~0.5 s each; building one
+    # template and cloning it costs ~0.1 s (measured), so the suite stays fast enough to keep running on
+    # every push.
+    psql_run "$p" "$s" -c "drop database if exists pgpm_tmpl" >/dev/null
+    psql_run "$p" "$s" -c "create database pgpm_tmpl" >/dev/null
+    psql_db "$p" "$s" pgpm_tmpl -c "create extension if not exists pgtap;" >/dev/null
+    install_channel "$ch" "$p" "$s" pgpm_tmpl
+    load_fixtures "$p" "$s" pgpm_tmpl
+
+    local n=0 failed=0
+    for f in tests/*.sql; do
+      local b db; b="$(basename "$f")"; n=$((n + 1)); db="pgpm_t$n"
+      if [ "$b" = "31_schedule_test.sql" ]; then
+        # pg_cron can only be created in the database named by cron.database_name (postgres on these
+        # images: "can only create extension in database postgres"), so this one file cannot run in a
+        # per-file clone. It gets `postgres`, which the uninstall check below installs into anyway.
+        db=postgres
+        install_channel "$ch" "$p" "$s"
+        load_fixtures "$p" "$s"
+      else
+        psql_run "$p" "$s" -c "drop database if exists $db" >/dev/null
+        psql_run "$p" "$s" -c "create database $db template pgpm_tmpl" >/dev/null
+      fi
+      if ! $DC --profile "$p" exec -T "$s" sh -c "pg_prove --timer -U postgres -d $db /repo/tests/$b"; then
+        failed=$((failed + 1))
+      fi
+      [ "$db" = postgres ] || psql_run "$p" "$s" -c "drop database if exists $db" >/dev/null
+    done
+    psql_run "$p" "$s" -c "drop database if exists pgpm_tmpl" >/dev/null
+    [ "$failed" -eq 0 ] || { echo "PG $v / $ch: FAIL ($failed file(s))"; return 1; }
+
+    # the uninstall check still needs a database with the channel installed
     install_channel "$ch" "$p" "$s"
-    load_fixtures "$p" "$s"
-    $DC --profile "$p" exec -T "$s" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/*.sql'
     uninstall_and_verify "$p" "$s"
     reset_demo "$p" "$s"
     echo "PG $v / $ch: PASS"
@@ -286,11 +326,37 @@ run_archive() {
 
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
+  # One database PER FILE, cloned from a template, exactly as the main suite does. These tests used to
+  # isolate themselves with begin/rollback, which stopped being possible once the fixture's
+  # pgpm.transmute became a committing PROCEDURE (#275): transaction control is illegal inside an
+  # explicit transaction block. Cloning gives back the isolation the rollback provided, and gives it
+  # for real -- a rollback never undid anything the tests pushed to MinIO anyway.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database pgpm_arch_tmpl" >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
+  $DC "${px[@]}" -d pgpm_arch_tmpl -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
+
+  local an=0
+  for af in tests/archive/db/*.sql; do
+    local ab adb; ab="$(basename "$af")"; an=$((an + 1)); adb="pgpm_a$an"
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database $adb template pgpm_arch_tmpl" >/dev/null
+    $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab" \
+      || fail=1
+    $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
+  done
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null
+
+  # The independent-reader verification below connects to `postgres`, so that database still needs the
+  # extensions and both installers.
+  $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/tests/archive/fixtures.sql >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q --single-transaction -f /repo/pgpm_core/install.sql >/dev/null
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -f /repo/pgpm_archive/install.sql >/dev/null
-  $DC --profile "$prof" exec -T "$svc" sh -c 'pg_prove --timer -U postgres -d postgres /repo/tests/archive/db/*.sql' \
-    || fail=1
 
   # Independent-reader verification (pyarrow + DuckDB, scripts/verify_parquet*.py): runs on the
   # host against the archive service's published port (5520), not inside the container like the
@@ -313,7 +379,7 @@ run_archive() {
 }
 
 # ------------------------------------------------------------------------------------------------------
-# The `perf` track: guard regrain against data-coupled work (issue #267, PRs #271/#272).
+# The `perf` track: guard against data-coupled locks and data-coupled work (issues #267, #275).
 #
 # NOT part of the pgTAP suite, and deliberately so. Its assertions read pg_stat_all_tables scan counters,
 # which are flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports growth of 0 when read
@@ -324,15 +390,38 @@ run_perf() {
   local prof="pg17" svc="postgres17" c="pgpm_test-17"
   $DC --profile "$prof" up -d --wait "$svc"
   psql_run "$prof" "$svc" -q -f /repo/pgpm_core/install.sql >/dev/null
-  bash "$(dirname "$0")/bench/regrain_perf.sh" "$c" pgpm_perf /repo/pgpm_core/install.sql
-  local rc=$?
+  local rc=0
+  bash "$(dirname "$0")/bench/regrain_perf.sh"   "$c" pgpm_perf  /repo/pgpm_core/install.sql || rc=1
+  bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
+  bash "$(dirname "$0")/bench/maintain_lock.sh" "$c" pgpm_perf3                              || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"
 }
 
+# The `discriminate` track: prove the guards above actually catch what they exist for.
+#
+# A green guard is not evidence -- it is green when the defect is absent, and just as green when the
+# guard never observed anything. This repo has shipped the second kind six times. bench/discriminate.sh
+# rebuilds install.sql with each defect put back and requires the matching guard to FAIL. It is a
+# separate track because it runs every guard a second time and so costs about double the perf track.
+run_discriminate() {
+  local prof="pg17" svc="postgres17" c="pgpm_test-17"
+  $DC --profile "$prof" up -d --wait "$svc"
+  local rc=0
+  bash "$(dirname "$0")/bench/discriminate.sh" "$c" || rc=1
+  $DC --profile "$prof" down -v
+  return "$rc"
+}
+
 if [ "$TRACK" = "perf" ]; then
   run_perf
+  echo; echo "All requested tests passed."
+  exit 0
+fi
+
+if [ "$TRACK" = "discriminate" ]; then
+  run_discriminate
   echo; echo "All requested tests passed."
   exit 0
 fi

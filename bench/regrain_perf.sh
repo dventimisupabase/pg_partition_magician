@@ -37,7 +37,7 @@ docker exec "$C" psql -U postgres -d "$DB" -q -f "$INSTALL" >/dev/null 2>&1
 
 q "create table public.rp (id bigint primary key, payload text);" >/dev/null
 q "insert into public.rp select g*2, repeat('x',50) from generate_series(1,$ROWS) g;" >/dev/null
-q "select pgpm.transmute('public.rp','id', $((ROWS*2/3+1)));" >/dev/null
+q "call pgpm.transmute('public.rp','id', $((ROWS*2/3+1)));" >/dev/null
 q "insert into public.rp values (99000000,'frontier');" >/dev/null
 q "vacuum analyze public.rp;" >/dev/null
 CHILD=$(q "select child_name from pgpm.part where parent_table='public.rp'::regclass order by lo::numeric limit 1")

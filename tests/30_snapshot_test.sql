@@ -5,7 +5,6 @@
 -- parent with the in-flight child, giving a consistency-sensitive reader the complete set inline.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.snap (
@@ -16,7 +15,7 @@ create table public.snap (
 insert into public.snap (created_at, body)
   select now() - (g || ' minutes')::interval, 'recent' from generate_series(1, 10) g;   -- recent -> monolith
 -- small batch so one interval needs several microbatches
-select pgpm.transmute('public.snap', 'created_at', interval '1 month', p_drain_batch => 10, p_paused => false);
+call pgpm.transmute('public.snap', 'created_at', interval '1 month', p_drain_batch => 10, p_paused => false);
 -- 30 strays, all in one CLOSED past interval (two months ago), land in the DEFAULT
 insert into public.snap (created_at, body)
   select date_trunc('month', now()) - interval '2 months' + (g || ' seconds')::interval, 'stray'
@@ -35,10 +34,9 @@ select is(
   (select count(*)::int from pgpm.snapshot(null::public.snap)),
   40, 'snapshot() restores the complete row set during the drain');
 
-select pgpm.drain_all('public.snap');
+call pgpm.drain_all('public.snap');
 select is(
   (select count(*)::int from public.snap),
   40, 'after the interval fully drains and attaches, the parent is whole again');
 
 select * from finish();
-rollback;

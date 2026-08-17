@@ -5,7 +5,6 @@
 -- control column on a keyless table is refused up front, leaving the table intact.
 create extension if not exists pgtap;
 
-begin;
 select plan(8);
 
 -- (A) keyless table (no PK, no unique constraint), control NOT NULL
@@ -14,9 +13,8 @@ insert into public.kl (ts, device, val)
   select date_trunc('month', now()) - interval '3 months' + (g || ' days')::interval, g, random()
   from generate_series(1, 40) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.kl', 'ts', interval '1 month', p_paused => false) $$,
-  'transmute accepts a keyless table (no primary key, no unique constraint)');
+call pgpm.transmute('public.kl', 'ts', interval '1 month', p_paused => false);
+select pass('transmute accepts a keyless table (no primary key, no unique constraint)');
 select is(
   (select relkind::text from pg_class where oid = 'public.kl'::regclass),
   'p', 'the keyless table is now partitioned');
@@ -36,7 +34,7 @@ select is(
 create table public.kl_null (ts timestamptz, v int);   -- nullable control
 insert into public.kl_null select now() - (g || ' days')::interval, g from generate_series(1, 10) g;
 select throws_like(
-  $$ select pgpm.transmute('public.kl_null', 'ts', interval '1 month') $$,
+  $$ call pgpm.transmute('public.kl_null', 'ts', interval '1 month') $$,
   'pg_partition_magician:%NOT NULL%',
   'a keyless table with a nullable control column is refused, naming NOT NULL');
 select is(
@@ -44,4 +42,3 @@ select is(
   'r', 'the nullable-control keyless table is left intact');
 
 select * from finish();
-rollback;

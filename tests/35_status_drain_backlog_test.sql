@@ -4,7 +4,6 @@
 -- from a merely slow one. The backlog here is a closed STRAY interval in the otherwise-empty DEFAULT.
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 create table public.s_t (
@@ -14,7 +13,7 @@ create table public.s_t (
   primary key (created_at, id)
 );
 insert into public.s_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 5) g;  -- recent -> monolith
-select pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.s_t', 'created_at', interval '1 month', p_paused => false);
 select pgpm.obtain('public.s_t');
 -- a closed stray backlog in the DEFAULT (two past months, 20 rows); the recent rows are in the monolith
 insert into public.s_t (created_at, body)
@@ -38,7 +37,7 @@ select ok(
   'last_drained is null before any drain progress');
 
 -- a wedged drain logs drain_skip without making progress; simulate one deferral
-insert into pgpm.log (parent_table, action, method) values ('public.s_t'::regclass, 'drain_skip', 'simulated');
+insert into pgpm.log (parent_table, action, method) values ('public.s_t'::regclass, 'skip_drain', 'simulated');
 
 -- (4) the deferral is visible: closed_rows > 0 (above) + drain_skips > 0 + last_drained null = WEDGED
 select cmp_ok(
@@ -46,7 +45,7 @@ select cmp_ok(
   '>', 0::bigint, 'status() counts drain deferrals since the last progress (a wedge is visible)');
 
 -- drain to completion: backlog clears and progress is recorded
-select pgpm.drain_all('public.s_t', p_include_open => true);
+call pgpm.drain_all('public.s_t', p_include_open => true);
 
 -- (5) caught up: closed_rows back to 0
 select is(
@@ -59,4 +58,3 @@ select is(
   0::bigint, 'drain_skips resets to 0 once the drain makes progress');
 
 select * from finish();
-rollback;

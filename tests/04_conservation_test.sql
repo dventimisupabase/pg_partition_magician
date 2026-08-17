@@ -1,13 +1,12 @@
 -- Verifies the migration neither loses nor duplicates any row.
 create extension if not exists pgtap;
 
-begin;
 select plan(2);
 
-create temporary table _before on commit drop as
+create temporary table _before as
 select tenant_id, count(*) as n from public.messages group by tenant_id;
 
-select pgpm.drain_all('public.messages', p_include_open => true);
+call pgpm.drain_all('public.messages', p_include_open => true);
 
 select is(
   (select count(*) from public.messages)::bigint,
@@ -28,4 +27,3 @@ select ok(
 );
 
 select * from finish();
-rollback;

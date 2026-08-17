@@ -7,7 +7,6 @@
 -- late-arriving data, retain on an ingestion timestamp or widen the window -- see docs/guide.md#retain.)
 create extension if not exists pgtap;
 
-begin;
 select plan(2);
 
 create table public.bd_t (
@@ -20,7 +19,7 @@ create table public.bd_t (
 insert into public.bd_t (created_at, body)
   select now() - (g || ' days')::interval, 'recent' from generate_series(1, 10) g;
 
-select pgpm.transmute('public.bd_t', 'created_at', interval '1 month',
+call pgpm.transmute('public.bd_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
 select pgpm.obtain('public.bd_t');
 
@@ -33,11 +32,10 @@ select is(
 
 -- a maintenance cycle: the retention-aware drain reclaims the below-horizon row, by policy. snapshot()
 -- gives the complete read (ruling out the drain visibility gap as the cause).
-select pgpm.drain_all('public.bd_t', p_include_open => true);
+call pgpm.drain_all('public.bd_t', p_include_open => true);
 select pgpm.retain('public.bd_t');
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.bd_t) where body = 'backdated'),
   0, 'a backdated row below the retention horizon is reclaimed by retention (a standing floor), as intended');
 
 select * from finish();
-rollback;

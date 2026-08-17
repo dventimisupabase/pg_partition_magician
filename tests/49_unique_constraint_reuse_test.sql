@@ -6,7 +6,6 @@
 -- primary key is synthesized when the source had only a unique constraint.
 create extension if not exists pgtap;
 
-begin;
 select plan(10);
 
 -- (A) NO primary key, a UNIQUE CONSTRAINT whose key LEADS with the control column
@@ -20,9 +19,8 @@ insert into public.uq_lead (ts, id, body)
   select date_trunc('month', now()) - interval '3 months' + (g || ' days')::interval, g, 'x'
   from generate_series(1, 40) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_lead', 'ts', interval '1 month', p_paused => false) $$,
-  'transmute reuses a UNIQUE constraint that includes the control column (no PK required)');
+call pgpm.transmute('public.uq_lead', 'ts', interval '1 month', p_paused => false);
+select pass('transmute reuses a UNIQUE constraint that includes the control column (no PK required)');
 
 select is(
   (select relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
@@ -46,7 +44,7 @@ select is(
 select is((select count(*)::int from public.uq_lead), 40, 'all rows conserved through the parent');
 
 -- uniqueness is enforced across partitions once they are materialized
-select pgpm.drain_all('public.uq_lead', p_include_open => true);
+call pgpm.drain_all('public.uq_lead', p_include_open => true);
 select throws_ok(
   $$ insert into public.uq_lead (ts, id, body)
        values (date_trunc('month', now()) - interval '3 months' + interval '1 day', 1, 'dup') $$,
@@ -64,9 +62,8 @@ insert into public.uq_mid (device_id, ts, body)
   select g, date_trunc('month', now()) - interval '2 months' + (g || ' days')::interval, 'x'
   from generate_series(1, 30) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_mid', 'ts', interval '1 month', p_paused => false) $$,
-  'transmute reuses a composite UNIQUE constraint even when control is not the leading column');
+call pgpm.transmute('public.uq_mid', 'ts', interval '1 month', p_paused => false);
+select pass('transmute reuses a composite UNIQUE constraint even when control is not the leading column');
 select is(
   (select relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where n.nspname = 'public' and c.relname = 'uq_mid'),
@@ -74,4 +71,3 @@ select is(
 select is((select count(*)::int from public.uq_mid), 30, 'rows conserved (non-leading control)');
 
 select * from finish();
-rollback;

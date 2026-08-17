@@ -65,7 +65,7 @@ and uninstall. `pg_cron` must be enabled for scheduled maintenance.
 
 ```sql
 -- 1. Convert and register. Registers PAUSED: nothing moves until you resume.
-select pgpm.transmute(
+call pgpm.transmute(
   p_parent   => 'public.events',
   p_control  => 'created_at',         -- the key to range-partition on (must be in the PK)
   p_interval => interval '1 month',

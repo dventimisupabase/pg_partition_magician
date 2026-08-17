@@ -5,7 +5,6 @@
 -- partition. drain_all is synchronous (ignores pause), so this does not depend on pg_cron.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 create table public.dr (
@@ -14,7 +13,7 @@ create table public.dr (
   body text, primary key (created_at, id)
 );
 insert into public.dr (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 20) g;
-select pgpm.transmute('public.dr', 'created_at', interval '1 month', p_paused => false);   -- monolith holds the recent rows; DEFAULT empty
+call pgpm.transmute('public.dr', 'created_at', interval '1 month', p_paused => false);   -- monolith holds the recent rows; DEFAULT empty
 -- a backdated stray lands in the (otherwise empty) DEFAULT, in a closed interval below the monolith
 insert into public.dr (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 15) g;
@@ -24,9 +23,8 @@ select cmp_ok(
   '>', 0,
   'a backdated stray lands in the otherwise-empty DEFAULT as a closed interval');
 
-select cmp_ok(
-  pgpm.drain_all('public.dr', p_include_open => true),
-  '>', 0,
+call pgpm.drain_all('public.dr', p_include_open => true) \gset
+select cmp_ok(:p_iterations, '>', 0,
   'the drain performs at least one batch evacuating the stray');
 
 select is(
@@ -35,4 +33,3 @@ select is(
   'the DEFAULT is empty again after the drain');
 
 select * from finish();
-rollback;

@@ -163,6 +163,34 @@ create table if not exists pgpm.part (
 -- upgrade path for installs that predate this column
 alter table pgpm.part add column if not exists attached boolean not null default true;
 
+-- In-flight conversions (issue #275). transmute runs in three transactions -- add the bound, validate it,
+-- cut over -- so that the O(rows) validation scan is not held under the ACCESS EXCLUSIVE lock the ADD
+-- takes. The cost of that split is that a failure between phases leaves a live `pgpm_monolith_bound` CHECK
+-- on the operator's table, which REJECTS any write outside [lo, hi) (a NOT VALID check still enforces new
+-- rows). This table is what lets maintenance find and undo that: a half-converted table is not in
+-- pgpm.config yet, because registration happens in the cutover, so there is nothing else to look it up by.
+--
+-- lo/hi are recorded so a resumed transmute reuses the SAME bound rather than recomputing one against a
+-- frontier that has since moved.
+create table if not exists pgpm.transmute_inflight (
+  parent_table  regclass    not null primary key,
+  nsp           name        not null,
+  rel           name        not null,
+  control_kind  text        not null,
+  lo            text        not null,
+  hi            text        not null,
+  started_at    timestamptz not null default now()
+);
+
+-- The audit trail. NAMING RULE for `action`: non-success events are PREFIXED, never suffixed --
+-- `skip_<mechanism>` for a deferral, `fail_<mechanism>` for a failure. So no non-success action is ever
+-- a prefix-extension of the success it corresponds to, and both query styles are safe: `action =
+-- 'obtain'` and `action like 'drain%'` match successes only, while `action like 'skip_%'` collects every
+-- deferral across all mechanisms without enumerating them.
+--
+-- This was the other way round (`drain_skip`) and it bit: a guard asserting a tick had drained matched
+-- `drain%`, which also matched `drain_skip` -- the exact row a tick writes when it was starved of its
+-- locks and did nothing. The guard passed on a tick that had done no work. Do not reintroduce a suffix.
 create table if not exists pgpm.log (
   id           bigint generated always as identity primary key,
   parent_table regclass,
@@ -614,10 +642,19 @@ begin
 end;
 $$;
 
-create or replace function pgpm.drain_all(
-  p_parent regclass, p_batch int default null, p_include_open boolean default false
+-- #279: drain_all became a PROCEDURE; the old function must be dropped before it can be recreated.
+drop function if exists pgpm.drain_all(regclass, int, boolean);
+
+-- drain_all(): drive the drain to completion in one call, for a migration run rather than a background
+-- tick. A PROCEDURE so each step commits (#279): a full drain of a large table is an unbounded number of
+-- batches, and holding them all open would make one transaction whose duration, WAL footprint and lock
+-- set all scale with the table. Committing per step also means an interrupted drain keeps the batches it
+-- finished, which is the whole point of a drain being resumable.
+create or replace procedure pgpm.drain_all(
+  p_parent regclass, p_batch int default null, p_include_open boolean default false,
+  inout p_iterations int default null
 )
-returns int language plpgsql as $$
+language plpgsql as $$
 declare v_status text; v_iter int := 0;
 begin
   -- Suspend any live preserve-managed FK before draining: moving referenced rows past a live
@@ -625,13 +662,20 @@ begin
   -- no-op unless a managed FK is live with closed-tail work. drain_all stays a pure drainer otherwise;
   -- restoration is left to maintenance or an explicit restore_incoming_fks call.
   perform pgpm.suspend_incoming_fks(p_parent);
+  commit;
   loop
     v_status := pgpm.drain_step(p_parent, p_batch, p_include_open);
     exit when v_status = 'idle';
     v_iter := v_iter + 1;
     if v_iter > 1000000 then raise exception 'pg_partition_magician: drain_all safety limit'; end if;
+    -- One transaction per batch. A managed FK stays suspended across these commits, which is the
+    -- designed steady state, not a regression: maintain() already suspends on one tick and restores on a
+    -- later one, status() surfaces it as fks_suspended, and restore_incoming_fks re-adds it once the
+    -- table is quiescent. An interrupted drain therefore leaves RI off until maintenance next runs,
+    -- exactly as an interrupted multi-tick drain always has.
+    commit;
   end loop;
-  return v_iter;
+  p_iterations := v_iter;
 end;
 $$;
 
@@ -720,7 +764,7 @@ begin
     return true;
   exception when others then
     insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (p_parent, 'retain_drop_fail', r.lo, r.hi, left(sqlerrm, 200));
+      values (p_parent, 'fail_retain_drop', r.lo, r.hi, left(sqlerrm, 200));
     return false;
   end;
 end;
@@ -1815,15 +1859,22 @@ $$;
 
 -- ============================== transmute ==============================
 
-create or replace function pgpm._transmute(
+-- #275 turned these from FUNCTIONs into PROCEDUREs. CREATE OR REPLACE cannot change that, so the old
+-- forms have to go first; an existing install upgrades cleanly through this.
+drop function if exists pgpm._transmute(regclass, name, text, text, text, int, text, boolean, int, boolean, text, boolean, boolean);
+drop function if exists pgpm.transmute(regclass, name, interval, int, interval, boolean, int, timestamptz, boolean, text, boolean, boolean);
+drop function if exists pgpm.transmute(regclass, name, bigint, int, bigint, boolean, int, bigint, boolean, text, boolean);
+
+create or replace procedure pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
   p_keep_default boolean, p_drain_batch int, p_paused boolean, p_incoming_fks text,
-  p_drain_adaptive boolean, p_force_uuidv7 boolean default false
+  p_drain_adaptive boolean, p_force_uuidv7 boolean default false, p_bound_headroom int default 0
 )
-returns regclass language plpgsql as $$
+language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_default name; v_defreg regclass; v_parent regclass;
+  v_lo_prev text; v_hi_prev text; v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
@@ -2104,20 +2155,59 @@ begin
                     pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
   v_monolith   := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
 
-  -- 0b. Certify the monolith's bound BEFORE the rename, so the ATTACH below is metadata-only. This is the
-  -- one O(rows) read of the conversion.
+  -- ============================ PHASE 1: add the bound (#275) ============================
   --
-  -- NOTE (issue #275): the split below is currently DECORATIVE. `ADD ... NOT VALID` takes ACCESS EXCLUSIVE,
-  -- and because _transmute is a FUNCTION and pgpm_core has no COMMIT anywhere, that lock is held until the
-  -- whole conversion commits -- across the VALIDATE scan. So the table is fully locked (ACCESS EXCLUSIVE
-  -- conflicts with everything, reads included) for a duration that scales with row count: measured 30 ms at
-  -- 1M rows, 173 ms at 5M, 492 ms at 10M, cached. VALIDATE's own SHARE UPDATE EXCLUSIVE is the right lock
-  -- and would not block anyone; it just never gets to be the only one held. The fix is a real commit
-  -- between the two statements, which needs transmute to become a PROCEDURE.
-  execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
-                 p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
-                 p_control, pgpm._encode(p_control_kind, v_hi_native));
-  execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
+  -- Certify the monolith's bound BEFORE the rename so the ATTACH below is metadata-only. This is the one
+  -- O(rows) read of the conversion, and it gets its own transaction so it is not held under the ACCESS
+  -- EXCLUSIVE lock the ADD takes. Measured before the split: the table was fully locked (ACCESS EXCLUSIVE
+  -- conflicts with everything, reads included) for 30 ms at 1M rows, 173 ms at 5M, 492 ms at 10M, cached.
+  --
+  -- A SESSION-level advisory lock is taken first and held across both commits. It is what lets the reaper
+  -- below tell "this conversion is still running" from "its session died mid-way", with no heartbeat and no
+  -- timeout guess: the lock is released automatically when the session ends, however it ends.
+  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+    raise exception 'pg_partition_magician: a transmute of % is already in progress in another session', p_parent;
+  end if;
+
+  -- Resume: a recorded conversion whose lock we just took means the previous attempt's session is gone.
+  -- Reuse its bound rather than recomputing one, because the frontier has moved on since but no row can
+  -- have landed outside the recorded range -- the CHECK was rejecting those the whole time.
+  select lo, hi into v_lo_prev, v_hi_prev from pgpm.transmute_inflight where parent_table = p_parent;
+  if found then
+    v_lo_native := v_lo_prev; v_hi_native := v_hi_prev;
+    v_monolith  := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
+    v_resumed := true;
+  else
+    -- Optional headroom: push hi further out so a fast writer cannot cross it while the scan runs. The
+    -- bound rejects writes at or past hi for as long as it is in place, which with the split is the whole
+    -- conversion rather than a single locked statement.
+    for v_i in 1 .. greatest(coalesce(p_bound_headroom, 0), 0) loop
+      v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native);
+    end loop;
+    v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
+    insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi)
+      values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native);
+  end if;
+
+  if not exists (select 1 from pg_constraint
+                  where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
+    execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
+                   p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native),
+                   p_control, pgpm._encode(p_control_kind, v_hi_native));
+  end if;
+  commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; the advisory lock survives
+
+  -- ============================ PHASE 2: validate it (#275) ============================
+  -- VALIDATE takes only SHARE UPDATE EXCLUSIVE, which blocks nobody. Skipped when a previous attempt
+  -- already validated it.
+  if not (select convalidated from pg_constraint
+           where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
+    execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
+  end if;
+  commit;
+
+  -- ============================ PHASE 3: the cutover ============================
+  -- Metadata only, and atomic: a raise from here rolls the whole cutover back.
 
   -- 1. rename the live table to the MONOLITH (coarse child) name
   execute format('alter table %s rename to %I', p_parent::text, v_monolith);
@@ -2216,6 +2306,12 @@ begin
     drain_adaptive = excluded.drain_adaptive;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
+  -- keyed on v_parent, not p_parent: after the rename p_parent's oid is the monolith's, so an operator
+  -- looking the table up by name would never see it (#275).
+  if v_resumed then
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reused the recorded bound');
+  end if;
 
   -- record the original table, now the bounded MONOLITH coarse child, as an attached partition
   -- (REDESIGN.md section 7) so obtain's overlap check and status() see it.
@@ -2235,7 +2331,10 @@ begin
   -- Run pgpm.obtain(parent) (or pgpm.maintain, or the scheduled job) AFTER transmute to build the forward
   -- partitions; with an EMPTY default, obtain takes the cheap plain path (no scan). Until the frontier
   -- crosses B, live writes land in the monolith (the current interval lives there too).
-  return v_parent;
+
+  -- the conversion is complete: nothing is left for the reaper to undo, and the advisory lock can go.
+  delete from pgpm.transmute_inflight where parent_table = p_parent;
+  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
 end;
 $$;
 
@@ -2255,31 +2354,105 @@ drop function if exists pgpm.generate_fk_recovery(regclass);
 -- random (UUIDv4) is refused unless p_force_uuidv7 => true), anything else is time
 -- (timestamptz/timestamp/date; _transmute rejects a non-time, non-uuid column). A bare interval literal is ambiguous against the bigint overload, so
 -- callers cast: transmute(t, c, interval '1 month').
-create or replace function pgpm.transmute(
+create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_interval interval,
   p_obtain int default 4, p_retain interval default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false
-) returns regclass language sql as $$
-  select pgpm._transmute(p_parent, p_control,
-    case when (select t.typname from pg_attribute a join pg_type t on t.oid = a.atttypid
-                 where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped) = 'uuid'
-         then 'uuidv7' else 'time' end,
+  p_drain_adaptive boolean default false, p_force_uuidv7 boolean default false,
+  p_bound_headroom int default 0
+) language plpgsql as $$
+declare v_kind text;
+begin
+  -- resolved into a variable first: a CALL argument may not contain a subquery
+  select case when t.typname = 'uuid' then 'uuidv7' else 'time' end into v_kind
+    from pg_attribute a join pg_type t on t.oid = a.atttypid
+   where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
+  call pgpm._transmute(p_parent, p_control, coalesce(v_kind, 'time'),
     p_interval::text, p_anchor::text, p_obtain,
-    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7);
+    p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive, p_force_uuidv7,
+    p_bound_headroom);
+end;
 $$;
 
 -- Integer grid: bigint width. Covers int/bigint/numeric keys, including Snowflake-style ids.
-create or replace function pgpm.transmute(
+create or replace procedure pgpm.transmute(
   p_parent regclass, p_control name, p_step bigint,
   p_obtain int default 4, p_retain bigint default null, p_keep_default boolean default true,
   p_drain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_drain_adaptive boolean default false
-) returns regclass language sql as $$
-  select pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
-                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive);
+  p_drain_adaptive boolean default false, p_bound_headroom int default 0
+) language plpgsql as $$
+begin
+  -- plpgsql, not sql: a SQL-bodied routine cannot host a callee's transaction control
+  call pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
+                     p_retain::text, p_keep_default, p_drain_batch, p_paused, p_incoming_fks, p_drain_adaptive,
+                     false, p_bound_headroom);
+end;
+$$;
+
+-- Abandon a half-finished conversion (issue #275). transmute runs in three transactions, so a failure
+-- between them leaves a validated-or-not `pgpm_monolith_bound` CHECK on the operator's table, and that
+-- CHECK REJECTS every write outside [lo, hi) for as long as it is there. This puts the table back exactly
+-- as it was.
+--
+-- It ABANDONS, it does not resume: finishing someone's half-done conversion of a production table
+-- unattended is too large an action to take on their behalf. Re-run transmute to try again; it will resume
+-- from the recorded bound.
+create or replace function pgpm.transmute_abort(p_parent regclass)
+returns boolean language plpgsql as $$
+declare r pgpm.transmute_inflight%rowtype;
+begin
+  select * into r from pgpm.transmute_inflight where parent_table = p_parent;
+  if not found then return false; end if;
+  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is still running in another session', p_parent;
+  end if;
+  execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
+  delete from pgpm.transmute_inflight where parent_table = p_parent;
+  insert into pgpm.log (parent_table, action, lo, hi, method)
+    values (p_parent, 'transmute_abort', r.lo, r.hi, 'bound dropped, table restored');
+  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
+  return true;
+end;
+$$;
+
+-- The reaper (issue #275). A conversion whose session died leaves the bound behind, and the table goes on
+-- rejecting out-of-range writes until someone notices. Rather than leave that to the operator, every
+-- maintain_all tick sweeps for abandoned conversions and undoes them.
+--
+-- "Abandoned" is decided by the session advisory lock transmute holds for its whole run, not by a timeout:
+-- if the lock can be taken, the owning session is gone, whatever the reason. A long validation scan is
+-- therefore never mistaken for a dead one, and an operator whose session is still open keeps the right to
+-- retry -- the sweep waits until they disconnect.
+--
+-- Deliberately independent of pgpm.config: a half-converted table is not registered yet, because
+-- registration happens in the cutover. That is exactly why this lives in maintain_all rather than maintain.
+create or replace function pgpm._transmute_reap()
+returns int language plpgsql as $$
+declare r pgpm.transmute_inflight%rowtype; v_n int := 0;
+begin
+  for r in select * from pgpm.transmute_inflight loop
+    -- the relation itself is gone: nothing to undo, just forget it
+    if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                    where n.nspname = r.nsp and c.relname = r.rel) then
+      delete from pgpm.transmute_inflight where parent_table = r.parent_table;
+      v_n := v_n + 1;
+      continue;
+    end if;
+    if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0)) then
+      continue;   -- still running; leave it alone
+    end if;
+    execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
+    delete from pgpm.transmute_inflight where parent_table = r.parent_table;
+    insert into pgpm.log (parent_table, action, lo, hi, method)
+      values (r.parent_table, 'transmute_reap', r.lo, r.hi,
+              'abandoned conversion undone: the bound was rejecting out-of-range writes');
+    perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0));
+    v_n := v_n + 1;
+  end loop;
+  return v_n;
+end;
 $$;
 
 -- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and
@@ -2641,8 +2814,34 @@ $$;
 drop function if exists pgpm.maintenance(regclass);
 drop procedure if exists pgpm.maintenance_all();
 
-create or replace function pgpm.maintain(p_parent regclass)
-returns text language plpgsql as $$
+-- #279: maintain became a PROCEDURE. CREATE OR REPLACE cannot turn a function into a procedure, so the
+-- old function has to go first or the installer fails on an upgrade with "cannot change routine kind".
+drop function if exists pgpm.maintain(regclass);
+
+-- maintain(): one tick of the lifecycle for one table.
+--
+-- A PROCEDURE, not a function, because a tick MUST NOT be one transaction (issue #279). obtain takes
+-- ACCESS EXCLUSIVE on the parent (CREATE TABLE ... PARTITION OF) and on the DEFAULT. Locks release only
+-- at transaction end, so in a single-transaction tick those were held across everything that followed,
+-- including the drain -- whose duration is proportional to drain_batch. On the PARENT that blocks readers
+-- too, so the whole table stalled for the length of a drain batch on every tick where obtain happened to
+-- create a partition. Measured at 926 ms for a 400k batch against 96 ms for a 5k one: 10x the batch, 10x
+-- the stall. That is the shape issue #263's acceptance rule exists to forbid.
+--
+-- So each step commits before the next begins, and no step's locks outlive it. The COMMITs sit at the top
+-- level between the steps, never inside one: transaction control is illegal inside a block with an
+-- EXCEPTION handler, and each step keeps its handler so a lock race still DEFERS that step alone rather
+-- than aborting the tick.
+--
+-- The status is reported through an INOUT parameter, which is how a procedure returns anything. Callers
+-- that do not care can `call pgpm.maintain(t)` and ignore it.
+--
+-- CAUTION for anyone adding a step: `set local` dies at COMMIT. lock_timeout is therefore re-applied
+-- after every boundary below, and a new step placed after a COMMIT without re-applying it silently runs
+-- with the session default -- which for obtain means waiting indefinitely for a lock it is designed to
+-- fail fast on.
+create or replace procedure pgpm.maintain(p_parent regclass, inout p_status text default null)
+language plpgsql as $$
 declare
   cfg pgpm.config;
   v_made int := 0; v_archived int := 0; v_dropped int := 0; v_drain text := 'skipped'; v_restored int := 0; v_suspended int := 0;
@@ -2656,7 +2855,7 @@ declare
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
-  if cfg.paused then return 'paused'; end if;
+  if cfg.paused then p_status := 'paused'; return; end if;
 
   -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
@@ -2687,11 +2886,16 @@ begin
       v_note := v_note || ' obtain_deferred';
       update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
         where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'obtain_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
     end;
   else
     v_note := v_note || ' obtain_backoff';
   end if;
+
+  -- BOUNDARY (#279). This is the one that matters: it drops obtain's ACCESS EXCLUSIVE on the parent and
+  -- the DEFAULT before the drain, so the stall lasts obtain's own duration instead of the whole tick.
+  commit;
+  perform set_config('lock_timeout', '200ms', true);   -- `set local` did not survive the COMMIT
 
   -- Write-block on retain-eligibility (issue #235), ahead of retain()'s own drop logic: a partition
   -- is blocked from writes the instant it crosses the boundary, whether or not (or how far along)
@@ -2702,8 +2906,14 @@ begin
     perform pgpm._enforce_regrain_capture(p_parent);   -- #267: reap capture left by an abandoned regrain
   exception when others then
     v_note := v_note || ' write_block_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'write_block_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_write_block', left(sqlerrm, 200));
   end;
+
+  -- BOUNDARY (#279). Installing a write-block trigger takes ACCESS EXCLUSIVE on the child. The archive
+  -- step below then reads that same child for a whole byte budget, which is O(bytes), so without this
+  -- the trigger's lock would cover the read.
+  commit;
+  perform set_config('lock_timeout', '200ms', true);
 
   -- Byte-budget chunked archiving (issue #237), one tick's worth per write-blocked, not-yet-covered
   -- child: only ever runs after the write-block step above, on children that step has already
@@ -2713,15 +2923,26 @@ begin
     v_archived := pgpm._archive_step(p_parent);
   exception when others then
     v_note := v_note || ' archive_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'archive_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_archive', left(sqlerrm, 200));
   end;
+
+  -- BOUNDARY (#279): make a whole tick's archived bytes durable before anything else runs. Chunked
+  -- archiving exists so a large child is covered over many ticks; folding a tick's chunk into the same
+  -- transaction as the drain would mean a drain failure discards archive progress that was already paid for.
+  commit;
+  perform set_config('lock_timeout', '200ms', true);
 
   begin
     v_dropped := pgpm.retain(p_parent);
   exception when others then
     v_note := v_note || ' retain_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'retain_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_retain', left(sqlerrm, 200));
   end;
+
+  -- BOUNDARY (#279). retain DROPs partitions, which takes ACCESS EXCLUSIVE on the parent. Also releases
+  -- the FOR UPDATE SKIP LOCKED claim retain holds on each pgpm.part row it worked, which would otherwise
+  -- be held against other retirement actors for the rest of the tick.
+  commit;
 
   -- Adaptive feathering (mode 2, REDESIGN.md): ride the per-tick drain budget just under the WAL
   -- supply. Measure the WAL generation rate since the last tick and compare it to the sustainable rate
@@ -2830,7 +3051,7 @@ begin
   exception when others then
     v_drain := 'deferred';
     v_note := v_note || ' drain_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'drain_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_drain', left(sqlerrm, 200));
   end;
 
   -- Commit the adaptive step ONLY when the drain did work (moved/reclaimed rows or attached). A
@@ -2849,6 +3070,13 @@ begin
       values (p_parent, 'drain_budget', v_budget, v_reason);
   end if;
 
+  -- BOUNDARY (#279), placed AFTER the adaptive bookkeeping and not between it and the drain: the budget
+  -- row records what this drain actually cost, so it has to land in the same transaction as the drain it
+  -- describes. The drain's own ATTACH takes a brief strong lock on the parent; this releases it, and the
+  -- regrain microbatch below is another O(batch) piece of work that must not run underneath it.
+  commit;
+  perform set_config('lock_timeout', '3s', true);
+
   -- Auto-regrain (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
   -- v_regrain_child) one budget-sized COPY microbatch toward regrain_to per tick, under the same adaptive
   -- budget as the drain. Isolated in its own subtransaction; a lock race or a soft status just retries next
@@ -2861,11 +3089,16 @@ begin
     exception when others then
       v_regrain := 'deferred';
       v_note := v_note || ' regrain_deferred';
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'regrain_skip', left(sqlerrm, 200));
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_regrain', left(sqlerrm, 200));
     end;
   elsif cfg.regrain_to is not null then
     v_regrain := 'none';   -- auto-regrain on, but no frozen coarse child to work
   end if;
+
+  -- BOUNDARY (#279). regrain_step's swap is atomic within itself; this only stops its locks reaching
+  -- the FK restore below, which re-adds a foreign key and so takes locks of its own on both sides.
+  commit;
+  perform set_config('lock_timeout', '3s', true);
 
   -- Re-add any incoming FKs that transmute(..., 'preserve') dropped, now against the new parent, AFTER
   -- both the drain and the regrain have moved this tick. restore_incoming_fks self-gates on quiescence (no
@@ -2876,20 +3109,41 @@ begin
     v_restored := pgpm.restore_incoming_fks(p_parent);
   exception when others then
     v_note := v_note || ' restore_fk_deferred';
-    insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_fk_skip', left(sqlerrm, 200));
+    insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_restore_fk', left(sqlerrm, 200));
   end;
 
-  return format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
-                v_made, v_archived, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
+  p_status := format('obtained=%s archived=%s dropped=%s drain=%s suspended_fk=%s restored_fk=%s regrain=%s%s',
+                     v_made, v_archived, v_dropped, v_drain, v_suspended, v_restored, v_regrain, v_note);
 end;
 $$;
 
 create or replace procedure pgpm.maintain_all()
 language plpgsql as $$
-declare r record;
+-- v_status exists only to receive maintain()'s INOUT: PL/pgSQL requires a writable argument for an
+-- output parameter, so the parameter's default cannot be relied on here. The sweep discards it; the
+-- per-parent detail is already in pgpm.log.
+declare r record; v_status text;
 begin
-  for r in select parent_table from pgpm.config loop
-    perform pgpm.maintain(r.parent_table);
+  -- #275: undo any conversion whose session died mid-way, before anything else. Independent of
+  -- pgpm.config on purpose: a half-converted table is not registered yet.
+  perform pgpm._transmute_reap();
+  commit;
+
+  -- One transaction per parent, not one for the whole sweep (#279). Two reasons. Locks: without it,
+  -- every parent's locks accumulate until the last one is done, so a ten-table sweep ends holding ten
+  -- tables' worth. Progress: a parent that raises no longer costs the parents before it their work.
+  --
+  -- Ordered so a sweep is reproducible: same tables, same order, every tick, which makes pgpm.log
+  -- readable and a partial sweep's stopping point meaningful.
+  --
+  -- Deliberately NO exception handler around the call. One would abort the whole sweep on the first
+  -- failing parent -- and worse, transaction control is illegal anywhere below an EXCEPTION handler, so
+  -- wrapping this would silently disable every COMMIT inside maintain() and put the locks straight back.
+  -- maintain() already isolates each of its own steps, so the raises that reach here are the ones that
+  -- should stop a sweep: a table that is not managed, or a config row pointing at something gone.
+  for r in select parent_table from pgpm.config order by parent_table loop
+    call pgpm.maintain(r.parent_table, v_status);
+    commit;
   end loop;
 end;
 $$;
@@ -3051,7 +3305,7 @@ begin
     select max(at), max(id) into v_last_drained, v_last_progress_id from pgpm.log
       where parent_table = r.parent_table and action in ('drain_move', 'drain_attach', 'retain_reclaim');
     select count(*) into v_skips from pgpm.log
-      where parent_table = r.parent_table and action = 'drain_skip' and id > coalesce(v_last_progress_id, 0);
+      where parent_table = r.parent_table and action = 'skip_drain' and id > coalesce(v_last_progress_id, 0);
     -- preserve-managed incoming FK state: dropped (RI off) vs re-added-but-not-validated (orphan-blocked)
     select count(*) filter (where restored_at is null),
            count(*) filter (where restored_at is not null and validated_at is null)
@@ -3065,7 +3319,7 @@ begin
     select max(id) into v_last_retain_id from pgpm.log
       where parent_table = r.parent_table and action = 'retain_drop';
     select count(*) into v_drop_fails from pgpm.log
-      where parent_table = r.parent_table and action = 'retain_drop_fail'
+      where parent_table = r.parent_table and action = 'fail_retain_drop'
         and id > coalesce(v_last_retain_id, 0);
     -- retain_backlog: eligible-but-undropped partitions (whole range at/below the retention horizon,
     -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks, or while
@@ -3475,7 +3729,7 @@ begin
       insert into pgpm.log (parent_table, action, method) values (p_parent, 'restore_incoming_fk', r.constraint_name);
     exception when others then
       insert into pgpm.log (parent_table, action, method)
-        values (p_parent, 'restore_incoming_fk_failed', left(r.constraint_name || ': ' || sqlerrm, 200));
+        values (p_parent, 'fail_restore_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;
     -- validate the just-re-added NOT VALID FK once; a pre-existing orphan keeps it NOT VALID (still
     -- enforcing new writes) and is surfaced, NOT rolled back into the dropped state.
@@ -3485,7 +3739,7 @@ begin
         update pgpm.dropped_fk set validated_at = now() where id = r.id;
       exception when others then
         insert into pgpm.log (parent_table, action, method)
-          values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+          values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
       end;
     end if;
   end loop;
@@ -3512,7 +3766,7 @@ begin
       v_n := v_n + 1;
     exception when others then
       insert into pgpm.log (parent_table, action, method)
-        values (p_parent, 'validate_incoming_fk_blocked', left(r.constraint_name || ': ' || sqlerrm, 200));
+        values (p_parent, 'fail_validate_incoming_fk', left(r.constraint_name || ': ' || sqlerrm, 200));
     end;
   end loop;
   return v_n;

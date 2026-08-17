@@ -2,7 +2,6 @@
 -- (v4) columns are flagged, and transmute REFUSES a column that samples as random (issue #96).
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- the seeded events_uuid column is genuinely time-ordered -> ~all plausible
@@ -24,10 +23,9 @@ select cmp_ok(
 -- refuse-by-default: range-partitioning a non-time-ordered key is meaningless, so transmute refuses
 -- a column that samples as random (the operator can override with p_force_uuidv7; see tests/39)
 select throws_like(
-  $$ select pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
+  $$ call pgpm.transmute('public.rnd_uuid', 'id', interval '1 month') $$,
   'pg_partition_magician:%UUIDv4%',
   'transmute (uuid column treated as uuidv7) refuses a random-uuid column'
 );
 
 select * from finish();
-rollback;

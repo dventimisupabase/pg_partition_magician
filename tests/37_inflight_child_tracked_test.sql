@@ -5,7 +5,6 @@
 -- status(), instead of being discoverable only by scanning pg_class.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.inflight_t (
@@ -15,7 +14,7 @@ create table public.inflight_t (
   primary key (created_at, id)
 );
 insert into public.inflight_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 3) g;  -- recent -> monolith
-select pgpm.transmute('public.inflight_t', 'created_at', interval '1 month',
+call pgpm.transmute('public.inflight_t', 'created_at', interval '1 month',
                   p_drain_batch => 1, p_paused => false);
 -- three strays in one closed past interval land in the DEFAULT for the drain to drain
 insert into public.inflight_t (created_at, body)
@@ -33,7 +32,7 @@ select cmp_ok(
   (select inflight_partitions from pgpm.status() where parent = 'public.inflight_t'::regclass),
   '>', 0::bigint, 'status() surfaces the in-flight (unattached) partition count');
 
-select pgpm.drain_all('public.inflight_t', p_include_open => true);
+call pgpm.drain_all('public.inflight_t', p_include_open => true);
 select is(
   (select count(*)::int from pgpm.part where parent_table = 'public.inflight_t'::regclass and not attached),
   0, 'once attached, the child is no longer marked in-flight');
@@ -42,4 +41,3 @@ select is(
   0::bigint, 'status() shows no in-flight partitions after the drain completes');
 
 select * from finish();
-rollback;

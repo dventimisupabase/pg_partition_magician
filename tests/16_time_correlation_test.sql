@@ -5,7 +5,6 @@
 -- out-of-order arrival drive the fraction down.
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 -- co-monotonic: id ascends together with created_at
@@ -37,4 +36,3 @@ select is(
   0, 'empty table yields zero sampled pairs (no crash)');
 
 select * from finish();
-rollback;

@@ -5,7 +5,6 @@
 -- table) -- the same refuse-or-preserve contract as the PK and incoming-FK cases.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- (A) UNIQUE(email) excludes the partition key (created_at) -> cannot be preserved -> refuse up front
@@ -20,7 +19,7 @@ insert into public.u_excl (created_at, email)
   select now() - (g || ' days')::interval, 'u' || g || '@x' from generate_series(1, 10) g;
 
 select throws_like(
-  $$ select pgpm.transmute('public.u_excl', 'created_at', interval '1 month') $$,
+  $$ call pgpm.transmute('public.u_excl', 'created_at', interval '1 month') $$,
   'pg_partition_magician:%UNIQUE%',
   'transmute refuses a unique secondary whose key excludes the partition key');
 select is(
@@ -42,9 +41,8 @@ insert into public.u_incl (created_at, sku)
   select date_trunc('month', now()) - interval '3 months' + (g || ' days')::interval, 'sku' || g
   from generate_series(1, 10) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.u_incl', 'created_at', interval '1 month', p_paused => false) $$,
-  'transmute carries a unique secondary whose key includes the partition key');
+call pgpm.transmute('public.u_incl', 'created_at', interval '1 month', p_paused => false);
+select pass('transmute carries a unique secondary whose key includes the partition key');
 
 -- the carried index exists on the partitioned parent as a (non-PK) partitioned unique index
 select is(
@@ -54,7 +52,7 @@ select is(
 
 -- materialize the months as real partitions, then a duplicate of (created_at, sku) is rejected by the
 -- carried index on the materialized partition (it propagated to the new child on attach)
-select pgpm.drain_all('public.u_incl', p_include_open => true);
+call pgpm.drain_all('public.u_incl', p_include_open => true);
 select throws_ok(
   $$ insert into public.u_incl (created_at, sku)
        values (date_trunc('month', now()) - interval '2 months' + interval '5 days', 'DUP') $$,
@@ -62,4 +60,3 @@ select throws_ok(
   'the carried unique index enforces global uniqueness on the materialized partition');
 
 select * from finish();
-rollback;

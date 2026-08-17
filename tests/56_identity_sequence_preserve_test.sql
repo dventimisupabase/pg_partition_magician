@@ -5,7 +5,6 @@
 -- not reopen the gap) now seed to the greater of max(id)+1 and the source sequence's own next value.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 -- (A) transmute preserves a sequence sitting AHEAD of max(id)
@@ -18,7 +17,7 @@ create table public.seqp (
 insert into public.seqp (created_at, body)
   select now() - (g || ' minutes')::interval, 'b' || g from generate_series(1, 100) g;
 select setval(pg_get_serial_sequence('public.seqp', 'id'), 200);   -- is_called => next source value is 201
-select pgpm.transmute('public.seqp', 'created_at', interval '1 month');
+call pgpm.transmute('public.seqp', 'created_at', interval '1 month');
 insert into public.seqp (created_at, body) values (now(), 'new');
 select is(
   (select id from public.seqp where body = 'new'),
@@ -34,7 +33,7 @@ create table public.seqp2 (
 insert into public.seqp2 (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 100) g;
 select setval(pg_get_serial_sequence('public.seqp2', 'id'), 300);   -- next is 301
-select pgpm.transmute('public.seqp2', 'created_at', interval '1 month');
+call pgpm.transmute('public.seqp2', 'created_at', interval '1 month');
 select pgpm.untransmute('public.seqp2');
 insert into public.seqp2 (created_at, body) values (now(), 'new');
 select is(
@@ -50,11 +49,10 @@ create table public.seqp3 (
 );
 insert into public.seqp3 (created_at, body)
   select now() - (g || ' minutes')::interval, 'y' from generate_series(1, 50) g;
-select pgpm.transmute('public.seqp3', 'created_at', interval '1 month');
+call pgpm.transmute('public.seqp3', 'created_at', interval '1 month');
 insert into public.seqp3 (created_at, body) values (now(), 'new');
 select is(
   (select id from public.seqp3 where body = 'new'),
   51::bigint, 'a sequence at its max is unchanged: the next id is max(id)+1 (51)');
 
 select * from finish();
-rollback;

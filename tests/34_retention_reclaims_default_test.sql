@@ -4,7 +4,6 @@
 -- partition that retain() would immediately drop. Within-horizon strays are materialized as normal.
 create extension if not exists pgtap;
 
-begin;
 select plan(4);
 
 create table public.ret_t (
@@ -14,7 +13,7 @@ create table public.ret_t (
   primary key (created_at, id)
 );
 insert into public.ret_t (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 10) g;  -- recent -> monolith
-select pgpm.transmute('public.ret_t', 'created_at', interval '1 month',
+call pgpm.transmute('public.ret_t', 'created_at', interval '1 month',
                   p_retain => interval '2 months', p_paused => false);
 
 -- strays in the DEFAULT: 30 aged (months 3,4,5 ago, BELOW the 2-month horizon) and 10 within-horizon
@@ -31,7 +30,7 @@ select is(
      where created_at < date_trunc('month', now()) - interval '2 months'),
   30, 'setup: 30 aged strays (below the horizon) sit in the DEFAULT');
 
-select pgpm.drain_all('public.ret_t');
+call pgpm.drain_all('public.ret_t');
 
 select is(
   (select count(*)::int from pgpm.snapshot(null::public.ret_t)
@@ -49,4 +48,3 @@ select is(
   20, 'within-horizon rows survive (10 recent in the monolith + 10 within-horizon stray)');
 
 select * from finish();
-rollback;

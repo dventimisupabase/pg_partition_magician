@@ -4,7 +4,6 @@
 -- leaves its adopted unique constraint standing on the now-standalone table, so the reverse is clean.)
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 create table public.uq_rt (
@@ -16,9 +15,8 @@ create table public.uq_rt (
 insert into public.uq_rt (ts, id, body)
   select now() - (g || ' days')::interval, g, 'x' from generate_series(1, 25) g;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.uq_rt', 'ts', interval '1 month') $$,
-  'transmute a no-PK unique-constraint table (paused, monolith holds all)');
+call pgpm.transmute('public.uq_rt', 'ts', interval '1 month');
+select pass('transmute a no-PK unique-constraint table (paused, monolith holds all)');
 select lives_ok(
   $$ select pgpm.untransmute('public.uq_rt') $$,
   'untransmute reverses it while the monolith still holds every row');
@@ -32,4 +30,3 @@ select is(
 select is((select count(*)::int from public.uq_rt), 25, 'all rows conserved through the round trip');
 
 select * from finish();
-rollback;

@@ -4,7 +4,6 @@
 -- temporary exclusion constraints linger on the DEFAULT afterward.
 create extension if not exists pgtap;
 
-begin;
 select plan(3);
 
 create table public.am (
@@ -13,12 +12,12 @@ create table public.am (
   body text, primary key (created_at, id)
 );
 insert into public.am (created_at) select now() - (g || ' minutes')::interval from generate_series(1, 20) g;
-select pgpm.transmute('public.am', 'created_at', interval '1 month', p_paused => false);
+call pgpm.transmute('public.am', 'created_at', interval '1 month', p_paused => false);
 select pgpm.obtain('public.am');   -- forward partitions, plain-attached (empty DEFAULT, no scan)
 -- a backdated stray for the drain to evacuate via check_skip
 insert into public.am (created_at, body)
   select date_trunc('month', now()) - interval '3 months' + interval '10 days', 'stray' from generate_series(1, 10) g;
-select pgpm.drain_all('public.am', p_include_open => true);
+call pgpm.drain_all('public.am', p_include_open => true);
 
 select cmp_ok(
   (select count(*) from pgpm.log where parent_table = 'public.am'::regclass and action = 'obtain' and method = 'plain')::int,
@@ -37,4 +36,3 @@ select is(
   'temporary exclusion CHECK constraints were dropped after attach');
 
 select * from finish();
-rollback;

@@ -1,7 +1,6 @@
 -- Verifies new writes route to a pre-made partition, not the DEFAULT.
 create extension if not exists pgtap;
 
-begin;
 select plan(2);
 
 -- A future-dated insert falls in a partition premade by transmute()/maintenance.
@@ -26,4 +25,3 @@ select is(
 );
 
 select * from finish();
-rollback;

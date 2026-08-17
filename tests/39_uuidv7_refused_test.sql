@@ -5,7 +5,6 @@
 -- is time-ordered can override with p_force_uuidv7 => true.
 create extension if not exists pgtap;
 
-begin;
 select plan(5);
 
 -- (A) a random UUIDv4 column samples near zero and is refused
@@ -17,7 +16,7 @@ select cmp_ok(
   '<', 0.5::numeric, 'setup: the column samples as random UUIDv4 (fraction < 0.5)');
 
 select throws_like(
-  $$ select pgpm.transmute('public.v4_t', 'id', interval '1 month') $$,
+  $$ call pgpm.transmute('public.v4_t', 'id', interval '1 month') $$,
   'pg_partition_magician:%UUIDv4%',
   'transmute refuses a uuid control column that samples as random');
 
@@ -27,9 +26,8 @@ select is(
   'r', 'the refusal is up front: v4_t is left a plain table, untouched');
 
 -- (B) the operator can override when certain the column is time-ordered
-select lives_ok(
-  $$ select pgpm.transmute('public.v4_t', 'id', interval '1 month', p_force_uuidv7 => true) $$,
-  'p_force_uuidv7 => true overrides the refusal');
+call pgpm.transmute('public.v4_t', 'id', interval '1 month', p_force_uuidv7 => true);
+select pass('p_force_uuidv7 => true overrides the refusal');
 
 -- (C) a genuine UUIDv7/ULID-shaped column (48-bit ms prefix) is accepted with no override
 create table public.v7_t (id uuid primary key, body text);
@@ -42,9 +40,7 @@ from (
   from generate_series(1, 200) g
 ) s;
 
-select lives_ok(
-  $$ select pgpm.transmute('public.v7_t', 'id', interval '1 month') $$,
-  'a genuine time-ordered uuid column is accepted without an override');
+call pgpm.transmute('public.v7_t', 'id', interval '1 month');
+select pass('a genuine time-ordered uuid column is accepted without an override');
 
 select * from finish();
-rollback;

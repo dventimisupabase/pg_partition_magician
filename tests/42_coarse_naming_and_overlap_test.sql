@@ -3,7 +3,6 @@
 -- candidate range that overlaps an existing attached partition (the coarse monolith) instead of
 -- erroring on an overlapping CREATE.
 create extension if not exists pgtap;
-begin;
 set time zone 'UTC';
 select plan(8);
 
@@ -61,4 +60,3 @@ select ok(
   'obtain did NOT create a partition overlapping the coarse child (4000)');
 
 select * from finish();
-rollback;

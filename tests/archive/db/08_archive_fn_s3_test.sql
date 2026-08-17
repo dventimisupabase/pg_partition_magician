@@ -15,12 +15,11 @@
 -- retain_batch is forced to 0 on both fixtures so pgpm.maintain()'s own pgpm.retain() call never
 -- drops what this test wants to keep inspecting via pgpm.part/_archive_fully_covered afterward --
 -- this test is about the archive_fn adapter, not retire()'s drop precondition (tests/64 covers that).
-begin;
 select plan(10);
 
 -- --- Part A: pgpm.archive_to_s3_ndjson -------------------------------------------------
 
-select mk_archive_table('a8', 5000, 1000, 3000, p_paused => false);   -- monolith [0, 6000), premakes 4 ahead
+call mk_archive_table('a8', 5000, 1000, 3000, p_paused => false);   -- monolith [0, 6000), premakes 4 ahead
 insert into public.a8 (id, payload) select g, 'y' from generate_series(6001, 6005) g;   -- into [6000,7000)
 insert into public.a8 (id, payload) select g, 'z' from generate_series(7001, 7005) g;   -- into [7000,8000)
 insert into public.a8 (id, payload) values (11000, 'frontier');   -- advances the frontier to 11000
@@ -34,7 +33,7 @@ select pgpm.set_archive_fn('public.a8', 'pgpm.archive_to_s3_ndjson(regclass,name
 -- eligibility math is already proven). One maintain() tick both write-blocks every eligible
 -- child (#235) and archives each of them in a single chunk (the default 8 MiB byte budget
 -- comfortably covers each one).
-select pgpm.maintain('public.a8');
+call pgpm.maintain('public.a8');
 
 select is(
   (select count(*)::int from pgpm.archive_ledger where parent_table = 'public.a8'::regclass),
@@ -81,7 +80,7 @@ select is(
 
 -- --- Part B: pgpm.archive_to_s3_parquet -------------------------------------------------
 
-select mk_archive_table('a8p', 5000, 1000, 3000, p_paused => false);
+call mk_archive_table('a8p', 5000, 1000, 3000, p_paused => false);
 insert into public.a8p (id, payload) select g, 'y' from generate_series(6001, 6005) g;
 insert into public.a8p (id, payload) select g, 'z' from generate_series(7001, 7005) g;
 insert into public.a8p (id, payload) values (11000, 'frontier');
@@ -90,7 +89,7 @@ select mk_archive_config('a8p', false);
 update pgpm.config set retain_batch = 0 where parent_table = 'public.a8p'::regclass;
 select pgpm.set_archive_fn('public.a8p', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 
-select pgpm.maintain('public.a8p');
+call pgpm.maintain('public.a8p');
 
 select is(
   (select count(*)::int from pgpm.archive_ledger where parent_table = 'public.a8p'::regclass),
@@ -110,4 +109,3 @@ select ok(
   'the monolith is fully covered after the single tick (parquet)');
 
 select * from finish();
-rollback;

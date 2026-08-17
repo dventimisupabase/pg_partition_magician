@@ -2,7 +2,6 @@
 -- of the id frontier, full drain, and row conservation. Robust to seed size.
 create extension if not exists pgtap;
 
-begin;
 select plan(6);
 
 select is(
@@ -28,8 +27,8 @@ select cmp_ok(
   '>=', 2, 'at least 2 id partitions premade ahead of the frontier'
 );
 
-create temporary table _before_id on commit drop as select count(*) as n from public.events_id;
-select pgpm.drain_all('public.events_id', p_include_open => true);
+create temporary table _before_id as select count(*) as n from public.events_id;
+call pgpm.drain_all('public.events_id', p_include_open => true);
 
 select is(
   (select count(*) from public.events_id_default)::int,
@@ -42,4 +41,3 @@ select is(
 );
 
 select * from finish();
-rollback;

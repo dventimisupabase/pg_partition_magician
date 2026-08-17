@@ -3,7 +3,6 @@
 -- pgpm.config. maintenance is a no-op while paused and acts once resumed.
 create extension if not exists pgtap;
 
-begin;
 select plan(10);
 
 create table public.pr (
@@ -16,15 +15,13 @@ insert into public.pr (created_at, body)
   select now() - (g || ' minutes')::interval, 'x' from generate_series(1, 30) g;
 
 -- transmute with no p_paused: the default is paused (cautious).
-select lives_ok(
-  $$ select pgpm.transmute('public.pr', 'created_at', interval '1 month') $$,
-  'transmute the table (paused by default)');
+call pgpm.transmute('public.pr', 'created_at', interval '1 month');
+select pass('transmute the table (paused by default)');
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'transmute registers the table paused by default');
-select is(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance is a no-op while paused');
+call pgpm.maintain('public.pr') \gset
+select is(:'p_status'::text, 'paused', 'maintenance is a no-op while paused');
 
 -- resume: scheduled maintenance acts.
 select lives_ok(
@@ -33,9 +30,8 @@ select lives_ok(
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   false, 'resume clears the paused flag');
-select isnt(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance acts once resumed');
+call pgpm.maintain('public.pr') \gset
+select isnt(:'p_status'::text, 'paused', 'maintenance acts once resumed');
 
 -- pause: back to a no-op.
 select lives_ok(
@@ -44,9 +40,8 @@ select lives_ok(
 select is(
   (select paused from pgpm.config where parent_table = 'public.pr'::regclass),
   true, 'pause sets the paused flag');
-select is(
-  pgpm.maintain('public.pr'),
-  'paused', 'maintenance is a no-op again while paused');
+call pgpm.maintain('public.pr') \gset
+select is(:'p_status'::text, 'paused', 'maintenance is a no-op again while paused');
 
 -- a table pgpm does not manage cannot be paused/resumed.
 create table public.pr_unmanaged (id bigint primary key, body text);
@@ -56,4 +51,3 @@ select throws_ok(
   'resume refuses a table pgpm does not manage');
 
 select * from finish();
-rollback;
