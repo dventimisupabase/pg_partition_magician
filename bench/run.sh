@@ -424,7 +424,9 @@ surge_pid=""; surge_launched=0; surge_active=0
 while :; do
   sleep "$BENCH_OBSERVE_INTERVAL"
   # ONE round-trip per poll. status() yields coarse_partitions (the regrain backlog: 1 while the monolith
-  # stands, 0 after the swap). _ambient_lock_waiters() is the role-independent ambient signal.
+  # stands, 0 after the swap). The adaptive-feathering samples this poll used to carry (the per-tick
+  # drain_budget, _ambient_lock_waiters() and config.drain_ambient_baseline) are gone with that closed loop
+  # (#288, #304); the function and the column no longer exist, so reading them errored rather than reporting.
   poll=$(q "with s as (select * from pgpm.status() where parent='bench.events'::regclass)
             select extract(epoch from clock_timestamp())::bigint
             ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
@@ -434,9 +436,7 @@ while :; do
             ||'|'|| coalesce((select sum(rows) from pgpm.log where parent_table='bench.events'::regclass and action='regrain_copy'),0)
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
                               from pgpm.log where parent_table='bench.events'::regclass and action in ('regrain_copy','regrain_attach','regrain')),-1)
-            ||'|'|| coalesce((select rows from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' order by at desc limit 1),-1)
-            ||'|'|| coalesce(pgpm._ambient_lock_waiters(),-1)
-            ||'|'|| coalesce((select round(drain_ambient_baseline,2) from pgpm.config where parent_table='bench.events'::regclass),-1)" 2>/dev/null) \
+            " 2>/dev/null) \
     || { echo "  (observe poll failed -- retrying)"; continue; }
   IFS='|' read -r now_s drows nparts coarse copies copied refage budget waiters baseline <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
@@ -595,10 +595,6 @@ say "report"
   echo "- transmute: metadata cutover; monolith \`[0, $MONO_HI)\` held \`$N0\` history rows"
   echo "- regrain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='regrain_copy'") copy microbatches, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='regrain_copy'") rows copied, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='regrain'") fine children created (swap), $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='skip_regrain'") skips"
   echo "- obtain: $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='obtain'") succeeded, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='skip_obtain'") deferred under lock contention"
-  echo "- drain (default janitor): $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") moves, $(q "select coalesce(sum(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_move'") stray rows (expected ~0: workload writes go to forward partitions)"
-  if [ "${BENCH_DRAIN_ADAPTIVE:-1}" = "1" ]; then
-    echo "- adaptive feathering (mode 2): $(q "select coalesce(min(rows),0)||'-'||coalesce(max(rows),0) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") rows/tick budget range over $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget'") steps, $(q "select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe'") backoffs ($(q "select coalesce(string_agg(method||':'||c,', '),'none') from (select method, count(*) c from pgpm.log where parent_table='bench.events'::regclass and action='drain_budget' and method<>'probe' group by method order by 2 desc) s") )"
-  fi
   echo "- coarse (un-regrained) children remaining: \`$REGRAIN_COARSE_FINAL\` (0 = history fully regrained into fine partitions)"
   echo "- **row conservation**: history rows \`id < $MONO_HI\` = \`$REGRAIN_HIST_AFTER\` (expected \`$N0\`) -> $([ "$REGRAIN_CONSERVED" = 1 ] && echo 'CONSERVED ✅' || ([ "$REGRAIN_CONSERVED" = partial ] && echo 'conserved (regrain partial)' || echo "MISMATCH ❌"))"
   echo "- regrain rate trace: \`drain.progress.csv\` (observed_s, default_rows, partitions, coarse, regrain_copies, rows_copied, last_regrain_age_s, budget, ambient_waiters, ambient_baseline, surge_active)"

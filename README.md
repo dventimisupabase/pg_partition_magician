@@ -121,12 +121,10 @@ See the [reference](docs/reference.md#migrating-from-timescaledb-from_hypertable
 pgpm logs every operation to `pgpm.log` but keeps no system-wide history. With
 [`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) (PGFR) installed,
 `pgpm.impact_report` reports what the workload experienced during a conversion (checkpoints, WAL, waits,
-latency) and `pgpm.feathering_validation` validates each adaptive-feathering backoff against PGFR's
-independent sampling.
+latency).
 
 ```sql
 select pgpm.impact_report('public.events');
-select * from pgpm.feathering_validation('public.events');
 ```
 
 Both ship with `pgpm_core`, read-only, and PGFR is **never a dependency**: they raise a clear error until

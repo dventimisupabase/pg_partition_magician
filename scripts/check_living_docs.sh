@@ -31,9 +31,10 @@ FROZEN=(REDESIGN.md NIGHT-LOG.md from_hypertable_design.md from_hypertable_test_
 # derived one: deriving "every pgpm identifier" from SQL text produces false positives on prose, and a
 # missed entry here costs nothing, while a false positive would block unrelated work. Add to it whenever
 # something public is removed -- that is the moment the docs need sweeping anyway.
-GONE=(drain_all drain_step 'snapshot()' check_default pgpm.hook drain_budget
+GONE=(drain_all drain_step 'snapshot()' check_default pgpm.hook drain_budget drain_move
       _ambient_lock_waiters _ambient_congested _aimd_next _feather_congested retain_reclaim
-      obtain_reap default_dirty)
+      obtain_reap default_dirty
+      feathering_validation adaptive_ticks wal_backoffs lock_backoffs io_backoffs)
 
 echo "== check 1: living docs must not name removed identifiers =="
 # The list is CURATED, not derived from install.sql, and an earlier version of this script shows why. It

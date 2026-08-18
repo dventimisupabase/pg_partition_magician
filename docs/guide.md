@@ -317,9 +317,8 @@ select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
 If [`pg_flight_recorder`](https://github.com/dventimisupabase/pg_flight_recorder) is installed,
 `pgpm.impact_report('public.events')` correlates pgpm's operation log against the database telemetry PGFR
 sampled, reporting what a conversion did to the workload (forced checkpoints, WAL, top waits, query latency)
-over the window pgpm was active, and `pgpm.feathering_validation('public.events')` cross-checks whether each
-adaptive backoff matched real pressure. Both ship with `pgpm_core`; PGFR is never a dependency, they just
-raise a clear error until it's installed. See the
+over the window pgpm was active. It ships with `pgpm_core`; PGFR is never a dependency, it just raises a
+clear error until PGFR is installed. See the
 [reference](reference.md#observability-with-pg_flight_recorder-observe).
 
 ## Retain

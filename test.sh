@@ -31,10 +31,10 @@
 # (tests/timescale/).
 #
 # The `observe` track is also separate: pgpm_core ships pg_flight_recorder (PGFR) correlation functions
-# (observe_window/impact_report/feathering_validation) that are always present but only do anything
+# (observe_window/impact_report) that are always present but only do anything
 # useful with PGFR installed (the PGFR-absent gate is a plain test in the main suite,
 # tests/65_observe_no_pgfr_test.sql). This track installs the vendored PGFR and asserts the
-# impact_report/feathering_validation correlation against its telemetry (tests/observe/). PGFR is
+# impact_report correlation against its telemetry (tests/observe/). PGFR is
 # vendored under bench/vendor/ and needs only pg_cron, so the track runs on the stock pgpm_test:15 image.
 #
 # The `archive` track is also separate: it installs the OPTIONAL pgpm_archive module on top of the
@@ -261,7 +261,7 @@ run_timescale() {
   echo "TimescaleDB track: PASS"
 }
 
-run_observe() {  # pg_flight_recorder observability track: impact_report/feathering_validation correlation
+run_observe() {  # pg_flight_recorder observability track: impact_report correlation
                  # against a real PGFR install (the PGFR-absent gate is tests/65 in the main suite)
   local prof="pg15" svc="postgres15" fail=0 out
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
