@@ -902,14 +902,12 @@ PGFR, and PGFR needs no changes), and PGFR is **never a dependency**: the PGFR-b
 ```sql
 pgpm.observe_window(p_parent regclass, p_since interval default '7 days') returns table (
   parent_table regclass, window_start timestamptz, window_end timestamptz, duration interval,
-  log_rows bigint, rows_moved bigint, drains bigint, regrains bigint, retains bigint,
-  adaptive_ticks bigint, backoffs bigint, wal_backoffs bigint, lock_backoffs bigint, io_backoffs bigint
+  log_rows bigint, rows_copied bigint, regrains bigint, retains bigint
 )
 ```
 
 The span pgpm was active on a table within `p_since`, plus a summary of what it did. **Pure `pgpm.log`** with
-no PGFR dependency, so it works (and is useful) standalone. The `backoffs` columns report on a
-log signal that nothing emits any more, so they are always zero.
+no PGFR dependency, so it works (and is useful) standalone.
 
 ```sql
 pgpm.impact_report(p_parent regclass, p_since interval default '7 days') returns text
@@ -920,17 +918,6 @@ pgpm.impact_report(p_parent regclass, p_since interval default '7 days') returns
 wait events, and top queries by execution-time delta. Sections degrade independently (a window with fewer
 than two PGFR snapshots, or a `pg_stat_statements` that is absent or was reset, is reported, not fatal).
 Requires PGFR.
-
-```sql
-pgpm.feathering_validation(p_parent regclass, p_since interval default '7 days',
-                           p_lead interval default '2 minutes') returns table (
-  tick_at timestamptz, reason text, wal_signal_confirmed boolean,
-  lock_signal_confirmed boolean, io_signal_confirmed boolean, note text
-)
-```
-
-**Returns no rows.** It corroborates a per-tick log signal that nothing writes any more, so there is
-nothing for it to report on. The function is retained but inert.
 
 ## Incoming foreign keys
 
@@ -1057,7 +1044,6 @@ the failures too, which is exactly how a guard once reported a starved tick as a
 |---|---|
 | `transmute` / `untransmute` | conversion and its reversal |
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
-| `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |

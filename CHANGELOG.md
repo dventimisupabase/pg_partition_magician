@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+- **Deleted the adaptive-feathering surface (issue #304).** #288 removed the drain and, with it, the AIMD
+  controller that paced it against WAL rate, checkpoint pressure and ambient IO/lock waiters. The machinery
+  that *measured and reported on* it survived, analysing a signal nothing emits.
+  - Gone: `_wal_sustainable_bps`, `_feather_congested`, `_ambient_lock_waiters`, `_ambient_io_latency`,
+    `_ambient_io_surge`, `_ambient_congested`, `_ambient_surge`, `_forced_checkpoints`, `_aimd_next`, and
+    the public `pgpm.feathering_validation` -- 295 lines, every one with zero call sites. Dropped via
+    `drop function if exists` in the upgrade path, as `install.sql` already does for the fourteen removed
+    `config` columns.
+  - `observe_window` loses `drains`, `adaptive_ticks` and the per-signal `backoffs` columns, and
+    `rows_moved` becomes `rows_copied`. They counted `drain_move` / `drain_budget` log actions, neither of
+    which has been written since #288, so they could only ever read 0. **A reported zero that means "this
+    never happens" is worse than no column, because it looks like a measurement.** `impact_report` loses its
+    feathering line for the same reason; both functions otherwise stay and remain useful.
+  - **CI was keeping it green by manufacturing its input.** `tests/65` and `tests/observe/db/with_pgfr_test.sql`
+    each inserted synthetic `drain_budget` rows and then asserted the analysis read them correctly. Those
+    assertions were true and useless: they proved the *analyser* worked, not that anything *emitted* the
+    signal, so a green suite said nothing about whether the feature existed. Both now exercise real regrain
+    and retention actions instead.
+  - `tests/41` keeps the claim that never depended on the sensors (no pgpm function reads cross-role
+    `wait_event`, so pgpm needs no `pg_monitor`) and gains one asserting the whole sensor family is gone.
+  - **`bench/run.sh` was already broken**: its observe poll read `pgpm._ambient_lock_waiters()` and
+    `config.drain_ambient_baseline`, a function and a column `install.sql` had already removed, so the poll
+    errored rather than reporting. Its dead samples and the adaptive-feathering summary are gone, and
+    `bench/run_ambient_demo.sh` is deleted -- it configured knobs that no longer exist to demonstrate a
+    capability that no longer exists. `bench/plot_results.py` is untouched: it renders figures from stored
+    run CSVs, which are history and still render.
+  - `scripts/check_living_docs.sh` gained the newly-removed identifiers, and immediately found four
+    documents still naming them (`README.md`, `docs/guide.md`, `docs/reference.md`, `bench/README.md`) --
+    the guard doing exactly the job it was added for in #300.
+
 - **`from_hypertable` no longer loses the migrated table's foreign keys (issue #264).** Outgoing keys went
   silently; incoming keys failed outright, after the entire online copy had run.
   - **Outgoing, silent loss.** `CREATE TABLE ... LIKE ... INCLUDING CONSTRAINTS` copies CHECK and NOT NULL

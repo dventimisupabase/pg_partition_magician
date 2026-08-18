@@ -2942,127 +2942,22 @@ $$;
 
 -- ============================== maintenance / observability ==============================
 
--- ===================== adaptive closed-loop feathering (REDESIGN.md, mode 2) =====================
+-- Adaptive feathering was removed with the drain it paced (#288); its measurement and reporting surface
+-- followed (#304). The AIMD controller, the WAL/checkpoint/ambient sensors and feathering_validation all
+-- analysed a `drain_budget` log signal that nothing emits any more, so they could only ever report
+-- nothing. Nothing left in pgpm is paced by row volume: regrain has a fixed batch and obtain is pure
+-- metadata.
+drop function if exists pgpm._wal_sustainable_bps();
+drop function if exists pgpm._feather_congested(numeric, numeric, numeric, boolean);
+drop function if exists pgpm._ambient_lock_waiters();
+drop function if exists pgpm._ambient_io_latency(numeric, bigint, numeric, bigint);
+drop function if exists pgpm._ambient_io_surge(numeric, numeric, numeric, numeric);
+drop function if exists pgpm._ambient_congested(int, int);
+drop function if exists pgpm._ambient_surge(int, numeric, numeric, int);
+drop function if exists pgpm._forced_checkpoints();
+drop function if exists pgpm._aimd_next(int, boolean, int, int, int);
+drop function if exists pgpm.feathering_validation(regclass, interval, interval);
 
--- The LEADING congestion signal: the WAL generation rate vs the rate the checkpointer can sustain.
--- A forced checkpoint fires when WAL written since the last checkpoint reaches ~max_wal_size before
--- the checkpoint_timeout timer does; the I/O storm of that checkpoint flush is the latency tail the
--- bench saw at 40M. So the sustainable WAL rate is max_wal_size / checkpoint_timeout: generate WAL
--- faster than that and a forced checkpoint (and its storm) is coming. Sensing the RATE lets the drain
--- ease off BEFORE the checkpoint fires -- unlike the forced-checkpoint counter, which only moves once
--- the storm is already underway (that counter is kept below only as a reactive backstop). Reads
--- pg_current_wal_lsn() + settings, all available to a non-superuser (pg_control_checkpoint(), which
--- would give the exact distance-to-threshold, is superuser-gated on managed Postgres, so we use rate).
-create or replace function pgpm._wal_sustainable_bps()
-returns numeric language sql stable as $$
-  select pg_size_bytes(current_setting('max_wal_size'))::numeric
-         / greatest(1, extract(epoch from current_setting('checkpoint_timeout')::interval));
-$$;
-
--- The decision (pure, unit-tested): are we over-driving the disk? True if the observed WAL rate exceeds
--- p_high_water of the sustainable rate (the LEADING trigger), OR a forced checkpoint already fired since
--- the last tick (the reactive backstop). Null observed rate (first tick) or unknown sustainable rate
--- (guard against divide-by-zero) => not congested.
-create or replace function pgpm._feather_congested(
-  p_observed_bps numeric, p_sustainable_bps numeric, p_high_water numeric, p_forced boolean
-) returns boolean language sql immutable as $$
-  select coalesce(p_forced, false)
-      or (p_observed_bps is not null and coalesce(p_sustainable_bps, 0) > 0
-          and p_observed_bps / p_sustainable_bps > p_high_water);
-$$;
-
--- The AMBIENT signal, term 1: how many OTHER (non-pgpm) backends are right now blocked on an ungranted
--- lock. This is a consumer-priority sensor the WAL rate misses entirely -- when the drain's brief ATTACH
--- (ACCESS EXCLUSIVE on the parent) or its row/page locks block the workload, those backends queue here
--- while generating little WAL of their own. Read from pg_locks, which is FULLY VISIBLE to any role (no
--- pg_monitor needed, unlike pg_stat_activity.wait_event, which is masked for other roles); this is what
--- lets pgpm keep pg_cron as its only runtime dependency. count(distinct pid) so one blocked backend
--- counts once however many lock rows it waits on; excludes pgpm's own maintenance backend. A
--- point-in-time sample per tick -- noisy alone, smoothed by the EWMA baseline and AIMD over ticks.
-create or replace function pgpm._ambient_lock_waiters()
-returns int language sql stable as $$
-  select count(distinct pid)::int from pg_locks
-   where not granted and pid is not null and pid <> pg_backend_pid();
-$$;
-
--- The AMBIENT signal, term 2 (pure): average ms per block read from disk over the interval between two
--- cumulative pg_stat_database samples (blk_read_time / blks_read). This is the read-I/O-starvation
--- sensor the lock signal misses: when the drain saturates the disk, the workload's reads slow down and
--- this latency climbs. Returns NULL when there is no prior sample or no blocks were read this interval
--- (nothing to measure). When track_io_timing is OFF, blk_read_time never advances, so the delta is 0
--- and this returns 0 -- inert, never surges. Like blk timing generally, this needs no elevated role.
-create or replace function pgpm._ambient_io_latency(
-  p_prev_time numeric, p_prev_blks bigint, p_cur_time numeric, p_cur_blks bigint)
-returns numeric language sql immutable as $$
-  select case
-           when p_prev_time is null or p_prev_blks is null then null
-           when coalesce(p_cur_blks, 0) - p_prev_blks <= 0 then null      -- no disk reads this interval
-           when coalesce(p_cur_time, 0) - p_prev_time < 0 then null       -- counter reset
-           else (p_cur_time - p_prev_time) / (p_cur_blks - p_prev_blks)   -- ms per block read
-         end;
-$$;
-
--- The ambient I/O-latency surge decision (pure, unit-tested): congested when the read latency exceeds
--- p_factor times the learned baseline, floored at p_floor (ms/block) so an idle/fast box (baseline ~0)
--- does not fire on a tiny absolute latency. Mirrors _ambient_surge but on a numeric latency rather than
--- an integer count. p_factor = 0 (the shared ambient factor) disables it; a NULL latency is calm.
-create or replace function pgpm._ambient_io_surge(
-  p_latency numeric, p_baseline numeric, p_factor numeric, p_floor numeric)
-returns boolean language sql immutable as $$
-  select coalesce(p_factor, 0) > 0 and p_latency is not null
-     and p_latency > greatest(coalesce(p_baseline, 0), coalesce(p_floor, 0)) * p_factor;
-$$;
-
--- The ambient ABSOLUTE-cap decision (pure, unit-tested): congested if more than p_max waiters are
--- contended, regardless of the learned baseline. p_max = 0 disables this backstop. An optional hard
--- ceiling on top of the self-calibrating trigger below.
-create or replace function pgpm._ambient_congested(p_waiters int, p_max int)
-returns boolean language sql immutable as $$
-  select coalesce(p_max, 0) > 0 and coalesce(p_waiters, 0) > p_max;
-$$;
-
--- Adaptive feathering removed with the drain (#288): it existed to pace the drain's microbatches
--- against WAL supply and ambient I/O. Nothing else in pgpm is paced by row volume.
-
--- The SELF-CALIBRATING surge decision (pure, unit-tested): congested if the current waiter count exceeds
--- p_factor times the learned baseline. A fixed threshold is the wrong shape (normal is box-dependent), so
--- this is RELATIVE to what this server has been doing. p_floor is a minimum effective baseline so an idle
--- box (baseline ~0) does not fire on a couple of transient waiters. p_factor = 0 disables the signal.
-create or replace function pgpm._ambient_surge(p_waiters int, p_baseline numeric, p_factor numeric, p_floor int)
-returns boolean language sql immutable as $$
-  select coalesce(p_factor, 0) > 0
-     and p_waiters::numeric
-         > greatest(coalesce(p_baseline, 0), coalesce(p_floor, 0)::numeric) * p_factor;
-$$;
-
--- The reactive backstop sensor: the cluster's forced/requested-checkpoint counter. A *requested*
--- checkpoint means WAL hit max_wal_size (or an explicit CHECKPOINT). *Timed* checkpoints (the
--- checkpoint_timeout rhythm) are normal and deliberately NOT counted. The counter moved from
--- pg_stat_bgwriter to pg_stat_checkpointer in PG 17, so this is version-aware.
-create or replace function pgpm._forced_checkpoints()
-returns bigint language plpgsql stable as $$
-declare v bigint;
-begin
-  if current_setting('server_version_num')::int >= 170000 then
-    select num_requested into v from pg_stat_checkpointer;
-  else
-    select checkpoints_req into v from pg_stat_bgwriter;
-  end if;
-  return coalesce(v, 0);
-end;
-$$;
-
--- The controller: one AIMD step (the same additive-increase / multiplicative-decrease law TCP uses to
--- ride just under a link's capacity). Calm => probe the budget up by a small increment; congested =>
--- halve it. Clamped to [floor, ceiling] so it always makes forward progress and never over-probes.
--- Pure arithmetic, no side effects -- unit-tested directly.
-create or replace function pgpm._aimd_next(
-  p_current int, p_congested boolean, p_floor int, p_ceiling int, p_increment int
-) returns int language sql immutable as $$
-  select greatest(p_floor, least(p_ceiling,
-    case when p_congested then floor(p_current / 2.0)::int
-         else p_current + p_increment end));
-$$;
 -- set_drain_adaptive / set_drain_ambient removed with adaptive feathering (#288). They tuned the closed
 -- loop that paced the drain's microbatches against WAL supply and ambient I/O. Nothing left in pgpm is
 -- paced by row volume: regrain has its own fixed batch, and obtain is pure metadata.
@@ -3655,12 +3550,12 @@ $$;
 -- pgpm.log records exactly when pgpm ran each operation, but pgpm keeps no history of what the
 -- rest of the database was doing during it. The optional pg_flight_recorder (PGFR) extension
 -- samples that history continuously (wait events, locks, checkpoints, WAL, I/O, query latency) but
--- does not know which spikes were pgpm's. The three functions below bridge the two over a
+-- does not know which spikes were pgpm's. The two functions below bridge the two over a
 -- pgpm.log time window. The integration is strictly READ-ONLY and ONE-DIRECTIONAL (pgpm writes
 -- nothing into PGFR, and PGFR needs no changes), and PGFR is NEVER a dependency: observe_window
--- works standalone from pure pgpm.log, and the PGFR-delegating functions (impact_report,
--- feathering_validation) raise a clear, catchable error when PGFR is absent rather than failing on
--- a raw "function pgfr_analyze.* does not exist".
+-- works standalone from pure pgpm.log, and the PGFR-delegating function (impact_report) raises a
+-- clear, catchable error when PGFR is absent rather than failing on a raw
+-- "function pgfr_analyze.* does not exist".
 
 -- _observe_has_pgfr: is pg_flight_recorder's analysis layer present? Gates on the pgfr_analyze
 -- SCHEMA, not pg_extension: PGFR's script install (the common path) creates the schema and its
@@ -3671,15 +3566,16 @@ returns boolean language sql stable as $$
   select exists (select 1 from pg_namespace where nspname = 'pgfr_analyze');
 $$;
 
--- observe_window: the span pgpm was active on p_parent within the last p_since, plus a summary of
--- what it did (rows moved, drain/regrain/retain counts, and the adaptive-feathering backoff
--- breakdown by signal). PURE pgpm.log -- no PGFR dependency, so it is useful and testable on its
--- own. Always returns exactly one row; when there is no activity, the window bounds are null and
--- the counts are 0.
+-- observe_window: the span pgpm was active on p_parent within the last p_since, plus a summary of what it
+-- did. PURE pgpm.log -- no PGFR dependency, so it is useful and testable on its own. Always returns exactly
+-- one row; when there is no activity, the window bounds are null and the counts are 0.
 --
--- "Operation" actions move data or change structure; the drain_budget rows are the per-tick
--- adaptive decision (method is the OR'd backoff reason: 'probe' = no congestion, else some
--- combination of 'wal'/'lock'/'io').
+-- Narrowed in #304: it used to report `drains`, `adaptive_ticks` and a per-signal `backoffs` breakdown,
+-- all counted from `drain_move` / `drain_budget` log actions. Neither action has been written since the
+-- drain and its adaptive feathering were removed (#288), so those columns could only ever read 0 -- a
+-- reported zero that means "this never happens" is worse than no column at all, because it looks like
+-- a measurement.
+drop function if exists pgpm.observe_window(regclass, interval);
 create or replace function pgpm.observe_window(
   p_parent regclass, p_since interval default '7 days'
 ) returns table (
@@ -3688,15 +3584,9 @@ create or replace function pgpm.observe_window(
   window_end     timestamptz,
   duration       interval,
   log_rows       bigint,
-  rows_moved     bigint,
-  drains         bigint,
-  regrains        bigint,
-  retains        bigint,
-  adaptive_ticks bigint,
-  backoffs       bigint,
-  wal_backoffs   bigint,
-  lock_backoffs  bigint,
-  io_backoffs    bigint
+  rows_copied    bigint,
+  regrains       bigint,
+  retains        bigint
 ) language sql stable as $$
   select
     p_parent,
@@ -3704,15 +3594,9 @@ create or replace function pgpm.observe_window(
     max(l.at),
     max(l.at) - min(l.at),
     count(*),
-    coalesce(sum(l.rows) filter (where l.action in ('drain_move','regrain_copy')), 0),
-    count(*) filter (where l.action = 'drain_move'),
+    coalesce(sum(l.rows) filter (where l.action = 'regrain_copy'), 0),
     count(*) filter (where l.action = 'regrain'),
-    count(*) filter (where l.action = 'retain_drop'),
-    count(*) filter (where l.action = 'drain_budget'),
-    count(*) filter (where l.action = 'drain_budget' and l.method <> 'probe'),
-    count(*) filter (where l.action = 'drain_budget' and l.method like '%wal%'),
-    count(*) filter (where l.action = 'drain_budget' and l.method like '%lock%'),
-    count(*) filter (where l.action = 'drain_budget' and l.method like '%io%')
+    count(*) filter (where l.action = 'retain_drop')
   from pgpm.log l
   where l.parent_table = p_parent
     and l.at >= now() - p_since;
@@ -3742,10 +3626,8 @@ begin
 
   ln := ln || format('pg_partition_magician :: impact report for %s', p_parent);
   ln := ln || format('  window:   %s  ->  %s  (%s)', w.window_start, w.window_end, w.duration);
-  ln := ln || format('  pgpm did: %s log rows, %s rows moved; %s drains, %s regrains, %s retains',
-                     w.log_rows, w.rows_moved, w.drains, w.regrains, w.retains);
-  ln := ln || format('  feathering: %s adaptive ticks, %s backed off (wal=%s lock=%s io=%s)',
-                     w.adaptive_ticks, w.backoffs, w.wal_backoffs, w.lock_backoffs, w.io_backoffs);
+  ln := ln || format('  pgpm did: %s log rows, %s rows copied; %s regrains, %s retains',
+                     w.log_rows, w.rows_copied, w.regrains, w.retains);
   ln := ln || ''::text;
 
   -- Checkpoints / WAL / temp / I/O over the window (pgfr_analyze.compare brackets
@@ -3804,78 +3686,6 @@ begin
   return array_to_string(ln, chr(10));
 end $$;
 
--- feathering_validation: ground-truth check on the adaptive feathering. pgpm backs off on its OWN
--- instantaneous reads of WAL rate / lock waiters / I/O latency and discards the raw values. PGFR
--- sampled the same signals independently. For each backoff tick (a drain_budget row whose reason
--- is not 'probe'), this asks PGFR whether real pressure was present in the lead-up window, so you
--- can tell whether the feathering fires for real reasons or phantoms -- ground truth for tuning
--- drain_batch / drain_wal_high_water / the ambient factors.
---
--- Corroboration is the strongest signal PGFR can supply per dimension:
---   wal  -> a forced checkpoint actually occurred in the lead-up (ckpt_requested_delta > 0)
---   lock -> PGFR sampled a Lock wait_event with waiters in the lead-up
---   io   -> client read time was non-zero in the lead-up (null where pg_stat_io is
---           unavailable, e.g. PG15)
--- p_lead is how far back from each tick to look (the backoff is a leading signal, so the pressure
--- precedes the tick). NOTE the lock dimension relies on PGFR's activity ring buffer (~2h retention
--- by default), so lock corroboration is only meaningful for ticks within that window; wal/io come
--- from the 30-day snapshot tier.
-create or replace function pgpm.feathering_validation(
-  p_parent regclass, p_since interval default '7 days', p_lead interval default '2 minutes'
-) returns table (
-  tick_at              timestamptz,
-  reason               text,
-  wal_signal_confirmed boolean,
-  lock_signal_confirmed boolean,
-  io_signal_confirmed  boolean,
-  note                 text
-) language plpgsql stable as $$
-declare
-  r           record;
-  cmp         record;
-  lk          bigint;
-  v_have_cmp  boolean;
-begin
-  if not pgpm._observe_has_pgfr() then
-    raise exception 'pg_partition_magician: feathering_validation requires pg_flight_recorder (the pgfr_analyze extension).';
-  end if;
-
-  for r in
-    select l.at as tick_at, l.method as reason
-      from pgpm.log l
-     where l.parent_table = p_parent
-       and l.action = 'drain_budget'
-       and l.method <> 'probe'
-       and l.at >= now() - p_since
-     order by l.at
-  loop
-    -- checkpoints / WAL / I/O in the lead-up window
-    begin
-      select * into cmp from pgfr_analyze.compare(r.tick_at - p_lead, r.tick_at);
-      v_have_cmp := found;          -- FOUND, not "cmp is null": compare's record has null fields (e.g. io_* on PG15)
-    exception when others then v_have_cmp := false;
-    end;
-    -- a Lock wait sampled with waiters in the lead-up window
-    begin
-      select coalesce(sum(total_waiters), 0) into lk
-        from pgfr_analyze.wait_summary(r.tick_at - p_lead, r.tick_at)
-       where wait_event_type = 'Lock';
-    exception when others then lk := null;
-    end;
-
-    tick_at               := r.tick_at;
-    reason                := r.reason;
-    wal_signal_confirmed  := case when not v_have_cmp then null else coalesce(cmp.ckpt_requested_delta, 0) > 0 end;
-    lock_signal_confirmed := case when lk is null then null else lk > 0 end;
-    io_signal_confirmed   := case when not v_have_cmp or cmp.io_client_read_time_ms is null then null
-                                  else cmp.io_client_read_time_ms > 0 end;
-    note := concat_ws('; ',
-              case when v_have_cmp then format('ckpt_req=%s wal=%s io_ms=%s',
-                     cmp.ckpt_requested_delta, cmp.wal_bytes_pretty, round(coalesce(cmp.io_client_read_time_ms,0),1)) end,
-              case when lk is not null then format('lock_waiters=%s', lk) end);
-    return next;
-  end loop;
-end $$;
 
 -- restore_incoming_fks(): re-add the incoming FKs that transmute(..., p_incoming_fks => 'preserve')
 -- recorded, pointing them back at the new partitioned parent, but only once it is SAFE. Safe = no

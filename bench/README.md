@@ -215,8 +215,7 @@ conversion summary, but no system-metric time-series; set `BENCH_PGFR=1` for the
 When pgfr is present, `pgpm_core`'s built-in correlation functions read that same telemetry from pgpm's
 side, which is handy for reading a `BENCH_PGFR=1` run: `pgpm.impact_report('bench.events')` summarizes what
 the conversion did to the workload over the window pgpm was active (forced checkpoints, WAL, top waits,
-query latency), and `pgpm.feathering_validation('bench.events')` cross-checks each adaptive backoff against
-the pressure pgfr sampled. The correlation has its own test track (`./test.sh observe`); see the
+query latency). The correlation has its own test track (`./test.sh observe`); see the
 [reference](../docs/reference.md#observability-with-pg_flight_recorder-observe).
 
 ## Interpreting the results

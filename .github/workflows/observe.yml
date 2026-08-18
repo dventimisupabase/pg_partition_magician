@@ -1,6 +1,6 @@
 name: Observe track
 
-# pgpm_core's pg_flight_recorder (PGFR) correlation functions (impact_report/feathering_validation),
+# pgpm_core's pg_flight_recorder (PGFR) correlation function (impact_report),
 # verified against a real PGFR install. Separate from the main matrix because it vendors PGFR
 # (bench/vendor/) alongside pgpm; the PGFR-absent gate is a plain test in the main suite instead
 # (tests/65_observe_no_pgfr_test.sql). PG15 only and PGFR needs only pg_cron, so it runs on the stock
