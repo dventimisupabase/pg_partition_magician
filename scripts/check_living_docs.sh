@@ -21,7 +21,8 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 LIVING=(README.md ONBOARDING.md docs/guide.md docs/reference.md docs/runbook.md
-        pgpm_archive/README.md bench/README.md bench/SIZE_LADDER.md)
+        pgpm_archive/README.md bench/README.md bench/SIZE_LADDER.md
+        index.html install.html)   # the explainer is user-facing documentation too, and rotted the same way
 
 FROZEN=(REDESIGN.md NIGHT-LOG.md from_hypertable_design.md from_hypertable_test_plan.md
         postgresql_online_partition_migration_summary.md docs/blog-partition-a-live-table.md
@@ -34,7 +35,9 @@ FROZEN=(REDESIGN.md NIGHT-LOG.md from_hypertable_design.md from_hypertable_test_
 GONE=(drain_all drain_step 'snapshot()' check_default pgpm.hook drain_budget drain_move
       _ambient_lock_waiters _ambient_congested _aimd_next _feather_congested retain_reclaim
       obtain_reap default_dirty
-      feathering_validation adaptive_ticks wal_backoffs lock_backoffs io_backoffs)
+      feathering_validation adaptive_ticks wal_backoffs lock_backoffs io_backoffs
+      _wal_sustainable_bps _ambient_io_latency _ambient_io_surge _ambient_surge
+      _forced_checkpoints rows_moved)
 
 echo "== check 1: living docs must not name removed identifiers =="
 # The list is CURATED, not derived from install.sql, and an earlier version of this script shows why. It

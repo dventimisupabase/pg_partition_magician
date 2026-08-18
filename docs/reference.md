@@ -25,20 +25,30 @@ pgpm.transmute(
   p_obtain int default 30, p_retain interval default null,
   p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_force_uuidv7 boolean default false
-) returns regclass
+  p_force_uuidv7 boolean default false,
+  p_bound_headroom int default 0
+)
 ```
+
+A **`PROCEDURE`**: invoke it with `CALL`, not `SELECT`, and it returns nothing. The new parent keeps the
+original's name, so `p_parent` still resolves to it afterwards.
 
 Converts `p_parent` into a partitioned table and registers it. The control column's type selects
 the kind: a `uuid` column is treated as **uuidv7** (time-ordered; ULIDs stored as `uuid` included), and a
-`timestamptz`/`timestamp`/`date` column is **time**. Returns the new partitioned parent (same name as the
-original).
+`timestamptz`/`timestamp`/`date` column is **time**.
 
-The cutover moves no rows: it validates a bound on the live table (one read-only scan), then in a
-metadata-only step renames the original to a coarse-child name, creates the
-partitioned parent, attaches the original as the bounded **monolith** child via the validated `CHECK`
-(scan-skipping), and builds the forward grid. The table registers **paused**; nothing happens
-until you `resume` it and maintenance runs.
+The cutover moves no rows, and runs in **three transactions** so that none of its locks scales with the
+row count: add the monolith's bound `CHECK` as `NOT VALID` (catalog only, instant); commit, which drops
+that statement's `ACCESS EXCLUSIVE`; `VALIDATE` it, the one `O(rows)` read, under `SHARE UPDATE EXCLUSIVE`,
+which blocks neither reads nor writes; commit; then one metadata-only transaction renames the original to
+a coarse-child name, creates the partitioned parent, attaches the original as the bounded **monolith**
+child via the now-validated `CHECK` (scan-skipping), and builds the forward grid. The table registers
+**paused**; nothing happens until you `resume` it and maintenance runs.
+
+The trade for the split is that the bound `CHECK` is live for the whole conversion rather than for one
+locked statement, so a write outside `[lo, hi)` is rejected for that span (`p_bound_headroom` buys room at
+the top), and a conversion that dies between transactions leaves the `CHECK` behind. See
+[`transmute_abort`](#transmute_abort).
 
 The new parent also takes over everything `CREATE TABLE ... LIKE` does not carry: the **owner**, table and
 **column-level grants**, **row level security** (both `ENABLE` and `FORCE`), every **policy**, table and
@@ -76,9 +86,15 @@ Parameters:
 - `p_regrain_batch` -- rows per regrain COPY microbatch.
 - `p_anchor` -- the grid origin the boundaries align to.
 - `p_paused` -- register paused (the default); `false` goes live immediately.
-- `p_incoming_fks` -- `'error'` (refuse if any incoming FK exists), `'drop'` (drop them), or `'preserve'`
-  (drop for the conversion and re-add against the new parent once the table is quiescent).
+- `p_incoming_fks` -- `'error'` (the default: refuse if any incoming FK exists) or `'preserve'` (drop each
+  for the conversion and re-add it against the new parent, which `maintain` does on a later tick, or
+  `restore_incoming_fks` does now). `'drop'` is also accepted, but it is **not** a third behavior: it takes
+  the same path as `'preserve'`, so the keys are recorded and restored just the same.
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
+- `p_bound_headroom` -- push the monolith's upper bound `hi` this many grid steps further out. The bound
+  `CHECK` refuses writes at or past `hi` for the whole conversion, so raise this if the frontier could
+  cross `hi` while the validation scan runs. `0` (the default) puts `hi` at the first grid boundary above
+  the frontier.
 
 Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
 excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
@@ -102,16 +118,37 @@ pgpm.transmute(
   p_obtain int default 30, p_retain bigint default null,
   p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-) returns regclass
+  p_bound_headroom int default 0
+)
 ```
 
-The **id** overload, for `int`/`bigint`/`numeric` keys (including Snowflake-style ids). Identical to the
-time overload except the grid width is a `bigint` `p_step`, `p_retain` is a `bigint` count of ids, and
-`p_anchor` is a `bigint`. There is no `p_force_uuidv7`.
+The **id** overload, for `int`/`bigint`/`numeric` keys (including Snowflake-style ids). Also a
+`PROCEDURE`. Identical to the time overload except the grid width is a `bigint` `p_step`, `p_retain` is a
+`bigint` count of ids, and `p_anchor` is a `bigint`. There is no `p_force_uuidv7`.
 
 ```sql
 call pgpm.transmute('public.events', 'id', 10000000, p_obtain => 2);
 ```
+
+### `transmute_abort`
+
+```sql
+pgpm.transmute_abort(p_parent regclass) returns boolean
+```
+
+Abandons a conversion that died between transactions, dropping the `pgpm_monolith_bound` `CHECK` it left
+on the table and clearing its `pgpm.transmute_inflight` row. Returns `false` if there is no in-flight
+conversion to abandon, and raises if one is still running in another session.
+
+It **abandons; it does not resume**. Finishing a half-done conversion of a live table unattended is a
+larger action than pgpm will take on your behalf. To try again, call `transmute` again: it finds the
+recorded row and reuses the bound already on the table rather than recomputing one against a frontier that
+has since moved.
+
+You mostly will not need to call this. Every `maintain_all` tick sweeps for abandoned conversions and
+undoes them, and it decides "abandoned" from the session-level advisory lock `transmute` holds for its
+whole run rather than from a timeout, so a long validation scan is never mistaken for a dead one and an
+operator whose session is still open keeps the right to retry.
 
 ### `untransmute`
 
@@ -576,7 +613,7 @@ so a burst of DML paces itself rather than landing inside the swap. If writes ou
 at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
 work is done under the swap's lock.
 
-Note the first tick therefore does no copying. A regrain that used to take N ticks now takes N + 1.
+The first tick installs the capture and copies nothing, so budget one tick more than the microbatch count.
 
 ### `regrain_cancel`
 
@@ -1036,24 +1073,26 @@ An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text de
 
 **Non-success events are prefixed, never suffixed.** A step that was deferred logs `skip_<mechanism>`
 and one that failed logs `fail_<mechanism>`, so no non-success action is ever a prefix-extension of the
-success it corresponds to. That makes both ways of querying safe: `action = 'obtain'` and
-`action like 'drain%'` match successes only, and `action like 'skip_%'` gives every deferral across all
-mechanisms without having to enumerate them. Suffixing (`drain_skip`) would make `drain%` quietly match
-the failures too, which is exactly how a guard once reported a starved tick as a successful one.
+success it corresponds to. So `action like 'skip_%'` gives every deferral across all mechanisms without
+having to enumerate them, and no failure can hide inside a prefix match on a success the way a suffixed
+`retain_skip` would hide inside `retain%`. Prefer exact values regardless: `action = 'obtain'`, not
+`action like 'obtain%'`, which would also match whatever is added later.
 
 `action` vocabulary:
 
 | Action | When |
 |---|---|
 | `transmute` / `untransmute` | conversion and its reversal |
+| `transmute_abort` | a half-finished conversion undone, by `transmute_abort()` or by `maintain_all`'s sweep; `method` records that the bound was dropped |
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
+| `regrain_prepare` / `regrain_capture_orphan` / `regrain_reconcile` / `regrain_reconcile_aged` / `regrain_rename` / `regrain_restart` / `regrain_cancel` | the cross-tick regrain's own steps: change capture installed / a leftover capture table cleared / the source-is-authority reconcile before the swap (and its below-horizon counterpart) / the source renamed onto the target grid / a stale run restarted / a run cancelled by `regrain_cancel()` |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
-| `skip_obtain` / `skip_retain` / `skip_drain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
+| `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
-| `fail_retain_drop` | an unexpected `DROP` failure; the partition was not dropped (`method` carries the error) |
+| `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
 
 ### `pgpm.dropped_fk`
 
@@ -1069,6 +1108,21 @@ Preserve-managed incoming FKs and their lifecycle.
 | `restored_at` | `timestamptz` | null = dropped (RI off); set = re-added |
 | `validated_at` | `timestamptz` | set = fully validated; null with `restored_at` set = re-added `NOT VALID` (orphans pending) |
 | `dropped_at` | `timestamptz` | when the FK was captured and dropped |
+
+### `pgpm.transmute_inflight`
+
+One row per conversion currently between transactions. Written when `transmute` adds the monolith's bound
+and deleted when the cutover commits, so a row that outlives its session is exactly the evidence
+`maintain_all`'s sweep and [`transmute_abort`](#transmute_abort) act on. A row here means the table still
+carries a `pgpm_monolith_bound` `CHECK` and is refusing writes outside `[lo, hi)`.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `parent_table` | `regclass` | the table being converted (primary key) |
+| `nsp` / `rel` | `name` | its schema and name as of the conversion's start, so the bound can still be dropped by name after the rename |
+| `control_kind` | `text` | `time`, `id` or `uuidv7` |
+| `lo` / `hi` | `text` | the native bounds the `CHECK` is enforcing; a retry reuses these rather than recomputing |
+| `started_at` | `timestamptz` | when the conversion added the bound |
 
 ### `pgpm.archive_ledger`
 

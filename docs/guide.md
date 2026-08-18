@@ -64,10 +64,10 @@ covers is **refused**, not parked:
 ERROR:  no partition of relation "events" found for row
 ```
 
-That is deliberate. A `DEFAULT` would absorb such a write silently and need a background process to file
-it away later, which is precisely the machinery, and the referential-integrity window, that pgpm removed.
-The trade is that `config.obtain x partition_step` is both your slack if maintenance stalls and a ceiling
-on how far ahead you may write, so size it for your grid: 30 steps is a month on a daily one.
+That is deliberate: a refused write is loud and immediate, where a `DEFAULT` would absorb it silently and
+leave you a backlog to discover later. The trade is that `config.obtain x partition_step` is both your
+slack if maintenance stalls and a ceiling on how far ahead you may write, so size it for your grid:
+30 steps is a month on a daily one.
 
 **The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives these
 per table:
@@ -125,7 +125,7 @@ psql "$DATABASE_URL" -f pgpm_core/uninstall.sql
 
 Conversion moves no data. It renames your table to a coarse-child name, creates a partitioned parent
 under the original name, attaches the old table as the bounded **monolith** child, and lays down the
-forward grid above it. It does read the original once, and the table is locked while it does; see
+forward grid above it. It does read the original once, but not under a lock that blocks you; see
 [The cutover moves no rows](#the-cutover-moves-no-rows).
 
 ### Pick the kind
@@ -158,21 +158,36 @@ read-only scan of the original, which certifies the monolith's bound so the late
 Everything after that is a metadata flip: rename, create the parent, attach the monolith, build the
 forward grid. No index rebuild, no row rewrite.
 
-**The table is locked for the duration of that scan.** `transmute` runs in one transaction, and the
-`ALTER TABLE` that adds the bound takes an `ACCESS EXCLUSIVE` lock which is therefore held until the
-conversion commits, scan included. `ACCESS EXCLUSIVE` conflicts with everything, so reads and writes both
-wait. Size a maintenance window from the row count:
+**The scan does not block you.** `transmute` runs in three transactions, and the boundary between the
+first two is the whole point. `ADD CONSTRAINT ... NOT VALID` takes `ACCESS EXCLUSIVE`, but it is catalog
+work and instant; that transaction commits and drops the lock; only then does `VALIDATE CONSTRAINT` run
+the `O(rows)` scan, under `SHARE UPDATE EXCLUSIVE`, which blocks neither readers nor writers. The cutover
+that follows is metadata-only. No lock the conversion takes scales with your row count, so there is no
+maintenance window to size.
 
-| rows | table locked for |
-|---|---|
-| 1M | ~30 ms |
-| 5M | ~170 ms |
-| 10M | ~490 ms |
+The commit between them is load-bearing rather than cosmetic. Locks are held to transaction end, so two
+statements in one transaction means the `ADD`'s `ACCESS EXCLUSIVE` is still held while `VALIDATE` scans,
+and `VALIDATE`'s lighter lock buys nothing.
 
-Measured on PostgreSQL 17 with the table cached in memory. A table larger than RAM makes the scan
-I/O-bound, so treat these as a floor rather than an estimate, and measure on a restored copy of your own
-data before converting a large table.
-(Contrast a model that pays no scan up front but then rewrites every historical row.)
+**What the conversion does cost is a write ceiling, for its whole duration.** The bound `CHECK` is live
+from the moment the first transaction commits until the cutover completes, so across that entire span, and
+not merely for one locked statement, a write outside `[lo, hi)` is rejected:
+
+```text
+ERROR:  new row for relation "events" violates check constraint "pgpm_monolith_bound"
+```
+
+`hi` is the grid boundary just above the frontier, so ordinary writes land well inside it. The case to
+plan for is a fast writer that would cross `hi` while the scan runs: pass `p_bound_headroom => <n>` to put
+`hi` that many grid steps further out. `lo` is the grid floor of the current minimum, so a *backdated*
+write below it is refused for the same window.
+
+**If a conversion dies partway, the bound outlives it** and the table goes on refusing those writes.
+`pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was. You rarely
+need to: every `maintain_all` tick sweeps for abandoned conversions and undoes them, deciding "abandoned"
+from a session-level advisory lock `transmute` holds from start to finish rather than from a timeout, so a
+long scan is never mistaken for a dead one. Re-running `transmute` resumes from the recorded bound rather
+than recomputing one.
 
 The one hard requirement is that the **control column be `NOT NULL`** (a partition key cannot be null, and
 `transmute` never scans to enforce it). A key is *not* required: if the table has a **primary key** or a
@@ -226,10 +241,9 @@ cron, drive it by hand: `obtain` the forward partitions, then `regrain` the mono
 (see [Regrain the history](#regrain-the-history)).
 
 Regrain's pace is set by `config.regrain_batch`, the rows copied per microbatch, with an optional
-`regrain_max_blocks` cap so wide rows cannot make one batch huge. It is a fixed rate: pgpm used to run a
-closed-loop controller that rode the budget against WAL and ambient I/O pressure, but that existed to pace
-the *drain*, and the drain is gone. Regrain copies old, frozen data at whatever rate you choose, and the
-work is bounded by the coarse child rather than by the write rate.
+`regrain_max_blocks` cap so wide rows cannot make one batch huge. It is a fixed rate you set, not one that
+reacts to load: regrain copies old, frozen data, so the work is bounded by the size of the coarse child
+rather than by your write rate, and you can size a batch from what your disk will absorb.
 
 ## Regrain the history
 
@@ -372,9 +386,9 @@ still live. If you also want the *drop* itself to wait until archiving has actua
 select pgpm.set_archive_fn('public.events', 'myschema.my_archiver(regclass,name,text,text)'::regprocedure);
 ```
 
-`null` (the default) means no archiving -- a write-blocked partition is immediately drop-ready, the
-same behavior as before this contract existed. With `archive_fn` set, `pgpm.maintain()` archives each
-eligible child in bounded chunks on its own schedule (sized by `config.archive_byte_budget`), and
+`null` (the default) means no archiving: a write-blocked partition is immediately drop-ready. With
+`archive_fn` set, `pgpm.maintain()` archives each eligible child in bounded chunks on its own schedule
+(sized by `config.archive_byte_budget`), and
 `pgpm.retire()` will not drop a child until `pgpm._archive_fully_covered` confirms every chunk has
 landed -- a child mid-archive is a normal, retryable state, not a failure, and nothing here fails
 loudly the way a hook used to; `retire()` just returns `false` and tries again next tick. See [the
@@ -431,6 +445,7 @@ parent -- so its multi-tick copy needs no such handling; only its atomic swap to
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
 - **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the referencing
   table is otherwise untouched), then re-add it against the new parent on a later maintenance tick.
+  (`'drop'` is accepted too, but takes the same path: the keys are recorded and restored just the same.)
 
 With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK against the new parent; `maintain`
 calls it automatically, so on the scheduled path you do nothing. It is a no-op while an in-flight,
@@ -540,14 +555,15 @@ Two facts about Postgres drive the design:
 
 pgpm sidesteps #2 with a scan-skip attach: certify the bound with a validated `CHECK` *before* the attach,
 so the attach itself is metadata-only. Certifying it is `VALIDATE CONSTRAINT`, whose own
-`SHARE UPDATE EXCLUSIVE` lock blocks nobody. Today it does not run alone, though: it shares a transaction
-with the `ALTER TABLE` that adds the constraint, so that statement's `ACCESS EXCLUSIVE` is still held while
-it scans, and the table is locked throughout. See
-[The cutover moves no rows](#the-cutover-moves-no-rows) for what to size.
+`SHARE UPDATE EXCLUSIVE` lock blocks nobody, and it gets a transaction to itself so no earlier statement's
+lock is still held while it scans. See
+[The cutover moves no rows](#the-cutover-moves-no-rows) for what that does and does not cost.
 
 ```sql
 ADD CONSTRAINT b CHECK (control >= lo AND control < hi) NOT VALID  -- catalog only, instant, ACCESS EXCLUSIVE
-VALIDATE CONSTRAINT b                                              -- the scan, wants only SHARE UPDATE EXCLUSIVE
+COMMIT                                                             -- drops that ACCESS EXCLUSIVE
+VALIDATE CONSTRAINT b                                              -- the scan, under SHARE UPDATE EXCLUSIVE
+COMMIT
 ATTACH PARTITION ...                                               -- scan skipped, metadata-only
 ```
 
@@ -560,18 +576,17 @@ lives inside it, and regrain only touches frozen children.
 
 ## Read consistency
 
-There is no read gap. A `SELECT` against the parent always sees every row.
+There is no read gap. A `SELECT` against the parent always sees every row, at every moment, on the paced
+path as much as the synchronous one.
 
-This used to be the one correctness caveat worth understanding. The paced **drain** evacuated a stray by
-`DELETE`ing it from the `DEFAULT` and re-`INSERT`ing it into a not-yet-attached child across separate
-transactions, and since a query against the parent only scans attached partitions, a read issued mid-move
-undercounted the range being moved. A helper existed to paper over exactly that, by unioning the in-flight
-children back into a read of the parent.
+A query against a partitioned parent scans only its **attached** partitions, so the way to open a gap
+would be to take a row out of an attached partition and hold it somewhere not yet attached. Nothing in
+pgpm does that. `regrain` **copies** and never deletes from its source: the coarse child stays whole and
+attached until a single transaction detaches it, attaches the fine children and drops it, so every row is
+visible through the parent the entire time and no reader ever sees a partial state.
 
-Both are gone. The drain and the `DEFAULT` were removed, and **regrain never opened the gap**: it *copies*
-and never deletes from the source, so the coarse child stays whole and attached until one atomic swap and
-every row is visible through the parent the entire time. Its in-flight copies are duplicates of rows still
-in the monolith, so the parent's count is already complete.
+Its in-flight copies (`status().inflight_partitions`) are therefore duplicates of rows still in the
+monolith, not rows in transit. They cost transient disk; they never cost you a row.
 
 ## WAL and checkpoint sizing
 
@@ -599,10 +614,10 @@ A meaningful and growing `num_requested` means `max_wal_size` is too small for y
   supabase --experimental --project-ref <ref> postgres-config update --config max_wal_size=16GB
   ```
 
-- **Or let pgpm throttle the producer.** Adaptive feathering paces the work's own WAL down when it
-  outruns what the checkpointer can sustain, and auto-regrain spreads the regrain across ticks so the WAL
-  burst becomes a trickle. The two compose: raise `max_wal_size` when you can, keep adaptive as a safety
-  net.
+- **Or spread the producer out.** Auto-regrain advances one budget-sized microbatch per maintenance tick,
+  so the burst becomes a trickle; `config.regrain_batch` (with `regrain_max_blocks` for wide rows) sets how
+  big each one is. The two remedies compose: raise `max_wal_size` where you can, and regrain in smaller
+  batches where you cannot.
 
 ## Operations and troubleshooting
 
@@ -628,9 +643,10 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window, and a straggler still lands in whichever partition already covers its
   key. Arbitrary backdated keys break it: with no `DEFAULT`, a key outside the grid is refused outright.
-- **The cutover locks the table for one read-only scan:** no row movement, no PK rewrite, no index
-  rebuild, but reads and writes both wait while the original is scanned once. The wait scales with row
-  count, so size a window from it (see [The cutover moves no rows](#the-cutover-moves-no-rows)).
+- **The cutover moves no rows and blocks nobody:** no row movement, no PK rewrite, no index rebuild, and
+  the one `O(rows)` scan runs in its own transaction under `SHARE UPDATE EXCLUSIVE`. What it costs instead
+  is a write ceiling: the bound `CHECK` refuses writes outside `[lo, hi)` for the whole conversion (see
+  [The cutover moves no rows](#the-cutover-moves-no-rows)).
 - **The history starts coarse.** It is one monolith partition until regrained; until then, pruning and
   fine-grained retention are suspended over its span. A coarse monolith is a valid permanent state.
 - **Regrain needs transient disk** (about 2x the span being regrained) and copies the rows; both the
@@ -643,7 +659,7 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   reused in place, and a keyless table is partitioned keyless. The control column must be `NOT NULL`.
 - **Incoming foreign keys** are refused by default, or preserved (dropped for the conversion, re-added
   against the new parent) with `p_incoming_fks => 'preserve'`.
-- **Mid-move reads undercount on the paced paths; writes to moved rows no-op.** Inherent to an online
-  move; see [Read consistency](#read-consistency). The synchronous paths avoid
-  it entirely.
+- **There is no read gap.** A `SELECT` against the parent always sees every row, on the paced path as much
+  as the synchronous one, because regrain copies and never moves a row out of an attached partition; see
+  [Read consistency](#read-consistency).
 - Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by default).

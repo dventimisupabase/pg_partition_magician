@@ -232,10 +232,10 @@ succeed unless you actually want that data kept.
 3. For a one-off bulk load with known-high ids, extend before loading rather than raising the standing
    lookahead.
 
-**Why there is no `DEFAULT` to catch these.** It used to exist, and a background **drain** evacuated it.
-That machine was removed deliberately: it was the only part of pgpm that opened a referential-integrity
-window, and it carried its own class of defects. A refused write is loud and immediate; a silent backlog
-in a `DEFAULT` was neither.
+**Why there is no `DEFAULT` to catch these.** A refused write is loud and immediate: it names the table
+and the row, and it tells you the moment the grid stops advancing. A `DEFAULT` would accept the same write
+silently and leave you a backlog to find later, plus a window in which those rows sit outside the
+partition that should hold them.
 
 ## Disk is filling during a regrain
 
@@ -323,8 +323,8 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
    (`fail_retain_drop`, `fail_retain_crossing` or `fail_retain_detach` rows, `method`).
 
-2. If anything has a foreign key **pointing at** this table, check the two failures specific to that
-   (issue #268). A referenced partition cannot be dropped outright; it is detached first, by a cron job.
+2. If anything has a foreign key **pointing at** this table, check the two failures specific to that. A
+   referenced partition cannot be dropped outright; it is detached first, by a cron job.
 
    ```sql
    select at, action, lo, hi, method from pgpm.log
@@ -334,7 +334,7 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    ```
 
    - `fail_retain_detach` -- there is no `pgpm_detach` cron job to dispatch to. Run `pgpm.schedule()`
-     once; installs scheduled before this existed have only the `pgpm` job.
+     once: it creates both jobs, and re-running it on an install that already has one is safe.
    - `fail_retain_crossing` -- a live row genuinely references an aged one, and that foreign key's own
      `ON DELETE` (`NO ACTION` or `RESTRICT`) refuses to let it go. `method` carries PostgreSQL's own
      error naming the constraint. This is the constraint doing its job, not a pgpm fault: remove the

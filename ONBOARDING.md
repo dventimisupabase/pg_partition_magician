@@ -3,7 +3,7 @@
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
 It transmutes an existing (possibly huge, live) table into a native partitioned table
-*online*, then manages the lifecycle (obtain, drain, retain, regrain) across three
+*online*, then manages the lifecycle (obtain, retain, regrain) across three
 partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
 
 For *what it does and how to use it*, read [`README.md`](./README.md) and the
@@ -137,7 +137,7 @@ rollback;
   `pgpm.check_uuidv7(table, col)` runs the check on demand.
 - **Incoming FKs**: `transmute` refuses by default; `p_incoming_fks => 'preserve'` records +
   drops them for the conversion, and `restore_incoming_fks` re-adds them against the new
-  parent once the drain is idle.
+  parent (`maintain` calls it every tick; it no-ops while a regrain has an unattached child).
 
 ## Releasing and publishing
 

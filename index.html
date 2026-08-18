@@ -269,7 +269,7 @@
     .dg-lock .bar.block { color: var(--fg); }
     .dg-lock .lockrow { display: flex; justify-content: flex-end; opacity: calc((var(--p) - 0.3) * 2); }
 
-    /* 6 · drain */
+    /* 6 · regrain (class names below predate the rename; the figure is regrain) */
     .dg-drain { flex-direction: row; align-items: stretch; gap: 22px; }
     .dg-drain .drainbox { flex: none; width: 132px; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden; }
     .dg-drain .drainbox .tag { position: absolute; top: 11px; left: 14px; }
@@ -459,7 +459,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">2</span> The switch &middot; <code>transmute</code></span>
             <h3>The table you query is swapped for an identical one, mid-show.</h3>
-            <p><code>transmute()</code> renames your live table aside and builds a partitioned parent under the <em>same name</em>, attaching the old table intact as one bounded <em>monolith</em> child that holds the whole history, with a fresh empty <code>DEFAULT</code> as the safety net. No rows move: same name, same data, a catalog-only swap the app never sees. The one requirement: the partition key must already be in the primary key (move 3); if not, <code>transmute</code> refuses and tells you how, rather than mangling it. And it reverses cleanly, while the monolith still holds the whole table, <code>untransmute</code> puts it back exactly as it was.</p>
+            <p><code>transmute()</code> renames your live table aside and builds a partitioned parent under the <em>same name</em>, attaching the old table intact as one bounded <em>monolith</em> child that holds the whole history, then laying a grid of real, empty partitions ahead of it. No rows move: same name, same data, a catalog-only swap the app never sees. The one hard requirement is that the partition key be <code>NOT NULL</code>. A key is optional: an existing primary key or unique constraint that contains the partition key is reused in place (move 3), and a table with neither is partitioned keyless. What <code>transmute</code> will not do is rewrite a key that <em>excludes</em> the partition key: it refuses and tells you how, rather than mangling it. And it reverses cleanly, while the monolith still holds the whole table, <code>untransmute</code> puts it back exactly as it was.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-switch">
@@ -477,7 +477,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">3</span> The index is already in hand</span>
             <h3>There's no hard part to hide.</h3>
-            <p>A partitioned table's primary key must contain the partition key, and the modern time-ordered key (Snowflake <code>bigint</code>, UUIDv7, ULID) already <em>is</em> the primary key. So nothing widens and no index rebuilds: <code>transmute</code> reuses the key in place, pure metadata, online at any size. The alternative pgpm refuses, rebuilding the key under <code>ACCESS EXCLUSIVE</code>, runs <code>O(rows)</code>: about 28&nbsp;minutes at 300M rows. Predictable beats clever.</p>
+            <p>Postgres requires a partitioned table's key to <em>contain</em> the partition key, and the modern time-ordered key (Snowflake <code>bigint</code>, UUIDv7, ULID) already <em>is</em> that key. So nothing widens and no index rebuilds: <code>transmute</code> reuses it in place, pure metadata, online at any size. Containing is enough, not leading, so a composite <code>(tenant_id, id)</code> qualifies too. The one shape pgpm refuses is a key that <em>excludes</em> the partition key, because widening that means rebuilding it under <code>ACCESS EXCLUSIVE</code>, <code>O(rows)</code>: about 28&nbsp;minutes at 300M rows. Predictable beats clever.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-prepare">
@@ -493,7 +493,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">4</span> The one rule of the act</span>
             <h3>Never touch the interval that's live.</h3>
-            <p>Everything keys off the <b style="color:var(--brass)">frontier</b>: the line between settled past and live present. Behind it sits the <b style="color:var(--green)">closed</b> history, in one coarse <b style="color:var(--brass)">monolith</b>, safe to regrain into fine partitions whenever you like; the one <em>straddling</em> it is <b style="color:var(--brass)">open</b>, still taking writes, and pgpm's lone rule is to leave it be. Ahead of it, partitions are <b style="color:var(--green)">obtained</b> in advance, so new rows always land in a real partition (only a stray falls to the empty <code>DEFAULT</code> net). Nothing is reorganized until it has closed.</p>
+            <p>Everything keys off the <b style="color:var(--brass)">frontier</b>: the line between settled past and live present. Behind it sits the <b style="color:var(--green)">closed</b> history, in one coarse <b style="color:var(--brass)">monolith</b>, safe to regrain into fine partitions whenever you like; the one <em>straddling</em> it is <b style="color:var(--brass)">open</b>, still taking writes, and pgpm's lone rule is to leave it be. Ahead of it, partitions are <b style="color:var(--green)">obtained</b> in advance, so new rows always land in a real partition. There is no <code>DEFAULT</code> to catch a stray, and that is the deliberate trade: a write past the grid is refused outright rather than parked somewhere to be filed away later by a background process. Nothing is reorganized until it has closed.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-frontier">
@@ -538,7 +538,7 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">6</span> Reshaping the history &middot; <code>regrain</code></span>
             <h3>The coarse history splits into fine partitions, by copying.</h3>
-            <p>The history starts as one coarse monolith. <code>regrain</code> splits it by <em>copying</em>: it reads a range into a fresh, born-validated partition, swaps it in, and drops the source, online and a chunk at a time. Because it copies instead of deleting, there are no dead tuples and no vacuum. It is optional, a coarse monolith is a correct, permanent state, and regrain is what restores partition pruning and fine-grained retention. (The leading-edge <code>DEFAULT</code> stays empty; the <code>drain</code> clears the rare stray that lands there.) Because the monolith stays whole and attached until one atomic swap, regrain never undercounts the parent the way the <code>drain</code> can. The one honest cost is transient disk, about 2x the span while the copies and the source briefly coexist.</p>
+            <p>The history starts as one coarse monolith. <code>regrain</code> splits it by <em>copying</em>: it reads a range into a fresh, born-validated partition, swaps it in, and drops the source, online and a chunk at a time. Because it copies instead of deleting, there are no dead tuples and no vacuum. It is optional, a coarse monolith is a correct, permanent state, and regrain is what restores partition pruning and fine-grained retention. Because the monolith stays whole and attached until that one atomic swap, a read of the parent is never short: every row stays visible the entire time. The one honest cost is transient disk, about 2x the span while the copies and the source briefly coexist.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-drain">
@@ -557,12 +557,12 @@
           <div class="beat-copy">
             <span class="move"><span class="move-n">7</span> The act runs itself &middot; <code>maintain_all</code></span>
             <h3>One <code>pg_cron</code> tick repeats every move, and shows its hands.</h3>
-            <p>One scheduled call ties it together: <b style="color:var(--green)">obtain</b> stocks the future, the <b style="color:var(--green)">drain</b> keeps the <code>DEFAULT</code> empty, <b style="color:var(--green)">retain</b> drops cold partitions, and, once you enable it, <b style="color:var(--green)">regrain</b> splits the history a chunk per tick, looping on <code>pg_cron</code> with every step written to <code>pgpm.log</code>, the magician keeping his hands open. It starts <em>paused</em>: <code>resume()</code> to go live, <code>pause()</code> to stop.</p>
+            <p>One scheduled call ties it together: <b style="color:var(--green)">obtain</b> stocks the future, <b style="color:var(--green)">retain</b> drops partitions past your policy (archiving each one first, if you set a strategy), and, once you enable it, <b style="color:var(--green)">regrain</b> splits the history a chunk per tick, looping on <code>pg_cron</code> with every step written to <code>pgpm.log</code>, the magician keeping his hands open. It starts <em>paused</em>: <code>resume()</code> to go live, <code>pause()</code> to stop.</p>
           </div>
           <figure class="fig" aria-hidden="true">
             <div class="dg dg-loop">
               <div class="ring"><span class="tickdot"></span><span class="ring-lbl">pg_cron &middot; maintain_all()</span></div>
-              <div class="jobs"><b class="job">obtain</b><b class="job">drain</b><b class="job">retain</b></div>
+              <div class="jobs"><b class="job">obtain</b><b class="job">retain</b><b class="job">regrain</b></div>
               <div class="ledger"><span class="ledger-lbl">pgpm.log</span><i></i><i></i><i></i></div>
             </div>
           </figure>
@@ -584,7 +584,7 @@
           <div class="glyph">♦</div>
           <h3>time</h3>
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamptz</code>, <code style="font-family:var(--font-mono);color:var(--fg-dim)">timestamp</code>, or <code style="font-family:var(--font-mono);color:var(--fg-dim)">date</code> column. Monthly, daily, hourly: any interval.</p>
-          <pre><code><span class="k">select</span> pgpm.transmute(
+          <pre><code><span class="k">call</span> pgpm.transmute(
   'public.events',
   'created_at', <span class="k">interval</span> '1 month');</code></pre>
         </div>
@@ -592,7 +592,7 @@
           <div class="glyph">♣</div>
           <h3>id</h3>
           <p>A <code style="font-family:var(--font-mono);color:var(--fg-dim)">bigint</code> or <code style="font-family:var(--font-mono);color:var(--fg-dim)">numeric</code> sequence, including Snowflake-style ids, where time lives in the high bits.</p>
-          <pre><code><span class="k">select</span> pgpm.transmute(
+          <pre><code><span class="k">call</span> pgpm.transmute(
   'public.events',
   'id', 10000000);</code></pre>
         </div>
@@ -600,7 +600,7 @@
           <div class="glyph">♠</div>
           <h3>uuidv7</h3>
           <p>Time-ordered uuids, and ULIDs stored as <code style="font-family:var(--font-mono);color:var(--fg-dim)">uuid</code>. The grid is time; the bounds are encoded back into uuids.</p>
-          <pre><code><span class="k">select</span> pgpm.transmute(
+          <pre><code><span class="k">call</span> pgpm.transmute(
   'public.events',
   'id', <span class="k">interval</span> '1 day');</code></pre>
         </div>
@@ -622,19 +622,19 @@
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M7 10l2 2 4-4"/><circle cx="10" cy="10" r="7.5"/></svg></div>
-          <div><h3>Foreign keys, preserved</h3><p>pgpm never rewrites the primary key, so the unique key an incoming FK references survives the conversion. With <code>p_incoming_fks =&gt; 'preserve'</code>, each FK is dropped for any row movement and re-added against the new parent once the move is idle, no denormalization.</p></div>
+          <div><h3>Foreign keys, both ways</h3><p>An <em>outgoing</em> key is carried onto the new parent for you, so it keeps enforcing across every partition and not just the monolith. An <em>incoming</em> key survives because pgpm never rewrites the primary key it references: with <code>p_incoming_fks =&gt; 'preserve'</code> it is dropped for the cutover and re-added against the new parent. No composite key, no denormalization.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-2.6 6-6 7-3.4-1-6-3-6-7V6z"/></svg></div>
-          <div><h3>A safety net, always</h3><p>The <code>DEFAULT</code> partition is always present, and empty in steady state. A row with no real partition lands there, never lost, and a check function flags it.</p></div>
+          <div><h3>No net, on purpose</h3><p>There is no <code>DEFAULT</code> partition. A write no partition covers is refused, loudly, instead of being parked somewhere for a background process to file away later. That removes the machinery, and the referential-integrity window that came with it. The price is a ceiling: <code>obtain &times; step</code> is how far ahead you may write.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13 13l4 4"/></svg></div>
-          <div><h3>One gap, in the open</h3><p>While the paced <code>drain</code> runs, its rows briefly live in a not-yet-attached child, so a mid-move read of the parent undercounts it and a write to a moved row no-ops. <code>regrain</code> never opens this gap (it copies, leaving every row in the monolith until an atomic swap). <code>pgpm.snapshot</code> reads the complete set, <code>drain_all()</code> is gap-free too, and nothing is lost.</p></div>
+          <div><h3>The one window we can't close</h3><p>Preserving an <em>incoming</em> key means dropping it for the cutover, so referential integrity is off on the referencing table until it is re-added. You can close that yourself the moment <code>transmute</code> returns; either way <code>status()</code> reports it rather than hiding it. Nothing else moves rows, so nothing else opens a gap.</p></div>
         </div>
         <div class="truth reveal">
           <div class="mk"><svg viewBox="0 0 20 20"><path d="M4 10l3 3 9-9"/><path d="M4 16h12"/></svg></div>
-          <div><h3>Proven across versions</h3><p>289 tests on PostgreSQL 15-18, all three install channels, every partition kind.</p></div>
+          <div><h3>Guards that must fail</h3><p>621 assertions on PostgreSQL 15-18, all three install channels, every partition kind. And five guards, four on locks and one on a data-coupled scan, that CI re-runs against a deliberately reintroduced defect: a guard that still passes then is not testing anything, so it fails the build.</p></div>
         </div>
       </div>
     </div>
