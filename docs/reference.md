@@ -781,7 +781,7 @@ parameter would be a foot-gun. With no argument the function can only ever match
 
 **It drops nothing.** A *detached* partition survives its parent's `DROP` still holding its rows, and
 "detached, not yet dropped" is exactly the state a referenced partition's retirement sits in between the
-cron detach and the completing drop (issue #268). Any such table is reported by name in `orphan_tables` and
+cron detach and the completing drop. Any such table is reported by name in `orphan_tables` and
 left in place -- destroying data as a side effect of a cleanup command would be the worst possible reading
 of "forget". Deal with those by hand. `pgpm.log` is also left intact, as the append-only audit trail it is;
 the clearance itself is logged `forget_missing`, naming any orphans in `method`.
@@ -852,8 +852,7 @@ One row per managed table. Beyond the static config it surfaces:
   entry. Everything else in the row still reports (it comes from pgpm's own catalog), but
   `retain_backlog` is null, because the retention horizon is derived from `max(control)` read from the
   relation and there is no honest answer without it. Clear the state with
-  [`forget_missing`](#forget_missing). Before issue #296 such a row made `status()` **raise**, so a single
-  dropped table returned no rows at all, for every managed table.
+  [`forget_missing`](#forget_missing).
 - `retain_detaching` -- partitions whose concurrent detach has been dispatched and not yet completed
   (issue #268). Non-zero for a tick or two is normal; persistently non-zero alongside climbing
   `retain_drop_failures` means the dispatch has nowhere to go -- run `pgpm.schedule()`.
