@@ -162,7 +162,6 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
-- **[REDESIGN.md](REDESIGN.md)**: the bounded-monolith design rationale.
 
 ## Tests
 

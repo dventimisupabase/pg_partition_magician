@@ -21,6 +21,14 @@ jobs:
             **/*.md
             !postgresql_online_partition_migration_summary.md
 
+  living-docs:
+    name: Living docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Living documentation must be true, and must not cite frozen artifacts
+        run: bash scripts/check_living_docs.sh
+
   shellcheck:
     name: Shell scripts
     runs-on: ubuntu-latest

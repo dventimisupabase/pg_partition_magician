@@ -1,5 +1,10 @@
 # Test plan: `from_hypertable`
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](docs/guide.md) and the
+> [reference](docs/reference.md).
+
 Status: Draft / proposed
 Companion to: `from_hypertable` design doc
 

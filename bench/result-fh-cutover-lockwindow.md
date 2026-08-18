@@ -1,5 +1,10 @@
 # Banked result: from_hypertable cutover lock window, drained vs undrained (R2 + R3, #170/#176)
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
+
 The #173 cutover-lock-window bench arm run at scale on Supabase **green**, to see whether the online
 pre-drain (#170 tracking delta, #176 append-only tail) shortens the cutover's `ACCESS EXCLUSIVE` window.
 Each rung is four arms = {tracking, append-only} x {drained, undrained}, each on its **own fresh 2XL PG15

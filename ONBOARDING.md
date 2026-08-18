@@ -60,22 +60,21 @@ docker compose --profile pg15 down -v
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
-| `docs/runbook.md` | Operational runbook: symptom -> step-by-step procedures (e.g. RI violations after a preserve drain) |
-| `REDESIGN.md` | The operating model and design rationale (the bounded-child transmute) |
-| `postgresql_online_partition_migration_summary.md` | The original design doc the project grew from |
+| `docs/runbook.md` | Operational runbook: symptom -> step-by-step procedures (e.g. RI violations after a preserve conversion) |
 
 ## The mental model (in one breath)
 
 You can't convert a table to partitioned in place, so `transmute()` renames it aside,
 makes a partitioned parent under the original name, and attaches the old table **intact**
-as one bounded **monolith** child (zero data movement), under a fresh empty **`DEFAULT`**
-net. New writes route to premade partitions; the `DEFAULT` stays empty (the
-**drain** evacuates any stray that lands there). The historical bulk stays in the monolith
-until you **regrain** it into proper partitions on demand, by copying (so no dead tuples, no
-vacuum). The unifying idea is the **frontier** (`now()` for time, `max(control)` for
-id/uuidv7): a child is *frozen* and refinable once its whole range is below it. The cutover
-stays online via a scan-skip attach (`NOT VALID` CHECK → `VALIDATE` under a gentle lock →
-attach). See REDESIGN.md for the full story.
+as one bounded **monolith** child (zero data movement). Alongside it, transmute lays down a
+**forward grid**: real, bounded partitions running ahead of the write frontier, which
+`obtain` keeps extending. There is no `DEFAULT`: a write no partition covers is **refused**
+rather than parked, so `obtain x partition_step` is both the slack if maintenance stalls and
+a ceiling on how far ahead you may write. The historical bulk stays in the monolith until you
+**regrain** it into proper partitions on demand, by copying (so no dead tuples, no vacuum).
+The unifying idea is the **frontier** (`now()` for time, `max(control)` for id/uuidv7): a
+child is *frozen* and refinable once its whole range is below it. The cutover stays online
+via a scan-skip attach (`NOT VALID` CHECK → `VALIDATE` under a gentle lock → attach).
 
 ## Developing here
 
@@ -171,9 +170,6 @@ with the bundle + minified dbdev package + a source tarball (release notes pulle
 
 - [`docs/guide.md`](./docs/guide.md) and [`docs/reference.md`](./docs/reference.md): the user-facing
   guide and the full function/catalog reference.
-- [`REDESIGN.md`](./REDESIGN.md): the operating model and design rationale (the bounded-child transmute,
-  the regrain machinery, and the foundational supply/demand principles).
 - `pgpm_core/install.sql`: heavily commented; the adapter layer
   (`_grid_floor`/`_grid_next`/`_encode`/`_decode`/`_frontier_native`/`_part_name`) is
   where new partition kinds plug in.
-- `postgresql_online_partition_migration_summary.md`: the origin design doc.

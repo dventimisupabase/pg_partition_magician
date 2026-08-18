@@ -1,5 +1,10 @@
 # REDESIGN: bounded-child transmute with on-demand regraining
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](docs/guide.md) and the
+> [reference](docs/reference.md).
+>
 > The canonical design note for pg_partition_magician's **bounded-child transmute**: the original table
 > becomes a bounded **coarse child** (the "monolith") instead of the `DEFAULT` partition, no rows move at
 > cutover, and the historical bulk is split into proper partitions ("regrained") on demand. This note

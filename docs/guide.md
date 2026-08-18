@@ -1,9 +1,8 @@
 # pg_partition_magician: user guide
 
 A task-oriented guide to converting a live PostgreSQL table to native `RANGE` partitioning and running
-it. For the full function and catalog reference see [reference.md](reference.md); for the design
-rationale see [REDESIGN.md](../REDESIGN.md); for a visual overview see the
-[explainer](https://dventimisupabase.github.io/pg_partition_magician/).
+it. For the full function and catalog reference see [reference.md](reference.md); for a visual overview
+see the [explainer](https://dventimisupabase.github.io/pg_partition_magician/).
 
 ## Contents
 
@@ -556,8 +555,8 @@ There is no read gap. A `SELECT` against the parent always sees every row.
 This used to be the one correctness caveat worth understanding. The paced **drain** evacuated a stray by
 `DELETE`ing it from the `DEFAULT` and re-`INSERT`ing it into a not-yet-attached child across separate
 transactions, and since a query against the parent only scans attached partitions, a read issued mid-move
-undercounted the range being moved. `pgpm.snapshot()` existed to paper over exactly that, by unioning the
-in-flight children back into a read of the parent.
+undercounted the range being moved. A helper existed to paper over exactly that, by unioning the in-flight
+children back into a read of the parent.
 
 Both are gone. The drain and the `DEFAULT` were removed, and **regrain never opened the gap**: it *copies*
 and never deletes from the source, so the coarse child stays whole and attached until one atomic swap and

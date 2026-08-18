@@ -167,8 +167,6 @@ cannot make progress yet.
 
    - A `maintain` summary of `regrain=active` means the monolith has **not frozen yet** (the current
      interval still lands in it); it will regrain once the frontier crosses `B`.
-   - `regrain=default_dirty` means a stray sits in the monolith's range in the `DEFAULT`; let the
-     drain clear it (see the next entry), then regrain resumes.
    - `regrain=copied:N` is healthy forward progress (one budget-sized copy microbatch); `regrain=swapped:K`
      is a completed regrain (K fine children attached). A `regrain_skip` log row is a lock-race deferral, and
      a `regrain_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
@@ -289,11 +287,11 @@ time. On an elastic volume, no special preparation is needed.
 
 ## Storage is not dropping despite a retention policy
 
-**Symptom.** `config.retain` is set, but disk is not falling as old data ages out: aged partitions linger,
-or the below-horizon tail sits in the `DEFAULT` and never goes away.
+**Symptom.** `config.retain` is set, but disk is not falling as old data ages out: aged partitions linger
+past the retention horizon.
 
-**What it means.** Retention is enforced only while maintenance runs and the drain keeps pace. Two
-mechanisms reclaim aged data, both driven by `maintain` on pg_cron:
+**What it means.** Retention is enforced only while maintenance runs. Two mechanisms reclaim aged data,
+both driven by `maintain` on pg_cron:
 
 - `retain()` drops whole materialized partitions older than the horizon (a `retain_drop` log row).
 So retention is **best-effort**: if the table is `paused`, or if `maintain_all` is not scheduled, aged
@@ -372,24 +370,23 @@ select n_partitions, retain_backlog from pgpm.status() where parent = 'public.ev
 ```
 
 **Prevent.** Keep `maintain_all` scheduled on pg_cron so aged partitions are dropped in time, and do not leave a
-managed table `paused` if you rely on retention to bound storage. A lagging or paused drain turns retention
-into best-effort.
+managed table `paused` if you rely on retention to bound storage. Retention only bounds storage while
+maintenance actually runs.
 
 ## Re-transmute fails with an orphan-table error
 
 **Symptom.** `transmute` refuses up front with an error like:
 
 > pg_partition_magician: public.events_p2026_03 already exists as a standalone table matching this
-> parent's partition naming -- most likely an orphan left by an interrupted drain. Drop it
+> parent's partition naming -- most likely an orphan left by an interrupted regrain. Drop it
 > (drop table public.events_p2026_03) and retry transmute.
 
-**What it means.** The drain (and regrain) builds each child as a **standalone** table and only `ATTACH`es
-it when the interval finishes. A standalone child has no dependency on the parent, so a
-`DROP TABLE <parent> CASCADE` does **not** remove an un-attached child -- it survives the cascade. If the
-parent is then recreated and re-transmuted, the next drain would reuse that orphan by name and collide on
-its stale keys. So `transmute` refuses when it finds a standalone table matching the parent's
-child-partition naming (`<rel>_p<digits>`), rather than silently adopting stale data (the orphan guard;
-`tests/18`). Since #94, an in-flight child is also tracked in `pgpm.part` with `attached = false`.
+**What it means.** A regrain builds each fine child as a **standalone** table and only `ATTACH`es it at
+the swap. A standalone child has no dependency on the parent, so a `DROP TABLE <parent> CASCADE` does
+**not** remove an un-attached child -- it survives the cascade. If the parent is then recreated and
+re-transmuted, the new conversion would collide with that orphan by name. So `transmute` refuses when it
+finds a standalone table matching the parent's child-partition naming (`<rel>_p<digits>`), rather than
+silently adopting stale data. An in-flight child is also tracked in `pgpm.part` with `attached = false`.
 
 **Steps.**
 
@@ -415,9 +412,9 @@ child-partition naming (`<rel>_p<digits>`), rather than silently adopting stale 
 select * from pgpm.status() where parent = 'public.events'::regclass;   -- transmute succeeded; the table is managed
 ```
 
-**Prevent.** Do not `DROP`/recreate a parent mid-conversion. Let an interrupted drain finish (it attaches
-the child, so it becomes a real partition rather than an orphan), or `untransmute` while the conversion is
-still reversible, rather than dropping the parent out from under its in-flight children.
+**Prevent.** Do not `DROP`/recreate a parent mid-conversion. Let an interrupted regrain finish (its swap
+attaches the fine children, so they become real partitions rather than orphans), or `untransmute` while the
+conversion is still reversible, rather than dropping the parent out from under its in-flight children.
 
 ## A `from_hypertable` cutover is slow or its pre-drain will not converge
 

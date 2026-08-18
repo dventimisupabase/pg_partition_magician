@@ -1,5 +1,10 @@
 # Overnight implementation log (branch: feat/design-md-implementation)
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](docs/guide.md) and the
+> [reference](docs/reference.md).
+
 Experiment: implement the REDESIGN.md §8 directions, test-first (pgtap), then validate up the
 size ladder (local Docker for small rungs, a fresh throwaway Supabase project for the at-scale
 rungs, torn down at the end). Climb a rung only on a clean pass; stop and fix on yellow/red.
