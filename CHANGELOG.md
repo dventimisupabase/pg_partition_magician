@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- **`transmute` no longer silently stops enforcing an outgoing foreign key (issue #263).** A foreign key
+  follows the table it is defined ON, and the conversion renames the original aside to become the monolith
+  child, so the constraint landed on the monolith and never on the new parent.
+  - **The loss was partial, which is what made it dangerous.** The key kept enforcing for rows routed into
+    the monolith, and only rows in a FORWARD partition escaped. Measured before the fix: an insert
+    referencing a row that does not exist was accepted into `ev263_p0000000000000030000`, with no error and
+    nothing in `pgpm.log`. The obvious post-conversion check ("is my foreign key still there?") passed,
+    because the constraint genuinely existed; it was simply scoped to one partition.
+  - The captured definitions are now re-added at the parent inside the same transaction as the attach, so
+    no session ever observes the parent without its keys. Replayed verbatim from `pg_get_constraintdef`, so
+    composite keys, referential actions and `DEFERRABLE`-ness come along without pgpm reasoning about them.
+  - **It is metadata-only.** PostgreSQL adopts a partition's equivalent already-validated foreign key
+    rather than rescanning: measured at **0.8 ms against a 200,000-row monolith**, with the parent
+    constraint ending up `convalidated` and the monolith's demoted to a child.
+  - **A `NOT VALID` outgoing key is refused**, with the `VALIDATE CONSTRAINT` remedy. Over one of those the
+    same `ADD` scans: `seq_tup_read` +400,000 at 200k rows, and 89 ms at 2M, holding SHARE ROW EXCLUSIVE on
+    the table and on the referenced table. That is the data-coupled blocking lock the project's acceptance
+    rule forbids, and validating on the operator's behalf would either fail on rows they never checked or
+    silently promote a constraint they deliberately left unvalidated.
+  - Self-referential keys are untouched here on purpose: `confrelid = p_parent` makes them **incoming** as
+    well, so `p_incoming_fks` has already decided their fate (verified: such a table hits the incoming
+    refusal).
+  - `tests/80_transmute_outgoing_fk_test.sql`, 11 assertions, opening with a liveness witness that the
+    plain table enforced the key BEFORE the conversion. Verified to fail against pre-fix code, where the
+    forward-partition orphan is accepted and the row count comes out one too high as a result.
+
 - **Deleted the adaptive-feathering surface (issue #304).** #288 removed the drain and, with it, the AIMD
   controller that paced it against WAL rate, checkpoint pressure and ambient IO/lock waiters. The machinery
   that *measured and reported on* it survived, analysing a signal nothing emits.

@@ -2019,6 +2019,7 @@ declare
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
   v_uq_cols text[]; v_bare_uq text;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
+  v_out_names text[]; v_out_defs text[]; v_bad_out text; v_i2 int;   -- outgoing FKs (#263)
   v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_monolith name; v_monreg regclass;
@@ -2292,6 +2293,40 @@ begin
     end if;
   end if;
 
+  -- OUTGOING foreign keys (issue #263). The conversion renames the original table aside to become the
+  -- monolith child, and a foreign key follows the table it is defined ON, so the constraint lands on the
+  -- monolith and NOT on the new parent. It keeps enforcing there, which is what made the loss so easy to
+  -- miss: rows routed into the monolith are still checked, and only rows in a FORWARD partition escape.
+  -- Measured before this fix: an insert referencing a row that does not exist was accepted into
+  -- ev263_p0000000000000030000 with no error and nothing in pgpm.log. Partial enforcement is worse than
+  -- none, because the obvious post-conversion check ("is my foreign key still there?") passes.
+  --
+  -- Captured here, re-added at the parent after the attach below. Self-referential keys are excluded on
+  -- purpose: confrelid = p_parent makes them INCOMING as well, so the incoming gate above has already
+  -- decided their fate (refuse, or drop-and-restore under 'preserve').
+  select array_agg(c.conname::text order by c.conname),
+         array_agg(pg_get_constraintdef(c.oid) order by c.conname)
+    into v_out_names, v_out_defs
+    from pg_constraint c
+   where c.conrelid = p_parent and c.contype = 'f' and c.confrelid <> p_parent and c.conparentid = 0
+     and c.convalidated;
+
+  -- A NOT VALID outgoing key is refused, because re-adding it at the parent could not then be
+  -- metadata-only. Measured on PG 17.10: adopting a VALIDATED child constraint costs 0.8 ms against a
+  -- 200k-row monolith, while the same ADD over a NOT VALID one SCANS (seq_tup_read +400,000) and takes
+  -- 89 ms at 2M rows -- an O(rows) scan holding SHARE ROW EXCLUSIVE on the table AND on the referenced
+  -- table, which is the data-coupled blocking lock this project's acceptance rule forbids. Validating it
+  -- first is the operator's call, not ours: it would either fail on rows they never checked or silently
+  -- promote a constraint they deliberately left unvalidated.
+  select string_agg(conname, ', ') into v_bad_out
+    from pg_constraint
+   where conrelid = p_parent and contype = 'f' and confrelid <> p_parent and conparentid = 0
+     and not convalidated;
+  if v_bad_out is not null then
+    raise exception 'pg_partition_magician: cannot transmute % -- its outgoing foreign key(s) (%) are NOT VALID. pgpm re-adds an outgoing key on the new parent, which is metadata-only only when the key is already validated; over a NOT VALID one PostgreSQL would rescan the whole table under a lock that blocks writes on it and on the referenced table. Run ALTER TABLE % VALIDATE CONSTRAINT <name> first (or drop the constraint), then re-run transmute.',
+      p_parent, v_bad_out, p_parent::text;
+  end if;
+
   -- ===== monolith cutover (REDESIGN.md sections 1, 2, 11) =====
   -- Bounds for the bounded coarse child the original table becomes: lo = grid_floor(min(control)),
   -- hi = B = the grid boundary just above the frontier. The monolith covers all history AND the
@@ -2452,6 +2487,19 @@ begin
                  v_parent::text, v_monreg::text,
                  pgpm._encode(p_control_kind, v_lo_native), pgpm._encode(p_control_kind, v_hi_native));
   execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
+
+  -- 7a. re-add the outgoing foreign keys at the PARENT (#263), so they cover every partition instead of
+  -- only the monolith. This is metadata-only: PostgreSQL ADOPTS a partition's equivalent already-validated
+  -- key rather than rescanning, and the monolith's copy is the original, validated constraint. Measured on
+  -- PG 17.10: 0.8 ms against a 200k-row monolith, and the resulting parent constraint is convalidated with
+  -- the monolith's demoted to a child (conparentid <> 0). Empty forward partitions cost nothing either.
+  -- Same transaction as the attach, so no session ever observes the parent without its keys.
+  if v_out_names is not null then
+    for v_i2 in 1 .. array_length(v_out_names, 1) loop
+      execute format('alter table %s add constraint %I %s',
+                     v_parent::text, v_out_names[v_i2], v_out_defs[v_i2]);
+    end loop;
+  end if;
 
   -- 7b. replay everything captured at 0b onto the new parent (#277). Same transaction as the rename and
   -- the attach, so the parent is never reachable without its policies.

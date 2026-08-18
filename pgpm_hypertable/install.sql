@@ -605,7 +605,6 @@ declare
   v_pseq text; v_curnext bigint; v_i int;
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
   v_in_refs text[]; v_in_names text[]; v_in_defs text[];   -- incoming FKs captured across the swap (#264)
-  v_out_names text[]; v_out_defs text[];                   -- outgoing FKs, re-added at the parent (#264)
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
@@ -753,21 +752,12 @@ begin
     end if;
     v_ident_next := array_append(v_ident_next, v_srcnext);
   end loop;
-  -- OUTGOING foreign keys, captured from the DESTINATION for re-adding at the parent after the handoff
-  -- (issue #264). The copy phase put them on the destination and validated them there, and the destination
-  -- becomes the monolith child -- so without this they would enforce on the monolith ONLY, and a row routed
-  -- into a forward partition would escape entirely (measured: an orphan inserted past the monolith's range
-  -- was accepted). #263 will make transmute adopt them at the parent for every table; from_hypertable does
-  -- it here so this issue stands on its own, exactly as #263's own scope note says it must.
-  for k in
-    select c.conname, pg_get_constraintdef(c.oid) as def
-      from pg_constraint c
-     where c.conrelid = format('%I.%I', v_nsp, v_dest)::regclass and c.contype = 'f'
-     order by c.conname
-  loop
-    v_out_names := array_append(v_out_names, k.conname::text);
-    v_out_defs  := array_append(v_out_defs, k.def);
-  end loop;
+  -- OUTGOING foreign keys need no work here any more (#263). from_hypertable_copy already added them to
+  -- the private destination and VALIDATED them there, off the lock; the destination then becomes the
+  -- monolith child, and transmute re-adds every validated outgoing key at the new parent as part of its own
+  -- cutover. This used to do that re-add itself (#264, when transmute did not), and doing BOTH now fails
+  -- with `constraint "..." already exists`: the copy-phase validation is what makes transmute's adoption
+  -- metadata-only, so that half stays and this half goes.
 
   -- INCOMING foreign keys (issue #264). An FK pointing AT the hypertable puts a constraint on each chunk,
   -- so `drop table <source>` below was refused outright -- and only here, after the entire online copy had
@@ -833,21 +823,6 @@ begin
   -- knob is regrain's now (#288), so the handoff names it explicitly rather than relying on position.
   call pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
                       p_regrain_batch => p_drain_batch, p_anchor => p_anchor, p_paused => p_paused);
-
-  -- Re-add the outgoing FKs at the PARENT, so they cover every partition and not just the monolith
-  -- (issue #264). This is metadata-only: PostgreSQL adopts a partition's equivalent already-VALIDATED
-  -- foreign key rather than re-scanning, and the copy phase validated each one on the destination -- which
-  -- is now the monolith child. So the O(rows) work stayed off the lock, in the copy phase, and this is a
-  -- catalog operation.
-  if v_out_names is not null then
-    for v_i in 1 .. array_length(v_out_names, 1) loop
-      execute format('alter table %I.%I add constraint %I %s',
-                     v_nsp, v_rel, v_out_names[v_i], v_out_defs[v_i]);
-      insert into pgpm.log (parent_table, action, method)
-        values (format('%I.%I', v_nsp, v_rel)::regclass, 'from_hypertable_adopt_fk', v_out_names[v_i]);
-    end loop;
-    commit;
-  end if;
 
   -- Re-add the incoming FKs the swap dropped, now against the new partitioned parent (issue #264). Handed
   -- to the CORE's existing state machine rather than re-implementing the dance: recording them in
