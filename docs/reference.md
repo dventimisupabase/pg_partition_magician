@@ -760,6 +760,39 @@ install; `0` if `pg_cron` is absent or nothing was scheduled).
 
 ## Control
 
+### `forget_missing`
+
+```sql
+pgpm.forget_missing() returns table (parent_oid oid, partitions_forgotten int, orphan_tables text[])
+```
+
+Clears pgpm's bookkeeping for every managed table whose relation no longer exists, returning one row per
+table it forgot. [`untransmute`](#untransmute) is the sanctioned way to stop managing a table and deletes
+these rows itself; a plain `DROP TABLE` does not, because `config.parent_table` is a `regclass` and carries
+no dependency. The row then survives pointing at a dead oid, nothing else ever cleans it up, and every
+maintenance tick logs `skip_obtain` / `skip_write_block` / `skip_retain` against it forever. A second, quieter
+reason not to leave it: `pg_class` oids are recycled, so a stale row is a standing chance of pgpm one day
+believing it manages an unrelated table that lands on that oid.
+
+**It takes no argument on purpose.** The relation is gone, so there is no name to pass, and an oid
+parameter would be a foot-gun. With no argument the function can only ever match rows whose relation is
+*already* absent, so by construction it cannot touch a live managed table -- safe to expose, safe to re-run
+(a no-op when nothing is missing).
+
+**It drops nothing.** A *detached* partition survives its parent's `DROP` still holding its rows, and
+"detached, not yet dropped" is exactly the state a referenced partition's retirement sits in between the
+cron detach and the completing drop (issue #268). Any such table is reported by name in `orphan_tables` and
+left in place -- destroying data as a side effect of a cleanup command would be the worst possible reading
+of "forget". Deal with those by hand. `pgpm.log` is also left intact, as the append-only audit trail it is;
+the clearance itself is logged `forget_missing`, naming any orphans in `method`.
+
+`orphan_tables` is **schema-qualified**, and deliberately so: `pgpm.part` records no namespace and the
+dropped parent's oid can no longer supply one, so the match is on the child's name alone and could in
+principle name a same-named table in an unrelated schema. Read the schema before acting on the list.
+
+Find candidates with `status().parent_missing`; see the runbook's
+[a managed table was dropped without untransmute](runbook.md#a-managed-table-was-dropped-without-untransmute).
+
 ### `resume` / `pause`
 
 ```sql
@@ -792,7 +825,7 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text, fks_suspended bigint, fks_unvalidated bigint,
   history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint,
-  retain_detaching bigint
+  retain_detaching bigint, parent_missing boolean
 )
 ```
 
@@ -814,6 +847,13 @@ One row per managed table. Beyond the static config it surfaces:
   is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
   one and the FK's own `ON DELETE` refused the delete) and `fail_retain_detach` (nowhere to dispatch a
   concurrent detach to), since all three wedge retention the same way.
+- `parent_missing` -- the managed relation itself is **gone**: dropped without
+  [`untransmute`](#untransmute), leaving the `pgpm.config` row pointing at an oid with no `pg_class`
+  entry. Everything else in the row still reports (it comes from pgpm's own catalog), but
+  `retain_backlog` is null, because the retention horizon is derived from `max(control)` read from the
+  relation and there is no honest answer without it. Clear the state with
+  [`forget_missing`](#forget_missing). Before issue #296 such a row made `status()` **raise**, so a single
+  dropped table returned no rows at all, for every managed table.
 - `retain_detaching` -- partitions whose concurrent detach has been dispatched and not yet completed
   (issue #268). Non-zero for a tick or two is normal; persistently non-zero alongside climbing
   `retain_drop_failures` means the dispatch has nowhere to go -- run `pgpm.schedule()`.

@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+- **`pgpm.status()` no longer returns nothing when a managed table was dropped without `untransmute`
+  (issue #296).** `pgpm.config.parent_table` is a `regclass` and carries no dependency on the relation, so
+  a plain `DROP TABLE` on a managed parent left the config row pointing at an oid with no `pg_class` entry.
+  `regclass::text` then rendered the bare oid, which `_frontier_native` interpolated into a `FROM` clause:
+
+  ```text
+  ERROR:  syntax error at or near "17379"
+  LINE 1: select t.id::text from 17379 t order by t.id desc limit 1
+  ```
+
+  Because `status()` loops every config row and raised out of the whole set-returning function, **one**
+  dropped table meant `status()` returned nothing at all -- for every managed table, healthy ones included.
+  Dropping a managed table is off-contract, so the state is self-inflicted; what made it worth fixing is
+  that the *diagnostic* was the thing that broke. Maintenance kept running (its per-step handlers absorb
+  the error) and logged `skip_obtain` / `skip_write_block` / `skip_retain` every tick forever, each giving
+  a syntax error as the reason, while the one tool that would explain it returned zero rows.
+  - Trigger, measured and narrower than it looks: only `id`/`uuidv7` kinds reach the failing `EXECUTE`
+    (`time` returns `now()` before it), and only when `config.retain` is set (otherwise `_retain_boundary`
+    short-circuits first). Both conditions are ordinary.
+  - **`_frontier_native` now refuses legibly**, naming the cause and the remedy instead of letting
+    PostgreSQL blame a syntax error on an integer. Checked there rather than in each of its four callers,
+    so `obtain`, `_retain_boundary`, `regrain_step` and `maintain` all inherit the real message. This
+    deliberately sits *before* the `control_kind` branch, so a `time` table no longer sails past it to fail
+    less legibly further downstream.
+  - **`status()` gains `parent_missing boolean`** and reports such a row instead of dying on it.
+    Everything else in the row still comes from pgpm's own catalog, so a dead parent gets a full, useful
+    row; only `retain_backlog` is null, since the horizon is derived from `max(control)` read from the
+    relation and there is no honest answer without it (`0` would read as "nothing is eligible", a claim
+    `status()` cannot make).
+  - **New `pgpm.forget_missing()`**, returning `(parent_oid, partitions_forgotten, orphan_tables)`. It
+    takes **no argument** on purpose: the relation is gone so there is no name to pass, and with no
+    argument it can only ever match rows whose relation is already absent, so by construction it cannot
+    touch a live managed table. Not an automatic reaper -- silently deleting pgpm state would trade a loud
+    failure for a silent one.
+  - **It drops nothing.** A *detached* partition survives its parent's `DROP` still holding its rows
+    (measured on PG 17.10), and "detached, not yet dropped" is exactly the state a referenced partition's
+    retirement sits in between the cron detach and the completing drop (#268). Those tables are reported by
+    name in `orphan_tables` and left in place; destroying data as a side effect of a cleanup command would
+    be the worst possible reading of "forget". `pgpm.log` is left intact as the audit trail it is.
+  - A second, quieter reason to clear a stale row: `pg_class` oids are recycled, so leaving one is a
+    standing chance of pgpm eventually believing it manages an unrelated table that lands on that oid.
+  - Tests: `tests/79_status_survives_dropped_parent_test.sql` (26 assertions), including the orphan case
+    against a genuinely detached-then-orphaned partition, and a new runbook entry.
+
 - **Retention now reclaims a partition an incoming foreign key references (issue #268).** `p_incoming_fks
   => 'preserve'` and a `retain` policy were both supported and both documented, and the combination never
   reclaimed anything: every `retain()` failed on the oldest eligible partition and returned 0, forever,

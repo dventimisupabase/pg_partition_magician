@@ -23,6 +23,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 - [Storage is not dropping despite a retention policy](#storage-is-not-dropping-despite-a-retention-policy)
 - [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
 - [A `from_hypertable` cutover is slow or its pre-drain will not converge](#a-from_hypertable-cutover-is-slow-or-its-pre-drain-will-not-converge)
+- [A managed table was dropped without `untransmute`](#a-managed-table-was-dropped-without-untransmute)
 
 ## Referential-integrity violations after a `preserve` conversion
 
@@ -488,3 +489,69 @@ select * from pgpm.status() where parent = 'public.events'::regclass; -- registe
 then cutover) rather than relying on the one-shot, and size `p_drain_batch` to the write rate. Append-only
 migrations rarely hit this (the backlog is structurally small -- the copy reads the current chunk last, so
 it captures appends as it goes). Migrate during a quieter write window when possible.
+
+## A managed table was dropped without `untransmute`
+
+**Symptom.** Any of: `pgpm.status()` shows `parent_missing = true` for a row whose `parent` prints as a bare
+number instead of a table name; `pgpm.log` fills with `skip_obtain` / `skip_write_block` / `skip_retain`
+every tick, all giving `syntax error at or near "<number>"` as the reason; or, on a version predating
+issue 296, `pgpm.status()` raises that syntax error and returns **no rows at all** for any managed table.
+
+**What it means.** Someone ran `DROP TABLE` on a pgpm-managed parent instead of
+[`pgpm.untransmute`](reference.md#untransmute). `pgpm.config.parent_table` is a `regclass`, which carries no
+dependency on the relation, so the config row survived pointing at an oid that no longer resolves. pgpm goes
+on trying to manage a table that is not there. Nothing self-heals this: `untransmute` is the only thing that
+deletes those rows and it cannot run against a table that is gone.
+
+Maintenance for **other** tables is unaffected -- `maintain`'s per-step handlers absorb the error -- so this
+is noise and a broken diagnostic rather than an outage. Two reasons to clear it anyway: the per-tick log
+noise buries real failures, and `pg_class` oids get recycled, so a stale row is a standing chance of pgpm
+one day believing it manages an unrelated table that lands on that oid.
+
+**Steps.**
+
+1. Confirm it, and see which tables are affected:
+
+   ```sql
+   select parent, parent_missing, n_partitions, retain_backlog from pgpm.status();
+   ```
+
+   `parent_missing = true` is the flag; `parent` prints as the raw oid, which is all that is left of the
+   table's identity. `retain_backlog` is null for those rows, because the retention horizon is read from the
+   relation.
+
+2. Clear the dead state:
+
+   ```sql
+   select * from pgpm.forget_missing();
+   -- parent_oid | partitions_forgotten | orphan_tables
+   ```
+
+   No argument, on purpose: it can only ever match rows whose relation is already gone, so it cannot touch a
+   live managed table. It is a no-op if nothing is missing.
+
+3. **Check `orphan_tables`.** Non-empty means partitions survived their parent's `DROP` and **still hold
+   data**. That happens when a partition was detached first -- which is exactly the state a referenced
+   partition's retirement sits in between the cron detach and the completing drop (see
+   [retention with an incoming foreign key](guide.md#retention-with-an-incoming-foreign-key)).
+   `forget_missing` deliberately leaves these alone. Decide per table:
+
+   ```sql
+   select count(*) from public.events_p0000000000000000000;   -- from orphan_tables
+   -- keep it (rename it out of the way), or, once you are sure:
+   -- drop table public.events_p0000000000000000000;
+   ```
+
+**Verify.**
+
+```sql
+select count(*) from pgpm.status() where parent_missing;   -- expect 0
+select * from pgpm.forget_missing();                       -- expect no rows
+```
+
+The per-tick `skip_*` noise stops with the next maintenance run.
+
+**Prevent.** Use `pgpm.untransmute(parent)` to stop managing a table -- it reverses the conversion and
+deletes pgpm's rows for you. If you genuinely want the table gone, `untransmute` first, then `DROP TABLE`.
+Note `untransmute` only works while the conversion is still reversible (before any real partition beyond the
+monolith exists); past that, drop the table and run `pgpm.forget_missing()`.
