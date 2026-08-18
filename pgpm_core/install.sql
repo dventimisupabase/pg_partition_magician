@@ -357,6 +357,17 @@ create or replace function pgpm._frontier_native(p_parent regclass)
 returns text language plpgsql as $$
 declare cfg pgpm.config; v_max text;
 begin
+  -- The relation can be gone: pgpm.config.parent_table is a regclass, and DROP TABLE on a managed parent
+  -- leaves the row pointing at an oid with no pg_class entry (only untransmute clears pgpm state). A dead
+  -- regclass renders as its BARE OID, which the EXECUTE below would interpolate into a FROM clause, so
+  -- Postgres reported `syntax error at or near "17379"` -- blaming a syntax error on an integer, with
+  -- nothing to tell an operator what actually happened (#296). Checked here rather than in each of the
+  -- four callers, so obtain, _retain_boundary, regrain_step and maintain all inherit the real message.
+  -- Deliberately BEFORE the control_kind branch: a `time` table returns now() without touching the
+  -- relation, so it used to sail past this point and fail further downstream instead.
+  if not exists (select 1 from pg_class c where c.oid = p_parent) then
+    raise exception 'pg_partition_magician: managed table with oid % no longer exists (dropped without pgpm.untransmute); run pgpm.forget_missing() to clear its pgpm state', p_parent::oid;
+  end if;
   select * into cfg from pgpm.config where parent_table = p_parent;
   if cfg.control_kind = 'time' then return now()::text; end if;
   -- ORDER BY ... LIMIT 1 (not max()) so it works for uuid too; uses the index.
@@ -3351,6 +3362,76 @@ begin
 end;
 $$;
 
+-- forget_missing(): clear pgpm's state for managed tables whose relation no longer exists (issue #296).
+--
+-- `pgpm.untransmute` is the sanctioned way to stop managing a table, and it deletes the pgpm rows. A plain
+-- `DROP TABLE` does not: pgpm.config.parent_table is a regclass, which carries no dependency, so the row
+-- survives pointing at a dead oid. Nothing then cleans it up, ever, and the consequences are permanent --
+-- every maintenance tick logs skip_obtain / skip_write_block / skip_retain for it, and (before #296)
+-- status() raised rather than reporting anything at all. There is a second, quieter reason not to leave it
+-- sitting: pg_class oids are recycled, so a stale row is a standing chance of pgpm one day believing it
+-- manages an unrelated table that happens to land on that oid.
+--
+-- Takes NO ARGUMENT deliberately. The relation is gone, so there is no name to pass, and an oid parameter
+-- would be a foot-gun; with no argument the function can only ever match rows whose relation is ALREADY
+-- absent, so by construction it cannot touch a live managed table. That is why this is safe to expose and
+-- safe to re-run.
+--
+-- It DELETES pgpm's own bookkeeping and DROPS NOTHING. A detached partition survives its parent's DROP
+-- still holding its rows (measured on PG 17.10) -- and "detached, not yet dropped" is exactly the state a
+-- referenced partition's retirement sits in between the cron detach and the completing drop (#268). Those
+-- tables are REPORTED in orphan_tables, by name, and left alone: destroying data as a side effect of a
+-- cleanup command would be the worst possible reading of "forget". pgpm.log is left intact too -- it is an
+-- append-only audit trail, and the history of a table that once existed is still history.
+create or replace function pgpm.forget_missing()
+returns table (parent_oid oid, partitions_forgotten int, orphan_tables text[])
+language plpgsql as $$
+declare r record; v_orphans text[]; v_parts int;
+begin
+  for r in
+    select c.parent_table, c.parent_table::oid as oid
+      from pgpm.config c
+     where not exists (select 1 from pg_class k where k.oid = c.parent_table)
+     order by c.parent_table::oid
+  loop
+    -- Children pgpm still has a row for that are STILL PRESENT on disk: everything attached went with the
+    -- parent's DROP, so anything left here was detached first and is holding data nobody agreed to lose.
+    --
+    -- Matched on the child NAME alone, because pgpm.part records no namespace and the dropped parent's oid
+    -- can no longer supply one. So this can in principle name a same-named table in an unrelated schema.
+    -- Reported SCHEMA-QUALIFIED for exactly that reason: an operator acting on this list has to be able to
+    -- see which table is meant, and if two schemas collide both are listed rather than one being guessed
+    -- at. relkind filtered to tables/partitioned tables so an index or sequence sharing the name cannot
+    -- appear as data at risk.
+    select coalesce(array_agg(format('%I.%I', n.nspname, k.relname) order by n.nspname, k.relname),
+                    '{}'::text[])
+      into v_orphans
+      from pgpm.part p
+      join pg_class k on k.relname = p.child_name and k.relkind in ('r', 'p')
+      join pg_namespace n on n.oid = k.relnamespace
+     where p.parent_table = r.parent_table;
+
+    select count(*)::int into v_parts from pgpm.part where parent_table = r.parent_table;
+
+    delete from pgpm.transmute_inflight where parent_table = r.parent_table;
+    delete from pgpm.archive_ledger     where parent_table = r.parent_table;
+    delete from pgpm.dropped_fk         where parent_table = r.parent_table;
+    delete from pgpm.part               where parent_table = r.parent_table;
+    delete from pgpm.config             where parent_table = r.parent_table;
+
+    insert into pgpm.log (parent_table, action, rows, method)
+      values (r.parent_table, 'forget_missing', v_parts,
+              case when coalesce(array_length(v_orphans, 1), 0) = 0
+                   then 'relation was gone; pgpm state cleared'
+                   else format('relation was gone; pgpm state cleared. LEFT IN PLACE (still hold data): %s',
+                               array_to_string(v_orphans, ', ')) end);
+
+    parent_oid := r.oid; partitions_forgotten := v_parts; orphan_tables := v_orphans;
+    return next;
+  end loop;
+end;
+$$;
+
 -- check_default removed with the DEFAULT partition (#288).
 
 -- check_uuidv7(): sanity-sample a uuid column. Genuine UUIDv7/ULID values decode
@@ -3407,8 +3488,13 @@ $$;
 -- campaign, so a standing non-zero value means a swap died mid-flight. fks_unvalidated = FKs re-added
 -- NOT VALID (enforcing new writes) but blocked from full validation by pre-existing orphans (see
 -- incoming_fk_orphans() / validate_incoming_fks()).
+-- parent_missing (#296) says the managed relation itself is gone -- dropped without untransmute, so the
+-- config row is pointing at an oid with no pg_class entry. status() used to RAISE on such a row and
+-- therefore return nothing for any table; now it reports it, since naming the dead table is the most
+-- useful thing it can do. pgpm.forget_missing() clears the state.
+--
 -- dropped/recreated (not CREATE OR REPLACE) because the redesign widens the return shape with
--- coarse_partitions + history_unregrained (REDESIGN.md section 14).
+-- coarse_partitions + history_unregrained (REDESIGN.md section 14), and again for parent_missing (#296).
 drop function if exists pgpm.status();
 create or replace function pgpm.status()
 returns table (
@@ -3416,11 +3502,12 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text,
   fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_drop_failures bigint,
-  retain_backlog bigint, retain_detaching bigint
+  retain_backlog bigint, retain_detaching bigint, parent_missing boolean
 )
 language plpgsql as $$
 declare
   r pgpm.config; v_nsp name; v_np bigint; v_coarse bigint; v_inflight bigint; v_new text;
+  v_missing boolean;
 
   v_fks_susp bigint; v_fks_unval bigint;
   v_last_retain_id bigint; v_drop_fails bigint; v_detaching bigint;
@@ -3428,6 +3515,14 @@ declare
 begin
   for r in select * from pgpm.config loop
     select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = r.parent_table;
+
+    -- Has the managed relation been dropped out from under us (#296)? status() is the DIAGNOSTIC, so it
+    -- must never be the thing that dies: one config row pointing at a vanished oid used to raise out of
+    -- this whole set-returning function, so a single dropped table returned NOTHING for every managed
+    -- table, healthy ones included. Everything below except retain_backlog comes from pgpm.part /
+    -- pgpm.config / pgpm.log, so a dead parent still gets a full, useful row -- and the flag says which
+    -- one it is, which is the single most actionable thing to report here.
+    v_missing := not exists (select 1 from pg_class c where c.oid = r.parent_table);
 
     -- n_partitions = attached (real) partitions; coarse_partitions = the un-regrained coarse children (a
     -- wider-than-one-step range, REDESIGN.md section 14) -- the regraining backlog; inflight = the
@@ -3468,8 +3563,12 @@ begin
     -- issue #189). Non-zero is normal while retain_batch paces a backlog across ticks, or while
     -- chunked archiving is still catching up on a write-blocked child -- it should fall tick over
     -- tick; flat with retain_drop_failures climbing = wedged on an unexpected drop failure.
-    v_retain_backlog := 0;
-    v_retain_boundary := pgpm._retain_boundary(r);
+    -- null, not 0, for a dead parent: the horizon is derived from the frontier, and the frontier is
+    -- max(control) READ FROM THE RELATION. With the relation gone there is no honest answer, and 0 would
+    -- read as "nothing is eligible" -- a claim status() cannot make. This is also the one branch that
+    -- would raise, via _retain_boundary -> _frontier_native, so skipping it is what keeps status() alive.
+    v_retain_backlog := case when v_missing then null else 0 end;
+    v_retain_boundary := case when v_missing then null else pgpm._retain_boundary(r) end;
     if v_retain_boundary is not null then
       execute format(
         'select count(*) from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s',
@@ -3482,6 +3581,7 @@ begin
     newest_bound := v_new;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_drop_failures := v_drop_fails;
     retain_backlog := v_retain_backlog; retain_detaching := v_detaching;
+    parent_missing := v_missing;
     return next;
   end loop;
 end;
