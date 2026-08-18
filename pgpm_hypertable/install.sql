@@ -85,6 +85,7 @@ returns void language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_cagg text; v_dims int; v_ctl_attnum int; v_bytes bigint;
   v_cache bigint; v_mibps numeric; v_regime text; v_eta interval;
+  v_bad_fk text; v_reusekey text[]; v_fk record;
 begin
   if not exists (select 1 from pg_extension where extname = 'timescaledb') then
     raise exception 'pg_partition_magician: from_hypertable requires the timescaledb extension to be installed';
@@ -120,6 +121,69 @@ begin
     from pg_attribute a where a.attrelid = p_hypertable and a.attname = p_control and not a.attisdropped;
   if v_ctl_attnum is null then
     raise exception 'pg_partition_magician: column % not found on %', p_control, p_hypertable;
+  end if;
+
+  -- (4) an outgoing FK the source never validated (issue #264). The migration carries outgoing FKs by
+  -- replaying each definition verbatim on the private destination and then VALIDATEing it, so a NOT VALID
+  -- constraint would either fail that validation on pre-existing violations or be silently strengthened
+  -- into a validated one. Neither is ours to decide, so refuse and name it.
+  select string_agg(conname, ', ') into v_bad_fk
+    from pg_constraint
+   where conrelid = p_hypertable and contype = 'f' and confrelid <> p_hypertable and not convalidated;
+  if v_bad_fk is not null then
+    raise exception 'pg_partition_magician: cannot migrate hypertable % -- its outgoing foreign key(s) (%) are NOT VALID. from_hypertable carries an outgoing key by replaying it on the copy and validating it, which would either fail on the rows the source never checked or silently upgrade the constraint. Run ALTER TABLE % VALIDATE CONSTRAINT <name> first (or drop the constraint), then re-run from_hypertable.',
+      p_hypertable, v_bad_fk, p_hypertable::text;
+  end if;
+
+  -- (5) an INCOMING FK that does not reference the key transmute will reuse (issue #264). The migration
+  -- re-adds each incoming FK against the new partitioned parent, which can only carry a unique key on
+  -- exactly the columns transmute reused. Refusing HERE is the single most valuable check in this
+  -- function: the alternative is discovering it in the cutover, after the entire online copy has run,
+  -- with the populated destination left orphaned behind the rollback.
+  --
+  -- The reused-key selection mirrors _transmute's, which stays the single source of truth: the PK if it
+  -- includes the control column, otherwise a non-partial, non-expression UNIQUE constraint that does.
+  -- Drift can only cost a MISSED refusal here, never a false one, because transmute re-checks eligibility
+  -- itself -- so this check is allowed to be the more permissive of the two, never the stricter.
+  if exists (select 1 from pg_constraint
+              where confrelid = p_hypertable and contype = 'f' and conrelid <> p_hypertable) then
+    select array_agg(a.attname::text order by k.ord) into v_reusekey
+      from pg_constraint con
+      cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+      join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+     where con.conrelid = p_hypertable and con.contype = 'p' and v_ctl_attnum = any(con.conkey)
+     group by con.conname;
+
+    if v_reusekey is null then
+      select cols into v_reusekey from (
+        select array_agg(a.attname::text order by k.ord) as cols, con.conname
+          from pg_constraint con
+          join pg_index i on i.indexrelid = con.conindid
+          cross join lateral unnest(con.conkey) with ordinality as k(attnum, ord)
+          join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.attnum
+         where con.conrelid = p_hypertable and con.contype = 'u'
+           and i.indpred is null and i.indexprs is null and v_ctl_attnum = any(con.conkey)
+         group by con.conname order by con.conname limit 1) s;
+    end if;
+
+    for v_fk in
+      select c.conname, c.conrelid::regclass as referencing,
+             (select array_agg(a.attname::text order by k.ord)
+                from unnest(c.confkey) with ordinality as k(attnum, ord)
+                join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) as rcols
+        from pg_constraint c
+       where c.confrelid = p_hypertable and c.contype = 'f' and c.conrelid <> p_hypertable
+         and c.conparentid = 0
+    loop
+      if v_reusekey is null
+         or (select array_agg(x order by x) from unnest(v_fk.rcols) x)
+            is distinct from (select array_agg(x order by x) from unnest(v_reusekey) x) then
+        raise exception 'pg_partition_magician: cannot migrate hypertable % -- the incoming foreign key % on % references (%), but the key pgpm would reuse is %. An incoming key can only be re-added against the new partitioned parent when it references exactly that reused key. Drop the foreign key, or give % a primary key or unique constraint on (%) that includes the control column %, then re-run from_hypertable.',
+          p_hypertable, v_fk.conname, v_fk.referencing, array_to_string(v_fk.rcols, ', '),
+          coalesce('(' || array_to_string(v_reusekey, ', ') || ')', 'none (the table would be partitioned keyless)'),
+          p_hypertable::text, array_to_string(v_fk.rcols, ', '), quote_ident(p_control);
+      end if;
+    end loop;
   end if;
 
   -- disk: the online copy writes a full second table, so warn how much extra space the migration needs until
@@ -263,6 +327,37 @@ begin
   -- core's shared mint-then-populate ANALYZE helper (#164).
   perform pgpm._analyze(format('%I.%I', v_nsp, v_dest)::regclass);
   commit;
+
+  -- OUTGOING foreign keys (issue #264). `CREATE TABLE ... LIKE ... INCLUDING CONSTRAINTS` copies CHECK and
+  -- NOT NULL only -- no INCLUDING option copies foreign keys -- and nothing later added them, so the source
+  -- hypertable was the only relation still holding them and the cutover DROPS it. The migration therefore
+  -- used to lose referential integrity silently: no error, nothing in pgpm.log, and orphan rows accepted
+  -- afterwards in every partition.
+  --
+  -- Replayed VERBATIM from pg_get_constraintdef, which carries composite keys, referential actions and
+  -- DEFERRABLE-ness without pgpm having to reason about any of them. The destination reaches the cutover
+  -- holding a VALIDATED key, so the swap stays metadata-only and the parent-level ADD adopts it.
+  --
+  -- Two steps in two transactions, and this is the reason the work lives HERE rather than in the cutover: a
+  -- validating ADD CONSTRAINT ... FOREIGN KEY holds SHARE ROW EXCLUSIVE on the REFERENCED table for the
+  -- whole scan, blocking writes on a table the operator did not ask us to lock. Splitting it means
+  -- VALIDATE holds only SHARE UPDATE EXCLUSIVE here and ROW SHARE there, so the referenced table stays
+  -- writable. The cutover could not do this at all: its pre-build block shares one transaction with the
+  -- swap, so the lock would span the swap. O(rows) work belongs in the copy phase, which is exactly why
+  -- the index pre-build lives here too.
+  for r in
+    select c.conname, pg_get_constraintdef(c.oid) as def
+      from pg_constraint c
+     where c.conrelid = p_hypertable and c.contype = 'f' and c.confrelid <> p_hypertable
+     order by c.conname
+  loop
+    execute format('alter table %I.%I add constraint %I %s not valid', v_nsp, v_dest, r.conname, r.def);
+    commit;
+    execute format('alter table %I.%I validate constraint %I', v_nsp, v_dest, r.conname);
+    commit;
+    insert into pgpm.log (parent_table, action, method)
+      values (p_hypertable, 'from_hypertable_carry_fk', r.conname);
+  end loop;
 
   -- #175: when change-tracking is on, build the reused-key index on the dest NOW -- off the lock, while the
   -- dest is still private -- with the SAME temp name and definition the cutover will ADOPT
@@ -509,6 +604,8 @@ declare
   v_ident_cols name[]; v_ident_next bigint[]; v_srcseq text; v_srcnext bigint; v_col name;
   v_pseq text; v_curnext bigint; v_i int;
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
+  v_in_refs text[]; v_in_names text[]; v_in_defs text[];   -- incoming FKs captured across the swap (#264)
+  v_out_names text[]; v_out_defs text[];                   -- outgoing FKs, re-added at the parent (#264)
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
@@ -656,6 +753,50 @@ begin
     end if;
     v_ident_next := array_append(v_ident_next, v_srcnext);
   end loop;
+  -- OUTGOING foreign keys, captured from the DESTINATION for re-adding at the parent after the handoff
+  -- (issue #264). The copy phase put them on the destination and validated them there, and the destination
+  -- becomes the monolith child -- so without this they would enforce on the monolith ONLY, and a row routed
+  -- into a forward partition would escape entirely (measured: an orphan inserted past the monolith's range
+  -- was accepted). #263 will make transmute adopt them at the parent for every table; from_hypertable does
+  -- it here so this issue stands on its own, exactly as #263's own scope note says it must.
+  for k in
+    select c.conname, pg_get_constraintdef(c.oid) as def
+      from pg_constraint c
+     where c.conrelid = format('%I.%I', v_nsp, v_dest)::regclass and c.contype = 'f'
+     order by c.conname
+  loop
+    v_out_names := array_append(v_out_names, k.conname::text);
+    v_out_defs  := array_append(v_out_defs, k.def);
+  end loop;
+
+  -- INCOMING foreign keys (issue #264). An FK pointing AT the hypertable puts a constraint on each chunk,
+  -- so `drop table <source>` below was refused outright -- and only here, after the entire online copy had
+  -- run, leaving the populated destination orphaned behind the rollback:
+  --
+  --   ERROR: cannot drop table _timescaledb_internal._hyper_2_2_chunk because other objects depend on it
+  --   DETAIL: constraint annotations_r_id_r_ts_fkey on table annotations depends on _hyper_2_2_chunk
+  --
+  -- Capture each definition and drop the constraint, which is what unblocks the drop. The recorded
+  -- definition names the referenced table BY NAME, and the new parent takes the source's name, so it
+  -- replays verbatim afterwards -- the same property transmute's own preserve path relies on.
+  --
+  -- Deliberately NOT re-added here: doing so would leave an incoming FK in place when the plain table is
+  -- handed to transmute, which refuses one by default, and asking for 'preserve' would just have transmute
+  -- drop it again. The re-add happens after the handoff, through the core's dropped_fk machinery.
+  -- The eligibility of these keys was settled in the preflight, before any copy work.
+  for k in
+    select c.conrelid::regclass as referencing, c.conname, pg_get_constraintdef(c.oid) as def
+      from pg_constraint c
+     where c.confrelid = p_hypertable and c.contype = 'f' and c.conrelid <> p_hypertable
+       and c.conparentid = 0
+     order by c.conname
+  loop
+    v_in_refs := array_append(v_in_refs, k.referencing::text);
+    v_in_names := array_append(v_in_names, k.conname::text);
+    v_in_defs := array_append(v_in_defs, k.def);
+    execute format('alter table %s drop constraint %I', k.referencing::text, k.conname);
+  end loop;
+
   execute format('drop table %I.%I', v_nsp, v_rel);   -- also drops the change-capture trigger, if any
   if v_track then
     -- the trigger went with the source; drop the now-orphaned delta table and trigger function. This is
@@ -692,6 +833,46 @@ begin
   -- knob is regrain's now (#288), so the handoff names it explicitly rather than relying on position.
   call pgpm.transmute(v_orig, p_control, p_interval, p_obtain, v_retain,
                       p_regrain_batch => p_drain_batch, p_anchor => p_anchor, p_paused => p_paused);
+
+  -- Re-add the outgoing FKs at the PARENT, so they cover every partition and not just the monolith
+  -- (issue #264). This is metadata-only: PostgreSQL adopts a partition's equivalent already-VALIDATED
+  -- foreign key rather than re-scanning, and the copy phase validated each one on the destination -- which
+  -- is now the monolith child. So the O(rows) work stayed off the lock, in the copy phase, and this is a
+  -- catalog operation.
+  if v_out_names is not null then
+    for v_i in 1 .. array_length(v_out_names, 1) loop
+      execute format('alter table %I.%I add constraint %I %s',
+                     v_nsp, v_rel, v_out_names[v_i], v_out_defs[v_i]);
+      insert into pgpm.log (parent_table, action, method)
+        values (format('%I.%I', v_nsp, v_rel)::regclass, 'from_hypertable_adopt_fk', v_out_names[v_i]);
+    end loop;
+    commit;
+  end if;
+
+  -- Re-add the incoming FKs the swap dropped, now against the new partitioned parent (issue #264). Handed
+  -- to the CORE's existing state machine rather than re-implementing the dance: recording them in
+  -- pgpm.dropped_fk means restore_incoming_fks re-adds each NOT VALID (O(1), and enforcing every new write
+  -- immediately) and validate_incoming_fks does the scan in its own transaction, with the orphan reporting,
+  -- the validate back-off, and status().fks_suspended / fks_unvalidated all coming for free. Re-resolved by
+  -- name because after transmute v_orig's oid is the monolith child, not the parent.
+  --
+  -- The window from the drop above to this re-add is real and bounded by the swap plus one transmute. It
+  -- cannot be closed by re-adding inside the cutover -- transmute would then refuse the incoming key -- so
+  -- it is surfaced rather than hidden, which is what pgpm.dropped_fk and status().fks_suspended are for.
+  if v_in_names is not null then
+    for v_i in 1 .. array_length(v_in_names, 1) loop
+      insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
+        values (format('%I.%I', v_nsp, v_rel)::regclass, v_in_refs[v_i]::regclass,
+                v_in_names[v_i], v_in_defs[v_i]);
+      insert into pgpm.log (parent_table, action, method)
+        values (format('%I.%I', v_nsp, v_rel)::regclass, 'drop_incoming_fk', v_in_names[v_i]);
+    end loop;
+    commit;
+    perform pgpm.restore_incoming_fks(format('%I.%I', v_nsp, v_rel)::regclass);
+    commit;
+    perform pgpm.validate_incoming_fks(format('%I.%I', v_nsp, v_rel)::regclass);
+    commit;
+  end if;
 
   -- preserve the source sequence's exact position. transmute moved identity to the new parent and seeded
   -- each sequence to max(id)+1; advance it to the source's captured next value when that is higher, so ids

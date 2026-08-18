@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` no longer loses the migrated table's foreign keys (issue #264).** Outgoing keys went
+  silently; incoming keys failed outright, after the entire online copy had run.
+  - **Outgoing, silent loss.** `CREATE TABLE ... LIKE ... INCLUDING CONSTRAINTS` copies CHECK and NOT NULL
+    only -- no `INCLUDING` option copies foreign keys -- nothing later added them, and the cutover dropped
+    the source hypertable, the only relation still holding them. Measured before the fix: the constraint
+    count went to 0 and an orphan row was accepted. Now each definition is replayed verbatim
+    (`pg_get_constraintdef`, so composite keys, referential actions and `DEFERRABLE` come along) on the
+    private copy as `NOT VALID`, validated there in its own transaction, and re-added at the new parent
+    after the handoff.
+  - **Validated on the copy, adopted at the parent.** A validating `ADD CONSTRAINT ... FOREIGN KEY` holds
+    SHARE ROW EXCLUSIVE on the *referenced* table for the whole scan, so the `O(rows)` work is done in the
+    copy phase where such work belongs, not in the cutover, whose pre-build shares a transaction with the
+    swap. The parent-level add is then metadata-only, because PostgreSQL adopts a partition's equivalent
+    already-validated key. **Carrying it onto the copy alone is not enough**: measured, that leaves the key
+    enforcing over the monolith's range only, and an orphan routed into a forward partition was accepted.
+  - **Incoming, hard failure.** An FK pointing at the hypertable puts a constraint on every chunk, so
+    `drop table <source>` was refused -- and only after the whole copy, leaving the populated destination
+    orphaned behind the rollback. The cutover now captures and drops those keys (which is what unblocks the
+    drop) and they are re-added against the new parent after the handoff via `pgpm.dropped_fk`, reusing the
+    core's `restore_incoming_fks` / `validate_incoming_fks` rather than duplicating the
+    `NOT VALID`-then-`VALIDATE` dance.
+  - **The residual window is stated, not hidden.** Referential integrity is off on the referencing table
+    from the cutover's drop until the re-add, bounded by the swap plus one `transmute`, and surfaced by
+    `status().fks_suspended`. Re-adding inside the cutover is impossible: `transmute` refuses a table that
+    still carries an incoming key.
+  - **Two new preflight refusals**, both before any copying: an outgoing key that is `NOT VALID` (replaying
+    it would either fail validation on rows the source never checked or silently upgrade the constraint),
+    and an incoming key that references anything other than the key pgpm will reuse. The second is the one
+    that matters most, since the alternative is discovering it after hours of copying.
+  - Tests: `tests/timescale/db/16_from_hypertable_foreign_keys_test.sql` (12 assertions, including
+    enforcement in a forward partition -- which fails against a fix that carries the key onto the copy but
+    never re-adds it at the parent) and two added to `01_preflight_refusals_test.sql`. Whole track green at
+    114 assertions.
+
 - **A uuidv7 grid can no longer produce a partition with `lo > hi` (issue #299).** A UUIDv7 carries its
   timestamp in the leading 48 bits, so the grid it can express stops at `2^48 - 1` ms after the epoch:
   `10889-08-02 05:31:50.65504+00`. Past that, `to_hex` returns 13 hex digits and **`lpad(..., 12, '0')`
