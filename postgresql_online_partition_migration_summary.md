@@ -1,5 +1,10 @@
 # Online Migration of a Large PostgreSQL Table to a Partitioned Table
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](docs/guide.md) and the
+> [reference](docs/reference.md).
+
 ## Background
 
 We explored the problem of partitioning a very large PostgreSQL

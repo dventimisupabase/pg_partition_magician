@@ -1,5 +1,10 @@
 # Storage IO on Supabase (green): gp3 vs io2, burst vs provisioned
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
+
 Findings from probing the disk-IO behavior of a **4XL** project on Supabase **green** staging
 (project `crmwxthrnykxhcpizkya`, PostgreSQL 17.6, 16 vCPU / 64 GB RAM), 2026-06-20. Motivation: the
 docs claim "4XL+ instances get provisioned/sustained throughput without bursting," while the

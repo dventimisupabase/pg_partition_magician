@@ -1,5 +1,10 @@
 # Banked result: 40M-row online conversion under load (rung 3)
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
+
 A run of the passive-observer harness (`bench/run.sh`) converting an unpartitioned
 `bench.events` to RANGE-partitioned **online**, while a 16-client OLTP workload runs
 continuously, on a provisioned Supabase **2xlarge** (8 vCPU / 32 GB RAM, gp3 500 GB /

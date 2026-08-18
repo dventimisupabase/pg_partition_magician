@@ -1,5 +1,10 @@
 # Self-calibrating ambient signal: live surge-yield demo (green 2XL)
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
+
 This is the "quiet -> surge -> yield -> recover" demonstration the *fixed* ambient waiter threshold
 could never produce. The self-calibrating signal (PR #52) learns the box's normal waiter count as an
 EWMA baseline and backs the drain off on a *relative* surge above it. Run on a fresh Supabase green 2XL

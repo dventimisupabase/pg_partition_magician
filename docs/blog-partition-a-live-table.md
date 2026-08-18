@@ -1,5 +1,10 @@
 # Partition a live Postgres table online, with nothing but SQL
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](guide.md) and the
+> [reference](reference.md).
+
 Partitioning a table you wish you had partitioned a year ago is one of Postgres's sharpest edges. The table is already large and already serving traffic, and the textbook fix (create a partitioned copy, backfill it, swap it in) wants a maintenance window, double the storage, and a careful application dance. So the table just keeps growing: autovacuum strains, indexes bloat, and "retention" becomes a `DELETE` that fights your workload.
 
 **pg_partition_magician** does the conversion online, in the background, with nothing but SQL.

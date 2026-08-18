@@ -1,5 +1,10 @@
 # Design: `from_hypertable` (migrating a TimescaleDB hypertable to a pgpm-managed native partition set)
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](docs/guide.md) and the
+> [reference](docs/reference.md).
+
 Status: Implemented (online copy, online pre-drain of the live-write backlog, brief cutover, transmute handoff). See `docs/reference.md` for the function reference and `CHANGELOG.md` for the changes.
 Scope: single time-or-monotonic RANGE dimension, TimescaleDB Apache 2 Edition
 

@@ -1,15 +1,15 @@
 # Reference
 
-Every public function and catalog object in `pg_partition_magician`. The schema is `pgpm`. This is the
-authoritative surface; the [user guide](guide.md) explains the concepts and how the pieces fit, and
-[REDESIGN.md](../REDESIGN.md) records the operating model.
+Every public function and catalog object in `pg_partition_magician`, described **as built**. The schema
+is `pgpm`. This is the authoritative surface; the [user guide](guide.md) explains the concepts and how the
+pieces fit.
 
 The mental model in one breath: `transmute` converts a live table into a native `RANGE`-partitioned one
 by renaming the original aside and attaching it, with **zero row movement**, as one bounded **monolith**
-child (covering `[grid_floor(min), B)`), under a fresh empty `DEFAULT`. Going forward, `obtain` keeps
-real partitions ahead of the write frontier, `retain` drops whole partitions past a policy, the **regrain**
-keeps the `DEFAULT` empty by evacuating strays, and `regrain` splits the coarse
-monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
+child (covering `[grid_floor(min), B)`), and laying down a **forward grid** of real, bounded partitions
+above it. There is no `DEFAULT`: a write no partition covers is refused. Going forward, `obtain` keeps the
+grid ahead of the write frontier, `retain` drops whole partitions past a policy, and `regrain` splits the
+coarse monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
 `timestamptz` for the `time` and `uuidv7` kinds and a `numeric` for the `id` kind; "the frontier" is
@@ -37,7 +37,7 @@ original).
 The cutover moves no rows: it validates a bound on the live table (one read-only scan), then in a
 metadata-only step renames the original to a coarse-child name, creates the
 partitioned parent, attaches the original as the bounded **monolith** child via the validated `CHECK`
-(scan-skipping), and creates a fresh empty `DEFAULT`. The table registers **paused**; nothing happens
+(scan-skipping), and builds the forward grid. The table registers **paused**; nothing happens
 until you `resume` it and maintenance runs.
 
 The new parent also takes over everything `CREATE TABLE ... LIKE` does not carry: the **owner**, table and
@@ -118,12 +118,12 @@ pgpm.untransmute(p_parent regclass) returns regclass
 
 Reverses a `transmute`, returning the restored ordinary table. It is a **clean, metadata-only reverse
 while the monolith is still intact and holds the whole table**: it detaches the monolith, drops the
-childless parent (cascading the empty `DEFAULT` and any empty forward partitions), renames the monolith
+childless parent (cascading any empty forward partitions), renames the monolith
 back, restores identity and any preserved incoming FKs, and clears `pgpm` state. The monolith is the
 attached partition with the smallest `lo`.
 
 It is a **one-way door** once any row lives outside the monolith's range -- a forward partition after the
-frontier crosses `B`, a backdated stray in the `DEFAULT`, or finer children from a regraining -- because a
+frontier crosses `B`, or finer children from a regraining -- because a
 metadata-only reverse would lose those rows. (Tier-2 fold-back and Tier-3 merge are not built.)
 
 ## Migrating from TimescaleDB (`from_hypertable`)
@@ -221,7 +221,7 @@ pgpm.from_hypertable_drain_delta_step(p_hypertable regclass, p_control name, p_b
 ```
 
 Reconcile the `p_track_changes` delta **online, while the source stays live**, so the cutover's lock applies
-only a tiny residual instead of the whole online-copy backlog (issue #170). The cutover runs this
+only a tiny residual instead of the whole online-copy backlog. The cutover runs this
 automatically (`p_predrain`), but you can also drive it directly during a long two-phase window: after
 `from_hypertable_copy`, call it repeatedly while the application keeps writing, then `from_hypertable_cutover`.
 
@@ -231,7 +231,7 @@ re-insert its current source row), which is what makes incremental draining safe
 source, so a change is never deleted-without-applying; the source read is bounded per batch to the touched
 control range for chunk exclusion. The driver mirrors `drain`'s `_step` + loop shape and **commits per batch**
 (so WAL recycles); `_step` does one batch (no commit, returns the keys it cleared). The per-batch delete uses
-the reused-key index that `from_hypertable_copy` builds once on the private destination (issue #175) -- the
+the reused-key index that `from_hypertable_copy` builds once on the private destination -- the
 same index the cutover later *adopts* (`USING INDEX`), so no throwaway index is built or dropped.
 
 - `p_batch` -- micro-batch size (delta rows processed per batch, bounded by a `pgpm_seq` watermark).
@@ -252,7 +252,7 @@ pgpm.from_hypertable_drain_appends_step(p_hypertable regclass, p_control name, p
   returns text
 ```
 
-The **append-only** counterpart of `from_hypertable_drain_delta` (issue #174), for the default
+The **append-only** counterpart of `from_hypertable_drain_delta`, for the default
 (non-`p_track_changes`) path: copy the rows appended past the copy watermark **online, while the source stays
 live**, so the cutover's lock applies only the final tail. The cutover runs it automatically (`p_predrain`)
 for the non-tracking path; you can also drive it directly during a long two-phase window.
@@ -398,26 +398,20 @@ the delta catch-up.
 ### `obtain`
 
 ```sql
-call pgpm.obtain(p_parent regclass, inout p_made int default null,
-                 inout p_deferred boolean default null)
+pgpm.obtain(p_parent regclass) returns int
 ```
 
 Creates empty partitions ahead of the frontier so live writes always land in a real partition, keeping
-`config.obtain` of them ready. `p_made` is how many it created. With the `DEFAULT` empty (the normal
-state) it uses a plain, scan-free attach. It skips any candidate range that overlaps an existing attached
-partition (for example the monolith, which covers the current interval) or that the `DEFAULT` still holds
-rows for.
+`config.obtain` of them ready, and returns how many it created. Pure catalog work: the partitions are
+created empty, so nothing is scanned and nothing is moved. It skips any candidate range that overlaps an
+existing attached partition, for example the monolith, which covers the current interval.
 
-Beside a non-empty `DEFAULT` it must prove the `DEFAULT` holds no row in the new range, which it does
-with a `NOT VALID` exclusion `CHECK` plus `VALIDATE` so the `CREATE` can skip its own scan. Those run in
-three transactions, so the O(rows) scan runs under `SHARE UPDATE EXCLUSIVE` and does not block writes;
-the only `ACCESS EXCLUSIVE` windows are sub-millisecond DDL.
+It stops early, returning what it built, when the next grid boundary cannot be expressed: a `uuidv7` grid
+ends at the last instant a 48-bit millisecond prefix can carry, `10889-08-02 05:31:50.65504+00`.
 
-The cost of committing between them is a window where the constraint is in place and the partition is
-not, so the `DEFAULT` rejects writes in that range. The range is always empty and ahead of the frontier,
-and the next `obtain` drops any leftover constraint and starts again, so an interrupted build clears
-itself on the next maintenance tick. A leftover is dropped rather than resumed, and logged as
-`obtain_reap`.
+This is the only thing standing between the workload and a write with nowhere to go, since a row outside
+the grid is refused rather than parked. `config.obtain x partition_step` is therefore both the slack if
+maintenance stalls and a ceiling on how far ahead an application may write.
 
 A procedure, not a function, because of those commits. It takes an advisory lock per parent, so a second
 concurrent `obtain` defers instead of interfering, and it reports failures through `p_deferred` rather
@@ -455,8 +449,7 @@ pgpm.retire(p_parent regclass, p_child name) returns boolean
 The sanctioned single-partition drop: `retain()`'s per-partition body, public and claim-guarded, for an
 external assistant (e.g. an archive-then-drop scanner) -- or several cooperating ones -- to drive
 retirement directly. It claims the `pgpm.part` row, ensures the child is write-blocked
-(`pgpm._install_write_block`, idempotent -- issue #235), checks `pgpm._archive_fully_covered` (from
-issue #237), and only then `DROP`s, deletes the catalog row, and logs `retain_drop`. Returns `true`
+(`pgpm._install_write_block`, idempotent), checks `pgpm._archive_fully_covered`, and only then `DROP`s, deletes the catalog row, and logs `retain_drop`. Returns `true`
 iff this call dropped the partition.
 
 `retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
@@ -468,13 +461,13 @@ It returns `false`, without side effects and without logging anything, in three 
 situations: the `pgpm.part` row is absent (already retired by another actor), it's claimed by a
 concurrent transaction (`FOR UPDATE SKIP LOCKED`, so each partition has exactly one owner at a time), or
 the partition is write-blocked but not yet `pgpm._archive_fully_covered` -- chunked archiving (from
-issue #237) simply hasn't caught up yet. Only a genuinely unexpected failure in the `DROP` itself is
+simply hasn't caught up yet. Only a genuinely unexpected failure in the `DROP` itself is
 logged (`fail_retain_drop`) and returns `false`.
 
 #### Retiring a partition an incoming FK references
 
 If any foreign key references the managed parent, a bare `DROP` is refused on a pure catalog dependency
-regardless of whether any row actually references the aged range, so `retire` detaches first (issue #268).
+regardless of whether any row actually references the aged range, so `retire` detaches first.
 The detach must be `CONCURRENTLY`, which PostgreSQL will not execute from a function, so `retire`
 **dispatches** it: it rewrites the standing `pgpm_detach` cron job's command and returns `false`, and a
 later call finds the partition detached and completes the `DROP`. Retiring a referenced partition
@@ -512,9 +505,6 @@ It finalizes unconditionally (a pending detach is never a state to leave sitting
 `retire` completes pgpm's own retirements on the normal path, and an operator's hand-run detach that was
 interrupted is finished and then left alone.
 
-The old `pgpm.hook` `pre_drop` registry this used to consult is gone entirely (issue #240) --
-archive coverage via `config.archive_fn` is the only drop-precondition gate now.
-
 ### `regrain`
 
 ```sql
@@ -528,8 +518,7 @@ rows and all. It never deletes from the source, which is what keeps a read of th
 short mid-regrain; the fine children are insert-only, so the product has no bloat. The whole call runs in
 one transaction, so it is **atomic and gap-free**. Retention-aware: a sub-range entirely below the horizon
 is reclaimed, never materialized. Refuses (as an exception) when the child is not frozen, the target step
-does not subdivide it, the `DEFAULT` holds rows in its range, or another regrain is already in flight on
-the same parent.
+does not subdivide it, or another regrain is already in flight on the same parent.
 
 Only one regrain runs per parent at a time. `config.regrain_cursor` and the change-capture delta are both
 per parent, so a second concurrent regrain is refused rather than allowed to reset the first one's cursor
@@ -564,13 +553,13 @@ A **below-horizon** sub-range is handled one of two ways, depending on whether t
 swap, since `retain` would drop those rows unconditionally the moment they became partitions. With
 `archive_fn` set it is **materialized like any other sub-range**, because `retire` will not drop a
 partition until archiving has fully covered it, so discarding it would destroy exactly the rows that gate
-is protecting (issue #278). Once materialized, the ordinary pipeline applies: `maintain` write-blocks it,
+is protecting. Once materialized, the ordinary pipeline applies: `maintain` write-blocks it,
 archives it, and `retire` drops it once covered. The cost is copying rows that are about to be dropped,
 which is paid only on tables that archive. The
 source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
 `prepared` (the first tick, which installs change capture and copies nothing), `reconciled:N`,
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
-complete, K children attached), or a soft no-progress status: `active` (not frozen yet), `default_dirty`
+complete, K children attached), or a soft no-progress status: `active` (not frozen yet)
 (a stray sits in the range), or `nosubdiv` (the step does not subdivide). This is the unit `maintain`
 paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its
 one FK touch is the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that
@@ -637,19 +626,19 @@ in a single-transaction tick that lock was held across the rest of the tick as w
 it as `call pgpm.maintain('public.events')` and the summary comes back as a result row; from
 PL/pgSQL, pass a variable to receive it.
 
-Write-blocking (issue #235): a child whose whole range sits at/below the retention horizon
+Write-blocking: a child whose whole range sits at/below the retention horizon
 (`_retain_boundary`, the same one `retain` itself uses) gets a `BEFORE INSERT OR UPDATE OR DELETE`
 trigger the moment it becomes eligible, independent of whether or how it is archived -- a backdated
 write into an eligible-but-not-yet-dropped range (including one a chunked archiver already covered)
 is rejected rather than silently diverging the archive from what is live. Loosening `config.retain`
 removes the trigger from a partition that becomes ineligible again. Write-blocked is one of
-`retire()`'s drop preconditions (issue #238; see [`retire`](#retire)).
+`retire()`'s drop preconditions (see [`retire`](#retire)).
 
-Chunked archiving (issue #237): `archived=N` counts how many chunks this tick recorded via
+Chunked archiving: `archived=N` counts how many chunks this tick recorded via
 `pgpm._archive_step` -- see [Archive strategy contract](#archive-strategy-contract) for the
 mechanism. It only ever considers a child the write-block step above has already protected, so it
 always runs after write-blocking within the same tick. Archive coverage is `retire()`'s other drop
-precondition (issue #238).
+precondition.
 
 ### `maintain_all`
 
@@ -661,9 +650,8 @@ A procedure that calls `maintain` for every managed table. This is what the sche
 
 ## Archive strategy contract
 
-`config.archive_fn` (issue #236) is one archive strategy per managed table, superseding the old
-`pgpm.hook` generic `pre_drop` registry (removed entirely, issue #240) -- archiving before a drop
-was its only real use. `null` (the default) means strategy `none` -- no archiving, a partition is
+`config.archive_fn` is one archive strategy per managed table. `null` (the default) means strategy
+`none` -- no archiving, a partition is
 immediately drop-ready. Set it with `pgpm.set_archive_fn`:
 
 ```sql
@@ -681,7 +669,7 @@ against the same child, making bounded incremental progress and reporting how mu
 is now durably archived (`covered_hi`, which may be short of `p_hi`) and how many rows this one call
 archived (`rows_archived`, `null` when nothing was actually archived) -- not to archive the whole
 range in a single call. `s3_key`/`etag` are optional: a transport strategy that has an object-store
-identifier to report (issue #239's `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) sets
+identifier to report (`pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) sets
 them; a strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none`
 strategy) leaves them `null`. This is the contract the byte-budget chunked archiver and the real S3
 upload functions implement.
@@ -693,13 +681,13 @@ protect against a drop. `pgpm._archive_noop` is a trivial built-in strategy (alw
 whole requested range archived immediately, having actually counted the rows in it) that exists only
 to exercise real dispatch in tests.
 
-`retire()`'s drop precondition consults `pgpm._archive_fully_covered` (issue #238; see
+`retire()`'s drop precondition consults `pgpm._archive_fully_covered` (see
 [`retire`](#retire)), which in turn is driven by `_run_archive_strategy` via `pgpm._archive_step`
 below.
 
 ### Byte-budget chunked archiving
 
-`pgpm.maintain()`'s per-tick archiving step (issue #237; `archived=N` in its summary) is the
+`pgpm.maintain()`'s per-tick archiving step (`archived=N` in its summary) is the
 built-in way to drive the contract above without hand-writing a resumable `archive_fn`. It ports
 `pgpm_archive`'s own byte-budget chunker (#213, #221) onto the contract, unchanged in intent: never
 archive a whole large partition as one giant operation, chunk it instead.
@@ -710,30 +698,27 @@ archive a whole large partition as one giant operation, chunk it instead.
 - `pgpm.archive_ledger` (successor to `pgpm_archive`'s `archive.ledger`, same shape:
   `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`, `rows_archived`, `archived_at`) records
   one row per chunk. `s3_key`/`etag` come straight from the `archive_fn` call's own
-  `pgpm.archive_result` -- populated for a real transport strategy (#239), still `null` for a
+  `pgpm.archive_result` -- populated for a real transport strategy, still `null` for a
   strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none` strategy).
 - `pgpm._next_archive_chunk(p_parent, p_child)` picks the next chunk **within one child's own
   `[lo, hi)`** -- resuming from wherever that child's ledger coverage left off, extended to the next
   distinct control value so a run of ties never splits across two chunks. Unlike the original
   (which picked ranges across the whole table, gated by the frontier and retention horizon
   directly), this is scoped to a single already-write-blocked child, because that gating is now the
-  write-block trigger's job (#235).
+  write-block trigger's job.
 - `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
   that child reach its own `hi` (or the strategy is `none`) -- `retire()`'s archive-coverage drop
-  precondition (issue #238; see [`retire`](#retire)).
+  precondition (see [`retire`](#retire)).
 - `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: for every
   attached child that **already has the write-block trigger installed** (checked directly, not
   re-derived from the boundary formula) and is not yet fully covered, it picks the next chunk, runs
   `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
   trigger yet is never touched, however far past the byte budget's reach it sits.
 
-`pgpm_archive`'s own old `archive.ledger`/`archive._next_range_byte_budget`/`archive.tick` -- the
-paced worker this path replaced -- are deleted entirely (issue #240).
-
 ### Real S3 archive strategies
 
 `pgpm_archive` (the optional module, `pgpm_archive/install.sql`) ships two `archive_fn`-conforming
-strategies, issue #239: `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet` (both in the
+strategies: `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet` (both in the
 `pgpm` schema, not `archive` -- they are `pgpm_core` contract implementations that happen to live in
 this optional module). Set either via `pgpm.set_archive_fn`:
 
@@ -747,11 +732,10 @@ synchronous functions, called directly rather than through `archive_fn`) are bui
 encoded bytes and S3 semantics are identical; only the calling contract differs. Connection settings
 (bucket, region, endpoint, prefix, vault key names, compression) still come from `archive.config`,
 the same one config surface the synchronous functions use -- setting `archive_fn` this way needs no
-second, independently configured surface. `archive._encode_upload_ndjson_commits` (a third format,
-with internal `COMMIT`s to bound an otherwise-unbounded single read) has no `archive_fn` counterpart
-and is gone (issue #240): `archive_fn` is a plain function and PL/pgSQL forbids transaction control
-inside one regardless of call context, and it doesn't need one anyway -- `pgpm._next_archive_chunk`
-already bounds every call to `config.archive_byte_budget` before `archive_fn` ever runs.
+second, independently configured surface. An `archive_fn` cannot issue `COMMIT`: it is a plain function
+and PL/pgSQL forbids transaction control inside one regardless of call context. It does not need to
+either, since `pgpm._next_archive_chunk` bounds every call to `config.archive_byte_budget` before
+`archive_fn` ever runs.
 
 ## Scheduling
 
@@ -766,7 +750,7 @@ Creates (or replaces) the `pg_cron` job named `pgpm` that runs `call pgpm.mainta
 and is idle while they are paused. Raises if `pg_cron` is not installed.
 
 It also creates a second job, `pgpm_detach`, on the same schedule and **idle** (`select 1`). That one is
-machinery for issue #268: `retire` rewrites its command in place when a partition an incoming foreign key
+machinery for the referenced-partition path: `retire` rewrites its command in place when a partition an incoming foreign key
 references needs `DETACH PARTITION ... CONCURRENTLY`, which PostgreSQL refuses to execute from a function,
 and returns it to idle once the drop lands. One standing job is rewritten rather than one scheduled per
 retirement, because `pg_cron` has no one-shot schedule. Retiring a referenced partition does not work
@@ -824,8 +808,7 @@ pgpm.pause(p_parent regclass)  returns void
 ```
 
 Flip `config.paused`. `transmute` registers a table paused; `resume` lets scheduled maintenance begin
-obtaining, draining, retaining (and regraining, if enabled). `pause` stops it. `drain_all`/`drain_step`
-ignore the flag, so you can still drive the drain by hand while paused.
+obtaining, archiving, retaining (and regraining, if enabled). `pause` stops it.
 
 ### `set_regrain`
 
@@ -865,7 +848,7 @@ One row per managed table. Beyond the static config it surfaces:
 - `fks_suspended` / `fks_unvalidated` -- preserve-managed incoming FKs currently dropped (RI off) versus
   re-added `NOT VALID` but blocked from full validation by pre-existing orphans. `fks_suspended` is a
   transient state inside a regrain swap now, so a standing non-zero value means a swap died mid-flight.
-- `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (issue #238; not a
+- `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (not a
   child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
   is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
   one and the FK's own `ON DELETE` refused the delete) and `fail_retain_detach` (nowhere to dispatch a
@@ -877,7 +860,7 @@ One row per managed table. Beyond the static config it surfaces:
   relation and there is no honest answer without it. Clear the state with
   [`forget_missing`](#forget_missing).
 - `retain_detaching` -- partitions whose concurrent detach has been dispatched and not yet completed
-  (issue #268). Non-zero for a tick or two is normal; persistently non-zero alongside climbing
+  Non-zero for a tick or two is normal; persistently non-zero alongside climbing
   `retain_drop_failures` means the dispatch has nowhere to go -- run `pgpm.schedule()`.
 - `retain_backlog` -- partitions whose whole range is past the retention horizon but which are not yet
   dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks, or while a write-blocked
@@ -925,8 +908,8 @@ pgpm.observe_window(p_parent regclass, p_since interval default '7 days') return
 ```
 
 The span pgpm was active on a table within `p_since`, plus a summary of what it did. **Pure `pgpm.log`** with
-no PGFR dependency, so it works (and is useful) standalone. `backoffs` counts adaptive ticks where some
-congestion signal fired (`method <> 'probe'`); the per-signal columns break that down.
+no PGFR dependency, so it works (and is useful) standalone. The `backoffs` columns report on a
+log signal that nothing emits any more, so they are always zero.
 
 ```sql
 pgpm.impact_report(p_parent regclass, p_since interval default '7 days') returns text
@@ -946,20 +929,15 @@ pgpm.feathering_validation(p_parent regclass, p_since interval default '7 days',
 )
 ```
 
-Ground truth for the adaptive feathering: for each backoff tick (a `drain_budget` row whose reason is not
-`probe`), it asks PGFR whether real pressure was present in the `p_lead` lead-up window, so you can tell
-whether the feathering fires for real reasons or phantoms. `wal` is corroborated by a forced checkpoint in
-the lead-up, `lock` by a sampled `Lock` wait with waiters, `io` by non-zero client read time (null where
-`pg_stat_io` is unavailable, e.g. PG15). The lock dimension uses PGFR's activity ring buffer (~2h retention),
-so lock corroboration is meaningful only for recent ticks; `wal`/`io` come from the 30-day snapshot tier.
-Requires PGFR.
+**Returns no rows.** It corroborates a per-tick log signal that nothing writes any more, so there is
+nothing for it to report on. The function is retained but inert.
 
 ## Incoming foreign keys
 
 These manage the `preserve` lifecycle: an incoming FK dropped at `transmute` is re-added against the new
-parent once the drain is idle, split into a re-add (`NOT VALID`, enforcing new writes) and a later
-validation so a pre-existing orphan can never permanently brick restoration. `maintain` calls
-`suspend`/`restore` automatically; the others are operator tools.
+parent on a later tick, split into a re-add (`NOT VALID`, enforcing new writes) and a later validation so a
+pre-existing orphan can never permanently brick restoration. `maintain` calls `restore` automatically; the
+others are operator tools.
 
 ### `restore_incoming_fks`
 
@@ -968,7 +946,7 @@ pgpm.restore_incoming_fks(p_parent regclass) returns int
 ```
 
 Re-adds each dropped preserve-managed FK against the new parent, returning the number re-added. Self-gates
-on quiescence: a no-op unless the closed tail is drained and no in-flight child remains.
+on quiescence: a no-op while an in-flight, not-yet-attached regrain child remains.
 
 It re-adds each FK `NOT VALID` and **stops there**. `NOT VALID` already enforces every *new* write, so
 referential integrity is live the moment this returns; only pre-existing rows are unverified, which
@@ -1083,7 +1061,6 @@ the failures too, which is exactly how a guard once reported a starved tick as a
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
-| `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `skip_obtain` / `skip_retain` / `skip_drain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
@@ -1106,7 +1083,7 @@ Preserve-managed incoming FKs and their lifecycle.
 
 ### `pgpm.archive_ledger`
 
-One row per archived chunk (issue #237). See [Byte-budget chunked archiving](#byte-budget-chunked-archiving).
+One row per archived chunk. See [Byte-budget chunked archiving](#byte-budget-chunked-archiving).
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -1114,8 +1091,8 @@ One row per archived chunk (issue #237). See [Byte-budget chunked archiving](#by
 | `lo` | `text` | native-grid start of this chunk |
 | `hi` | `text` | native-grid end of this chunk |
 | `child_name` | `name` | the child this chunk belongs to |
-| `s3_key` | `text` | set by a real transport strategy (#239); null for a strategy with nothing object-store-shaped to name |
-| `etag` | `text` | set by a real transport strategy (#239); null for a strategy with nothing object-store-shaped to name |
+| `s3_key` | `text` | set by a real transport strategy; null for a strategy with nothing object-store-shaped to name |
+| `etag` | `text` | set by a real transport strategy; null for a strategy with nothing object-store-shaped to name |
 | `rows_archived` | `bigint` | rows this chunk archived; null if the strategy reported no progress |
 | `archived_at` | `timestamptz` | when this chunk was recorded |
 
@@ -1136,7 +1113,7 @@ excludes `_to_`).
 Functions named `pgpm._*` are private and may change without notice. The kind-specific logic lives in a
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
-`_create_partition`, the `_feather_*`/`_ambient_*`/`_aimd_next` controller, `_uuid_to_ts`/`_ts_to_uuid`,
+`_create_partition`, `_uuid_to_ts`/`_ts_to_uuid`,
 `_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`/`_is_write_blocked`,
 `_run_archive_strategy`/`_archive_noop`,
 `_next_archive_chunk`/`_archive_fully_covered`/`_archive_step`) implements the engine. Do not call
