@@ -52,8 +52,11 @@ partition, and reaching a partition directly needs grants that live on the paren
 
 One shape is refused rather than carried: a `FOR EACH ROW` trigger with a transition table
 (`REFERENCING OLD/NEW TABLE`), which PostgreSQL does not permit on a partitioned table. Rewrite it as a
-statement trigger, which can carry a transition table, or drop it. Foreign keys are separate; see
-`p_incoming_fks` below and the outgoing-FK limit. An identity column is carried onto the parent and its sequence
+statement trigger, which can carry a transition table, or drop it. **Outgoing** foreign keys (this table
+referencing another) are carried onto the new parent automatically, so they keep enforcing across every
+partition; a `NOT VALID` one is refused rather than carried, because re-adding it at the parent could not
+then be metadata-only. **Incoming** keys are governed by `p_incoming_fks` below. An identity column is
+carried onto the parent and its sequence
 advanced to the greater of `max(id) + 1` and the original sequence's own next value, so auto-generated ids
 never collide and never re-issue a value the sequence had already moved past (`untransmute` restores it the
 same way).

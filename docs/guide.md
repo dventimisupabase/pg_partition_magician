@@ -393,10 +393,21 @@ diagnostic.
 
 ## Incoming foreign keys
 
-If other tables reference the table you are transmuting (e.g. `reactions(message_id) -> messages(id)`),
-those FKs are handled, not ignored. Because `transmute` never rewrites the primary key, the referenced
-unique key always survives partitioning, so an incoming FK to the primary key is always preservable: no
-composite key, no denormalization, ever.
+Foreign keys in **both** directions survive the conversion.
+
+An **outgoing** key (the table you are transmuting referencing another table) is carried onto the new
+parent for you, with no option to configure and nothing to run afterwards. It has to be carried, because a
+foreign key follows the table it is defined on and the conversion renames your table aside to become the
+monolith child: left alone, the constraint would keep enforcing over the monolith's range only, and a row
+written into a forward partition would escape it. Carrying it is metadata-only, since PostgreSQL adopts the
+monolith's already-validated copy rather than rescanning. A `NOT VALID` outgoing key is refused up front:
+adding it at the parent would rescan the whole table under a lock that blocks writes on it and on the
+referenced table, so validate or drop it first.
+
+The rest of this section is about the **incoming** direction, where other tables reference the one you are
+transmuting (e.g. `reactions(message_id) -> messages(id)`). Because `transmute` never rewrites the primary
+key, the referenced unique key always survives partitioning, so an incoming FK to the primary key is always
+preservable: no composite key, no denormalization, ever.
 
 There is one mechanical wrinkle, and it is the cutover itself. A foreign key tracks the table it
 references by identity, not by name, and the cutover *renames your table aside* to become the monolith
