@@ -316,10 +316,33 @@ The refusal gate, factored out so you can dry-run it inside a transaction. Raise
 `pg_partition_magician:`-prefixed error when the hypertable cannot be migrated by this version, and returns
 normally otherwise. **Refuses** when: the `timescaledb` extension is absent; `p_hypertable` is not a
 hypertable; it has one or more **continuous aggregates** (no native-partition equivalent, and dropping them is
-data-destructive); it has more than one **dimension** (space partitioning); or the `p_control` column does not
-exist. On success it raises a `NOTICE` estimating the transient extra disk the migration needs (see
+data-destructive); it has more than one **dimension** (space partitioning); the `p_control` column does not
+exist; an **outgoing** foreign key is `NOT VALID`; or an **incoming** foreign key references anything other
+than the key pgpm will reuse. On success it raises a `NOTICE` estimating the transient extra disk the migration needs (see
 `from_hypertable_disk_estimate`) and a rough copy-time ETA (see `from_hypertable_time_estimate`). Both
 `from_hypertable_copy` and `from_hypertable` call it first.
+
+#### Foreign keys
+
+Both directions are carried across the migration.
+
+An **outgoing** key (the migrated table referencing another table) is replayed verbatim on the private copy
+during `from_hypertable_copy` as `NOT VALID`, validated there in its own transaction, and re-added at the new
+parent after the handoff. Validating on the copy keeps the `O(rows)` scan off the cutover's lock, and because
+the copy becomes the monolith child with an already-validated key, the parent-level add is metadata-only.
+Logged `from_hypertable_carry_fk` and `from_hypertable_adopt_fk`.
+
+An **incoming** key (another table referencing the migrated one) is captured and dropped in the cutover --
+that is what allows the source hypertable to be dropped, since such a key puts a constraint on every chunk --
+then re-added against the new parent afterwards through `pgpm.dropped_fk`, so
+[`restore_incoming_fks`](#restore_incoming_fks) and [`validate_incoming_fks`](#validate_incoming_fks) do the
+re-add and the validation with their usual reporting. Referential integrity is therefore **off on the
+referencing table** from the cutover's drop until that re-add, a window bounded by the swap plus one
+`transmute` and surfaced by `status().fks_suspended`. It cannot be closed by re-adding inside the cutover,
+because `transmute` refuses a table that still carries an incoming key.
+
+`from_hypertable_preflight` refuses an incoming key that references anything other than the key pgpm will
+reuse, before any copying happens.
 
 ### `from_hypertable_disk_estimate`
 
