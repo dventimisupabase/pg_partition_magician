@@ -102,7 +102,14 @@ begin
   commit;
   while not exists(select 1 from public.done) loop
     begin
-      set local lock_timeout = '1s';
+      -- 150 ms, not 1 s. The unit of observation costs one lock_timeout, so a 1 s timeout could fit only
+      -- ONE OR TWO attempts into the ~1.8 s of blocked window that remains after the 0.5 s head start --
+      -- and it showed: against its own mutant this guard scored exactly 1 timeout, a margin of a single
+      -- observation. Any millisecond-scale shift in obtain's duration then flips it to 0 and the guard
+      -- silently stops discriminating, which is precisely the failure mode bench/discriminate.sh exists
+      -- to catch (and did, on issue #299). At 150 ms the same window is ~12 observations wide, while
+      -- staying ~150x above obtain's own ~1 ms post-fix lock window, so neither verdict rides on timing.
+      set local lock_timeout = '150ms';
       perform 1 from public.ml limit 1;
     exception when others then t := t + 1; end;
     n := n + 1;

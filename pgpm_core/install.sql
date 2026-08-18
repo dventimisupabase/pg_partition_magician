@@ -231,10 +231,33 @@ returns timestamptz language sql stable as $$
   );
 $$;
 
+-- A UUIDv7 carries its timestamp in the leading 48 bits, so the grid it can express STOPS at
+-- 2^48 - 1 ms after the epoch: 10889-08-02 05:31:50.65504+00. Past that, `to_hex` returns 13 hex digits
+-- and `lpad(..., 12, '0')` TRUNCATES rather than pads -- silently dropping the high nibble, so a LATER
+-- timestamp encodes as a SMALLER uuid (issue #299):
+--
+--   _ts_to_uuid(ceiling)         -> ffffffff-ffff-0000-0000-000000000000
+--   _ts_to_uuid(ceiling + 1 ms)  -> 10000000-0000-0000-0000-000000000000
+--
+-- Monotonicity is the one property every caller assumes, and losing it silently produced partition
+-- bounds with lo > hi -- surfacing as PostgreSQL's `empty range bound specified for partition`, an error
+-- that names neither the cause nor the ceiling. Refusing here fixes it once for every caller instead of
+-- at each bound-computing site.
+--
+-- Note the inverse can never overflow: a uuid's leading 48 bits cannot exceed the 48-bit maximum, so
+-- _uuid_to_ts always returns a representable timestamp. Only stepping FORWARD off the end is possible.
 create or replace function pgpm._ts_to_uuid(p_ts timestamptz)
-returns uuid language sql stable as $$
-  select (substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)||'-'||substr(h,17,4)||'-'||substr(h,21,12))::uuid
-  from (select lpad(to_hex(floor(extract(epoch from p_ts) * 1000)::bigint), 12, '0') || repeat('0', 20) as h) s;
+returns uuid language plpgsql stable as $$
+declare v_ms numeric; v_h text;
+begin
+  v_ms := floor(extract(epoch from p_ts) * 1000);
+  if v_ms < 0 or v_ms > 281474976710655 then
+    raise exception 'pg_partition_magician: % is outside the range a UUIDv7 timestamp can express (the leading 48 bits stop at 10889-08-02 05:31:50.65504+00); a uuidv7 grid cannot reach it', p_ts
+      using errcode = 'datetime_field_overflow';
+  end if;
+  v_h := lpad(to_hex(v_ms::bigint), 12, '0') || repeat('0', 20);
+  return (substr(v_h,1,8)||'-'||substr(v_h,9,4)||'-'||substr(v_h,13,4)||'-'||substr(v_h,17,4)||'-'||substr(v_h,21,12))::uuid;
+end;
 $$;
 
 -- native grid type for comparisons: numeric for id, timestamptz otherwise
@@ -471,6 +494,18 @@ begin
   for k in 0 .. cfg.obtain loop
     if k > 0 then v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo); end if;
     v_hi   := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
+    -- The grid can RUN OUT (issue #299). A uuidv7 grid stops at the 48-bit ceiling, and no uuid can
+    -- express a bound past it. That is a terminal state, not a failure: EXIT with whatever was built
+    -- rather than raising, so a tick keeps working and the lookahead is simply shorter. transmute
+    -- refuses up front when the monolith's own bound is unreachable, so a table only gets here by
+    -- legitimately advancing toward the ceiling over its lifetime. Deliberately NOT logged: obtain runs
+    -- every tick and the condition is permanent, so logging it would bury real failures under identical
+    -- rows forever. A write past the grid is already refused loudly by PostgreSQL.
+    begin
+      perform pgpm._encode(cfg.control_kind, v_hi);
+    exception when datetime_field_overflow then
+      exit;
+    end;
     v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo, v_hi);
     continue when to_regclass(format('%I.%I', v_nsp, v_name)) is not null;
     -- skip a candidate that overlaps an EXISTING attached partition (e.g. the coarse monolith that
@@ -2069,6 +2104,7 @@ begin
           (round(v_uchk_frac * 100, 1) || '%'), v_uchk_n, quote_ident(p_control);
       end if;
     end if;
+
   end if;
 
   -- existing PK columns and identity columns
@@ -2280,6 +2316,27 @@ begin
   v_hi_native  := pgpm._grid_next(p_control_kind, p_step,
                     pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
   v_monolith   := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
+
+  -- Refuse, before touching anything, when the monolith's own upper bound cannot be expressed (#299).
+  -- B is the grid boundary ABOVE the frontier, so a frontier sitting in the last partial step puts B past
+  -- the 48-bit UUIDv7 ceiling and no uuid can carry it. This is arithmetic, not a heuristic, which is why
+  -- p_force_uuidv7 does NOT override it: that override exists to let an operator vouch for a column the
+  -- SAMPLING misjudged, not to ask for a bound that cannot exist.
+  --
+  -- In practice it catches the same garbage column the sampling check does, from the other side: random
+  -- uuids have their maximum near the top of the 128-bit space, so the frontier decodes to within a
+  -- whisker of the ceiling and every step forward overflows. Before this, the overflow was silently
+  -- truncated into a SMALLER uuid and surfaced much later as PostgreSQL's `empty range bound specified for
+  -- partition`, naming neither the cause nor the ceiling -- and only on the runs where the random maximum
+  -- happened to land close enough, which made it a CI flake rather than a reproducible bug.
+  if p_control_kind = 'uuidv7' then
+    begin
+      perform pgpm._encode(p_control_kind, v_hi_native);
+    exception when datetime_field_overflow then
+      raise exception 'pg_partition_magician: % cannot be partitioned on a uuidv7 grid using %: its newest value decodes to %, so the next grid boundary lands past 10889-08-02 05:31:50.65504+00, the newest instant a UUIDv7 timestamp can express. A column whose frontier sits at that ceiling is almost certainly random (UUIDv4) rather than time-ordered -- inspect it with pgpm.check_uuidv7(). p_force_uuidv7 does not override this, because no uuid can express the bound.',
+        p_parent, quote_ident(p_control), v_frontier_native;
+    end;
+  end if;
 
   -- ============================ PHASE 1: add the bound (#275) ============================
   --
