@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+- **A uuidv7 grid can no longer produce a partition with `lo > hi` (issue #299).** A UUIDv7 carries its
+  timestamp in the leading 48 bits, so the grid it can express stops at `2^48 - 1` ms after the epoch:
+  `10889-08-02 05:31:50.65504+00`. Past that, `to_hex` returns 13 hex digits and **`lpad(..., 12, '0')`
+  truncates rather than pads**, silently dropping the high nibble, so a LATER timestamp encoded as a
+  SMALLER uuid:
+
+  ```text
+  _ts_to_uuid(ceiling)        -> ffffffff-ffff-0000-0000-000000000000
+  _ts_to_uuid(ceiling + 1 ms) -> 10000000-0000-0000-0000-000000000000
+  ```
+
+  Monotonicity is the one property every bound-computing caller assumes. Losing it silently produced
+  partition bounds with `lo > hi`, surfacing much later as PostgreSQL's `empty range bound specified for
+  partition` -- an error naming neither the cause nor the ceiling.
+  - **`_ts_to_uuid` now refuses** (`datetime_field_overflow`) instead of truncating. Fixed at the root, so
+    no caller can receive a non-monotonic bound. The inverse needs no guard: a uuid's leading 48 bits
+    cannot exceed the 48-bit maximum, so `_uuid_to_ts` always returns a representable timestamp and only
+    stepping *forward* off the end is possible.
+  - **`transmute` refuses up front** when the monolith's own upper bound `B` -- the grid boundary above the
+    frontier -- cannot be expressed, leaving the table untouched. **`p_force_uuidv7` does not override
+    this**: that override exists to let an operator vouch for a column the *sampling* misjudged, not to
+    request a bound no uuid can carry. In practice it catches the same random-UUIDv4 column the sampling
+    check does, from the other side.
+  - **`obtain` exits cleanly** when the grid runs out rather than raising, so a table that legitimately
+    advances toward the ceiling keeps working with a shorter lookahead. Deliberately not logged: obtain
+    runs every tick and the condition is permanent, so logging would bury real failures under identical
+    rows -- and a write past the grid is already refused loudly by PostgreSQL.
+  - `tests/39_uuidv7_refused_test.sql` goes from 5 to 11 assertions and **stops being a CI flake**. It had
+    asserted that `p_force_uuidv7` converts a random-uuid column; whether that blew up depended on how
+    close to the ceiling the run's random maximum landed. The ceiling case now uses a crafted
+    top-of-range fixture, and a new deterministic year-1990 fixture keeps the override's real remit
+    covered (samples implausible, grid ordinary). Verified across 12 independent runs with fresh
+    `gen_random_uuid()` data.
+  - **`bench/maintain_lock.sh`: probe `lock_timeout` 1 s -> 150 ms.** Against its own mutant this guard
+    scored exactly **1** timeout -- a margin of a single observation, because one attempt costs one
+    timeout and only one or two fit in the blocked window. The `obtain` change above shifted timing by
+    milliseconds and flipped it to 0, so `./test.sh discriminate` correctly reported the guard as
+    non-discriminating. At 150 ms the same window is ~12 observations wide (measured: 8 against the
+    mutant, 0 against real code) while staying ~150x above obtain's own ~1 ms lock window.
+
 - **`pgpm.status()` no longer returns nothing when a managed table was dropped without `untransmute`
   (issue #296).** `pgpm.config.parent_table` is a `regclass` and carries no dependency on the relation, so
   a plain `DROP TABLE` on a managed parent left the config row pointing at an oid with no `pg_class` entry.
