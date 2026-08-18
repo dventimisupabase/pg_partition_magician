@@ -16,7 +16,7 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 
 ## Entries
 
-- [Referential-integrity violations after a `preserve` drain](#referential-integrity-violations-after-a-preserve-drain)
+- [Referential-integrity violations after a `preserve` conversion](#referential-integrity-violations-after-a-preserve-conversion)
 - [The history is not splitting into fine partitions](#the-history-is-not-splitting-into-fine-partitions)
 - [A write is refused: `no partition of relation ... found for row`](#a-write-is-refused-no-partition-of-relation--found-for-row)
 - [Disk is filling during a regrain](#disk-is-filling-during-a-regrain)
@@ -24,24 +24,31 @@ Every entry has the same shape: **Symptom** (how you noticed) -> **What it means
 - [Re-transmute fails with an orphan-table error](#re-transmute-fails-with-an-orphan-table-error)
 - [A `from_hypertable` cutover is slow or its pre-drain will not converge](#a-from_hypertable-cutover-is-slow-or-its-pre-drain-will-not-converge)
 
-## Referential-integrity violations after a `preserve` drain
+## Referential-integrity violations after a `preserve` conversion
 
 **Symptom.** Any of: an incoming foreign key on a table that points at a pgpm-managed parent shows as
 `NOT VALID`; `pgpm.status()` reports `fks_unvalidated > 0`; `pgpm.log` has `fail_validate_incoming_fk`
 rows; or a periodic RI audit (or an application error) flags dangling references into the parent.
 
-**What it means.** You converted with `p_incoming_fks => 'preserve'`. While the **drain** moved
-referenced rows (evacuating a stray from the `DEFAULT` through an unattached child), the incoming FK was
-dropped, so referential integrity was off on the referencing table for that window. (This is by design and
-visible as `status().fks_suspended`; see the guide's
-[incoming foreign keys](guide.md#incoming-foreign-keys).) When the drain reached quiescence, pgpm re-added
-the FK so it once again enforces every *new* write (as `NOT VALID`), but it could not fully *validate* the
-constraint because rows that violate it were written during the window. Those orphans are real RI
-violations to reconcile; new writes are already guarded again. The attribution is exact: the FK was valid
-when pgpm dropped it, so any orphan present now arose during the window. (Note: **regrain** does *not* open
-this window -- it copies, and its swap drops and re-adds the FK within one atomic transaction -- but the
-same reconciliation applies if a regrain or retention drops aged, still-referenced history: the re-validate
-then finds a true orphan.)
+**What it means.** You converted with `p_incoming_fks => 'preserve'`. The **cutover** drops each incoming
+FK, because it renames your table aside to become the monolith child and an FK left in place would go on
+referencing that partition rather than the new parent. Referential integrity is therefore off on the
+referencing table from the cutover until `pgpm.restore_incoming_fks` re-adds the constraint against the new
+parent -- the next maintenance tick, or immediately if you call it by hand. (This is by design and visible
+as `status().fks_suspended`; see the guide's
+[incoming foreign keys](guide.md#incoming-foreign-keys).) The re-add enforces every *new* write straight
+away (as `NOT VALID`), but it could not fully *validate* the constraint, because rows that violate it were
+written during that window. Those orphans are real RI violations to reconcile; new writes are already
+guarded again. The attribution is exact: the FK was valid when pgpm dropped it, so any orphan present now
+arose during the window.
+
+Two things that do *not* produce orphans this way. **Regrain** copies rather than moves, and its swap drops
+and re-adds the FK inside one atomic transaction, so no session observes RI off. **Retention** honours
+whatever the foreign key declares in its `ON DELETE` clause (see
+[retention with an incoming foreign key](guide.md#retention-with-an-incoming-foreign-key)), so it severs or
+refuses rather than leaving a dangling reference. The one remaining way maintenance can strand a reference
+is a regrain discarding aged, still-referenced sub-ranges below the retention horizon, which it only does
+when `archive_fn` is unset; the reconciliation below applies unchanged.
 
 **Steps.**
 
@@ -102,16 +109,22 @@ then finds a true orphan.)
 
    The foreign key is fully valid again.
 
-**Prevent.** Referential integrity is necessarily off while the **drain** relocates referenced rows: the FK
-must be dropped so a row can move through an unattached child, and that cannot be avoided. In the monolith
-model the conversion itself moves no rows, so the FK is typically restorable immediately after `transmute`
-(`select pgpm.restore_incoming_fks('public.events');`); the window opens only if a later drain
-actually moves referenced rows. To shrink it: keep `obtain` ahead so strays never accumulate, so the drain
-rarely runs; or `pause` heavy referencing-table write bursts while the drain catches up. A `regrain` (manual
-or auto) opens no RI window of its own -- the copy never moves a referenced row out of the parent, and the
-swap's FK drop/re-add is one atomic transaction. The one regrain-related caveat is data, not timing: if a
-regrain or a retention policy drops aged history that is still referenced, the FK re-validates against a real
-orphan -- do not retain below rows you still reference.
+**Prevent.** The window is the gap between the cutover's drop and the re-add, and it is entirely under your
+control: **close it yourself, immediately after `transmute`**, rather than waiting for a tick.
+
+```sql
+select pgpm.restore_incoming_fks('public.events');   -- then again next tick for the VALIDATE
+```
+
+The conversion moves no rows, so there is nothing to wait for: the monolith holds every referenced row,
+attached, from the moment of cutover. If you also keep writes off the referencing table across those few
+seconds, the window carries no risk at all. There is no later window to worry about -- nothing in a
+maintenance tick suspends a restored FK again.
+
+The one remaining way to strand a reference is data, not timing: a `regrain` that discards aged,
+still-referenced sub-ranges below the retention horizon (which it only does when `archive_fn` is unset)
+leaves a real orphan for the re-validate to find. Retention itself does not, since it honours whatever the
+foreign key declares in its `ON DELETE` clause.
 
 ## The history is not splitting into fine partitions
 

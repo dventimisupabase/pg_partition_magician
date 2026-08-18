@@ -125,8 +125,8 @@ psql "$DATABASE_URL" -f pgpm_core/uninstall.sql
 ## Transmute a table
 
 Conversion moves no data. It renames your table to a coarse-child name, creates a partitioned parent
-under the original name, attaches the old table as the bounded **monolith** child, and creates a fresh
-empty `DEFAULT`. It does read the original once, and the table is locked while it does; see
+under the original name, attaches the old table as the bounded **monolith** child, and lays down the
+forward grid above it. It does read the original once, and the table is locked while it does; see
 [The cutover moves no rows](#the-cutover-moves-no-rows).
 
 ### Pick the kind
@@ -156,8 +156,8 @@ nothing until you `resume` it (see [Run it](#run-it)). All parameters are in the
 
 The conversion never rewrites the primary key and never moves a row. Its only `O(rows)` work is a single
 read-only scan of the original, which certifies the monolith's bound so the later attach is metadata-only.
-Everything after that is a metadata flip: rename, create the parent, attach the monolith, create the
-`DEFAULT`. No index rebuild, no row rewrite.
+Everything after that is a metadata flip: rename, create the parent, attach the monolith, build the
+forward grid. No index rebuild, no row rewrite.
 
 **The table is locked for the duration of that scan.** `transmute` runs in one transaction, and the
 `ALTER TABLE` that adds the bound takes an `ACCESS EXCLUSIVE` lock which is therefore held until the
@@ -218,8 +218,8 @@ select pgpm.resume('public.events');      -- go live
 updates the cadence in place. `pgpm.unschedule()` removes it. Run these from the database where `pg_cron`
 is installed. The raw equivalent is `cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')`.
 
-From there, each tick obtains ahead, evacuates any stray from the `DEFAULT`, applies retention, and (if
-auto-regrain is on) advances one regrain microbatch. You can also transmute with `p_paused => false` to go
+From there, each tick obtains ahead, archives and applies retention, restores any preserved incoming
+foreign key, and (if auto-regrain is on) advances one regrain microbatch. You can also transmute with `p_paused => false` to go
 live immediately and skip `resume`.
 
 To convert and split a table synchronously (tests, one-shot migrations) instead of waiting for the paced
@@ -265,12 +265,12 @@ select pgpm.set_regrain('public.events', '1 month');   -- feather the monolith t
 ```
 
 With auto-regrain on, each `maintain` tick advances one budget-sized microbatch of the oldest frozen coarse
-child toward the target step, under the same adaptive budget as the drain. It is off by default
+child toward the target step, sized by `config.regrain_batch`. It is off by default
 (`set_regrain(parent, null)` turns it back off) and always safe to enable: it only paces regraining; it
-never starts on a child that is not frozen or whose range still has strays in the `DEFAULT`.
+never starts on a child that is not frozen.
 
 Regrain **copies**; it never deletes from the source. The coarse child stays whole and attached until one
-atomic swap detaches it, attaches the fine children, and drops it. So unlike the drain, a regrain -- the
+atomic swap detaches it, attaches the fine children, and drops it. So a regrain -- the
 paced, cross-tick auto-regrain included -- never undercounts: every row stays visible in the monolith the
 whole time, and the swap is atomic, so a concurrent reader never sees a partial state. The kept fine
 children only ever receive inserts, so there are no dead tuples and no vacuum. (The one moment regrain
@@ -400,25 +400,34 @@ those FKs are handled, not ignored. Because `transmute` never rewrites the prima
 unique key always survives partitioning, so an incoming FK to the primary key is always preservable: no
 composite key, no denormalization, ever.
 
-There is one mechanical wrinkle. The drain moves referenced rows through a standalone,
-not-yet-attached child, so a referenced row is briefly outside the parent, which a `NO ACTION` FK would
-reject and a `CASCADE`/`SET NULL` FK would silently honour. So the FK cannot ride through in place during a
-drain: it is dropped for the conversion and re-added against the new parent. (Regrain is different -- it
-copies, never moving a referenced row out of the parent -- so the multi-tick copy needs no such leash; only
-its atomic swap touches the FK, see below.)
+There is one mechanical wrinkle, and it is the cutover itself. A foreign key tracks the table it
+references by identity, not by name, and the cutover *renames your table aside* to become the monolith
+child and puts a new parent in its place under the original name. An FK left in place would therefore
+still reference the **monolith partition**, not the new logical table. It stays valid and keeps
+enforcing, which is what makes this dangerous rather than merely wrong: the constraint has silently
+narrowed to one partition, so any new referencing row pointing at data that has since landed in a
+forward partition is rejected.
+
+```text
+ERROR:  insert or update on table "reactions" violates foreign key constraint "reactions_message_id_fkey"
+DETAIL:  Key (message_id)=(1500) is not present in table "messages".
+```
+
+So the FK cannot ride through the cutover in place: it is dropped for the conversion and re-added
+against the new parent. (Regrain is different -- it copies, never moving a referenced row out of the
+parent -- so its multi-tick copy needs no such handling; only its atomic swap touches the FK, see below.)
 
 `transmute` offers two modes for incoming FKs:
 
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
 - **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the referencing
-  table is otherwise untouched), then re-add it against the new parent once maintenance is idle.
+  table is otherwise untouched), then re-add it against the new parent on a later maintenance tick.
 
-With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK once the closed tail has drained;
-`maintain` calls it automatically, so on the scheduled path you do nothing. It is a no-op until the drain
-is quiescent (no closed rows in the `DEFAULT`, no in-flight *drain* child -- a regrain's copy-children do not
-count, since they never take a referenced row out of the parent), so it is safe to call early or
-repeatedly. Because the monolith holds every referenced row attached from the moment of cutover, with no
-closed tail to wait for, the FK is typically restorable immediately after transmute.
+With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK against the new parent; `maintain`
+calls it automatically, so on the scheduled path you do nothing. It is a no-op while an in-flight,
+not-yet-attached child exists mid-regrain, so it is safe to call early or repeatedly. Because the monolith
+holds every referenced row attached from the moment of cutover, the FK is normally restorable immediately
+after transmute.
 
 ```sql
 call pgpm.transmute('public.events', 'id', 10000000, p_incoming_fks => 'preserve');
@@ -443,19 +452,17 @@ select pgpm.validate_incoming_fks('public.events');        -- validates the now-
 ```
 
 For the full step-by-step recovery, see the runbook entry
-[Referential-integrity violations after a `preserve` drain](runbook.md#referential-integrity-violations-after-a-preserve-drain).
+[Referential-integrity violations after a `preserve` conversion](runbook.md#referential-integrity-violations-after-a-preserve-conversion).
 
-After it is restored, `maintain` keeps a managed FK on a leash: it is live only while the closed tail is
-empty. If a later drain appears (obtain falls behind and rows land in the `DEFAULT` for an interval that
-then closes), `maintain` suspends the FK before draining (`pgpm.suspend_incoming_fks`) and restores it
-afterward. Referential actions, `DEFERRABLE`-ness, and self-referential FKs are all preserved across the
-cycle.
+**Once restored, it stays restored.** Nothing in a maintenance tick suspends a managed FK again;
+`pgpm.suspend_incoming_fks` has exactly one caller left, described next. Referential actions,
+`DEFERRABLE`-ness, and self-referential FKs are all preserved across the drop-and-restore.
 
-Auto-regrain needs **no such leash during the copy**: a regrain copies, so every referenced row stays in the
-monolith and is never outside the parent. The single exception is the swap's `DETACH` -- Postgres refuses
-to detach a partition whose rows are still referenced -- so the swap transiently drops the incoming FK(s)
-and re-adds them *within that one atomic transaction*. No other session ever observes RI off; there is no
-multi-tick suspension window the way the drain has, and the synchronous `regrain()` is atomic end to end.
+Auto-regrain needs **no suspension during the copy**: a regrain copies, so every referenced row stays in
+the monolith and is never outside the parent. The single exception is the swap's `DETACH` -- Postgres
+refuses to detach a partition whose rows are still referenced -- so the swap transiently drops the incoming
+FK(s) and re-adds them *within that one atomic transaction*. No other session ever observes RI off, and the
+synchronous `regrain()` is atomic end to end.
 
 ### Retention with an incoming foreign key
 
@@ -536,8 +543,8 @@ ATTACH PARTITION ...                                               -- scan skipp
 ```
 
 The monolith attaches this way at transmute (one scan of the original). `obtain`'s forward
-partitions need no scan at all, because the `DEFAULT` they would be checked against is empty (this is why
-keeping the `DEFAULT` empty matters). Regrain's fine children are born with their bound `CHECK`, so they
+partitions need no scan at all: they are created empty, so there is nothing to certify. Regrain's fine
+children are born with their bound `CHECK`, so they
 too attach metadata-only. The one rule that keeps it safe: never certify a range that is still receiving
 writes -- the monolith covers up to `B` (a boundary above the frontier) precisely so the current interval
 lives inside it, and regrain only touches frozen children.
@@ -559,8 +566,7 @@ in the monolith, so the parent's count is already complete.
 
 ## WAL and checkpoint sizing
 
-Moving rows rewrites them (a cross-partition `DELETE` + `INSERT`), so a **regrain** is a burst of WAL
-concentrated over the regrain window (the steady-state drain is tiny by comparison). If
+Copying rows rewrites them, so a **regrain** is a burst of WAL concentrated over the regrain window. If
 `max_wal_size` is small relative to that WAL rate plus your ambient write load, Postgres fires *requested*
 (forced) checkpoints whenever WAL hits the limit, rather than gentle *timed* checkpoints. A forced
 checkpoint flushes a burst of dirty buffers; on a throughput-limited disk that flush can stall the
@@ -611,8 +617,8 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   (bigint/numeric step), `uuidv7`/ULID-as-uuid (time grid, uuid bounds). `float`/`double` rejected; other
   encodings partition on a companion column.
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
-  clock-skew/late-arrival window; the don't-close-until-frontier-past rule plus the `DEFAULT` net absorb
-  stragglers. Arbitrary backdated keys break it.
+  clock-skew/late-arrival window, and a straggler still lands in whichever partition already covers its
+  key. Arbitrary backdated keys break it: with no `DEFAULT`, a key outside the grid is refused outright.
 - **The cutover locks the table for one read-only scan:** no row movement, no PK rewrite, no index
   rebuild, but reads and writes both wait while the original is scanned once. The wait scales with row
   count, so size a window from it (see [The cutover moves no rows](#the-cutover-moves-no-rows)).

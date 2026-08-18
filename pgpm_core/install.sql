@@ -5,7 +5,7 @@
 --     extension. Install with: psql -f this_file.sql.  Schema: pgpm.
 --   * Manages the full lifecycle of native RANGE-partitioned tables: transmute an
 --     existing (possibly huge, live) table online, obtain ahead of the write
---     frontier, drain the DEFAULT's closed tail, retain, all via maintenance.
+--     frontier, archive, retain, regrain, all via maintenance.
 --
 -- Control-type contract -- a column works as the partition key if it is:
 --   (a) RANGE-partitionable (btree-ordered),
@@ -188,9 +188,9 @@ create table if not exists pgpm.dropped_fk (
   --                                            are tolerated-but-flagged -- surfaced by status().fks_unvalidated
   --                                            and pgpm.incoming_fk_orphans(), cleared via validate_incoming_fks()).
   --   restored_at set, validated_at set    => fully VALIDATED.
-  -- maintenance keeps "a managed FK is live (in any re-added form) iff the closed tail is empty": it
-  -- suspends (re-drops, both timestamps -> null) before a drain that would move referenced rows, and
-  -- restore_incoming_fks re-adds NOT VALID once the drain is idle. Splitting the re-add from the VALIDATE
+  -- The FK is dropped once, by the cutover, and re-added by restore_incoming_fks on a later tick; nothing
+  -- in a maintenance tick suspends it again (#288 removed the drain that used to). Regrain's swap is the
+  -- one remaining suspend/restore, and it does both inside one transaction. Splitting the re-add from the VALIDATE
   -- is what stops a pre-existing orphan from permanently bricking restoration: the FK comes back
   -- enforcing new writes immediately, and validation is a separate, loud step.
   restored_at         timestamptz,
@@ -1851,8 +1851,8 @@ begin
   -- DETACH is refused while an incoming FK still references the source's rows (they leave the parent between
   -- detach and the re-attach of the copies). Drop the incoming FK(s) for the swap and re-add them, all inside
   -- THIS one transaction, so no other session ever observes RI off. force=true since the copy did not
-  -- suspend; v_fk=0 means a drain already holds them suspended this tick (maintain re-adds them once the
-  -- drain is idle, gated on no closed rows), so leave the re-add to that lifecycle rather than fight it.
+  -- suspend; v_fk=0 means there was no live preserve-managed FK to drop -- either the table has none, or
+  -- the conversion's drop has not been restored yet -- so leave the re-add to restore_incoming_fks.
   v_fk := pgpm.suspend_incoming_fks(p_parent, true);
   execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
   -- #267: the correctness backstop. The DETACH above holds ACCESS EXCLUSIVE on the source, so no further
@@ -1882,8 +1882,8 @@ begin
     execute format('truncate %I.%I', v_nsp, v_delta_name);
   end if;
   -- re-add the FK(s) this swap dropped, against the new parent (the copies now hold every key). Only if WE
-  -- dropped them (v_fk > 0): a v_fk = 0 means a drain already had them suspended, and re-adding mid-drain
-  -- would break the drain's own leash -- maintain re-adds those once the drain is idle.
+  -- dropped them (v_fk > 0): v_fk = 0 means there was nothing live to drop, so there is nothing here to put
+  -- back -- restore_incoming_fks owns any FK still suspended from the conversion.
   if v_fk > 0 then perform pgpm.restore_incoming_fks(p_parent); end if;
   update pgpm.config set regrain_cursor = null where parent_table = p_parent;
   insert into pgpm.log (parent_table, action, lo, hi, rows, method) values (p_parent, 'regrain', v_lo, v_hi, v_made, 'copy_swap_drop');
@@ -2208,12 +2208,14 @@ begin
 
   -- 0. incoming FKs (capture before the rename; record after the new parent exists). pgpm never
   -- rewrites the PK, so the referenced unique key (the reused PK) always survives and an incoming FK
-  -- can be re-pointed at the new parent verbatim once the drain is idle -- the 'preserve' lifecycle.
+  -- can be re-pointed at the new parent verbatim on a later tick -- the 'preserve' lifecycle. It cannot
+  -- ride through in place: the rename below makes the ORIGINAL table the monolith child, so a surviving FK
+  -- would go on referencing that partition instead of the new parent, silently narrowing to one partition.
   -- We refuse by default (the operator opts into the drop-and-restore dance).
   if exists (select 1 from pg_constraint where confrelid = p_parent and contype = 'f') then
     if p_incoming_fks = 'error' then
       raise exception
-        'pg_partition_magician: % has incoming foreign key(s) (%). Re-run with p_incoming_fks => ''preserve'' to keep them: pgpm drops each for the conversion and re-adds it against the new parent once the drain is idle.',
+        'pg_partition_magician: % has incoming foreign key(s) (%). Re-run with p_incoming_fks => ''preserve'' to keep them: pgpm drops each for the conversion and re-adds it against the new parent on a later maintenance tick (or call pgpm.restore_incoming_fks to do it now).',
         p_parent,
         (select string_agg(conname || ' on ' || conrelid::regclass::text, ', ')
            from pg_constraint where confrelid = p_parent and contype = 'f');
@@ -2526,7 +2528,7 @@ begin
     values (v_parent, v_monolith, v_lo_native, v_hi_native, true);
 
   -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
-  -- always preserve-managed now, re-added by restore_incoming_fks once the drain is idle.
+  -- always preserve-managed now, re-added against the new parent by restore_incoming_fks on a later tick.
   for v_e in select value from jsonb_array_elements(v_dropped) loop
     insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
     values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def');
@@ -3230,8 +3232,8 @@ begin
   perform set_config('lock_timeout', '3s', true);
 
   -- Re-add any incoming FKs that transmute(..., 'preserve') dropped, now against the new parent, AFTER
-  -- both the drain and the regrain have moved this tick. restore_incoming_fks self-gates on quiescence (no
-  -- closed rows AND no in-flight child), so while a multi-tick regrain is mid-flight it stays a no-op and
+  -- the regrain has moved this tick. restore_incoming_fks self-gates on quiescence (no in-flight,
+  -- not-yet-attached child), so while a multi-tick regrain is mid-flight it stays a no-op and
   -- the FK remains suspended (RI off, surfaced by status().fks_suspended), re-adding only once the regrain
   -- has swapped in its fine children. Isolated: a hiccup here never aborts progress.
   begin
@@ -3719,17 +3721,17 @@ begin
 end $$;
 
 -- restore_incoming_fks(): re-add the incoming FKs that transmute(..., p_incoming_fks => 'preserve')
--- recorded, pointing them back at the new partitioned parent, but only once it is SAFE. Safe = the
--- conversion is quiescent: the closed tail is fully drained (no closed rows linger in the DEFAULT) and
--- no in-flight, not-yet-attached child partition exists. The drain moves rows out of the DEFAULT through
--- such a child, during which a referenced row is briefly outside the parent and a live NO ACTION FK
--- would reject the move (see REDESIGN.md), so the FK must stay dropped until the drain is idle.
+-- recorded, pointing them back at the new partitioned parent, but only once it is SAFE. Safe = no
+-- in-flight, not-yet-attached child partition exists. (The drained-closed-tail gate this used to carry
+-- went with the DEFAULT in #288: there is no tail to drain.) A referenced row inside such a child is
+-- outside the visible parent, which a live NO ACTION FK would reject and a CASCADE/SET NULL one would
+-- silently honour, so the FK must stay dropped until the child is attached.
 -- The re-add is split (issue #95): `ADD CONSTRAINT ... NOT VALID` (enforces every new write, always
 -- succeeds) committed separately from `VALIDATE` (scans existing rows, may fail on an orphan written
 -- during the suspend window). A failed VALIDATE leaves the FK NOT VALID -- enforcing new writes,
 -- surfaced via status().fks_unvalidated -- rather than rolling the re-add back into a permanent silent
--- brick. Returns the number re-added; 0 (a no-op) while the drain is still in flight, so `maintain`
--- can call it every tick and it acts only when the table is ready.
+-- brick. Returns the number re-added; 0 (a no-op) while a regrain copy-child is still unattached, so
+-- `maintain` can call it every tick and it acts only when the table is ready.
 create or replace function pgpm.restore_incoming_fks(p_parent regclass)
 returns int language plpgsql as $$
 declare
@@ -3773,7 +3775,7 @@ begin
   -- Re-add each dropped FK, then attempt to VALIDATE it once -- in SEPARATE subtransactions, so a
   -- VALIDATE that fails on a pre-existing orphan does NOT roll back the re-add (issue #95). A re-added
   -- NOT VALID FK already enforces RI for every NEW write; only pre-existing rows go unverified. So the
-  -- FK comes back the instant the drain is idle and can never be permanently bricked by an orphan
+  -- FK comes back at the first opportunity and can never be permanently bricked by an orphan
   -- written during the suspend window; the orphans (if any) are surfaced by status().fks_unvalidated /
   -- pgpm.incoming_fk_orphans() and cleared with pgpm.validate_incoming_fks() once the operator removes
   -- them. The recorded definition already names the parent (captured before the rename).
@@ -3894,13 +3896,12 @@ $$;
 -- dropping the FK for the whole span of a multi-tick drain campaign -- an RI window other sessions could
 -- observe, and pgpm's only one. That caller is gone with the drain. The remaining caller is regrain's
 -- SWAP, which suspends and restores INSIDE its own transaction, so no session ever observes RI off.
--- suspend_incoming_fks(): the inverse of restore. When the closed tail has drain work pending, re-drop
--- any preserve-managed FK that is currently live, so the drain never moves a referenced row past a
--- live FK. That matters beyond a mere stall: a live ON DELETE CASCADE / SET NULL FK would silently
--- delete or null the referencing rows as the drain removes their referent from the DEFAULT (verified
--- on PG 17). maintenance calls this before each drain step; restore_incoming_fks re-adds once the
--- tail is drained, maintaining the invariant "a managed FK is live iff the closed tail is empty".
--- A no-op (returns 0) when the closed tail is empty, so it is safe to call every tick.
+-- suspend_incoming_fks(): the inverse of restore. Re-drop any preserve-managed FK that is currently live,
+-- so a referenced row is never taken out of the visible parent past a live FK. That matters beyond a mere
+-- stall: a live ON DELETE CASCADE / SET NULL FK would silently delete or null the referencing rows as
+-- their referent leaves the parent (verified on PG 17), which is why regrain's swap drops and re-adds
+-- inside one transaction rather than relying on the DETACH being brief.
+-- p_force is what regrain's swap passes, since a copy-regrain has no pending work of its own to detect.
 create or replace function pgpm.suspend_incoming_fks(p_parent regclass, p_force boolean default false)
 returns int language plpgsql as $$
 declare v_closed bigint; r pgpm.dropped_fk%rowtype; v_n int := 0;
