@@ -299,7 +299,7 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
 1. Confirm the policy is set and that maintenance can act on it:
 
    ```sql
-   select parent, paused, retain_backlog, retain_drop_failures
+   select parent, paused, retain_backlog, retain_drop_failures, retain_detaching
      from pgpm.status() where parent = 'public.events'::regclass;
    select retain, retain_batch, archive_fn from pgpm.config where parent_table = 'public.events'::regclass;
    ```
@@ -308,24 +308,45 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    also flat at zero, and `archive_fn` set, means chunked archiving simply hasn't caught up yet for the
    partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
-   with `retain_drop_failures` actually **climbing** is a real, unexpected `DROP` failure: the error is in
-   the log (`retain_drop_fail` rows, `method`).
+   with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
+   (`fail_retain_drop`, `fail_retain_crossing` or `fail_retain_detach` rows, `method`).
 
-2. Run a maintenance pass, or force the reclaim by hand:
+2. If anything has a foreign key **pointing at** this table, check the two failures specific to that
+   (issue #268). A referenced partition cannot be dropped outright; it is detached first, by a cron job.
 
    ```sql
-   call pgpm.maintain('public.events');       -- one pass: obtain, retain, drain (and auto-regrain)
+   select at, action, lo, hi, method from pgpm.log
+    where parent_table = 'public.events'::regclass
+      and action in ('fail_retain_detach', 'fail_retain_crossing', 'retain_detach', 'retain_crossing')
+    order by id desc limit 20;
+   ```
+
+   - `fail_retain_detach` -- there is no `pgpm_detach` cron job to dispatch to. Run `pgpm.schedule()`
+     once; installs scheduled before this existed have only the `pgpm` job.
+   - `fail_retain_crossing` -- a live row genuinely references an aged one, and that foreign key's own
+     `ON DELETE` (`NO ACTION` or `RESTRICT`) refuses to let it go. `method` carries PostgreSQL's own
+     error naming the constraint. This is the constraint doing its job, not a pgpm fault: remove the
+     referencing rows, or change the referential action, if you meant retention to win.
+   - `retain_detaching` non-zero for many ticks with neither logged means the detach is dispatched but
+     the `pgpm` job is not running: check `cron.job_run_details`.
+
+3. Run a maintenance pass, or force the reclaim by hand:
+
+   ```sql
+   call pgpm.maintain('public.events');       -- one pass: obtain, archive, retain (and auto-regrain)
    -- or catch up now, synchronously:
-   call pgpm.drain_all('public.events');      -- evacuate / reclaim the closed tail
    select pgpm.retain('public.events');       -- drop aged partitions now
    select pgpm.retire('public.events', 'events_p...');  -- or surgically: drop ONE eligible partition
    ```
 
-3. Confirm reclamation actually happened:
+   A referenced partition needs **two** calls with the cron detach in between, so `retain()` returning 0
+   once is expected there; check `retain_detaching` rather than assuming it failed.
+
+4. Confirm reclamation actually happened:
 
    ```sql
    select at, action, lo, hi, rows from pgpm.log
-    where parent_table = 'public.events'::regclass and action in ('retain_drop', 'retain_reclaim')
+    where parent_table = 'public.events'::regclass and action = 'retain_drop'
     order by id desc limit 20;
    ```
 

@@ -157,16 +157,25 @@ run_version() {  # <pg_version>
     install_channel "$ch" "$p" "$s" pgpm_tmpl
     load_fixtures "$p" "$s" pgpm_tmpl
 
-    local n=0 failed=0
+    local n=0 failed=0 pg_ready=""
     for f in tests/*.sql; do
       local b db; b="$(basename "$f")"; n=$((n + 1)); db="pgpm_t$n"
-      if [ "$b" = "31_schedule_test.sql" ]; then
+      if [ "$b" = "31_schedule_test.sql" ] || [ "$b" = "78_retain_detach_dispatch_test.sql" ]; then
         # pg_cron can only be created in the database named by cron.database_name (postgres on these
-        # images: "can only create extension in database postgres"), so this one file cannot run in a
-        # per-file clone. It gets `postgres`, which the uninstall check below installs into anyway.
+        # images: "can only create extension in database postgres"), so these files cannot run in a
+        # per-file clone. They get `postgres`, which the uninstall check below installs into anyway.
+        # 31 covers schedule()/unschedule(); 78 covers retire() dispatching a concurrent detach to the
+        # standing pgpm_detach job (#268). Both leave the cron state clean for the next file.
         db=postgres
-        install_channel "$ch" "$p" "$s"
-        load_fixtures "$p" "$s"
+        # Set `postgres` up ONCE per channel, however many files land here. fixtures/demo.sql CREATEs
+        # its tables, so a second load fails on "relation messages already exists" -- and with
+        # ON_ERROR_STOP under `set -e` that takes the whole version down, which is exactly what adding
+        # a second file to this branch did.
+        if [ "$pg_ready" != "$ch" ]; then
+          install_channel "$ch" "$p" "$s"
+          load_fixtures "$p" "$s"
+          pg_ready="$ch"
+        fi
       else
         psql_run "$p" "$s" -c "drop database if exists $db" >/dev/null
         psql_run "$p" "$s" -c "create database $db template pgpm_tmpl" >/dev/null
@@ -404,6 +413,7 @@ run_perf() {
   bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
   bash "$(dirname "$0")/bench/maintain_lock.sh" "$c" pgpm_perf3                              || rc=1
   bash "$(dirname "$0")/bench/restore_fk_lock.sh" "$c" pgpm_perf5                            || rc=1
+  bash "$(dirname "$0")/bench/retire_detach_lock.sh" "$c" pgpm_perf6                          || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"

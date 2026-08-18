@@ -446,7 +446,48 @@ situations: the `pgpm.part` row is absent (already retired by another actor), it
 concurrent transaction (`FOR UPDATE SKIP LOCKED`, so each partition has exactly one owner at a time), or
 the partition is write-blocked but not yet `pgpm._archive_fully_covered` -- chunked archiving (from
 issue #237) simply hasn't caught up yet. Only a genuinely unexpected failure in the `DROP` itself is
-logged (`retain_drop_fail`) and returns `false`.
+logged (`fail_retain_drop`) and returns `false`.
+
+#### Retiring a partition an incoming FK references
+
+If any foreign key references the managed parent, a bare `DROP` is refused on a pure catalog dependency
+regardless of whether any row actually references the aged range, so `retire` detaches first (issue #268).
+The detach must be `CONCURRENTLY`, which PostgreSQL will not execute from a function, so `retire`
+**dispatches** it: it rewrites the standing `pgpm_detach` cron job's command and returns `false`, and a
+later call finds the partition detached and completes the `DROP`. Retiring a referenced partition
+therefore takes at least two calls and requires [`pgpm.schedule`](#schedule) to have been run.
+
+The sequence, per partition:
+
+1. If a live row references a doomed one, `DELETE` exactly those keys from the parent, so PostgreSQL
+   applies the referential action the operator declared. `CASCADE`, `SET NULL` and `SET DEFAULT` proceed;
+   `NO ACTION` and `RESTRICT` refuse, and the refusal is logged `fail_retain_crossing` with the
+   constraint's own error, leaving the partition intact. A successful crossing is logged `retain_crossing`.
+2. Set `pgpm.part.retiring_at` and point `pgpm_detach` at this partition's concurrent detach, in one
+   transaction, logged `retain_detach`. With no such job, `fail_retain_detach` is logged instead.
+3. On a later call, with the partition detached, `DROP` it, delete the catalog row, log `retain_drop`, and
+   return the cron job to idle.
+
+`fail_retain_crossing` and `fail_retain_detach` both count in `status().retain_drop_failures`; in-flight
+detaches show in `status().retain_detaching`. A partition that is detached but carries no `retiring_at` was
+detached by something other than pgpm, and `retire` refuses to drop it.
+
+### `_detach_reap`
+
+```sql
+pgpm._detach_reap() returns int
+```
+
+Finishes any concurrent detach whose session died part-way, and returns how many it finished.
+`maintain_all` calls it before the per-parent loop, alongside `_transmute_reap`, because it is the most
+urgent thing in a tick: a backend killed during a concurrent detach's *wait* phase leaves the partition
+flagged `pg_inherits.inhdetachpending` with its rows **already invisible through the parent**, so rows
+appear to vanish from the table while the partition is neither detached nor dropped. `ALTER TABLE ...
+DETACH PARTITION ... FINALIZE` completes it, logged `detach_reap`.
+
+It finalizes unconditionally (a pending detach is never a state to leave sitting) but drops nothing:
+`retire` completes pgpm's own retirements on the normal path, and an operator's hand-run detach that was
+interrupted is finished and then left alone.
 
 The old `pgpm.hook` `pre_drop` registry this used to consult is gone entirely (issue #240) --
 archive coverage via `config.archive_fn` is the only drop-precondition gate now.
@@ -697,9 +738,16 @@ already bounds every call to `config.archive_byte_budget` before `archive_fn` ev
 pgpm.schedule(p_every text default '* * * * *') returns bigint
 ```
 
-Creates (or replaces) the single `pg_cron` job named `pgpm` that runs `call pgpm.maintain_all()` on the
+Creates (or replaces) the `pg_cron` job named `pgpm` that runs `call pgpm.maintain_all()` on the
 `p_every` cron schedule in the current database, returning the job id. One job covers every managed table
 and is idle while they are paused. Raises if `pg_cron` is not installed.
+
+It also creates a second job, `pgpm_detach`, on the same schedule and **idle** (`select 1`). That one is
+machinery for issue #268: `retire` rewrites its command in place when a partition an incoming foreign key
+references needs `DETACH PARTITION ... CONCURRENTLY`, which PostgreSQL refuses to execute from a function,
+and returns it to idle once the drop lands. One standing job is rewritten rather than one scheduled per
+retirement, because `pg_cron` has no one-shot schedule. Retiring a referenced partition does not work
+without it; if you scheduled pgpm before upgrading, re-run `pgpm.schedule()` once.
 
 ### `unschedule`
 
@@ -707,8 +755,8 @@ and is idle while they are paused. Raises if `pg_cron` is not installed.
 pgpm.unschedule() returns int
 ```
 
-Removes the `pgpm` cron job (returns the number removed; `0` if `pg_cron` is absent or nothing was
-scheduled).
+Removes the `pgpm` and `pgpm_detach` cron jobs (returns the number removed, so `2` for a fully scheduled
+install; `0` if `pg_cron` is absent or nothing was scheduled).
 
 ## Control
 
@@ -743,7 +791,8 @@ pgpm.status() returns table (
   parent regclass, control_kind text, partition_step text, obtain int, retain text,
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text, fks_suspended bigint, fks_unvalidated bigint,
-  history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint
+  history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint,
+  retain_detaching bigint
 )
 ```
 
@@ -762,7 +811,12 @@ One row per managed table. Beyond the static config it surfaces:
   transient state inside a regrain swap now, so a standing non-zero value means a swap died mid-flight.
 - `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (issue #238; not a
   child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
-  is genuinely stuck.
+  is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
+  one and the FK's own `ON DELETE` refused the delete) and `fail_retain_detach` (nowhere to dispatch a
+  concurrent detach to), since all three wedge retention the same way.
+- `retain_detaching` -- partitions whose concurrent detach has been dispatched and not yet completed
+  (issue #268). Non-zero for a tick or two is normal; persistently non-zero alongside climbing
+  `retain_drop_failures` means the dispatch has nowhere to go -- run `pgpm.schedule()`.
 - `retain_backlog` -- partitions whose whole range is past the retention horizon but which are not yet
   dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks, or while a write-blocked
   child's chunked archiving is still catching up -- either way it should fall tick over tick. A flat
@@ -940,7 +994,8 @@ The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 | `child_name` | `name` | the partition's table name |
 | `lo` / `hi` | `text` | native `[lo, hi)` bounds (a partition is coarse when `hi > grid_next(lo)`) |
 | `created_at` | `timestamptz` | when created |
-| `attached` | `boolean` | false while a drain/regrain is still filling it standalone; true once attached |
+| `attached` | `boolean` | false while a regrain is still filling it standalone; true once attached |
+| `retiring_at` | `timestamptz` | set when `retire` dispatches a concurrent detach for this partition, so recovery can tell whose detach a pending one was; null for every partition on the ordinary one-step drop path |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.
@@ -963,7 +1018,8 @@ the failures too, which is exactly how a guard once reported a starved tick as a
 | `transmute` / `untransmute` | conversion and its reversal |
 | `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
 | `drain_move` / `drain_attach` | a drain microbatch moved rows / attached a completed interval |
-| `retain_drop` / `retain_reclaim` | a partition dropped by retention (via `retain()` or `retire()`) / aged rows deleted from the `DEFAULT` |
+| `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
+| `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
 | `drain_budget` | an adaptive controller step (`rows` = the new budget, `method` = the reason) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
