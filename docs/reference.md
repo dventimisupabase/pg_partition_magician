@@ -82,7 +82,10 @@ Parameters:
   `pgpm` never scans to enforce it). A key is not required: if a **primary key or unique constraint**
   includes the control column, `pgpm` reuses it in place and never rewrites it; otherwise the table is
   partitioned **keyless** (no key synthesized). A key that *excludes* the control column is refused (no
-  rewrite), as is a *bare* unique index (promote it to a constraint first). Note: `regrain` is unavailable
+  rewrite), as is a *bare* unique index (promote it to a constraint first). Column **order** within the key
+  is free: PostgreSQL requires only that the key *contain* the partition key, and `pgpm` reads the key for
+  identity, never for ordering. Choose it for your own reads (see
+  [the guide](guide.md#the-cutover-moves-no-rows)). Note: `regrain` is unavailable
   on a keyless monolith, so its history stays as one coarse child unless a key is added before transmute.
 - `p_interval` -- the grid width (`interval '1 day'`, `'1 month'`, `'1 year'`, ...). Cast a bare literal:
   `interval '1 month'` (it disambiguates from the `bigint` overload).

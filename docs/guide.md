@@ -215,6 +215,24 @@ Then re-transmute. One consequence of going keyless: `regrain` is unavailable on
 no key to identify rows for a resumable copy), so the history stays as one coarse, queryable monolith. Add
 a key before transmuting if you want to regrain the history into fine partitions later.
 
+**Widening a key: which order?** Both orders are legal, and pgpm has no preference. It reads the key to
+*identify* rows (a regrain reconciles by equality on the key columns) and never to order them, so nothing
+in pgpm is faster one way than the other. That leaves the choice to your own reads, and it is worth making
+deliberately: reversing it later costs another `CREATE UNIQUE INDEX CONCURRENTLY` and constraint swap, on a
+table that has grown since.
+
+A lookup carrying no control-column predicate prunes to nothing either way, so both orders visit every
+partition. The difference is what happens inside each one:
+
+- **Lead with the row identifier** (`(id, created_at)`) when the read you care about is a point lookup by
+  that identifier. Each partition's local index seeks straight to the row.
+- **Lead with the control column** (`(created_at, id)`) when the read you care about is a range scan over
+  the control column, and you want the key itself to serve it rather than a separate index.
+
+Either mismatch costs the same thing: a key whose leading column your `WHERE` does not constrain cannot
+seek, so each partition's index gets scanned rather than probed. The `(tenant_id, id)` shape above is this
+choice already made: the control column sits second because `tenant_id` is what the application filters on.
+
 `transmute` is reversible until you commit to it: while the monolith is intact and holds the whole table,
 [`untransmute`](reference.md#untransmute) cleanly restores the original. It becomes a one-way door once a
 row lands outside the monolith (the frontier crosses `B`) or you regrain it.
