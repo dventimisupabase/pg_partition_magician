@@ -147,6 +147,11 @@ call pgpm.transmute('public.events', 'id', 10000000);
 call pgpm.transmute('public.events', 'event_uuid', interval '1 day');
 ```
 
+`transmute` commits between its phases, so it has to be called at the **top level**, never inside a
+surrounding transaction. That rules out running it from a schema-migration tool that wraps each migration
+in one (Prisma, Flyway, Liquibase, Rails, Alembic): it fails there with `invalid transaction termination`.
+Convert as an operator-driven step, then let your migrations manage the table afterwards as usual.
+
 Transmutation registers the table **paused** by default: it is converted, but scheduled maintenance does
 nothing until you `resume` it (see [Run it](#run-it)). All parameters are in the
 [reference](reference.md#conversion).

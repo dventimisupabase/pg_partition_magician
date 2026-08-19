@@ -33,6 +33,11 @@ pgpm.transmute(
 A **`PROCEDURE`**: invoke it with `CALL`, not `SELECT`, and it returns nothing. The new parent keeps the
 original's name, so `p_parent` still resolves to it afterwards.
 
+It `COMMIT`s between its phases, so like [`from_hypertable`](#from_hypertable) it must be called at the
+**top level**: a plain `CALL`, never inside a surrounding transaction or an atomic block. A schema-migration
+tool that wraps each migration in a transaction (Prisma, Flyway, Liquibase, Rails, Alembic) will therefore
+fail it with `invalid transaction termination`. Convert as an operator-driven step instead.
+
 Converts `p_parent` into a partitioned table and registers it. The control column's type selects
 the kind: a `uuid` column is treated as **uuidv7** (time-ordered; ULIDs stored as `uuid` included), and a
 `timestamptz`/`timestamp`/`date` column is **time**.
@@ -657,12 +662,14 @@ under a short `lock_timeout`, so it never blocks or deadlocks the live workload;
 lock race is deferred and retried next tick.
 
 A procedure, and each step commits before the next begins, so no step's locks outlive it. This
-matters most for `obtain`, which takes `ACCESS EXCLUSIVE` on the parent when it creates a partition:
-in a single-transaction tick that lock was held across the rest of the tick as well, stalling the whole table
-(readers included) for as long as the drain batch took.
+matters most for `obtain`, which takes `ACCESS EXCLUSIVE` on the parent when it creates a partition: in a
+single-transaction tick that lock would be held across the rest of the tick as well, stalling the whole
+table (readers included) until the tick finished. Those commits also mean `maintain` and `maintain_all`,
+like `transmute`, must be called at the **top level**, never inside a surrounding transaction; `pg_cron`
+runs its command as a top-level statement, so the scheduled path satisfies this for free.
 
 `p_status` reports a one-line summary, for example
-`obtained=2 archived=1 dropped=0 drain=idle suspended_fk=0 restored_fk=0 regrain=copied:5000`. Call
+`obtained=2 archived=1 dropped=0 restored_fk=0 regrain=copied:5000`. Call
 it as `call pgpm.maintain('public.events')` and the summary comes back as a result row; from
 PL/pgSQL, pass a variable to receive it.
 
