@@ -411,6 +411,7 @@ run_perf() {
   local rc=0
   bash "$(dirname "$0")/bench/regrain_perf.sh"   "$c" pgpm_perf  /repo/pgpm_core/install.sql || rc=1
   bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
+  bash "$(dirname "$0")/bench/transmute_lock_timeout.sh" "$c" pgpm_perf7                      || rc=1
   bash "$(dirname "$0")/bench/maintain_lock.sh" "$c" pgpm_perf3                              || rc=1
   bash "$(dirname "$0")/bench/restore_fk_lock.sh" "$c" pgpm_perf5                            || rc=1
   bash "$(dirname "$0")/bench/retire_detach_lock.sh" "$c" pgpm_perf6                          || rc=1

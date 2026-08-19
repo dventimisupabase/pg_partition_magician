@@ -2008,7 +2008,8 @@ create or replace procedure pgpm._transmute(
   p_parent regclass, p_control name, p_control_kind text,
   p_step text, p_anchor text, p_obtain int, p_retain text,
   p_regrain_batch int, p_paused boolean, p_incoming_fks text,
-  p_force_uuidv7 boolean default false, p_bound_headroom int default 0
+  p_force_uuidv7 boolean default false, p_bound_headroom int default 0,
+  p_lock_timeout text default '5s'
 )
 language plpgsql as $$
 declare
@@ -2028,6 +2029,7 @@ declare
   -- the new parent inside the cutover transaction.
   v_owner name; v_acl aclitem[]; v_rls boolean; v_rls_force boolean;
   v_comment text; v_colcom record; v_pol record; v_trg record; v_bad_trg text;
+  v_prev_lock_timeout text;   -- #309: so validating p_lock_timeout leaves the setting untouched
   v_trgdefs text[] := '{}'; v_grant text; v_g record;
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7') then
@@ -2036,6 +2038,22 @@ begin
   if p_incoming_fks not in ('error', 'drop', 'preserve') then
     raise exception 'pg_partition_magician: p_incoming_fks must be ''error'', ''drop'', or ''preserve'' (got %)', p_incoming_fks;
   end if;
+  -- #309: validate the lock timeout HERE, before anything is committed. set_config raises on a bad value
+  -- anyway, but it would do so from inside phase 1 or, worse, phase 3 -- after the O(rows) validation
+  -- scan the operator has already waited through. A typo should cost nothing.
+  --
+  -- The prior value is restored immediately, so this check has NO side effect. That is not tidiness: the
+  -- phases below share this transaction with the check, so a validation that left the setting applied
+  -- would silently do phase 1's job for it. The mutation that proves bench/transmute_lock_timeout.sh
+  -- discriminates strips the per-phase set_config calls, and it would strip them onto a transaction that
+  -- was already correctly configured -- a guard that passed against its own defect.
+  begin
+    v_prev_lock_timeout := current_setting('lock_timeout');
+    perform set_config('lock_timeout', p_lock_timeout, true);
+    perform set_config('lock_timeout', v_prev_lock_timeout, true);
+  exception when others then
+    raise exception 'pg_partition_magician: p_lock_timeout must be a valid lock_timeout value (got %): %', p_lock_timeout, sqlerrm;
+  end;
 
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
@@ -2407,6 +2425,12 @@ begin
       values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native);
   end if;
 
+  -- #309: bound the wait for the ADD's ACCESS EXCLUSIVE. Re-applied per phase rather than set once,
+  -- because `set local` does not survive a COMMIT -- the same caution maintain() records at its own
+  -- boundaries. Without it this statement waits indefinitely, and a PENDING AccessExclusive request
+  -- blocks every lock request queued behind it, so one long-running query turns the wait into an outage
+  -- of the whole table. Failing here costs nothing: nothing is committed yet.
+  perform set_config('lock_timeout', p_lock_timeout, true);
   if not exists (select 1 from pg_constraint
                   where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
     execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
@@ -2417,7 +2441,9 @@ begin
 
   -- ============================ PHASE 2: validate it (#275) ============================
   -- VALIDATE takes only SHARE UPDATE EXCLUSIVE, which blocks nobody. Skipped when a previous attempt
-  -- already validated it.
+  -- already validated it. It still needs the timeout: SHARE UPDATE EXCLUSIVE conflicts with itself, so
+  -- an autovacuum or a concurrent ALTER on the same table can queue this behind them.
+  perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT
   if not (select convalidated from pg_constraint
            where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
     execute format('alter table %s validate constraint pgpm_monolith_bound', p_parent::text);
@@ -2426,6 +2452,13 @@ begin
 
   -- ============================ PHASE 3: the cutover ============================
   -- Metadata only, and atomic: a raise from here rolls the whole cutover back.
+  --
+  -- One set_config covers every wait in this phase, since it is one transaction: the RENAME's ACCESS
+  -- EXCLUSIVE on the live table, and the outgoing-FK re-add's SHARE ROW EXCLUSIVE on each REFERENCED
+  -- table (#263), which queues behind writers there rather than on the table being converted. A timeout
+  -- here aborts the cutover whole and leaves the phase-1 bound in place -- the recorded, resumable state
+  -- transmute_abort and maintain_all's sweep already handle.
+  perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT
 
   -- 0b. capture what CREATE TABLE ... LIKE will NOT carry (#277): owner, grants, RLS, policies, comments
   -- and triggers. Captured HERE, before the rename, and replayed below in this same transaction. Both
@@ -2679,6 +2712,14 @@ drop function if exists pgpm.transmute_by_uuidv7(regclass, name, interval, int, 
 drop procedure if exists pgpm.build_pk_concurrently(regclass, name, interval, interval);
 drop function if exists pgpm.generate_fk_recovery(regclass);
 
+-- #309 added p_lock_timeout, which CHANGES THE ARGUMENT COUNT. CREATE OR REPLACE does not replace across
+-- a different arg count, even when the new parameter has a default: re-running install.sql over a prior
+-- install would leave BOTH arities defined, and every existing call site would then be ambiguous
+-- (`function pgpm.transmute(...) is not unique`). That is #209/#210 exactly. Drop the old arities first.
+drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, int, boolean, text, boolean, int);
+drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, int, timestamptz, boolean, text, boolean, int);
+drop procedure if exists pgpm.transmute(regclass, name, bigint, int, bigint, int, bigint, boolean, text, int);
+
 -- Time grid: interval width. The control column's type selects the kind -- a uuid column is TREATED as
 -- uuidv7 (ULIDs stored as uuid included; PostgreSQL has no UUIDv7 type to detect, so this is an
 -- assumption check_uuidv7 samples to gate, not a verification: a column that samples as overwhelmingly
@@ -2691,7 +2732,8 @@ create or replace procedure pgpm.transmute(
   p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_force_uuidv7 boolean default false,
-  p_bound_headroom int default 0
+  p_bound_headroom int default 0,
+  p_lock_timeout text default '5s'
 ) language plpgsql as $$
 declare v_kind text;
 begin
@@ -2702,7 +2744,7 @@ begin
   call pgpm._transmute(p_parent, p_control, coalesce(v_kind, 'time'),
     p_interval::text, p_anchor::text, p_obtain,
     p_retain::text, p_regrain_batch, p_paused, p_incoming_fks, p_force_uuidv7,
-    p_bound_headroom);
+    p_bound_headroom, p_lock_timeout);
 end;
 $$;
 
@@ -2712,13 +2754,14 @@ create or replace procedure pgpm.transmute(
   p_obtain int default 30, p_retain bigint default null,
   p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_bound_headroom int default 0
+  p_bound_headroom int default 0,
+  p_lock_timeout text default '5s'
 ) language plpgsql as $$
 begin
   -- plpgsql, not sql: a SQL-bodied routine cannot host a callee's transaction control
   call pgpm._transmute(p_parent, p_control, 'id', p_step::text, p_anchor::text, p_obtain,
                      p_retain::text, p_regrain_batch, p_paused, p_incoming_fks,
-                     false, p_bound_headroom);
+                     false, p_bound_headroom, p_lock_timeout);
 end;
 $$;
 

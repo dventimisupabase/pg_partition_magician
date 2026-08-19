@@ -26,7 +26,8 @@ pgpm.transmute(
   p_regrain_batch int default 5000, p_anchor timestamptz default '2000-01-01 00:00:00+00',
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_force_uuidv7 boolean default false,
-  p_bound_headroom int default 0
+  p_bound_headroom int default 0,
+  p_lock_timeout text default '5s'
 )
 ```
 
@@ -103,6 +104,13 @@ Parameters:
   `CHECK` refuses writes at or past `hi` for the whole conversion, so raise this if the frontier could
   cross `hi` while the validation scan runs. `0` (the default) puts `hi` at the first grid boundary above
   the frontier.
+- `p_lock_timeout` -- how long each phase waits for a lock before giving up (`'5s'` by default; any
+  `lock_timeout` value). This bounds a wait, it does not shorten one: the locks themselves are brief. It
+  matters because a *pending* `ACCESS EXCLUSIVE` request blocks every lock request queued behind it, so
+  without a bound one long-running query stalls the whole table for as long as it runs. A bad value is
+  refused before anything is committed. On timeout, a failure in phase 1 leaves the table untouched, and
+  one in the cutover leaves the recorded, resumable state [`transmute_abort`](#transmute_abort) and
+  `maintain_all`'s sweep handle; either way, re-run `transmute` to retry.
 
 Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
 excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
@@ -126,7 +134,8 @@ pgpm.transmute(
   p_obtain int default 30, p_retain bigint default null,
   p_regrain_batch int default 5000, p_anchor bigint default 0,
   p_paused boolean default true, p_incoming_fks text default 'error',
-  p_bound_headroom int default 0
+  p_bound_headroom int default 0,
+  p_lock_timeout text default '5s'
 )
 ```
 

@@ -187,6 +187,12 @@ plan for is a fast writer that would cross `hi` while the scan runs: pass `p_bou
 `hi` that many grid steps further out. `lo` is the grid floor of the current minimum, so a *backdated*
 write below it is refused for the same window.
 
+**Each phase gives up rather than queueing.** `p_lock_timeout` (`'5s'` by default) bounds how long the
+conversion waits for a lock. The locks it takes are brief; what this protects you from is the *wait*,
+because a pending `ACCESS EXCLUSIVE` request blocks every lock request behind it, so without a bound one
+long-running query against your table stalls all of it for as long as that query runs. Raise it in a quiet
+window, lower it under heavy traffic. A timeout is safe to retry: re-running `transmute` resumes.
+
 **If a conversion dies partway, the bound outlives it** and the table goes on refusing those writes.
 `pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was. You rarely
 need to: every `maintain_all` tick sweeps for abandoned conversions and undoes them, deciding "abandoned"
