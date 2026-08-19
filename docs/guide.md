@@ -377,12 +377,19 @@ update pgpm.config set retain = '90 days' where parent_table = 'public.events'::
 Retain drops a partition only when its **whole range** is older than the horizon, using plain `DROP` (a
 brief lock) when nothing references the table. Two consequences in the monolith model:
 
-- **Retention is suspended over un-regrained coarse history.** A coarse monolith spanning the horizon is
-  not dropped (it still holds within-horizon data), so its aged span is not reclaimed until you regrain
-  it. Regrain is retention-aware: it skips the below-horizon sub-ranges (it never copies them; they are
-  discarded with the source at the swap) instead of materializing partitions only to drop them. So on a
-  table you want aggressively retained, enable
-  auto-regrain (or regrain by hand) to let retention reach the history.
+- **Retention over un-regrained coarse history is all-or-nothing.** A coarse monolith *spanning* the
+  horizon is not dropped, because it still holds within-horizon data, so its aged span is not reclaimed
+  for as long as it straddles. The monolith is **not exempt** from retention, though: it is an ordinary
+  child partition, and once its whole range is past the horizon it drops like any other, in one step.
+  Since its upper bound `B` sits just above the frontier at conversion, that happens roughly one retention
+  period after you convert, and reclaims the whole history at once.
+  What regraining changes is the *granularity*: split into fine children, each drops on its own schedule,
+  so storage falls gradually instead of in one cliff, and the aged history goes sooner than that one
+  period. Regrain is also retention-aware -- it skips the below-horizon sub-ranges (never copies them;
+  they are discarded with the source at the swap) instead of materializing partitions only to drop them,
+  so its transient disk is bounded by the span you are *keeping*, not by the whole child. On a table you
+  want aggressively retained, enable auto-regrain (or regrain by hand) to let retention reach the history
+  sooner.
 - **A referenced partition is retired in two steps, not one.** If any foreign key points at the managed
   table, a plain `DROP` cannot reclaim the partition at all, so retention detaches it first. That path is
   asynchronous and needs `pgpm.schedule()`; see [Retention with an incoming foreign
