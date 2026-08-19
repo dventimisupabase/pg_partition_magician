@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+- **`transmute` no longer waits indefinitely for a lock (issue #309).** It takes `ACCESS EXCLUSIVE` twice
+  on the operator's live table -- phase 1's `ADD CONSTRAINT`, phase 3's `RENAME` -- and set no
+  `lock_timeout` on any phase, while `maintain` has applied one at every boundary since #279.
+  - **The wait was the hazard, not the lock.** Both locks are brief. But a *pending* `AccessExclusive`
+    request blocks every lock request queued behind it, including plain `SELECT`s that conflict with
+    nothing currently running, so one long-running query turned transmute's wait into an outage of the
+    whole table, with nothing to break it.
+  - New `p_lock_timeout` on both public overloads, `'5s'` by default, applied at each of the three phases
+    (re-applied per phase, since `set local` does not survive a `COMMIT` -- the caution `maintain` already
+    records at its own boundaries). One setting covers every wait in the cutover, which is one
+    transaction: the `RENAME`, and the outgoing-FK re-add's `SHARE ROW EXCLUSIVE` on each *referenced*
+    table (#263), which queues behind writers there rather than on the table being converted.
+  - A bad value is refused before anything is committed, rather than from inside phase 1 or, far worse,
+    phase 3 -- after the operator has already waited through the `O(rows)` validation scan. The check
+    restores the previous setting, so validating the parameter does not double as applying it.
+  - **Adding the parameter changed the argument count**, so `install.sql` now drops the prior arities of
+    `pgpm.transmute` (both overloads) and `pgpm._transmute` first. `CREATE OR REPLACE` does not replace
+    across a different arg count even when the new parameter has a default, so without the drops a
+    re-install over a prior one would leave both arities defined and every existing call site ambiguous.
+    That is #209/#210 exactly.
+  - Guarded by `bench/transmute_lock_timeout.sh` (a second session holds a conflicting lock; the
+    conversion must fail with `55P03`, leave nothing behind, and -- the liveness witness -- succeed once
+    unblocked), with a `transmute_no_lock_timeout` mutation that strips the per-phase `set_config` and
+    requires the guard to fail. The mutation deliberately leaves the parameter in the signature: a mutant
+    that removed it too would fail the guard's `CALL` with `42883` and look like a catch for the wrong
+    reason. `tests/81` covers the parameter's own contract, which the shell guard cannot: the up-front
+    refusal, that it leaves no inflight row or bound `CHECK`, and that the caller's `lock_timeout` is
+    unchanged afterwards.
+
 - **`transmute` no longer silently stops enforcing an outgoing foreign key (issue #263).** A foreign key
   follows the table it is defined ON, and the conversion renames the original aside to become the monolith
   child, so the constraint landed on the monolith and never on the new parent.

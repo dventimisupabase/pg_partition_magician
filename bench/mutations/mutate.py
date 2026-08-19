@@ -82,6 +82,25 @@ MUTATIONS = {
           "                     p_parent::text, v_nsp, p_child);\n"
           "      v_reason := null;\n", 1)],
     ),
+    "transmute_no_lock_timeout": (
+        "bench/transmute_lock_timeout.sh",
+        "Pre-#309 transmute: no lock_timeout on any phase, so it waits indefinitely for the ACCESS "
+        "EXCLUSIVE the ADD and the RENAME need -- and a PENDING AccessExclusive blocks every request "
+        "queued behind it, turning one slow query into an outage of the whole table. Strips only the "
+        "per-phase set_config, leaving p_lock_timeout in the signature: the defect being modelled is "
+        "'the timeout is not applied', not 'the parameter does not exist'. A mutant that dropped the "
+        "parameter too would fail the guard's CALL with 42883 and look like a catch for the wrong "
+        "reason.",
+        # Phase 1's line is anchored on the statement that FOLLOWS it: these edits are plain substring
+        # replacements, and the bare line is also a substring of the (more-indented) validation check
+        # near the top of _transmute, which must survive -- the mutant should still reject a bad
+        # p_lock_timeout, it just must not apply a good one.
+        [("  perform set_config('lock_timeout', p_lock_timeout, true);\n"
+          "  if not exists (select 1 from pg_constraint\n",
+          "  if not exists (select 1 from pg_constraint\n", 1),
+         ("  perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT\n",
+          "", 2)],
+    ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",
         "Pre-#272 regrain: the trigger-populated delta carries no row estimate, so the planner "
