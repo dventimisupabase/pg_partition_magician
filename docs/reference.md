@@ -483,9 +483,15 @@ pgpm.retain(p_parent regclass) returns int
 ```
 
 Drops every partition whose whole range is older than the retention horizon (`config.retain`), returning
-the count dropped. A coarse partition that merely straddles the horizon is **not** dropped, so retention
-is suspended over un-regrained coarse history until `regrain` splits it (or `regrain` reclaims the aged
-sub-ranges directly). `null` retention drops nothing.
+the count dropped. A coarse partition that merely *straddles* the horizon is **not** dropped, since it
+still holds within-horizon data, so its aged span is not reclaimed for as long as it straddles.
+
+A coarse child is **not exempt from retention, only all-or-nothing about it**: once its whole range is
+past the horizon it drops like any other partition, in one step. What `regrain` changes is the
+*granularity* of that reclamation, not whether it happens -- split into fine children, each drops on its
+own schedule, so storage falls gradually rather than in one cliff (and `regrain` reclaims below-horizon
+sub-ranges directly rather than materializing partitions only to drop them). `null` retention drops
+nothing.
 
 `config.retain_batch` caps how many eligible partitions one call will **attempt** (write-block ensure,
 archive-coverage check, drop), oldest first; the rest of the backlog waits for later calls -- on the
