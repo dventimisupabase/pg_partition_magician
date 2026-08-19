@@ -90,6 +90,37 @@ if grep -nE '^\\' "$BUNDLE" "$DBDEV_PKG"; then
   echo "ERROR: a packaged artifact still contains psql metacommands"; exit 1
 fi
 
+# Wait for the REAL server, over TCP (#317).
+#
+# The postgres entrypoint starts a TEMPORARY init server to run its init scripts, then shuts it down and
+# starts the real one. That temporary server listens on the UNIX SOCKET ONLY. So a socket probe can
+# succeed against it and hand back a connection that dies moments later -- the next command fails with
+# `No such file or directory` on the socket, or `the database system is shutting down`, one or two
+# seconds after compose reported the container Started. A TCP probe cannot see the init server at all, so
+# it succeeds only once the real one is accepting connections.
+#
+# The timescale track hit this first and fixed it there (supabase/postgres's heavier init widens the
+# window). The matrix and the observe/archive tracks raced it too, just rarely enough to look like bad
+# luck: it surfaced as one PG17 job of four failing while the other three passed the same commit.
+#
+# `up -d --wait` is NOT the fix, which is why it is not used here: the compose healthcheck is
+# `pg_isready -U postgres`, which also goes over the socket and so is satisfied by the very init server
+# this is trying to see past.
+#
+# Fails LOUDLY on exhaustion. The loops this replaces fell through to the first real command, which then
+# reported the same confusing connection error -- so a genuinely dead container looked identical to a
+# slow one, and the log pointed at the wrong statement.
+wait_pg() {  # <profile> <service> [seconds]
+  local prof="$1" svc="$2" n="${3:-90}"
+  for _ in $(seq 1 "$n"); do
+    $DC --profile "$prof" exec -T -e PGPASSWORD=postgres "$svc" \
+       psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "ERROR: $svc did not accept TCP connections within ${n}s (container up but never ready)" >&2
+  return 1
+}
+
 psql_run() { $DC --profile "$1" exec -T "$2" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "${@:3}"; }
 # same, but against an arbitrary database: the pgTAP suite now runs one database PER FILE
 psql_db()  { $DC --profile "$1" exec -T "$2" psql -U postgres -d "$3" -v ON_ERROR_STOP=1 "${@:4}"; }
@@ -136,9 +167,7 @@ run_version() {  # <pg_version>
   $DC --profile "$p" build $BUILD_PROGRESS
   $DC --profile "$p" up -d
 
-  for _ in $(seq 1 60); do
-    $DC --profile "$p" exec -T "$s" psql -U postgres -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1
-  done
+  wait_pg "$p" "$s" 60
   psql_run "$p" "$s" -c "create extension if not exists pg_cron; create extension if not exists pgtap;" >/dev/null
 
   for ch in "${CHANNELS[@]}"; do
@@ -225,13 +254,8 @@ run_timescale() {
       sleep $((attempt * 15))
     done
     $DC --profile "$prof" up -d
-    # Wait for the REAL server over TCP. The postgres entrypoint runs a temporary init server on the unix
-    # socket only, so a TCP probe succeeds ONLY once the real server is up -- avoiding the "database system
-    # is shutting down" race (supabase/postgres's heavier init widens that window).
-    for _ in $(seq 1 120); do
-      $DC "${px[@]}" -tAc 'select 1' >/dev/null 2>&1 && break
-      sleep 1
-    done
+    # This track is where the TCP-probe rule was learned; wait_pg now carries it for every track.
+    wait_pg "$prof" "$svc" 120
     echo "  edition: timescaledb $($DC "${px[@]}" -d postgres -tAc "select default_version||' ('||current_setting('timescaledb.license')||')' from pg_available_extensions where name='timescaledb'" 2>/dev/null | tr -d '\r')"
 
     for f in tests/timescale/db/*.sql; do
@@ -282,7 +306,7 @@ run_observe() {  # pg_flight_recorder observability track: impact_report correla
   echo "========================================="
   $DC --profile "$prof" down -v 2>/dev/null || true
   $DC --profile "$prof" up -d
-  for _ in $(seq 1 90); do $DC "${px[@]}" -d postgres -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+  wait_pg "$prof" "$svc" 90
 
   run_observe_file() {  # <db> <test-file> -- run one pgTAP file, collect TAP, flag failures
     local db="$1" f="$2"
@@ -332,9 +356,7 @@ run_archive() {
   $DC --profile "$prof" build $BUILD_PROGRESS archive
   $DC --profile "$prof" up -d
 
-  for _ in $(seq 1 60); do
-    $DC "${px[@]}" -d postgres -tAc 'select 1' >/dev/null 2>&1 && break; sleep 1
-  done
+  wait_pg "$prof" "$svc" 60
   for _ in $(seq 1 60); do
     docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1 && break
     sleep 1
