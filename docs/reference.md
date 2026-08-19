@@ -118,8 +118,9 @@ control column is `float`/`double` (imprecise boundaries); a `time`-kind control
 is not a timestamp/date, or a `uuidv7` control is not `uuid`; a `uuid` control samples as overwhelmingly
 random (UUIDv4) and `p_force_uuidv7` is not set; a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
-`'error'`; or a standalone table matching the child-partition naming already exists (an orphan from an
-interrupted run).
+`'error'`; a standalone table matching the child-partition naming already exists (an orphan from an
+interrupted run); or a relation already occupies one of the `<index>_pgpm` names the conversion needs for
+the partitioned copies of the table's secondary indexes (also usually a leftover from an interrupted run).
 
 ```sql
 call pgpm.transmute('public.events', 'created_at', interval '1 month',

@@ -2018,6 +2018,7 @@ declare
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
+  v_pgpm_clash text;   -- #311: existing relations occupying the <index>_pgpm names step 9b needs
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
   v_uq_cols text[]; v_bare_uq text;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
@@ -2260,6 +2261,29 @@ begin
   if v_uniq_bad is not null then
     raise exception 'pg_partition_magician: cannot transmute % -- the UNIQUE secondary index(es) (%) do not include the partition key % in their key columns (or are partial/expression indexes), so global uniqueness cannot be enforced on a partitioned table. Add % to the key of each, or drop them, then re-run transmute. A unique index that already includes % is carried automatically.',
       p_parent, v_uniq_bad, quote_ident(p_control), quote_ident(p_control), quote_ident(p_control);
+  end if;
+
+  -- Refuse a colliding <index>_pgpm name (#311). Step 9b recreates each carried secondary as a
+  -- PARTITIONED index on the parent named <original>_pgpm, then attaches the monolith's original under
+  -- it. Nothing checked that name was free, so a pre-existing relation by it -- a leftover from an
+  -- interrupted run, or an operator's own index that happens to be named that way -- made the CREATE
+  -- INDEX fail with a raw 42P07 from inside the cutover: no pgpm prefix, no guidance, and no hint that
+  -- the fix is `drop index ..._pgpm`.
+  --
+  -- The cutover is one transaction, so that failure rolled back rather than losing anything; the cost
+  -- was a confusing error and a conversion the operator then had to abort by hand. Every sibling shape
+  -- here (a key that excludes the control column, a bare unique index, an un-carryable UNIQUE secondary,
+  -- a transition-table trigger, an orphaned child table) refuses UP FRONT with the remedy. This was the
+  -- one hole in that contract.
+  --
+  -- Names every collision at once: one per retry would make an operator with several re-run the
+  -- conversion once per index to discover them.
+  select string_agg(quote_ident(n || '_pgpm'), ', ' order by n) into v_pgpm_clash
+    from unnest(coalesce(v_idx_names, '{}'::text[])) as n
+   where to_regclass(format('%I.%I', v_nsp, n || '_pgpm')) is not null;
+  if v_pgpm_clash is not null then
+    raise exception 'pg_partition_magician: cannot transmute % -- the name(s) (%) are already taken, and transmute needs them for the partitioned copies of this table''s secondary indexes. Most likely leftovers from an interrupted run. Drop them, then re-run transmute.',
+      p_parent, v_pgpm_clash;
   end if;
 
   -- Refuse the one trigger shape a partitioned table cannot host (#277). Measured on PG 17.10: this is
