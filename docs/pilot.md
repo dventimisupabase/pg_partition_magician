@@ -45,7 +45,8 @@ went well; the whole point is that each rung risks strictly more than the one be
 
 | Rung | Where | What | Go/no-go |
 | --- | --- | --- | --- |
-| 0 | A branch or a restored copy | `transmute` the real table, with its real schema | Row counts and constraints match; RLS policies, triggers, grants and owner all survive |
+| 0a | A clone or branch, no traffic needed | `transmute` the real table with its real schema, then `regrain`, then retention and archiving if the key is time-like | Schema fidelity checklist below passes; rows survive by identity; maintenance does real work |
+| 0b | The same clone, plus a synthetic workload | The concurrency claims: conversion while readers and writers are live | No reader or writer error; nothing blocked beyond `p_lock_timeout`; the probe observed the conversion actually in progress |
 | 1 | Production, a low-value table | Install, register, retention only. No conversion | A week with no `fail_%` in `pgpm.log` and no operator surprises |
 | 2 | Production, the target table | `transmute` in a low-traffic window, maintainer live on a call | Conversion completes inside the agreed window; reads and writes never blocked longer than `p_lock_timeout` |
 | 3 | Production, steady state | Scheduled maintenance, hands off | Two weeks clean, and your on-call can read the health checks in section 5 unaided |
@@ -57,6 +58,60 @@ authorization incident and not a bug report.
 
 `transmute` registers a table **paused**, so conversion and going live are separate decisions. Use
 that: convert, inspect, and only then `pgpm.resume`.
+
+### Why 0a and 0b are separate rungs
+
+A clone with no traffic on it is the usual starting arena, and it establishes a lot: that the
+conversion is correct, that the schema survives it, that regrain moves a monolith onto a finer grid,
+and (for a time-like key) that obtain, retention and archiving do real work on a schedule. Those are
+prerequisites for everything else, and they are cheap to check where no user can be hurt.
+
+What it cannot establish is anything about **concurrency**, and that is a different claim rather than a
+weaker version of the same one:
+
+- "No reader or writer was blocked" is trivially true where there are no readers or writers. It is
+  satisfied by an execution with nothing to block, so on an idle clone it is not evidence.
+- `p_lock_timeout` never exercises. With no competing lock the request is granted immediately, so the
+  path that bounds a wait is never taken.
+- `transmute` splits itself across three transactions specifically so that no ACCESS EXCLUSIVE is held
+  across its validation scan. With no concurrent reader, holding it and not holding it look identical.
+
+So 0a proves the conversion is correct and 0b proves it is *online*. Skipping 0b does not make the
+ladder shorter, it moves the first real test of online-ness to rung 2, in production, which is the
+least forgiving place to learn about it. 0b needs only a writer inserting at the frontier and a reader
+running the application's hot query, both live for the duration of the conversion.
+
+### If the control column is a `uuid`, check this first
+
+pgpm derives the forward frontier differently per control kind, and `uuid` (`uuidv7`) is the one case
+where a stale clone matters. A `timestamptz` key grids against the clock, and an integer key cannot
+fall behind where the next write goes, so neither is affected. For a `uuid` key the frontier is the
+newest **stored value**, so on a clone that has received no writes it stays frozen wherever the data
+ended while the clock moves on:
+
+```sql
+-- On the clone, before transmute. max(uuid) does not exist in PostgreSQL, hence ORDER BY ... LIMIT 1.
+select now() - (select pgpm._uuid_to_ts(<control>) from <table> order by <control> desc limit 1)
+         as gap_to_now;
+```
+
+If `gap_to_now` exceeds `obtain x step`, no partition covers the present and every new write is
+rejected with a bare `no partition of relation ... found for row`. It does not recover on its own.
+Choose `obtain x step` to comfortably exceed the clone's age, and remember an idle clone keeps ageing
+while nothing advances its frontier.
+
+### Retention on an idle clone is a ratchet
+
+For time-like keys the retention boundary is `now() - retain`, measured against the present rather than
+against the data's own timeline. On a clone whose newest row is already days old, the whole dataset
+starts that much closer to being dropped and moves further every day, and on an idle clone nothing
+arrives to replace what goes.
+
+This matters most for the obvious rung-0a experiment, "prove that retention drops old partitions." On a
+live table a short `retain` trims the tail. Here it can take far more than intended, and at the limit it
+empties the table. Derive the `retain` value from the clone's actual data span rather than from what
+production will eventually use, and branch or snapshot before testing retention so the arena can be
+restored.
 
 ## 4. Stopping
 
