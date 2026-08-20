@@ -370,3 +370,95 @@ The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pcti
 `*.pgss.csv`, and pgfr when enabled), plus `copy.progress.csv` (the online copy: dest rows
 and pending delta keys over time), `regrain.progress.csv` (coarse children counting down
 to 0), and `lockprobe.log` (the cutover lock-window probe's `LOCKPROBE …` line).
+
+## Pilot instruments: rung 0b (`pilot_workload.sql`, `transmute_online.sh`)
+
+Everything above drives pgpm's own fixtures at scale. These two drive a **customer's** table over a
+DSN, and they exist for one specific question that the rest of the suite cannot ask.
+
+An idle clone, which is the usual first pilot arena, establishes that a conversion is correct: that the
+schema survives it, that rows survive by identity, that regrain and (for a time-like key) obtain and
+retention do real work. It cannot establish that the conversion is **online**, because "no reader or
+writer was blocked" is trivially true where there are none. `docs/pilot.md` splits that into rung 0a
+and rung 0b; this is rung 0b's apparatus.
+
+```bash
+# 1. Generate a workload for the target table. Introspects the catalog and builds
+#    pgpm_probe.step() for this table specifically.
+psql "$DSN" -f bench/pilot_workload.sql
+psql "$DSN" -c "call pgpm_probe.install('public.events','created_at')"
+
+# 2. Convert under load, and measure. The table IS converted when this returns.
+bench/transmute_online.sh "$DSN" public.events created_at '1 month'
+
+# 3. Remove the apparatus. Leaves the converted table and pgpm alone.
+psql "$DSN" -c "drop schema pgpm_probe cascade"
+```
+
+### Why the workload generates itself
+
+`workload.pgbench` calls `bench.workload_step()`, which only knows the bench schema. A customer table
+has its own columns, NOT NULLs, foreign keys, checks and identity columns, so the insert has to come
+from the catalog. It is built by **copying an existing row with the control column overridden**, which
+satisfies every NOT NULL, FK and CHECK by construction, because the template row already satisfies
+them. Identity and generated columns are omitted so their defaults fire, which is also what stops a
+copied row colliding on a surrogate key. `install()` then **dry-runs the generated INSERT and rolls it
+back**, so a statement that would fail at run time is caught at setup instead of showing up later as
+"the writer was blocked", which is the one conclusion this whole apparatus exists to draw.
+
+Three things worth knowing about the generated workload:
+
+- **One insert and one read per transaction, deliberately.** Not a batch, unlike `workload.pgbench`.
+  Locks are held to transaction end, so a step that wrote N rows would hold ROW EXCLUSIVE across all of
+  them, transmute's ACCESS EXCLUSIVE would queue behind it, and every later reader would queue behind
+  that. The workload would be starving the conversion it is supposed to be competing with.
+- **`uuidv7` needs its own value generator.** `pgpm._ts_to_uuid` zero-fills the tail because it encodes
+  partition *bounds*, so two calls in the same millisecond return the same uuid and collide on a primary
+  key. `pgpm_probe.uuidv7_now()` keeps the 48-bit millisecond prefix the grid reads and randomises the
+  rest.
+- **A failed `install()` leaves nothing runnable.** It drops the previous `step()` first. A surviving
+  one points at a *different* table, and a workload driving the wrong table looks exactly like a
+  workload driving the right one. That happened while this was being written.
+
+### What the probe asserts, and how it is known to discriminate
+
+`transmute_online.sh` is not a CI guard. `transmute_lock.sh` is the CI guard for the same property,
+with its own fixture and a mutation behind `./test.sh discriminate`. This is the field instrument, and
+it cannot run in CI because it needs a target database and a workload. It carries its own
+discrimination at run time instead: three of its nine assertions exist only to establish that the
+conditions for the others were present.
+
+- The workload was committing writes **before** the conversion, and again **during** it. Without both,
+  every other assertion passes vacuously, which is rung 0a wearing a rung 0b label.
+- The probe **caught the validation scan in progress**. A probe that samples after the window closes
+  reports "nothing held" against arbitrarily broken code.
+- No ACCESS EXCLUSIVE **granted** during the scan. `granted` matters here in a way it does not for the
+  CI guard: with a workload running, transmute's own AEL request legitimately queues behind the
+  workload's ROW EXCLUSIVE and appears in `pg_locks` ungranted. Counting a pending request as a held
+  lock would fail this against correct code.
+- No writer **queued** at the moment the scan was running. ROW EXCLUSIVE does not conflict with the
+  scan's SHARE UPDATE EXCLUSIVE, so a queued writer is queued behind something that should not be
+  there. A lock-state assertion, not a wall-clock one, so there is nothing to flake.
+
+Verified in all three directions, on PG 17 against a 3M-row table:
+
+| run against | result |
+| --- | --- |
+| real `install.sql` | 9/9 pass, 2000 writes committed during the conversion window |
+| the `transmute_no_commits` mutant | fails: ACCESS EXCLUSIVE granted during the scan, and writers queued |
+| a workload that commits nothing | refuses to convert at all, on the pre-conversion liveness check |
+
+One calibration note from that mutant run: at 3M rows the lock-mode and queued-writer assertions failed
+while "no writer failed" still passed, because the stall stayed inside the workload's `lock_timeout`.
+The lock-state assertions detect the defect at any table size; the writer-failure count only fires once
+the stall exceeds a real client's patience. Keep all of them.
+
+### Knobs
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `PILOT_CLIENTS` | 4 | pgbench clients |
+| `PILOT_WARMUP` | 5 | seconds of workload before converting |
+| `PILOT_LOCK_TIMEOUT` | `2s` | the workload's own `lock_timeout` |
+| `PILOT_TX_LOCK_TIMEOUT` | `5s` | `p_lock_timeout` passed to transmute |
+| `PILOT_BOUND_HEADROOM` | 1 | `p_bound_headroom`. Defaults ON, unlike transmute's own 0: the monolith bound rejects writes at or past `hi` for the whole conversion, so a writer at the frontier can cross it if the conversion spans a grid boundary (a daily step converted at 23:59). This is the pattern a live production conversion should use too. |
