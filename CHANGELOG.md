@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-20
+
 - **An installed database can say what it is: `pgpm.version()` and `pgpm.installed`.** There was no way
   to ask a database which pgpm was in it. The only version string lived in `extension.control`, which the
   `install.sql` channel never reads, so a database installed that way carried no version at all and every
