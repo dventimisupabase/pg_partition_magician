@@ -4022,3 +4022,37 @@ $$;
 
 create or replace view pgpm.partitions as
   select parent_table, child_name, lo, hi, created_at, attached from pgpm.part order by parent_table, lo;
+
+-- =============================================================================
+-- Identity: what is installed here, and when it got here.
+--
+-- version() is the version of the CODE in this database, baked in at release time. It is the same
+-- string as extension.control's default_version and the git tag; test.sh checks that pairing at the
+-- file level, which nothing inside the database can do. Every support conversation starts with this
+-- question, and the install.sql channel never reads extension.control, so without this a database
+-- installed from install.sql carries no version at all.
+--
+-- pgpm.installed is the history of install.sql runs, not a single current-version row. Re-running
+-- install.sql IS the upgrade path for this channel (hence the `add column if not exists` lines
+-- throughout), so each run appends and the table doubles as an upgrade log. One honest limitation: an
+-- install predating this table records its first row as the version it was upgraded TO, because the
+-- history can only start where the table does.
+-- =============================================================================
+create or replace function pgpm.version()
+returns text language sql immutable as $$ select '0.2.0'::text $$;
+
+create table if not exists pgpm.installed (
+  id         bigint      generated always as identity primary key,
+  version    text        not null,
+  -- The full server_version string, packaging suffix included ('17.10 (Debian 17.10-1.pgdg13+1)'),
+  -- because for support the exact build matters as much as the major.
+  pg_version text        not null,
+  at         timestamptz not null default now()
+);
+
+-- THE LAST STATEMENT IN THIS FILE, deliberately. psql -f gives each statement its own transaction
+-- unless it is called with --single-transaction, so a file that dies partway leaves a partial install.
+-- Appending the row here makes "a row for version V" mean "the V run reached the end of the file",
+-- which is the only cheap evidence an operator has that an upgrade completed rather than aborted.
+insert into pgpm.installed (version, pg_version)
+  values (pgpm.version(), current_setting('server_version'));

@@ -57,6 +57,9 @@ subset in any order is fine.
 psql "$DATABASE_URL" -f pgpm_core/install.sql
 ```
 
+Re-running that file over an existing install is the supported upgrade path. `select pgpm.version()`
+reports what is installed, and `pgpm.installed` records one row per install.sql run.
+
 The [install page](https://dventimisupabase.github.io/pg_partition_magician/install.html) has dashboard
 copy-paste bundles and the registry command; the [guide](docs/guide.md#install) covers all three channels
 and uninstall. `pg_cron` must be enabled for scheduled maintenance.
@@ -160,15 +163,22 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
+- **[Pilot template](docs/pilot.md)**: how an early production install is run, and what it does not promise.
+- **[Releasing](RELEASING.md)**: what a version number covers, and how a release is cut.
+- **[Security policy](SECURITY.md)**: how to report a vulnerability, and what is in scope.
 
 ## Tests
 
 ```bash
 ./test.sh        # full matrix: PG 15-18 x all install channels
 ./test.sh 15     # one version, all channels
+./test.sh ci     # every track CI runs, including the ones the matrix skips
 ```
 
-pgTAP on Docker, exactly what CI runs on every push. See [ONBOARDING.md](ONBOARDING.md) for the dev loop.
+pgTAP on Docker. `./test.sh` covers the four PostgreSQL versions but skips the `timescale`, `observe`,
+`archive`, `perf` and `discriminate` tracks, which need their own image or service, so it does not by
+itself predict a green CI. Use `./test.sh ci` before pushing anything that touches
+`pgpm_core/install.sql`. See [ONBOARDING.md](ONBOARDING.md) for the dev loop.
 
 ## License
 
