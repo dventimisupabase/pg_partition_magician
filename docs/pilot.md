@@ -81,6 +81,24 @@ ladder shorter, it moves the first real test of online-ness to rung 2, in produc
 least forgiving place to learn about it. 0b needs only a writer inserting at the frontier and a reader
 running the application's hot query, both live for the duration of the conversion.
 
+Both are provided. `bench/pilot_workload.sql` generates the workload for your table by reading the
+catalog: it copies an existing row with the control column overridden, so every NOT NULL, foreign key
+and check is satisfied by construction, and it dry-runs the statement before handing it to anything.
+`bench/transmute_online.sh` then converts under that load and reports.
+
+```bash
+psql "$DSN" -f bench/pilot_workload.sql
+psql "$DSN" -c "call pgpm_probe.install('public.events','created_at')"
+bench/transmute_online.sh "$DSN" public.events created_at '1 month'
+psql "$DSN" -c "drop schema pgpm_probe cascade"      # when finished
+```
+
+The probe refuses to draw a conclusion it has not earned: it checks that the workload was committing
+writes before the conversion and again during it, and that it caught the validation scan in progress.
+If the workload is not actually running it fails rather than reporting success, so a 0b run cannot
+quietly degrade into a 0a run. `bench/README.md` records how it was verified against a mutation that
+reintroduces the defect. The table **is** converted when it finishes, so run it on the clone.
+
 ### If the control column is a `uuid`, check this first
 
 pgpm derives the forward frontier differently per control kind, and `uuid` (`uuidv7`) is the one case
