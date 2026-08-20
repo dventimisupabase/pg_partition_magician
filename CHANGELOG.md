@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+- **An installed database can say what it is: `pgpm.version()` and `pgpm.installed`.** There was no way
+  to ask a database which pgpm was in it. The only version string lived in `extension.control`, which the
+  `install.sql` channel never reads, so a database installed that way carried no version at all and every
+  support conversation started by guessing.
+  - `pgpm.version()` returns the semver triple, baked into `install.sql` at release time.
+    `RELEASING.md` makes it the same string as `extension.control`'s `default_version` and the git tag.
+  - `pgpm.installed` records one row per `install.sql` run, with the version and the full
+    `server_version`. It is a history, not a current-version row, because re-running `install.sql` *is*
+    the upgrade path for this channel. The `insert` is deliberately the **last statement in the file**,
+    so a row for version V means the V run reached the end rather than dying partway: `psql -f` gives
+    each statement its own transaction unless called with `--single-transaction`.
+  - One honest limit: an install predating the table records its first row as the version it was
+    upgraded *to*. The history can only start where the table does.
+
+- **`bench/upgrade_in_place.sh`: the in-place upgrade was never tested at all.** `install.sql` is the
+  upgrade path, and a new column reaches an existing database only if the file also carries an
+  `alter table ... add column if not exists` line for it. There are fourteen such lines, all
+  hand-maintained, and nothing enforced them. Add a column to a `create table` body, forget the backfill
+  line, and every existing install comes out missing it.
+  - The whole pgTAP suite is blind to this by construction: it installs **fresh**, one database per file,
+    so it never upgrades anything. The break lands only on operators who already had pgpm installed,
+    which is to say only on the ones who are not evaluating it.
+  - The guard installs, degrades the database to an older shape by dropping all fourteen columns,
+    re-runs `install.sql`, and requires the result to be catalog-identical to a fresh install of the
+    same code, with its managed table's rows intact by identity and its registration unchanged.
+  - Two liveness witnesses, because every assertion in it is of the form "the upgrade restored X" and
+    all of them pass against a degrade that silently did nothing. First: the columns really are absent
+    after the degrade. Second: `maintain()` still mints a partition afterwards, named, since a
+    structurally perfect install that can no longer obtain is not an upgrade anyone wants.
+  - The fixture is id-kind rather than time-kind, and that is load-bearing: `obtain` measures a time
+    table against the **clock**, so nothing the harness inserts can give it work to do. For an id table
+    the frontier is `max(control)`, which the harness moves on purpose. It moves it to one below the last
+    bound, since with no DEFAULT partition (#288) an insert past the newest bound is rejected rather than
+    extending the grid.
+  - Mutation `upgrade_no_column_backfill` deletes the `obtain_retry_after` backfill line and the guard
+    fails against it, catalog mismatch first and then `record "cfg" has no field "obtain_retry_after"`
+    out of `maintain` itself. Wired into `./test.sh perf`, verified by `./test.sh discriminate`.
+
+- **`RELEASING.md`, `SECURITY.md`, `docs/pilot.md`.** Project mechanics that had no written form.
+  `RELEASING.md` states what a version number covers (the callable surface, the config tables, the
+  `pgpm.log.action` values, the supported PostgreSQL majors), the pre-1.0 policy and the bar for
+  spending `1.0.0`, the release steps and two traps in the existing tag pipeline, and the
+  install.sql-is-the-upgrade-path rule for contributors. Cadence anchored to PostgreSQL's release
+  calendar, and the deprecation policy, are recorded there as an explicit TODO rather than invented now.
+  `SECURITY.md` gives a private report route and scope, and states the properties a reviewer would
+  otherwise have to infer: no `SECURITY DEFINER` anywhere, no superuser requirement of pgpm's own, and
+  identifiers quoted through `format(%I)` or `quote_ident()` in dynamic SQL. `docs/pilot.md` is the
+  template for an early production install: what it does not promise, the exposure ladder, the kill
+  switch and what a stopped pgpm actually leaves behind, and the two health queries an operator needs.
+
 - **`transmute` refuses a colliding `<index>_pgpm` name up front instead of failing mid-cutover
   (issue #311).** It recreates each carried secondary index as a partitioned index on the new parent named
   `<original>_pgpm`, then attaches the monolith's original under it. Nothing checked that name was free.

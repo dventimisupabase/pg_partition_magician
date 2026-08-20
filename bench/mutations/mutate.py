@@ -110,6 +110,16 @@ MUTATIONS = {
   end if;
 """, "", 1)],
     ),
+    "upgrade_no_column_backfill": (
+        "bench/upgrade_in_place.sh",
+        "A column present in pgpm.config's `create table` body with no matching `add column if not "
+        "exists` line: precisely the mistake install.sql's 14 backfill lines exist to prevent. A FRESH "
+        "install is unaffected, because it gets the column from the create table -- so the whole pgTAP "
+        "suite stays green, installing fresh one database per file and never upgrading anything. Only a "
+        "database that already had pgpm installed comes out of the upgrade missing the column, which is "
+        "to say only the operators who are not evaluating it.",
+        [("alter table pgpm.config add column if not exists obtain_retry_after timestamptz;\n", "", 1)],
+    ),
 }
 
 
