@@ -43,13 +43,13 @@ A pilot without a written success condition does not fail, it fades, and nobody 
 One rung at a time, with an explicit go/no-go before the next. Do not compress this because a rung
 went well; the whole point is that each rung risks strictly more than the one before it.
 
-| Rung | Where | What | Go/no-go |
-| --- | --- | --- | --- |
-| 0a | A clone or branch, no traffic needed | `transmute` the real table with its real schema, then `regrain`, then retention and archiving if the key is time-like | Schema fidelity checklist below passes; rows survive by identity; maintenance does real work |
-| 0b | The same clone, plus a synthetic workload | The concurrency claims: conversion while readers and writers are live | No reader or writer error; nothing blocked beyond `p_lock_timeout`; the probe observed the conversion actually in progress |
-| 1 | Production, a low-value table | Install, register, retention only. No conversion | A week with no `fail_%` in `pgpm.log` and no operator surprises |
-| 2 | Production, the target table | `transmute` in a low-traffic window, maintainer live on a call | Conversion completes inside the agreed window; reads and writes never blocked longer than `p_lock_timeout` |
-| 3 | Production, steady state | Scheduled maintenance, hands off | Two weeks clean, and your on-call can read the health checks in section 5 unaided |
+| Rung | Where                                     | What                                                                                                                  | Go/no-go                                                                                                                   |
+|------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| 0a   | A clone or branch, no traffic needed      | `transmute` the real table with its real schema, then `regrain`, then retention and archiving if the key is time-like | Schema fidelity checklist below passes; rows survive by identity; maintenance does real work                               |
+| 0b   | The same clone, plus a synthetic workload | The concurrency claims: conversion while readers and writers are live                                                 | No reader or writer error; nothing blocked beyond `p_lock_timeout`; the probe observed the conversion actually in progress |
+| 1    | Production, a low-value table             | Install, register, retention only. No conversion                                                                      | A week with no `fail_%` in `pgpm.log` and no operator surprises                                                            |
+| 2    | Production, the target table              | `transmute` in a low-traffic window, maintainer live on a call                                                        | Conversion completes inside the agreed window; reads and writes never blocked longer than `p_lock_timeout`                 |
+| 3    | Production, steady state                  | Scheduled maintenance, hands off                                                                                      | Two weeks clean, and your on-call can read the health checks in section 5 unaided                                          |
 
 Rung 0 is not optional and it uses **your** schema, not a fixture. The failure modes that matter here
 are schema-shaped: an RLS policy dropped, a trigger lost, an identity column downgraded. On a database
@@ -130,6 +130,64 @@ live table a short `retain` trims the tail. Here it can take far more than inten
 empties the table. Derive the `retain` value from the clone's actual data span rather than from what
 production will eventually use, and branch or snapshot before testing retention so the arena can be
 restored.
+
+### Resetting the arena between runs
+
+Rungs 0a and 0b both convert the table, and the destructive experiments cannot be undone by repeating
+them, so a reset mechanism is part of the arena rather than an afterthought. On Supabase that is a
+point-in-time restore, which rolls the project back in place. Measured on a staging project (PG 17.6,
+pgpm 0.2.0, a 5000-row table): **44 seconds**, project unreachable throughout. Duration grows with WAL
+volume and with time since the weekly full backup, so treat that as a floor rather than a typical.
+
+**Take the reset point with pgpm PAUSED.** This is the one thing to get right and it is not obvious.
+`cron.job` survives a restore with `active = true`, and the scheduler resumes within about a second of
+the project becoming reachable. In the measured run the first tick landed one second after
+reconnection and immediately re-applied the retention pass the restore had just undone, dropping the
+same partition again plus one the original pass had never touched:
+
+```text
+ 50 | retain_drop | 22:26:00 -> 22:57:00 | 23:01:00   <- the partition the restore had just brought back
+ 51 | retain_drop | 22:57:00 -> 22:58:00 | 23:01:00   <- and one more, the clock having moved on
+```
+
+The restored rows were gone before an aggressively polling observer could read them. So "unschedule
+immediately after the restore" is not achievable, because there is no window in which to do it. Pausing
+at the reset point leaves the cron jobs intact and makes their ticks no-ops, so the arena comes back
+quiet and resumes only when you are ready to watch it.
+
+**A maintenance-driven effect re-applies itself. An operator-driven one does not.** Retention, obtain
+and auto-regrain are issued by `maintain`, so a restore that undoes them hands them straight back.
+`transmute` and `untransmute` are issued by a person, so restoring to before a conversion leaves an
+ordinary unmanaged table and nothing re-issues it (verified: `relkind` back to `r`, no `pgpm.config`
+row, rows intact). Roll back a conversion with maintenance running and you are fine; roll back a
+retention pass and you are not.
+
+**Retention re-applies as a superset, not a repeat.** The boundary is `now() - retain`, so a pass that
+runs after a restore is evaluated against a later clock. The effect is quantised by the partition step:
+90 seconds of drift changed nothing with 1-minute steps, while nine minutes turned "drops nothing" into
+"drops every row". Cycles shorter than one step re-apply exactly what they undid; longer ones do more.
+
+**Capture results before resetting.** The restore rolls back `pgpm.log`, the probe tables and the
+workload log along with the data. Anything you want to compare across cycles has to leave the database
+first, or the loop produces activity rather than evidence.
+
+**Do not use `max(pgpm.log.id)` as a rollback witness.** Identity sequences cache ahead of what is
+committed, so ids are not contiguous across a physical restore: a reset point whose highest id was 23
+resumed at 46. Use content, or a counter that can legitimately decrease, such as the row count of
+`cron.job_run_details`, which went from 48 to 42 across the measured restore and made the rollback
+unambiguous.
+
+**Mind the RPO.** Recoverable points are quantised to roughly two minutes, and the endpoint for forcing
+a named restore point was unavailable when this was tested, so the reset target has to be a timestamp
+you wait out rather than a point you can demand. Do the setup, wait out the RPO, then start the test.
+
+The loop is scriptable end to end, which is worth knowing before anyone plans it around the dashboard:
+
+```bash
+PATCH /v1/projects/$REF/billing/addons                 # {"addon_type":"pitr","addon_variant":"pitr_7"}
+GET   /v1/projects/$REF/database/backups               # confirm pitr_enabled
+POST  /v1/projects/$REF/database/backups/restore-pitr  # {"recovery_time_target_unix":<epoch>}
+```
 
 ## 4. Stopping
 
