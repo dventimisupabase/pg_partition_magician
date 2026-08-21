@@ -155,6 +155,19 @@ immediately after the restore" is not achievable, because there is no window in 
 at the reset point leaves the cron jobs intact and makes their ticks no-ops, so the arena comes back
 quiet and resumes only when you are ready to watch it.
 
+That was then tested directly, as a controlled pair on one project with the same cron and the same
+retention settings, varying only the paused flag at the reset point:
+
+| reset point taken with | what the restore landed on |
+| --- | --- |
+| pgpm resumed | the first tick fired about a second after reachability and dropped the restored data again |
+| pgpm paused | four ticks over five minutes, monolith retention-eligible throughout, data untouched |
+
+The second row is the one to build a loop on. Note what makes it evidence rather than an absence: the
+monolith was verified eligible for retention at the moment of the check, and cron was verified armed and
+ticking, so the paused flag was the only thing standing between the restored rows and another
+`retain_drop`.
+
 **A maintenance-driven effect re-applies itself. An operator-driven one does not.** Retention, obtain
 and auto-regrain are issued by `maintain`, so a restore that undoes them hands them straight back.
 `transmute` and `untransmute` are issued by a person, so restoring to before a conversion leaves an
@@ -176,6 +189,13 @@ committed, so ids are not contiguous across a physical restore: a reset point wh
 resumed at 46. Use content, or a counter that can legitimately decrease, such as the row count of
 `cron.job_run_details`, which went from 48 to 42 across the measured restore and made the rollback
 unambiguous.
+
+**Restoring repeatedly works.** Three restores on one project took 44, 50 and 46 seconds, with no
+degradation from having already been restored, and a reset point taken after an earlier restore is
+reachable normally. One caveat found the hard way: the landing point can be a second or two EARLIER
+than the timestamp requested, so the setup you want preserved must be comfortably older than the reset
+point rather than seconds older. A reset point recorded one second after a `transmute` came back with
+the conversion undone.
 
 **Mind the RPO.** Recoverable points are quantised to roughly two minutes, and the endpoint for forcing
 a named restore point was unavailable when this was tested, so the reset target has to be a timestamp
