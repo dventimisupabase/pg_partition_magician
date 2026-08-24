@@ -120,6 +120,47 @@ MUTATIONS = {
         "to say only the operators who are not evaluating it.",
         [("alter table pgpm.config add column if not exists obtain_retry_after timestamptz;\n", "", 1)],
     ),
+    "uuidv7_frontier_data_only": (
+        "bench/frontier_drought.sh",
+        "Pre-#325: uuidv7's forward frontier was plain max(control), decoded, with no clock in it at "
+        "all. A table whose writes go quiet (a restored dump, a stale clone, a drought exceeding "
+        "obtain x step) has that frontier stuck wherever the data ended while now() keeps moving -- "
+        "obtain measures itself against its own past output, finds nothing to do, and every write past "
+        "the stalled grid is refused, permanently and silently. Reverts BOTH sites: _frontier_native "
+        "(what obtain/maintain/regrain_step use every tick) and _transmute's inline duplicate (what "
+        "sets the monolith's initial bound, before pgpm.config exists to call the shared function). "
+        "Fixing only one leaves the other stuck at the data-only value.",
+        [
+            ("  v_decoded := pgpm._decode(cfg.control_kind, v_max);\n"
+             "  -- #325: uuidv7 is a TIME grid fed by DATA. Left as plain max(control), a table whose writes go quiet\n"
+             "  -- (a restored dump, a stale clone, a drought) has a frontier stuck wherever the data ended while\n"
+             "  -- now() keeps moving -- obtain measures itself against its own past output and finds nothing to do,\n"
+             "  -- so the grid stalls exactly where the drought began and every write past it is refused, permanently\n"
+             "  -- and silently. greatest() with now() makes uuidv7 self-healing the same way `time` already is: the\n"
+             "  -- grid can never fall further behind the clock than one maintenance tick, drought or not. `id` is\n"
+             "  -- untouched below -- it has no clock, so its frontier can only be where the data actually put it.\n"
+             "  if cfg.control_kind = 'uuidv7' then\n"
+             "    return greatest(v_decoded::timestamptz, now())::text;\n"
+             "  end if;\n"
+             "  return v_decoded;\n"
+             "end;\n",
+             "  return pgpm._decode(cfg.control_kind, v_max);\nend;\n", 1),
+            ("    if v_max_raw is null then\n"
+             "      v_frontier_native := case when p_control_kind = 'id' then p_anchor else now()::text end;\n"
+             "    elsif p_control_kind = 'uuidv7' then\n"
+             "      -- #325: mirrors _frontier_native's greatest(decoded, now()) here too. pgpm.config does not exist\n"
+             "      -- yet (see the note above), so this cannot just call the shared function -- and fixing only that\n"
+             "      -- one would leave THIS bound stuck at the data-driven value, opening a gap between the\n"
+             "      -- monolith's frozen upper edge and obtain's now()-anchored forward grid on the very next tick.\n"
+             "      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw)::timestamptz, now())::text;\n"
+             "    else\n"
+             "      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw);\n"
+             "    end if;\n",
+             "    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw),\n"
+             "                                  case when p_control_kind = 'id' then p_anchor else now()::text end);\n",
+             1),
+        ],
+    ),
 }
 
 

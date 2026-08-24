@@ -378,7 +378,7 @@ $$;
 -- the write frontier in native terms: now() (time), max(control) (id/uuidv7)
 create or replace function pgpm._frontier_native(p_parent regclass)
 returns text language plpgsql as $$
-declare cfg pgpm.config; v_max text;
+declare cfg pgpm.config; v_max text; v_decoded text;
 begin
   -- The relation can be gone: pgpm.config.parent_table is a regclass, and DROP TABLE on a managed parent
   -- leaves the row pointing at an oid with no pg_class entry (only untransmute clears pgpm state). A dead
@@ -400,7 +400,18 @@ begin
   if v_max is null then
     return case when cfg.control_kind = 'id' then cfg.partition_anchor else now()::text end;
   end if;
-  return pgpm._decode(cfg.control_kind, v_max);
+  v_decoded := pgpm._decode(cfg.control_kind, v_max);
+  -- #325: uuidv7 is a TIME grid fed by DATA. Left as plain max(control), a table whose writes go quiet
+  -- (a restored dump, a stale clone, a drought) has a frontier stuck wherever the data ended while
+  -- now() keeps moving -- obtain measures itself against its own past output and finds nothing to do,
+  -- so the grid stalls exactly where the drought began and every write past it is refused, permanently
+  -- and silently. greatest() with now() makes uuidv7 self-healing the same way `time` already is: the
+  -- grid can never fall further behind the clock than one maintenance tick, drought or not. `id` is
+  -- untouched below -- it has no clock, so its frontier can only be where the data actually put it.
+  if cfg.control_kind = 'uuidv7' then
+    return greatest(v_decoded::timestamptz, now())::text;
+  end if;
+  return v_decoded;
 end;
 $$;
 
@@ -2380,15 +2391,25 @@ begin
   -- current interval, so live writes keep landing in it until the frontier crosses B (then obtain's
   -- forward partitions take over and the monolith freezes). Every row satisfies [lo, B): lo <= min and
   -- B > frontier >= every row. An empty table anchors lo at the frontier's grid floor (empty monolith).
-  -- frontier (now() for time, max(control) for id/uuidv7) and min(control), computed directly:
+  -- frontier (now() for time, max(control) for id, greatest(max(control), now()) for uuidv7 (#325))
+  -- and min(control), computed directly:
   -- pgpm.config does not exist yet, so _frontier_native (which reads config) cannot be used here.
   if p_control_kind = 'time' then
     v_frontier_native := now()::text;
   else
     execute format('select t.%I::text from %s t order by t.%I desc limit 1', p_control, p_parent::text, p_control)
       into v_max_raw;
-    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw),
-                                  case when p_control_kind = 'id' then p_anchor else now()::text end);
+    if v_max_raw is null then
+      v_frontier_native := case when p_control_kind = 'id' then p_anchor else now()::text end;
+    elsif p_control_kind = 'uuidv7' then
+      -- #325: mirrors _frontier_native's greatest(decoded, now()) here too. pgpm.config does not exist
+      -- yet (see the note above), so this cannot just call the shared function -- and fixing only that
+      -- one would leave THIS bound stuck at the data-driven value, opening a gap between the
+      -- monolith's frozen upper edge and obtain's now()-anchored forward grid on the very next tick.
+      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw)::timestamptz, now())::text;
+    else
+      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw);
+    end if;
   end if;
   execute format('select t.%I::text from %s t order by t.%I asc limit 1', p_control, p_parent::text, p_control)
     into v_min_raw;
