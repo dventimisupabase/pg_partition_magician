@@ -13,7 +13,8 @@ coarse monolith into finer partitions on demand. `maintain` is the one procedure
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
 `timestamptz` for the `time` and `uuidv7` kinds and a `numeric` for the `id` kind; "the frontier" is
-`now()` for `time` and `max(control)` for `id`/`uuidv7`.
+`now()` for `time`, `max(control)` for `id`, and `greatest(max(control), now())` for `uuidv7` (a time
+grid fed by data, so it never falls behind the clock; #325).
 
 ## Conversion
 

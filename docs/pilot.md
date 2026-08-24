@@ -99,24 +99,17 @@ If the workload is not actually running it fails rather than reporting success, 
 quietly degrade into a 0a run. `bench/README.md` records how it was verified against a mutation that
 reintroduces the defect. The table **is** converted when it finishes, so run it on the clone.
 
-### If the control column is a `uuid`, check this first
+### uuid keys: obtain self-heals on an idle clone, retention does not
 
-pgpm derives the forward frontier differently per control kind, and `uuid` (`uuidv7`) is the one case
-where a stale clone matters. A `timestamptz` key grids against the clock, and an integer key cannot
-fall behind where the next write goes, so neither is affected. For a `uuid` key the frontier is the
-newest **stored value**, so on a clone that has received no writes it stays frozen wherever the data
-ended while the clock moves on:
-
-```sql
--- On the clone, before transmute. max(uuid) does not exist in PostgreSQL, hence ORDER BY ... LIMIT 1.
-select now() - (select pgpm._uuid_to_ts(<control>) from <table> order by <control> desc limit 1)
-         as gap_to_now;
-```
-
-If `gap_to_now` exceeds `obtain x step`, no partition covers the present and every new write is
-rejected with a bare `no partition of relation ... found for row`. It does not recover on its own.
-Choose `obtain x step` to comfortably exceed the clone's age, and remember an idle clone keeps ageing
-while nothing advances its frontier.
+pgpm derives the forward frontier differently per control kind. A `timestamptz` key grids against the
+clock, and an integer key cannot fall behind where the next write goes, so neither is affected by a
+stale clone. A `uuid` (`uuidv7`) key is a time grid fed by data: its frontier is
+`greatest(max(control), now())` (#325), so `obtain` never falls further behind the clock than
+`config.obtain x partition_step` even on a clone that has received no writes since it was taken. Before
+the fix, the frontier was the newest **stored value** alone, so an idle clone's frontier stayed frozen
+wherever the data ended while the clock moved on -- exceed `obtain x step` and every new write was
+rejected with a bare `no partition of relation ... found for row`, permanently. There is nothing to
+check here before converting now.
 
 ### Retention on an idle clone is a ratchet
 

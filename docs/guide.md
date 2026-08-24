@@ -46,9 +46,11 @@ your retention policy. Everything is pure SQL in the `pgpm` schema; the only run
 ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a
 companion column instead.
 
-**The frontier.** The frontier is the newest point the data has reached: `now()` for `time`, and
-`max(control)` for `id` and `uuidv7`. An interval is "open" while the frontier is inside it (still
-receiving writes) and "closed" once the frontier moves past its upper bound.
+**The frontier.** For `time` the frontier is `now()`; for `id` it is `max(control)`, the newest point
+the data has reached. `uuidv7` is a time grid fed by data: its frontier is `greatest(max(control),
+now())` (#325), so it tracks the newest row while writes are current and falls back to the clock when
+they lag, rather than freezing wherever the data last landed. An interval is "open" while the frontier
+is inside it (still receiving writes) and "closed" once the frontier moves past its upper bound.
 
 **The monolith.** Conversion moves **no rows**. It renames your original table aside and attaches it,
 intact, as one bounded **coarse child** -- the *monolith* -- covering `[grid_floor(min), B)`, where `B` is
