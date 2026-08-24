@@ -2719,12 +2719,6 @@ begin
     insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
   end loop;
 
-  -- NOTE: obtain is intentionally NOT run inside transmute. The cutover above is the online work (one
-  -- SHARE UPDATE EXCLUSIVE validate scan, then a brief metadata-only ACCESS EXCLUSIVE rename and attach).
-  -- Run pgpm.obtain(parent) (or pgpm.maintain, or the scheduled job) AFTER transmute to build the forward
-  -- partitions; with an EMPTY default, obtain takes the cheap plain path (no scan). Until the frontier
-  -- crosses B, live writes land in the monolith (the current interval lives there too).
-
   -- Build the forward grid (#288). With no DEFAULT, a write past the monolith has nowhere to go until
   -- these exist, so they are created here rather than waiting for the first maintenance tick. obtain needs
   -- no special casing: the frontier sits inside the monolith, so its k=0 candidate overlaps and is skipped,
