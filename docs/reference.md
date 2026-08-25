@@ -12,13 +12,13 @@ grid ahead of the write frontier, `retain` drops whole partitions past a policy,
 coarse monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
-`timestamptz` for the `time` and `uuidv7` kinds and a `numeric` for the `id` kind; "the frontier" is
-`now()` for `time`, `max(control)` for `id`, and `greatest(max(control), now())` for `uuidv7` (a time
-grid fed by data, so it never falls behind the clock; #325).
+`timestamptz` for the `time`, `uuidv7` and `text_time` kinds and a `numeric` for the `id` kind; "the
+frontier" is `now()` for `time`, `max(control)` for `id`, and `greatest(max(control), now())` for
+`uuidv7`/`text_time` (both are time grids fed by data, so neither falls behind the clock; #325).
 
 ## Conversion
 
-### `transmute` (time / uuidv7 grid)
+### `transmute` (time / uuidv7 / text_time grid)
 
 ```sql
 pgpm.transmute(
@@ -28,7 +28,10 @@ pgpm.transmute(
   p_paused boolean default true, p_incoming_fks text default 'error',
   p_force_uuidv7 boolean default false,
   p_bound_headroom int default 0,
-  p_lock_timeout text default '5s'
+  p_lock_timeout text default '5s',
+  p_tt_prefix text default null, p_tt_width int default null,
+  p_tt_radix int default null, p_tt_unit text default null,
+  p_force_text_time boolean default false
 )
 ```
 
@@ -41,8 +44,11 @@ tool that wraps each migration in a transaction (Prisma, Flyway, Liquibase, Rail
 fail it with `invalid transaction termination`. Convert as an operator-driven step instead.
 
 Converts `p_parent` into a partitioned table and registers it. The control column's type selects
-the kind: a `uuid` column is treated as **uuidv7** (time-ordered; ULIDs stored as `uuid` included), and a
-`timestamptz`/`timestamp`/`date` column is **time**.
+the kind: a `uuid` column is treated as **uuidv7** (time-ordered; ULIDs stored as `uuid` included), a
+`text`/`varchar` column is treated as **text_time** (a general opaque-sortable-TEXT id -- classic `cuid`
+is the motivating case -- decoded via a declared `<prefix><fixed-width base-N encoded epoch>` shape; see
+`p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` below), and a `timestamptz`/`timestamp`/`date` column
+is **time**.
 
 The cutover moves no rows, and runs in **three transactions** so that none of its locks scales with the
 row count: add the monolith's bound `CHECK` as `NOT VALID` (catalog only, instant); commit, which drops
@@ -101,6 +107,12 @@ Parameters:
   `restore_incoming_fks` does now). `'drop'` is also accepted, but it is **not** a third behavior: it takes
   the same path as `'preserve'`, so the keys are recorded and restored just the same.
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
+- `p_tt_prefix`, `p_tt_width`, `p_tt_radix`, `p_tt_unit` -- **text_time only**, and all four are required
+  together when the control column is `text`/`varchar`. They describe the column's shape: a constant
+  literal prefix (`'c'` for classic `cuid`), the fixed character width of the encoded-epoch field that
+  follows it (`8`), the base it's encoded in (`36`), and the time unit it counts (`'ms'` or `'s'`). See
+  [`check_text_time`](#check_text_time).
+- `p_force_text_time` -- skip the text_time plausibility refusal (see below).
 - `p_bound_headroom` -- push the monolith's upper bound `hi` this many grid steps further out. The bound
   `CHECK` refuses writes at or past `hi` for the whole conversion, so raise this if the frontier could
   cross `hi` while the validation scan runs. `0` (the default) puts `hi` at the first grid boundary above
@@ -116,12 +128,20 @@ Parameters:
 Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
 excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
 control column is `float`/`double` (imprecise boundaries); a `time`-kind control column
-is not a timestamp/date, or a `uuidv7` control is not `uuid`; a `uuid` control samples as overwhelmingly
-random (UUIDv4) and `p_force_uuidv7` is not set; a non-PK `UNIQUE` secondary index does not include the
+is not a timestamp/date, a `uuidv7` control is not `uuid`, or a `text_time` control is not `text`/`varchar`;
+a `uuid` control samples as overwhelmingly random (UUIDv4) and `p_force_uuidv7` is not set; a `text_time`
+control is missing any of `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit`, has a `p_tt_radix` outside
+2-36 or a non-positive `p_tt_width`, or samples as not matching the declared shape and `p_force_text_time`
+is not set; a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
 `'error'`; a standalone table matching the child-partition naming already exists (an orphan from an
 interrupted run); or a relation already occupies one of the `<index>_pgpm` names the conversion needs for
 the partitioned copies of the table's secondary indexes (also usually a leftover from an interrupted run).
+
+```sql
+call pgpm.transmute('public.search_history', 'id', interval '1 month',
+                      p_tt_prefix => 'c', p_tt_width => 8, p_tt_radix => 36, p_tt_unit => 'ms');
+```
 
 ```sql
 call pgpm.transmute('public.events', 'created_at', interval '1 month',
@@ -466,7 +486,9 @@ created empty, so nothing is scanned and nothing is moved. It skips any candidat
 existing attached partition, for example the monolith, which covers the current interval.
 
 It stops early, returning what it built, when the next grid boundary cannot be expressed: a `uuidv7` grid
-ends at the last instant a 48-bit millisecond prefix can carry, `10889-08-02 05:31:50.65504+00`.
+ends at the last instant a 48-bit millisecond prefix can carry, `10889-08-02 05:31:50.65504+00`; a
+`text_time` grid ends wherever the declared `p_tt_width` digits at `p_tt_radix` run out (classic cuid's
+8 base36 digits reach year 2059).
 
 This is the only thing standing between the workload and a write with nowhere to go, since a row outside
 the grid is refused rather than parked. `config.obtain x partition_step` is therefore both the slack if
@@ -883,7 +905,7 @@ obtaining, archiving, retaining (and regraining, if enabled). `pause` stops it.
 pgpm.set_regrain(p_parent regclass, p_target_step text default null) returns void
 ```
 
-Turn auto-regrain on or off. A non-null `p_target_step` (an interval as text for time/uuidv7, a `bigint`
+Turn auto-regrain on or off. A non-null `p_target_step` (an interval as text for time/uuidv7/text_time, a `bigint`
 step as text for id) lets each `maintain` tick feather the oldest frozen coarse child one microbatch
 toward that granularity; `null` turns it off (regrain stays operator-driven). Enabling it is always safe:
 `regrain_step` enforces its own preconditions, so an un-meetable tick simply retries.
@@ -944,6 +966,20 @@ pgpm.check_uuidv7(p_table regclass, p_control name, p_sample int default 1000)
 Samples a `uuid` column and reports the fraction whose decoded 48-bit timestamp prefix is a plausible
 recent time. Genuine UUIDv7/ULID scores `~1.0`; random UUIDv4 scores `~0`. A heuristic, not a proof; this
 is the check `transmute` runs to gate the uuidv7 kind.
+
+### `check_text_time`
+
+```sql
+pgpm.check_text_time(p_table regclass, p_control name, p_prefix text, p_width int, p_radix int,
+                      p_unit text, p_sample int default 1000)
+  returns table (sampled bigint, plausible bigint, fraction numeric)
+```
+
+The `text_time` analogue of `check_uuidv7`: samples a `text`/`varchar` column against a *declared* shape
+(the same `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` `transmute` takes) and reports the fraction
+that both match the shape and decode to a plausible recent time. A value that does not even match the
+shape counts as implausible directly, rather than raising -- one malformed row must not abort the sample.
+A heuristic, not a proof; this is the check `transmute` runs to gate the text_time kind.
 
 ### `check_time_monotonic`
 
@@ -1062,11 +1098,11 @@ One row per managed table (`parent_table` is the primary key). Columns:
 |---|---|---|
 | `parent_table` | `regclass` | the managed partitioned parent |
 | `control_column` | `name` | the partition-key column |
-| `control_kind` | `text` | `time`, `id`, or `uuidv7` |
-| `partition_step` | `text` | grid width (`1 month` for time/uuidv7; a bigint for id) |
+| `control_kind` | `text` | `time`, `id`, `uuidv7`, or `text_time` |
+| `partition_step` | `text` | grid width (`1 month` for time/uuidv7/text_time; a bigint for id) |
 | `partition_anchor` | `text` | grid origin |
 | `obtain` | `int` | partitions kept ahead of the frontier |
-| `retain` | `text` | retention horizon (interval for time/uuidv7, bigint count for id; null = keep) |
+| `retain` | `text` | retention horizon (interval for time/uuidv7/text_time, bigint count for id; null = keep) |
 | `retain_batch` | `int` | max partitions one `retain()` call attempts, oldest first (null = unbounded) |
 | `regrain_batch` | `int` | rows per regrain COPY microbatch |
 | `paused` | `boolean` | maintenance is idle while true |
@@ -1077,6 +1113,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining) |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
+| `text_time_prefix` / `text_time_width` / `text_time_radix` / `text_time_unit` | `text` / `int` / `int` / `text` | the declared shape for a `text_time` control column (null for every other kind); see `p_tt_prefix` etc. above |
 
 ### `pgpm.part`
 
@@ -1147,7 +1184,7 @@ carries a `pgpm_monolith_bound` `CHECK` and is refusing writes outside `[lo, hi)
 |---|---|---|
 | `parent_table` | `regclass` | the table being converted (primary key) |
 | `nsp` / `rel` | `name` | its schema and name as of the conversion's start, so the bound can still be dropped by name after the rename |
-| `control_kind` | `text` | `time`, `id` or `uuidv7` |
+| `control_kind` | `text` | `time`, `id`, `uuidv7` or `text_time` |
 | `lo` / `hi` | `text` | the native bounds the `CHECK` is enforcing; a retry reuses these rather than recomputing |
 | `started_at` | `timestamptz` | when the conversion added the bound |
 
@@ -1171,7 +1208,7 @@ One row per archived chunk. See [Byte-budget chunked archiving](#byte-budget-chu
 A fine (one-step) partition is named `<rel>_p<lo>`; a coarse or monolith partition (wider than one step)
 is `<rel>_p<lo>_to_<hi>`, both bounds formatted at the step's granularity:
 
-- time/uuidv7: `events_p2026_03` (a fine month), `events_p2026_03_to_2026_07` (the monolith)
+- time/uuidv7/text_time: `events_p2026_03` (a fine month), `events_p2026_03_to_2026_07` (the monolith)
 - id: `events_p0000000000000010000`, `events_p0000000000000000000_to_0000000000000060000`
 
 The name is a human-facing label; `pgpm.part` holds the authoritative bounds. The `_to_` form also keeps
