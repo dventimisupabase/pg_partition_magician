@@ -135,7 +135,7 @@ MUTATIONS = {
         "duplicate reproduced a 10-month gap with no partition at all, not just a stale frontier.",
         [
             ("  v_decoded := pgpm._decode(cfg.control_kind, v_max,\n"
-             "                             cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);\n"
+             "                             cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);\n"
              "  -- #325: uuidv7 (and text_time, the same shape of thing) is a TIME grid fed by DATA. Left as plain\n"
              "  -- max(control), a table whose writes go quiet (a restored dump, a stale clone, a drought) has a\n"
              "  -- frontier stuck wherever the data ended while now() keeps moving -- obtain measures itself against\n"
@@ -150,7 +150,7 @@ MUTATIONS = {
              "  return v_decoded;\n"
              "end;\n",
              "  return pgpm._decode(cfg.control_kind, v_max,\n"
-             "                       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);\n"
+             "                       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);\n"
              "end;\n", 1),
             ("    if v_max_raw is null then\n"
              "      v_frontier_native := case when p_control_kind = 'id' then p_anchor else now()::text end;\n"
@@ -162,11 +162,11 @@ MUTATIONS = {
              "      -- Confirmed the hard way while building text_time support: adding the kind to _frontier_native\n"
              "      -- but not here reproduces exactly that gap (an unfixed [2025-07,2025-10) monolith with the next\n"
              "      -- partition not starting until 2026-08 -- ten covered months missing entirely).\n"
-             "      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit)::timestamptz, now())::text;\n"
+             "      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now())::text;\n"
              "    else\n"
-             "      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit);\n"
+             "      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);\n"
              "    end if;\n",
-             "    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit),\n"
+             "    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),\n"
              "                                  case when p_control_kind = 'id' then p_anchor else now()::text end);\n",
              1),
         ],

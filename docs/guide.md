@@ -42,12 +42,15 @@ your retention policy. Everything is pure SQL in the `pgpm` schema; the only run
   column that samples as overwhelmingly random (UUIDv4) is refused. Pass `p_force_uuidv7 => true` to
   override if you are certain it is time-ordered.
 - `text_time`: a `text` / `varchar` column holding an opaque id shaped `<constant prefix><fixed-width
-  base-N encoded epoch>`. Classic `cuid` is the motivating case (prefix `'c'`, 8 base36 digits,
-  milliseconds), and the same shape covers KSUID, base32 ULID-as-text, and MongoDB ObjectId (empty
-  prefix, 8 base16 digits, seconds) without any format-specific code. The shape is *declared*, not
-  detected: `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` on `transmute`. pgpm samples the column
-  against it ([`check_text_time`](reference.md#check_text_time)) to gate the conversion, the same way
-  `check_uuidv7` does; `p_force_text_time => true` overrides.
+  base-N encoded value>`. For cuid and ULID that value *is* the timestamp; for KSUID it's the top bits
+  of a wider one (KSUID base62-encodes its whole 160-bit payload as a single number, against a non-Unix
+  epoch). The shape is *declared*, not detected: `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` on
+  `transmute`, plus `p_tt_alphabet` for a digit set other than the default `0-9a-z` (ULID's Crockford
+  base32, KSUID's base62 both need it) and `p_tt_discard_bits`/`p_tt_epoch` for the KSUID case. Ready-to-use
+  values for cuid v1, ULID, KSUID and MongoDB ObjectId are in [Pick the kind](#pick-the-kind) below --
+  verified against each format's own source, not guessed from its name. pgpm samples the column against
+  the declared shape ([`check_text_time`](reference.md#check_text_time)) to gate the conversion, the
+  same way `check_uuidv7` does; `p_force_text_time => true` overrides.
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
 ordering. An encoding whose alphabet order does not match its digit-value order (so plain text comparison
@@ -157,10 +160,35 @@ call pgpm.transmute('public.events', 'id', 10000000);
 -- uuidv7 / ULID-as-uuid (a uuid control column is treated as this kind)
 call pgpm.transmute('public.events', 'event_uuid', interval '1 day');
 
--- text_time (a text/varchar control column needs the shape spelled out; classic cuid shown)
+-- text_time (a text/varchar control column needs the shape spelled out -- four verified recipes)
+
+-- cuid v1 (Prisma's bare cuid()): prefix 'c', 8 base36 digits, milliseconds
 call pgpm.transmute('public.events', 'id', interval '1 month',
   p_tt_prefix => 'c', p_tt_width => 8, p_tt_radix => 36, p_tt_unit => 'ms');
+
+-- ULID-as-text: no prefix, 10 digits in Crockford's base32 (skips I/L/O/U), milliseconds
+call pgpm.transmute('public.events', 'id', interval '1 month',
+  p_tt_prefix => '', p_tt_width => 10, p_tt_radix => 32, p_tt_unit => 'ms',
+  p_tt_alphabet => '0123456789ABCDEFGHJKMNPQRSTVWXYZ');
+
+-- KSUID: no prefix, all 27 base62 digits (it encodes its whole 160-bit payload as one number, not
+-- just the timestamp), seconds, a custom epoch, and discard the low 128 bits to keep only the top 32
+call pgpm.transmute('public.events', 'id', interval '1 month',
+  p_tt_prefix => '', p_tt_width => 27, p_tt_radix => 62, p_tt_unit => 's',
+  p_tt_alphabet => '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+  p_tt_discard_bits => 128, p_tt_epoch => '2014-05-13 16:53:20+00');
+
+-- MongoDB ObjectId: no prefix, 8 hex digits, seconds (the default alphabet already covers hex)
+call pgpm.transmute('public.events', 'id', interval '1 month',
+  p_tt_prefix => '', p_tt_width => 8, p_tt_radix => 16, p_tt_unit => 's');
 ```
+
+Every value above was verified against the format's own source or spec, not guessed from its name --
+that mattered in practice: cuid's timestamp field turned out not to be zero-padded the way it first
+appeared, and ULID/KSUID's alphabets are not the plain `0-9a-z` convention `text_time` defaults to.
+If your id is shaped like one of these but isn't quite the same (a fork, a different version), sample
+it with [`check_text_time`](reference.md#check_text_time) against your best-guess parameters before
+trusting the result -- the same way you would for any other `text_time` column.
 
 `transmute` commits between its phases, so it has to be called at the **top level**, never inside a
 surrounding transaction. That rules out running it from a schema-migration tool that wraps each migration
