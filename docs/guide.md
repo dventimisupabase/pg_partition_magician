@@ -29,7 +29,7 @@ optionally splits the historical bulk into proper partitions on a schedule, and 
 your retention policy. Everything is pure SQL in the `pgpm` schema; the only runtime dependency is
 `pg_cron`, and only to run the background job.
 
-**Control kinds.** A table is partitioned on one monotonic key, of one of three kinds:
+**Control kinds.** A table is partitioned on one monotonic key, of one of four kinds:
 
 - `time`: a `timestamptz` / `timestamp` / `date` column, on an interval grid (calendar-aligned for whole
   months/years, fixed-duration otherwise). Transmute with `pgpm.transmute(..., interval '...')`.
@@ -41,15 +41,23 @@ your retention policy. Everything is pure SQL in the `pgpm` schema; the only run
   time-ordered and samples it ([`check_uuidv7`](reference.md#check_uuidv7)) to gate the conversion: a
   column that samples as overwhelmingly random (UUIDv4) is refused. Pass `p_force_uuidv7 => true` to
   override if you are certain it is time-ordered.
+- `text_time`: a `text` / `varchar` column holding an opaque id shaped `<constant prefix><fixed-width
+  base-N encoded epoch>`. Classic `cuid` is the motivating case (prefix `'c'`, 8 base36 digits,
+  milliseconds), and the same shape covers KSUID, base32 ULID-as-text, and MongoDB ObjectId (empty
+  prefix, 8 base16 digits, seconds) without any format-specific code. The shape is *declared*, not
+  detected: `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` on `transmute`. pgpm samples the column
+  against it ([`check_text_time`](reference.md#check_text_time)) to gate the conversion, the same way
+  `check_uuidv7` does; `p_force_text_time => true` overrides.
 
 `float` / `double` are rejected: they cannot guarantee gapless boundaries and `NaN`/`Inf` poison the
-ordering. Other sortable encodings (KSUID, base32 ULID, ObjectId) are not built in; partition on a
-companion column instead.
+ordering. An encoding whose alphabet order does not match its digit-value order (so plain text comparison
+would not reflect time order), or whose timestamp field is not a fixed width, does not fit `text_time`;
+partition on a companion column instead.
 
 **The frontier.** For `time` the frontier is `now()`; for `id` it is `max(control)`, the newest point
-the data has reached. `uuidv7` is a time grid fed by data: its frontier is `greatest(max(control),
-now())` (#325), so it tracks the newest row while writes are current and falls back to the clock when
-they lag, rather than freezing wherever the data last landed. An interval is "open" while the frontier
+the data has reached. `uuidv7` and `text_time` are time grids fed by data: their frontier is
+`greatest(max(control), now())` (#325), so it tracks the newest row while writes are current and falls
+back to the clock when they lag, rather than freezing wherever the data last landed. An interval is "open" while the frontier
 is inside it (still receiving writes) and "closed" once the frontier moves past its upper bound.
 
 **The monolith.** Conversion moves **no rows**. It renames your original table aside and attaches it,
@@ -134,7 +142,8 @@ forward grid above it. It does read the original once, but not under a lock that
 
 There is one `pgpm.transmute`, with two type-safe overloads chosen by the width parameter: an `interval`
 selects the time grid, a `bigint` step selects the integer grid. Within the time grid, a `uuid` control
-column is treated as `uuidv7` and a timestamp column as plain `time`. A bare interval string literal is
+column is treated as `uuidv7`, a `text`/`varchar` column as `text_time` (needing `p_tt_prefix` etc., see
+above), and a timestamp column as plain `time`. A bare interval string literal is
 ambiguous between the overloads, so interval calls must cast (`interval '...'`); an integer width needs no
 cast.
 
@@ -147,6 +156,10 @@ call pgpm.transmute('public.events', 'id', 10000000);
 
 -- uuidv7 / ULID-as-uuid (a uuid control column is treated as this kind)
 call pgpm.transmute('public.events', 'event_uuid', interval '1 day');
+
+-- text_time (a text/varchar control column needs the shape spelled out; classic cuid shown)
+call pgpm.transmute('public.events', 'id', interval '1 month',
+  p_tt_prefix => 'c', p_tt_width => 8, p_tt_radix => 36, p_tt_unit => 'ms');
 ```
 
 `transmute` commits between its phases, so it has to be called at the **top level**, never inside a
@@ -351,9 +364,15 @@ For `uuidv7` tables, confirm the column really is time-ordered (not random UUIDv
 select * from pgpm.check_uuidv7('public.events', 'event_uuid');
 ```
 
-A low `fraction` means the values do not decode to plausible timestamps and the table should not be
-partitioned on that column. For an `id`-partitioned table where you want calendar retention, check that a
-timestamp column rises with the id:
+For `text_time` tables, the equivalent check needs the declared shape:
+
+```sql
+select * from pgpm.check_text_time('public.events', 'id', 'c', 8, 36, 'ms');
+```
+
+A low `fraction` means the values do not match the shape or do not decode to plausible timestamps, and
+the table should not be partitioned on that column. For an `id`-partitioned table where you want calendar
+retention, check that a timestamp column rises with the id:
 
 ```sql
 select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
@@ -369,7 +388,7 @@ clear error until PGFR is installed. See the
 ## Retain
 
 Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops partitions
-past it. Retain is an interval for `time`/`uuidv7` and a count of intervals for `id`. `null` keeps
+past it. Retain is an interval for `time`/`uuidv7`/`text_time` and a count of intervals for `id`. `null` keeps
 everything.
 
 ```sql
@@ -676,8 +695,10 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 ## Caveats and v1 scope
 
 - **Dimensions:** `time` (interval step; whole-month or fixed-duration; mixing rejected), `id`
-  (bigint/numeric step), `uuidv7`/ULID-as-uuid (time grid, uuid bounds). `float`/`double` rejected; other
-  encodings partition on a companion column.
+  (bigint/numeric step), `uuidv7`/ULID-as-uuid (time grid, uuid bounds), `text_time` (time grid, a
+  declared `<prefix><fixed-width base-N epoch>` TEXT shape -- cuid, KSUID, ULID-as-text, ObjectId).
+  `float`/`double` rejected; an encoding whose alphabet order does not track its digit-value order, or
+  whose timestamp field is not fixed-width, partitions on a companion column instead.
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window, and a straggler still lands in whichever partition already covers its
   key. Arbitrary backdated keys break it: with no `DEFAULT`, a key outside the grid is refused outright.
