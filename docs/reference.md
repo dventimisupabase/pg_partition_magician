@@ -31,7 +31,9 @@ pgpm.transmute(
   p_lock_timeout text default '5s',
   p_tt_prefix text default null, p_tt_width int default null,
   p_tt_radix int default null, p_tt_unit text default null,
-  p_force_text_time boolean default false
+  p_force_text_time boolean default false,
+  p_tt_alphabet text default null, p_tt_discard_bits int default 0,
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
 )
 ```
 
@@ -109,9 +111,23 @@ Parameters:
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
 - `p_tt_prefix`, `p_tt_width`, `p_tt_radix`, `p_tt_unit` -- **text_time only**, and all four are required
   together when the control column is `text`/`varchar`. They describe the column's shape: a constant
-  literal prefix (`'c'` for classic `cuid`), the fixed character width of the encoded-epoch field that
-  follows it (`8`), the base it's encoded in (`36`), and the time unit it counts (`'ms'` or `'s'`). See
-  [`check_text_time`](#check_text_time).
+  literal prefix (`''` if none, `'c'` for classic `cuid`), the fixed character width of the
+  encoded-count field (`8`), the base it's encoded in (`36`), and the time unit it counts (`'ms'` or
+  `'s'`). See [`check_text_time`](#check_text_time) and the [ready-to-use recipes](guide.md#pick-the-kind)
+  for cuid v1, ULID, KSUID and MongoDB ObjectId.
+- `p_tt_alphabet` -- **text_time only**, optional. The digit-to-character mapping, one character per
+  value `0..p_tt_radix-1`, in order. `null` (the default) uses the contiguous `0123456789abcdefghi...z`
+  convention, valid for `p_tt_radix` up to 36; a radix above that, or a different character set
+  entirely (ULID's Crockford base32 skips I/L/O/U; KSUID's base62 is digits then uppercase then
+  lowercase), requires spelling the alphabet out explicitly. Its length must equal `p_tt_radix`.
+- `p_tt_discard_bits` -- **text_time only**, default `0`. After decoding the whole
+  `p_tt_prefix`-plus-`p_tt_width`-characters field as one number, discard this many of its low-order
+  bits before treating what remains as the time count. `0` (the default) means the decoded field *is*
+  the count already (cuid, ULID); KSUID needs `128`, since it base-`62`-encodes its entire 160-bit
+  payload (32-bit timestamp + 128 bits of random) as a single number, not the timestamp alone.
+- `p_tt_epoch` -- **text_time only**, default `'1970-01-01 00:00:00+00'` (standard Unix epoch). The
+  zero-point the decoded count is measured from. Only formats with a non-standard epoch (KSUID:
+  `'2014-05-13 16:53:20+00'`) need to set this.
 - `p_force_text_time` -- skip the text_time plausibility refusal (see below).
 - `p_bound_headroom` -- push the monolith's upper bound `hi` this many grid steps further out. The bound
   `CHECK` refuses writes at or past `hi` for the whole conversion, so raise this if the frontier could
@@ -131,8 +147,9 @@ control column is `float`/`double` (imprecise boundaries); a `time`-kind control
 is not a timestamp/date, a `uuidv7` control is not `uuid`, or a `text_time` control is not `text`/`varchar`;
 a `uuid` control samples as overwhelmingly random (UUIDv4) and `p_force_uuidv7` is not set; a `text_time`
 control is missing any of `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit`, has a `p_tt_radix` outside
-2-36 or a non-positive `p_tt_width`, or samples as not matching the declared shape and `p_force_text_time`
-is not set; a non-PK `UNIQUE` secondary index does not include the
+2-36 with no `p_tt_alphabet` supplied, a `p_tt_alphabet` whose length does not match `p_tt_radix` or that
+repeats a character, a non-positive `p_tt_width`, a negative `p_tt_discard_bits`, or samples as not
+matching the declared shape and `p_force_text_time` is not set; a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
 `'error'`; a standalone table matching the child-partition naming already exists (an orphan from an
 interrupted run); or a relation already occupies one of the `<index>_pgpm` names the conversion needs for
@@ -142,6 +159,9 @@ the partitioned copies of the table's secondary indexes (also usually a leftover
 call pgpm.transmute('public.search_history', 'id', interval '1 month',
                       p_tt_prefix => 'c', p_tt_width => 8, p_tt_radix => 36, p_tt_unit => 'ms');
 ```
+
+(that's cuid v1; ULID, KSUID and MongoDB ObjectId need `p_tt_alphabet` and/or `p_tt_discard_bits`/
+`p_tt_epoch` too -- see the [ready-to-use recipes](guide.md#pick-the-kind) for all four.)
 
 ```sql
 call pgpm.transmute('public.events', 'created_at', interval '1 month',
@@ -971,7 +991,9 @@ is the check `transmute` runs to gate the uuidv7 kind.
 
 ```sql
 pgpm.check_text_time(p_table regclass, p_control name, p_prefix text, p_width int, p_radix int,
-                      p_unit text, p_sample int default 1000)
+                      p_unit text, p_sample int default 1000,
+                      p_alphabet text default null, p_discard_bits int default 0,
+                      p_epoch timestamptz default '1970-01-01 00:00:00+00')
   returns table (sampled bigint, plausible bigint, fraction numeric)
 ```
 
@@ -1114,6 +1136,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 | `text_time_prefix` / `text_time_width` / `text_time_radix` / `text_time_unit` | `text` / `int` / `int` / `text` | the declared shape for a `text_time` control column (null for every other kind); see `p_tt_prefix` etc. above |
+| `text_time_alphabet` / `text_time_discard_bits` / `text_time_epoch` | `text` / `int` / `timestamptz` | non-default digit set, bits to discard, and epoch for a `text_time` column (null/0/Unix epoch for cuid/ULID-shaped ones; see `p_tt_alphabet` etc. above) |
 
 ### `pgpm.part`
 

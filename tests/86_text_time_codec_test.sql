@@ -12,8 +12,8 @@ select plan(10);
 
 -- ---- _radix_decode / _radix_encode: the bottom primitive, base-N <-> bigint, lowercase 0-9a-z ----
 
-select is(pgpm._radix_decode('z', 36), 35::bigint, 'radix_decode: single digit z (base36) = 35');
-select is(pgpm._radix_decode('10', 36), 36::bigint, 'radix_decode: 10 (base36) = 36 (Horner, not concatenation)');
+select is(pgpm._radix_decode('z', 36), 35::numeric, 'radix_decode: single digit z (base36) = 35');
+select is(pgpm._radix_decode('10', 36), 36::numeric, 'radix_decode: 10 (base36) = 36 (Horner, not concatenation)');
 select is(pgpm._radix_encode(35, 36, 1), 'z', 'radix_encode: 35 (base36), width 1 = z');
 select is(pgpm._radix_encode(36, 36, 2), '10', 'radix_encode: 36 (base36), width 2 = 10, zero-padded');
 

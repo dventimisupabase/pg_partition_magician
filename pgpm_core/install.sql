@@ -47,14 +47,22 @@ create table if not exists pgpm.config (
   -- to a row limit via the coarse child's average bytes/row), so wide rows cannot make a single batch
   -- huge. null = cap by regrain_batch rows only (default).
   regrain_max_blocks int,
-  -- text_time only (general opaque-sortable-TEXT-id support, e.g. classic cuid): the value is
-  -- <text_time_prefix><fixed-width base-text_time_radix encoded epoch>. Null for every other kind.
-  -- _encode/_decode are the only functions that ever read these -- grid math operates on the already
-  -- decoded native timestamptz, identically to time/uuidv7, so nothing else needs them.
-  text_time_prefix text,
-  text_time_width  int,
-  text_time_radix  int,
-  text_time_unit   text        -- 'ms' or 's'
+  -- text_time only (general opaque-sortable-TEXT-id support: cuid, KSUID, ULID-as-text, ObjectId): the
+  -- value is <text_time_prefix><fixed-width base-text_time_radix encoded count>. Null for every other
+  -- kind. _encode/_decode are the only functions that ever read these -- grid math operates on the
+  -- already decoded native timestamptz, identically to time/uuidv7, so nothing else needs them.
+  text_time_prefix       text,
+  text_time_width        int,
+  text_time_radix        int,
+  text_time_unit         text,       -- 'ms' or 's'
+  -- alphabet/discard_bits/epoch cover formats the plain cuid/ULID case does not need: a custom digit
+  -- alphabet (null = the default contiguous 0-9a-z convention; ULID's Crockford base32 and KSUID's
+  -- base62 are NOT that), and a timestamp that is the top bits of a WIDER encoded value rather than the
+  -- whole field (KSUID base62-encodes its entire 160-bit payload as one number and a non-Unix epoch;
+  -- discard_bits drops the low bits after decoding the whole field, epoch is the zero-point).
+  text_time_alphabet     text,
+  text_time_discard_bits int,
+  text_time_epoch        timestamptz
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.config add column if not exists obtain_retry_after timestamptz;
@@ -62,6 +70,9 @@ alter table pgpm.config add column if not exists text_time_prefix text;
 alter table pgpm.config add column if not exists text_time_width  int;
 alter table pgpm.config add column if not exists text_time_radix  int;
 alter table pgpm.config add column if not exists text_time_unit   text;
+alter table pgpm.config add column if not exists text_time_alphabet text;
+alter table pgpm.config add column if not exists text_time_discard_bits int;
+alter table pgpm.config add column if not exists text_time_epoch timestamptz;
 -- the control_kind check predates 'text_time' (issue #325 follow-up); widen it for installs that
 -- already have the narrower constraint. Named per Postgres's default inline-CHECK convention
 -- (<table>_<column>_check), which is what a fresh pre-text_time install actually produced.
@@ -286,62 +297,93 @@ $$;
 -- Lowercase 0-9a-z only (radix 2-36) for now -- covers cuid outright; a wider alphabet (base62 for
 -- KSUID, Crockford base32 for ULID-as-text) is future work, not a redesign, since it only touches the
 -- digit<->character mapping here, nothing upstream.
-create or replace function pgpm._radix_decode(p_digits text, p_radix int)
-returns bigint language plpgsql stable as $$
-declare v_c text; v_d int; v_acc numeric := 0;
+-- p_alphabet overrides the default 0-9a-z digit set (e.g. Crockford base32 for ULID, base62 for
+-- KSUID -- neither is contiguous-0-9-then-lowercase, so they cannot use the default). null = the
+-- original convention, capped at radix 36; a supplied alphabet's own length IS the radix ceiling, so a
+-- wider one (up to base62 and beyond) is exactly as valid as a narrow one. Returns numeric, not bigint:
+-- KSUID's whole-payload encoding is a 160-bit number, far past a 64-bit bigint's range.
+create or replace function pgpm._radix_decode(p_digits text, p_radix int, p_alphabet text default null)
+returns numeric language plpgsql stable as $$
+declare v_alphabet text; v_c text; v_d int; v_acc numeric := 0;
 begin
-  if p_radix < 2 or p_radix > 36 then
-    raise exception 'pg_partition_magician: radix % is out of range (supported: 2-36)', p_radix;
+  if p_alphabet is not null then
+    if length(p_alphabet) <> p_radix then
+      raise exception 'pg_partition_magician: alphabet % has length %, which does not match radix %', p_alphabet, length(p_alphabet), p_radix;
+    end if;
+    v_alphabet := p_alphabet;
+  else
+    if p_radix < 2 or p_radix > 36 then
+      raise exception 'pg_partition_magician: radix % is out of range for the default 0-9a-z alphabet (supported: 2-36; supply p_alphabet for a wider or different one)', p_radix;
+    end if;
+    v_alphabet := substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix);
   end if;
   for i in 1..length(p_digits) loop
     v_c := substr(p_digits, i, 1);
-    v_d := case when v_c between '0' and '9' then ascii(v_c) - ascii('0')
-                when v_c between 'a' and 'z' then ascii(v_c) - ascii('a') + 10
-                else -1 end;
-    if v_d < 0 or v_d >= p_radix then
-      raise exception 'pg_partition_magician: % is not a valid base-% digit string (lowercase 0-9a-z only)', p_digits, p_radix
+    v_d := position(v_c in v_alphabet) - 1;
+    if v_d < 0 then
+      raise exception 'pg_partition_magician: % is not a valid base-% digit string for alphabet %', p_digits, p_radix, v_alphabet
         using errcode = 'invalid_text_representation';
     end if;
     v_acc := v_acc * p_radix + v_d;
   end loop;
-  return v_acc::bigint;
+  return v_acc;
 end;
 $$;
 
--- The inverse: zero-padded to EXACTLY p_width characters. Refuses (rather than truncates -- the same
--- issue #299 lesson applied generally) when p_value needs more than p_width base-p_radix digits, since
--- a truncated high end would silently encode a LATER instant as a SMALLER string and break the
--- monotonicity every bound-computing caller assumes.
-create or replace function pgpm._radix_encode(p_value bigint, p_radix int, p_width int)
+-- The inverse: zero-padded (using the alphabet's own zero-digit character) to EXACTLY p_width
+-- characters. Refuses (rather than truncates -- the same issue #299 lesson applied generally) when
+-- p_value needs more than p_width base-p_radix digits, since a truncated high end would silently
+-- encode a LATER instant as a SMALLER string and break the monotonicity every bound-computing caller
+-- assumes.
+create or replace function pgpm._radix_encode(p_value numeric, p_radix int, p_width int, p_alphabet text default null)
 returns text language plpgsql stable as $$
-declare v_n numeric := p_value; v_s text := ''; v_d int;
+declare v_alphabet text; v_n numeric := p_value; v_s text := ''; v_d int;
 begin
-  if p_radix < 2 or p_radix > 36 then
-    raise exception 'pg_partition_magician: radix % is out of range (supported: 2-36)', p_radix;
+  if p_alphabet is not null then
+    if length(p_alphabet) <> p_radix then
+      raise exception 'pg_partition_magician: alphabet % has length %, which does not match radix %', p_alphabet, length(p_alphabet), p_radix;
+    end if;
+    v_alphabet := p_alphabet;
+  else
+    if p_radix < 2 or p_radix > 36 then
+      raise exception 'pg_partition_magician: radix % is out of range for the default 0-9a-z alphabet (supported: 2-36; supply p_alphabet for a wider or different one)', p_radix;
+    end if;
+    v_alphabet := substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix);
   end if;
   if p_value < 0 then
     raise exception 'pg_partition_magician: % is negative; _radix_encode only supports non-negative values', p_value;
   end if;
-  if v_n = 0 then v_s := '0'; end if;
+  if v_n = 0 then v_s := substr(v_alphabet, 1, 1); end if;
+  -- div()/mod(), not floor(v_n / p_radix): general numeric division computes non-terminating
+  -- quotients to a BOUNDED number of decimal digits, and at KSUID scale (~48 decimal digits) that
+  -- rounding compounds across the loop into a wrong, sometimes NEGATIVE, digit -- reproduced and
+  -- diagnosed by hand while building this. div()/mod() are exact integer operations for numeric
+  -- regardless of magnitude, which floor(a/b) is not.
   while v_n > 0 loop
-    v_d := (v_n - floor(v_n / p_radix) * p_radix)::int;
-    v_s := (case when v_d < 10 then chr(ascii('0') + v_d) else chr(ascii('a') + v_d - 10) end) || v_s;
-    v_n := floor(v_n / p_radix);
+    v_d := mod(v_n, p_radix::numeric)::int;
+    v_s := substr(v_alphabet, v_d + 1, 1) || v_s;
+    v_n := div(v_n, p_radix::numeric);
   end loop;
   if length(v_s) > p_width then
     raise exception 'pg_partition_magician: % needs % base-% digit(s), which does not fit in the configured width %', p_value, length(v_s), p_radix, p_width
       using errcode = 'numeric_value_out_of_range';
   end if;
-  return lpad(v_s, p_width, '0');
+  return lpad(v_s, p_width, substr(v_alphabet, 1, 1));
 end;
 $$;
 
 -- p_prefix is the CONSTANT literal characters before the timestamp field (e.g. 'c' for classic cuid),
 -- verified here rather than assumed: a value that does not start with it is refused, the same
 -- discipline as uuidv7's plausibility sampling but at the single-value level.
-create or replace function pgpm._text_time_to_ts(p_value text, p_prefix text, p_width int, p_radix int, p_unit text)
+-- p_discard_bits + p_epoch cover formats (KSUID) whose timestamp is not the WHOLE decoded field but
+-- the top bits of a wider one -- KSUID base62-encodes its entire 160-bit payload (32-bit timestamp +
+-- 128 bits of random) as one number, so the timestamp is recovered by decoding all of it and discarding
+-- the low 128 bits, against a non-Unix epoch. Both default to the cuid/ULID case (the decoded field IS
+-- the timestamp already, against the standard epoch), so neither changes behavior when omitted.
+create or replace function pgpm._text_time_to_ts(p_value text, p_prefix text, p_width int, p_radix int, p_unit text,
+  p_alphabet text default null, p_discard_bits int default 0, p_epoch timestamptz default '1970-01-01 00:00:00+00')
 returns timestamptz language plpgsql stable as $$
-declare v_digits text; v_epoch bigint;
+declare v_digits text; v_wide numeric; v_count numeric;
 begin
   if p_unit not in ('ms', 's') then
     raise exception 'pg_partition_magician: unknown text_time unit % (expected ms or s)', p_unit;
@@ -352,9 +394,10 @@ begin
       using errcode = 'invalid_text_representation';
   end if;
   v_digits := substr(p_value, length(p_prefix) + 1, p_width);
-  v_epoch := pgpm._radix_decode(v_digits, p_radix);
-  if p_unit = 'ms' then return to_timestamp(v_epoch / 1000.0);
-  else return to_timestamp(v_epoch); end if;
+  v_wide := pgpm._radix_decode(v_digits, p_radix, p_alphabet);
+  v_count := floor(v_wide / power(2::numeric, p_discard_bits));
+  if p_unit = 'ms' then return p_epoch + (v_count / 1000.0) * interval '1 second';
+  else return p_epoch + v_count * interval '1 second'; end if;
 end;
 $$;
 
@@ -364,19 +407,21 @@ $$;
 -- sorts strictly after it -- a string is always less than any longer string that extends it. So this
 -- needs no knowledge of the source format's total width or trailing fields at all, which is what makes
 -- it general rather than cuid-specific.
-create or replace function pgpm._ts_to_text_time(p_ts timestamptz, p_prefix text, p_width int, p_radix int, p_unit text)
+create or replace function pgpm._ts_to_text_time(p_ts timestamptz, p_prefix text, p_width int, p_radix int, p_unit text,
+  p_alphabet text default null, p_discard_bits int default 0, p_epoch timestamptz default '1970-01-01 00:00:00+00')
 returns text language plpgsql stable as $$
-declare v_epoch bigint;
+declare v_count numeric; v_wide numeric;
 begin
-  if p_unit = 'ms' then v_epoch := floor(extract(epoch from p_ts) * 1000)::bigint;
-  elsif p_unit = 's' then v_epoch := floor(extract(epoch from p_ts))::bigint;
+  if p_unit = 'ms' then v_count := floor(extract(epoch from (p_ts - p_epoch)) * 1000);
+  elsif p_unit = 's' then v_count := floor(extract(epoch from (p_ts - p_epoch)));
   else raise exception 'pg_partition_magician: unknown text_time unit % (expected ms or s)', p_unit;
   end if;
-  if v_epoch < 0 then
-    raise exception 'pg_partition_magician: % is before the epoch, which a % text_time encoding cannot express', p_ts, p_unit
+  if v_count < 0 then
+    raise exception 'pg_partition_magician: % is before % (the configured epoch), which a % text_time encoding cannot express', p_ts, p_epoch, p_unit
       using errcode = 'numeric_value_out_of_range';
   end if;
-  return p_prefix || pgpm._radix_encode(v_epoch, p_radix, p_width);
+  v_wide := v_count * power(2::numeric, p_discard_bits);
+  return p_prefix || pgpm._radix_encode(v_wide, p_radix, p_width, p_alphabet);
 end;
 $$;
 
@@ -439,12 +484,15 @@ $$;
 -- (default null for every other kind, which never reads them) -- see pgpm.config's text_time_* columns.
 create or replace function pgpm._encode(p_kind text, p_native text,
   p_tt_prefix text default null, p_tt_width int default null,
-  p_tt_radix int default null, p_tt_unit text default null)
+  p_tt_radix int default null, p_tt_unit text default null,
+  p_tt_alphabet text default null, p_tt_discard_bits int default 0,
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00')
 returns text language plpgsql immutable as $$
 begin
   if p_kind = 'uuidv7' then return pgpm._ts_to_uuid(p_native::timestamptz)::text;
   elsif p_kind = 'text_time' then
-    return pgpm._ts_to_text_time(p_native::timestamptz, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit);
+    return pgpm._ts_to_text_time(p_native::timestamptz, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit,
+                                  p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
   else return p_native; end if;
 end;
 $$;
@@ -452,13 +500,16 @@ $$;
 -- a stored COLUMN value -> native grid value. Same text_time_* trailing params as _encode.
 create or replace function pgpm._decode(p_kind text, p_colvalue text,
   p_tt_prefix text default null, p_tt_width int default null,
-  p_tt_radix int default null, p_tt_unit text default null)
+  p_tt_radix int default null, p_tt_unit text default null,
+  p_tt_alphabet text default null, p_tt_discard_bits int default 0,
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00')
 returns text language plpgsql immutable as $$
 begin
   if p_colvalue is null then return null; end if;
   if p_kind = 'uuidv7' then return pgpm._uuid_to_ts(p_colvalue::uuid)::text;
   elsif p_kind = 'text_time' then
-    return pgpm._text_time_to_ts(p_colvalue, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit)::text;
+    return pgpm._text_time_to_ts(p_colvalue, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit,
+                                  p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::text;
   else return p_colvalue; end if;
 end;
 $$;
@@ -530,7 +581,7 @@ begin
     return case when cfg.control_kind = 'id' then cfg.partition_anchor else now()::text end;
   end if;
   v_decoded := pgpm._decode(cfg.control_kind, v_max,
-                             cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+                             cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
   -- #325: uuidv7 (and text_time, the same shape of thing) is a TIME grid fed by DATA. Left as plain
   -- max(control), a table whose writes go quiet (a restored dump, a stale clone, a drought) has a
   -- frontier stuck wherever the data ended while now() keeps moving -- obtain measures itself against
@@ -594,9 +645,9 @@ returns void language plpgsql as $$
 declare v_lo_lit text; v_hi_lit text;
 begin
   v_lo_lit := pgpm._encode(p_cfg.control_kind, p_lo,
-                            p_cfg.text_time_prefix, p_cfg.text_time_width, p_cfg.text_time_radix, p_cfg.text_time_unit);
+                            p_cfg.text_time_prefix, p_cfg.text_time_width, p_cfg.text_time_radix, p_cfg.text_time_unit, p_cfg.text_time_alphabet, p_cfg.text_time_discard_bits, p_cfg.text_time_epoch);
   v_hi_lit := pgpm._encode(p_cfg.control_kind, p_hi,
-                            p_cfg.text_time_prefix, p_cfg.text_time_width, p_cfg.text_time_radix, p_cfg.text_time_unit);
+                            p_cfg.text_time_prefix, p_cfg.text_time_width, p_cfg.text_time_radix, p_cfg.text_time_unit, p_cfg.text_time_alphabet, p_cfg.text_time_discard_bits, p_cfg.text_time_epoch);
   execute format('create table %I.%I partition of %I.%I for values from (%L) to (%L)',
                  p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
   perform pgpm._own_like_parent(format('%I.%I', p_nsp, p_rel)::regclass,
@@ -647,7 +698,7 @@ begin
     -- rows forever. A write past the grid is already refused loudly by PostgreSQL.
     begin
       perform pgpm._encode(cfg.control_kind, v_hi,
-                            cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+                            cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
     exception when datetime_field_overflow or numeric_value_out_of_range then
       exit;
     end;
@@ -766,8 +817,8 @@ begin
   select a.attnum into v_ctrl_attnum from pg_attribute a
    where a.attrelid = p_parent and a.attname = cfg.control_column and not a.attisdropped;
 
-  v_lo_lit := pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
-  v_hi_lit := pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+  v_lo_lit := pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+  v_hi_lit := pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
 
   -- conparentid = 0 picks the top-level constraint. An FK referencing a PARTITIONED table also gets
   -- one pg_constraint row per partition of the referenced side, so an unfiltered scan would visit the
@@ -956,8 +1007,8 @@ begin
       if coalesce(array_length(v_cross, 1), 0) > 0 then
         select format_type(a.atttypid, a.atttypmod) into v_coltype
           from pg_attribute a where a.attrelid = p_parent and a.attname = cfg.control_column;
-        v_lo_lit := pgpm._encode(cfg.control_kind, r.lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
-        v_hi_lit := pgpm._encode(cfg.control_kind, r.hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+        v_lo_lit := pgpm._encode(cfg.control_kind, r.lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+        v_hi_lit := pgpm._encode(cfg.control_kind, r.hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
         begin
           -- The write block installed above is a BEFORE ROW trigger on this child covering DELETE
           -- too, so it would refuse this. Lift it for the delete and put it straight back: DDL is
@@ -1182,8 +1233,8 @@ begin
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                 v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit))
+                 v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch))
     into v_rows;
   v_result.covered_hi := p_hi;
   v_result.rows_archived := v_rows;
@@ -1287,7 +1338,7 @@ begin
 
   execute format(
     'select avg(pg_column_size(t.*))::numeric from (select * from %I.%I t where t.%I >= %L order by t.%I limit %s) t',
-    v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit), cfg.control_column, cfg.archive_probe_sample)
+    v_nsp, p_child, cfg.control_column, pgpm._encode(cfg.control_kind, v_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch), cfg.control_column, cfg.archive_probe_sample)
     into v_avg;
   if coalesce(v_avg, 0) <= 0 then
     -- no rows remain in [v_lo, child_hi) for this child. Unlike the original (which read ahead of a
@@ -1303,20 +1354,20 @@ begin
   execute format(
     'select count(*), max(%I)::text from (select %I from %I.%I t where t.%I >= %L order by t.%I limit %s) s',
     cfg.control_column, cfg.control_column, v_nsp, p_child, cfg.control_column,
-    pgpm._encode(cfg.control_kind, v_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit), cfg.control_column, v_batch)
+    pgpm._encode(cfg.control_kind, v_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch), cfg.control_column, v_batch)
     into v_batch_count, v_probe_hi_col;
 
   if v_batch_count < v_batch then
     v_stop := v_child_hi;   -- the byte budget reaches past this child's own live end
   else
-    v_probe_hi := pgpm._decode(cfg.control_kind, v_probe_hi_col, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+    v_probe_hi := pgpm._decode(cfg.control_kind, v_probe_hi_col, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
     -- extend to the next distinct value past the boundary, so hi never splits a run of ties (a
     -- child's own CHECK bounds every row here to < v_child_hi already, so this can never overshoot it)
     execute format('select min(%I)::text from %I.%I t where t.%I > %L',
                    cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col)
       into v_next_distinct_col;
     v_stop := case when v_next_distinct_col is null then v_child_hi
-                   else pgpm._decode(cfg.control_kind, v_next_distinct_col, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit) end;
+                   else pgpm._decode(cfg.control_kind, v_next_distinct_col, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch) end;
   end if;
 
   if not pgpm._native_gt(cfg.control_kind, v_stop, v_lo) then
@@ -1575,7 +1626,7 @@ begin
   if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return; end if;
   execute format('delete from %I.%I where not (%3$s >= %4$L and %3$s < %5$L)',
                  v_nsp, v_delta, quote_ident(cfg.control_column),
-                 pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit), pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit));
+                 pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch), pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch));
 end;
 $$;
 
@@ -1637,9 +1688,9 @@ begin
   -- instead of with the budget, so draining a large delta cost O(delta^2 / batch). uuidv7 compares
   -- correctly this way because a UUIDv7 sorts by its embedded timestamp, which is why the copy can do it too.
   v_ctl     := quote_ident(cfg.control_column);
-  v_lo_lit  := pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
-  v_hi_lit  := pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
-  v_cur_lit := pgpm._encode(cfg.control_kind, p_cursor, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+  v_lo_lit  := pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+  v_hi_lit  := pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+  v_cur_lit := pgpm._encode(cfg.control_kind, p_cursor, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
 
   -- eligible: in this child's range AND behind the cursor
   v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl, v_lo_lit, v_hi_lit, v_cur_lit);
@@ -1650,10 +1701,11 @@ begin
 
   -- one pair of set-based statements per distinct fine child touched, not per key
   for r in execute format(
-    'select distinct pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %I::text, %L, %L, %L, %L)) as sub_lo
+    'select distinct pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %I::text, %L, %L, %L, %L, %L, %L, %L)) as sub_lo
        from %I.%I where pgpm_seq <= %s and %s',
     cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
     cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
+    cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch,
     v_nsp, v_delta, v_wm, v_elig)
   loop
     v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, p_step, r.sub_lo,
@@ -1667,16 +1719,18 @@ begin
     end if;
     execute format(
       'delete from %I.%I d where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
-          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L)) = %L)',
+          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L, %L, %L, %L)) = %L)',
       v_nsp, v_sub_name, v_dkey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
-      cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, r.sub_lo);
+      cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
+      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, r.sub_lo);
     execute format(
       'insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
-          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L)) = %L)',
+          and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L, %L, %L, %L)) = %L)',
       v_nsp, v_sub_name, v_cols, v_cols, v_nsp, p_child, v_skey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
-      cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, r.sub_lo);
+      cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
+      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, r.sub_lo);
   end loop;
 
   execute format('delete from %I.%I where pgpm_seq <= %s and %s', v_nsp, v_delta, v_wm, v_elig);
@@ -1986,8 +2040,8 @@ begin
   -- the child's current max(control), so it never re-copies and never deletes. row_count < batch means the
   -- remaining rows fit in this batch -> the sub-range is complete, advance the cursor to the next one.
   if pgpm._native_gt(cfg.control_kind, v_hi, v_cursor) then
-    v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
-    v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit);
+    v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+    v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
     v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, v_step, v_sub_lo, v_sub_hi);
     -- invariant (#266): the rename above makes this unreachable. Assert it anyway -- when it was false the
     -- failure was silent row destruction, so a future change to _part_name must break loudly here.
@@ -2061,7 +2115,7 @@ begin
   loop
     execute format('alter table %s attach partition %I.%I for values from (%L) to (%L)',
                    p_parent::text, v_nsp, r.child_name,
-                   pgpm._encode(cfg.control_kind, r.lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit), pgpm._encode(cfg.control_kind, r.hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit));
+                   pgpm._encode(cfg.control_kind, r.lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch), pgpm._encode(cfg.control_kind, r.hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch));
     execute format('alter table %I.%I drop constraint %I', v_nsp, r.child_name, (r.child_name || '_ck'));
     update pgpm.part set attached = true where parent_table = p_parent and child_name = r.child_name;
     insert into pgpm.log (parent_table, action, lo, hi, method) values (p_parent, 'regrain_attach', r.lo, r.hi, 'check_skip');
@@ -2162,7 +2216,13 @@ create or replace procedure pgpm._transmute(
   -- (p_tt_prefix 'c', p_tt_width 8, p_tt_radix 36, p_tt_unit 'ms'). Null for every other kind.
   p_tt_prefix text default null, p_tt_width int default null,
   p_tt_radix int default null, p_tt_unit text default null,
-  p_force_text_time boolean default false
+  p_force_text_time boolean default false,
+  -- covers formats the plain cuid case does not need: a custom digit alphabet (ULID's Crockford
+  -- base32, KSUID's base62 -- neither is the default contiguous 0-9a-z), and a timestamp that is the
+  -- top bits of a WIDER encoded value against a non-Unix epoch (KSUID: discard the low 128 bits of its
+  -- whole-payload base62 encoding, epoch 2014-05-13 16:53:20+00).
+  p_tt_alphabet text default null, p_tt_discard_bits int default 0,
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
 )
 language plpgsql as $$
 declare
@@ -2238,14 +2298,26 @@ begin
     if p_tt_prefix is null or p_tt_width is null or p_tt_radix is null or p_tt_unit is null then
       raise exception 'pg_partition_magician: control_kind text_time needs p_tt_prefix, p_tt_width, p_tt_radix and p_tt_unit all set -- e.g. classic cuid: prefix ''c'', width 8, radix 36, unit ''ms''';
     end if;
-    if p_tt_radix < 2 or p_tt_radix > 36 then
-      raise exception 'pg_partition_magician: p_tt_radix must be 2-36 (got %)', p_tt_radix;
+    -- p_tt_alphabet's own length IS the radix ceiling when supplied (ULID needs 32, KSUID needs 62);
+    -- without one, the default contiguous 0-9a-z convention caps out at 36.
+    if p_tt_alphabet is not null then
+      if length(p_tt_alphabet) <> p_tt_radix then
+        raise exception 'pg_partition_magician: p_tt_alphabet % has length %, which does not match p_tt_radix %', p_tt_alphabet, length(p_tt_alphabet), p_tt_radix;
+      end if;
+      if length(p_tt_alphabet) <> (select count(distinct c) from unnest(regexp_split_to_array(p_tt_alphabet, '')) c) then
+        raise exception 'pg_partition_magician: p_tt_alphabet % has a repeated character, which makes decoding ambiguous', p_tt_alphabet;
+      end if;
+    elsif p_tt_radix < 2 or p_tt_radix > 36 then
+      raise exception 'pg_partition_magician: p_tt_radix must be 2-36 for the default 0-9a-z alphabet (got %); supply p_tt_alphabet for a wider or different one', p_tt_radix;
     end if;
     if p_tt_width < 1 then
       raise exception 'pg_partition_magician: p_tt_width must be positive (got %)', p_tt_width;
     end if;
     if p_tt_unit not in ('ms', 's') then
       raise exception 'pg_partition_magician: p_tt_unit must be ''ms'' or ''s'' (got %)', p_tt_unit;
+    end if;
+    if p_tt_discard_bits < 0 then
+      raise exception 'pg_partition_magician: p_tt_discard_bits must not be negative (got %)', p_tt_discard_bits;
     end if;
   end if;
 
@@ -2302,7 +2374,8 @@ begin
   -- real data actually matches it before anything is partitioned on it.
   if p_control_kind = 'text_time' then
     select sampled, fraction into v_uchk_n, v_uchk_frac
-      from pgpm.check_text_time(p_parent, p_control, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, 1000);
+      from pgpm.check_text_time(p_parent, p_control, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, 1000,
+                                 p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
     if coalesce(v_uchk_n, 0) > 0 then
       if v_uchk_frac < 0.5 and not p_force_text_time then
         raise exception 'pg_partition_magician: only % of % sampled % values match the declared text_time shape (prefix %, % base-% digit(s)) and decode to plausible recent timestamps -- range-partitioning it would scatter rows across meaningless partitions on a garbage frontier. If you are certain of the shape, re-run with p_force_text_time => true; otherwise check p_tt_prefix/p_tt_width/p_tt_radix/p_tt_unit. Inspect with pgpm.check_text_time().',
@@ -2584,14 +2657,14 @@ begin
       -- Confirmed the hard way while building text_time support: adding the kind to _frontier_native
       -- but not here reproduces exactly that gap (an unfixed [2025-07,2025-10) monolith with the next
       -- partition not starting until 2026-08 -- ten covered months missing entirely).
-      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit)::timestamptz, now())::text;
+      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now())::text;
     else
-      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit);
+      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
     end if;
   end if;
   execute format('select t.%I::text from %s t order by t.%I asc limit 1', p_control, p_parent::text, p_control)
     into v_min_raw;
-  v_min_native := coalesce(pgpm._decode(p_control_kind, v_min_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit),
+  v_min_native := coalesce(pgpm._decode(p_control_kind, v_min_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),
                            pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native));
   v_lo_native  := pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_min_native);
   v_hi_native  := pgpm._grid_next(p_control_kind, p_step,
@@ -2612,7 +2685,7 @@ begin
   -- happened to land close enough, which made it a CI flake rather than a reproducible bug.
   if p_control_kind in ('uuidv7', 'text_time') then
     begin
-      perform pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit);
+      perform pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
     exception when datetime_field_overflow or numeric_value_out_of_range then
       if p_control_kind = 'uuidv7' then
         raise exception 'pg_partition_magician: % cannot be partitioned on a uuidv7 grid using %: its newest value decodes to %, so the next grid boundary lands past 10889-08-02 05:31:50.65504+00, the newest instant a UUIDv7 timestamp can express. A column whose frontier sits at that ceiling is almost certainly random (UUIDv4) rather than time-ordered -- inspect it with pgpm.check_uuidv7(). p_force_uuidv7 does not override this, because no uuid can express the bound.',
@@ -2667,8 +2740,8 @@ begin
   if not exists (select 1 from pg_constraint
                   where conrelid = p_parent and conname = 'pgpm_monolith_bound') then
     execute format('alter table %s add constraint pgpm_monolith_bound check (%I >= %L and %I < %L) not valid',
-                   p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit),
-                   p_control, pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit));
+                   p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),
+                   p_control, pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
   end if;
   commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; the advisory lock survives
 
@@ -2757,7 +2830,7 @@ begin
   -- drop the now-redundant CHECK (the partition bound enforces it).
   execute format('alter table %s attach partition %s for values from (%L) to (%L)',
                  v_parent::text, v_monreg::text,
-                 pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit), pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit));
+                 pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch), pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
   execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
 
   -- 7a. re-add the outgoing foreign keys at the PARENT (#263), so they cover every partition instead of
@@ -2894,17 +2967,20 @@ begin
   -- 10. register
   insert into pgpm.config (parent_table, control_column, control_kind, partition_step, partition_anchor,
                            obtain, retain, regrain_batch, paused,
-                           text_time_prefix, text_time_width, text_time_radix, text_time_unit)
+                           text_time_prefix, text_time_width, text_time_radix, text_time_unit,
+                           text_time_alphabet, text_time_discard_bits, text_time_epoch)
   values (v_parent, p_control, p_control_kind, p_step, p_anchor, p_obtain, p_retain,
           p_regrain_batch, p_paused,
-          p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit)
+          p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)
   on conflict (parent_table) do update set
     control_column = excluded.control_column, control_kind = excluded.control_kind,
     partition_step = excluded.partition_step, partition_anchor = excluded.partition_anchor,
     obtain = excluded.obtain, retain = excluded.retain,
     regrain_batch = excluded.regrain_batch, paused = excluded.paused,
     text_time_prefix = excluded.text_time_prefix, text_time_width = excluded.text_time_width,
-    text_time_radix = excluded.text_time_radix, text_time_unit = excluded.text_time_unit;
+    text_time_radix = excluded.text_time_radix, text_time_unit = excluded.text_time_unit,
+    text_time_alphabet = excluded.text_time_alphabet, text_time_discard_bits = excluded.text_time_discard_bits,
+    text_time_epoch = excluded.text_time_epoch;
 
   insert into pgpm.log (parent_table, action) values (v_parent, 'transmute');
   -- keyed on v_parent, not p_parent: after the rename p_parent's oid is the monolith's, so an operator
@@ -2963,6 +3039,11 @@ drop procedure if exists pgpm.transmute(regclass, name, bigint, int, bigint, int
 drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, int, boolean, text, boolean, int, text);
 drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, int, timestamptz, boolean, text, boolean, int, text);
 
+-- The ULID/KSUID follow-up added 3 more trailing params (alphabet/discard_bits/epoch) to both. Same
+-- #209/#210 arg-count hazard again.
+drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, int, boolean, text, boolean, int, text, text, int, int, text, boolean);
+drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, int, timestamptz, boolean, text, boolean, int, text, text, int, int, text, boolean);
+
 -- Time grid: interval width. The control column's type selects the kind -- a uuid column is TREATED as
 -- uuidv7 (ULIDs stored as uuid included; PostgreSQL has no UUIDv7 type to detect, so this is an
 -- assumption check_uuidv7 samples to gate, not a verification: a column that samples as overwhelmingly
@@ -2981,7 +3062,9 @@ create or replace procedure pgpm.transmute(
   p_lock_timeout text default '5s',
   p_tt_prefix text default null, p_tt_width int default null,
   p_tt_radix int default null, p_tt_unit text default null,
-  p_force_text_time boolean default false
+  p_force_text_time boolean default false,
+  p_tt_alphabet text default null, p_tt_discard_bits int default 0,
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
 ) language plpgsql as $$
 declare v_kind text;
 begin
@@ -2995,7 +3078,8 @@ begin
     p_interval::text, p_anchor::text, p_obtain,
     p_retain::text, p_regrain_batch, p_paused, p_incoming_fks, p_force_uuidv7,
     p_bound_headroom, p_lock_timeout,
-    p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_force_text_time);
+    p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_force_text_time,
+    p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
 end;
 $$;
 
@@ -3180,8 +3264,8 @@ begin
   end if;
   v_monreg := format('%I.%I', v_nsp, v_mon)::regclass;
   execute format('select exists (select 1 from %s where %I >= %L or %I < %L)',
-                 p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit)) into v_outside;
+                 p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch),
+                 cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch)) into v_outside;
   if v_outside then
     raise exception 'pg_partition_magician: cannot untransmute % -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or regraining begins.',
       p_parent;
@@ -3760,15 +3844,24 @@ $$;
 -- exactly as check_uuidv7 does. Heuristic, not a proof.
 create or replace function pgpm.check_text_time(
   p_table regclass, p_control name, p_prefix text, p_width int, p_radix int, p_unit text,
-  p_sample int default 1000
+  p_sample int default 1000,
+  p_alphabet text default null, p_discard_bits int default 0,
+  p_epoch timestamptz default '1970-01-01 00:00:00+00'
 ) returns table (sampled bigint, plausible bigint, fraction numeric)
 language plpgsql as $$
 declare v_class text;
 begin
-  if p_radix < 2 or p_radix > 36 then
-    raise exception 'pg_partition_magician: radix % is out of range (supported: 2-36)', p_radix;
+  if p_alphabet is not null then
+    if length(p_alphabet) <> p_radix then
+      raise exception 'pg_partition_magician: alphabet % has length %, which does not match radix %', p_alphabet, length(p_alphabet), p_radix;
+    end if;
+    v_class := p_alphabet;
+  else
+    if p_radix < 2 or p_radix > 36 then
+      raise exception 'pg_partition_magician: radix % is out of range for the default 0-9a-z alphabet (supported: 2-36; supply p_alphabet for a wider or different one)', p_radix;
+    end if;
+    v_class := substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix);
   end if;
-  v_class := substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix);
   return query execute format($q$
     with s as (select %1$I::text as v from %2$s limit %3$s),
          shaped as (
@@ -3779,7 +3872,7 @@ begin
               and substr(v, length(%4$L) + 1, %5$s) !~ %6$L
          ),
          decoded as (
-           select pgpm._text_time_to_ts(v, %4$L, %5$s, %7$s, %8$L) as ts from shaped
+           select pgpm._text_time_to_ts(v, %4$L, %5$s, %7$s, %8$L, %9$L, %10$s, %11$L) as ts from shaped
          )
     select (select count(*) from s where v is not null)::bigint,
            (select count(*) from decoded
@@ -3788,7 +3881,8 @@ begin
              (select count(*) from decoded
                where ts between timestamptz '2015-01-01' and now() + interval '1 day')::numeric
                / nullif((select count(*) from s where v is not null), 0), 0), 4)
-  $q$, p_control, p_table::text, p_sample, p_prefix, p_width, '[^' || v_class || ']', p_radix, p_unit);
+  $q$, p_control, p_table::text, p_sample, p_prefix, p_width, '[^' || v_class || ']', p_radix, p_unit,
+      p_alphabet, p_discard_bits, p_epoch);
 end;
 $$;
 
