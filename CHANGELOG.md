@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
+- **`uuidv7`'s forward frontier no longer stalls on a data drought (issue #325).** Every other kind's
+  frontier is either the clock (`time`) or bounded by it (`id` has no clock, so it cannot fall behind
+  where the next write goes). `uuidv7` was the one exception: gridded against plain `max(control)`, with
+  no clock in it at all. A table whose writes went quiet for longer than `obtain x step` -- a restored
+  dump, a stale clone, a table that simply stopped being written to -- had that frontier stuck wherever
+  the data ended while `now()` kept moving. `obtain` then measured itself against its own past output,
+  found nothing to do, and every write past the stalled grid was refused, permanently and silently: no
+  `fail_*`/`skip_*` log event distinguished the tick from a healthy one.
+  - Fixed by gridding `uuidv7` against `greatest(max(control), now())`, in **both** places that compute
+    it: `_frontier_native` (what `obtain`/`maintain`/`regrain_step` use every tick) and `_transmute`'s
+    separate inline duplicate (the initial monolith bound, computed before `pgpm.config` exists to call
+    the shared function). Fixing only one leaves the other stuck at the data-only value, opening a
+    partition gap between the monolith's frozen edge and `obtain`'s now()-anchored forward grid on the
+    very next tick.
+  - `bench/frontier_drought.sh` reproduces the issue's own repro (a table backfilled 13/11 months stale,
+    `p_obtain => 2`) and drives three separate maintenance ticks, matching the issue's own "across five
+    ticks, nothing changes" observation but showing it now stays fixed instead. Verified via
+    `./test.sh discriminate` against the `frontier_data_only` mutation, which reverts both sites.
+  - `docs/pilot.md`'s uuid preflight section, added while this was still open, is retired: there is
+    nothing to check before converting now.
+
+- **A fourth control kind, `text_time`, for opaque sortable TEXT ids** -- classic `cuid`, KSUID, ULID
+  stored as text, and MongoDB `ObjectId`, none of which fit `time`/`id`/`uuidv7`. The shape is declared,
+  not detected: a constant prefix, a fixed character width, a radix, a time unit, and (for formats that
+  need them) a custom digit alphabet, a bit-discard count, and a non-Unix epoch --
+  `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit`/`p_tt_alphabet`/`p_tt_discard_bits`/`p_tt_epoch` on
+  `transmute`. `pgpm.check_text_time` (the `check_uuidv7` analogue) samples a column against the declared
+  shape to gate the conversion, the same way `check_uuidv7` gates `uuidv7`; `p_force_text_time`
+  overrides. Ready-to-use parameter recipes for all four formats are in the
+  [user guide](docs/guide.md#pick-the-kind).
+  - Motivated by a real production id shape: a customer's `cuid()`-generated TEXT primary key, verified
+    empirically (order-monotonicity and value-closeness against a companion timestamp column, and a
+    check for incoming foreign keys) before choosing to partition on it directly rather than widen the
+    key or drop it.
+  - ULID and KSUID needed more than cuid and ObjectId did. ULID uses Crockford's base32 (deliberately
+    skips I/L/O/U), not the plain `0-9a-z` convention -- `p_tt_alphabet` overrides it. KSUID base62-encodes
+    its *entire* 160-bit payload (a 32-bit timestamp plus 128 bits of random) as a single number against
+    a non-Unix epoch (`2014-05-13 16:53:20+00`) -- the timestamp is the top 32 bits of a wider decoded
+    value, not a separate substring, which is what `p_tt_discard_bits` and `p_tt_epoch` are for. Every
+    alphabet and epoch value was verified against the format's own source (`segmentio/ksuid`,
+    `ulid/spec`, MongoDB's BSON reference), not assumed from the name.
+  - `_radix_decode`/`_radix_encode` (the base-N codec `text_time` is built on; PostgreSQL has none built
+    in) widened from `bigint` to `numeric`, since KSUID's whole-payload value overflows a 64-bit bigint
+    by close to 100 decimal digits. Building the KSUID case surfaced a real arithmetic bug at that scale:
+    digit extraction used `floor(v_n / p_radix)`, and PostgreSQL's general numeric division computes a
+    non-terminating quotient to a *bounded* number of decimal digits -- exact enough at cuid's ~12-digit
+    scale, silently wrong (occasionally negative "digits") at KSUID's ~48-digit scale. Fixed with exact
+    integer `div()`/`mod()`, verified with a round trip at real KSUID scale.
+  - Inherits the `uuidv7` frontier fix above from day one: `_frontier_native` and `_transmute`'s inline
+    duplicate both grid `text_time` against `greatest(max(control), now())`. Confirmed the hard way
+    during development that generalizing only the shared function reproduces the exact partition-gap
+    defect the `uuidv7` fix closed, since `_transmute`'s copy is a separate site that does not call it.
+    `bench/frontier_drought.sh` proves the drought-immunity property for `uuidv7` and `text_time`
+    independently rather than inferring one from the other, for exactly that reason.
+
+- **The pilot playbook (`docs/pilot.md`) split rung 0 into correctness and concurrency, and gained a
+  field apparatus for the second half.** An idle restored clone proves a conversion is correct but
+  cannot prove it is online -- "no reader or writer was blocked" is trivially true where there are none.
+  Rung 0a now covers correctness on an idle clone; rung 0b needs a live writer and reader across the
+  conversion, and now has one: `bench/pilot_workload.sql` generates a self-consistent workload from a
+  target table's own catalog (copying an existing row with the control column overridden, so every
+  `NOT NULL`, FK and `CHECK` holds by construction), and `bench/transmute_online.sh` is the field
+  instrument that drives a live conversion under it and asserts no writer was blocked or even queued.
+  Verified on a 3M-row table: 9/9 assertions pass against real `install.sql` and fail correctly against
+  the `transmute_no_commits` mutant.
+  - The rung 0a/0b split also surfaced the `uuidv7` idle-clone gap that became issue #325, and the doc's
+    reset-between-runs section was rewritten from measurement rather than reasoning: on a real
+    point-in-time restore, `cron.job`'s scheduler resumes about one second after the database becomes
+    reachable, immediately re-applying whatever retention pass the restore had just undone. The fix is
+    to take the reset point with pgpm **paused**, verified with a controlled pair of restores (resumed
+    vs. paused) on the same project.
+
 ## [0.2.0] - 2026-08-20
 
 - **An installed database can say what it is: `pgpm.version()` and `pgpm.installed`.** There was no way

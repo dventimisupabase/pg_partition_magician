@@ -14,10 +14,15 @@
 --   (d) free of unordered/extreme values that poison the frontier (NaN/Inf/wrap).
 --
 -- Supported control_kind:
---   'time'    -- timestamptz/timestamp/date, interval step (calendar-aligned)
---   'id'      -- int/bigint/NUMERIC, integer step (covers Snowflake-style ids)
---   'uuidv7'  -- uuid whose leading 48 bits are a ms timestamp (also ULID-as-uuid);
---                time grid, boundaries encoded as uuids
+--   'time'      -- timestamptz/timestamp/date, interval step (calendar-aligned)
+--   'id'        -- int/bigint/NUMERIC, integer step (covers Snowflake-style ids)
+--   'uuidv7'    -- uuid whose leading 48 bits are a ms timestamp (also ULID-as-uuid);
+--                  time grid, boundaries encoded as uuids
+--   'text_time' -- text/varchar shaped <constant prefix><fixed-width base-N encoded
+--                  count>: classic cuid, KSUID, ULID-as-text, MongoDB ObjectId. The
+--                  shape is declared (p_tt_prefix/width/radix/unit, plus
+--                  p_tt_alphabet/discard_bits/epoch for formats that need them), not
+--                  detected.
 -- float/double are explicitly rejected (imprecise boundaries; NaN/Inf).
 --
 -- The engine is kind-agnostic: all type-specific logic lives in a small adapter
@@ -4391,7 +4396,7 @@ create or replace view pgpm.partitions as
 -- history can only start where the table does.
 -- =============================================================================
 create or replace function pgpm.version()
-returns text language sql immutable as $$ select '0.2.0'::text $$;
+returns text language sql immutable as $$ select '0.3.0'::text $$;
 
 create table if not exists pgpm.installed (
   id         bigint      generated always as identity primary key,
