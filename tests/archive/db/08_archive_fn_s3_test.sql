@@ -15,7 +15,7 @@
 -- retain_batch is forced to 0 on both fixtures so pgpm.maintain()'s own pgpm.retain() call never
 -- drops what this test wants to keep inspecting via pgpm.part/_archive_fully_covered afterward --
 -- this test is about the archive_fn adapter, not retire()'s drop precondition (tests/64 covers that).
-select plan(10);
+select plan(15);
 
 -- --- Part A: pgpm.archive_to_s3_ndjson -------------------------------------------------
 
@@ -73,6 +73,22 @@ begin
 end;
 $$;
 
+create function pgpm_test08.fetch_ndjson_ids(p_parent regclass, p_key text) returns text[]
+language plpgsql as $$
+declare cfg archive.config; v_key_id text; v_secret text; v_resp http_response;
+begin
+  select * into cfg from archive.config where parent_table = p_parent;
+  select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
+  select decrypted_secret into v_secret from vault.decrypted_secrets where name = cfg.vault_secret;
+  v_resp := archive.s3_signed_request('GET', cfg.endpoint, cfg.bucket, cfg.region, p_key, '', 'text/plain', '', v_key_id, v_secret);
+  if v_resp.status not between 200 and 299 then
+    raise exception 'fetch of % failed: HTTP %', p_key, v_resp.status;
+  end if;
+  return (select array_agg(l::jsonb ->> 'id' order by l::jsonb ->> 'id')
+            from regexp_split_to_table(v_resp.content, e'\n') l where l <> '');
+end;
+$$;
+
 select is(
   pgpm_test08.fetch_ndjson_row_count('public.a8'::regclass,
     (select s3_key from pgpm.archive_ledger where parent_table = 'public.a8'::regclass and lo = '0')),
@@ -107,5 +123,68 @@ select is(
 select ok(
   pgpm._archive_fully_covered('public.a8p', (select child_name from pgpm.part where parent_table = 'public.a8p'::regclass and lo = '0')),
   'the monolith is fully covered after the single tick (parquet)');
+
+-- --- Part C: text_time bounds carry their stored codec configuration -------------------
+
+create table public.a8t (id text primary key, payload text);
+insert into public.a8t (id, payload) values
+  (pgpm._ts_to_text_time('2026-01-10 00:00:00+00', 't', 8, 16, 's', '0123456789ABCDEF', 4,
+                         '2026-01-01 00:00:00+00'), 'inside-first'),
+  (pgpm._ts_to_text_time('2026-02-10 00:00:00+00', 't', 8, 16, 's', '0123456789ABCDEF', 4,
+                         '2026-01-01 00:00:00+00'), 'inside-second'),
+  (pgpm._ts_to_text_time('2026-03-10 00:00:00+00', 't', 8, 16, 's', '0123456789ABCDEF', 4,
+                         '2026-01-01 00:00:00+00'), 'outside');
+
+call pgpm.transmute('public.a8t', 'id', interval '1 month',
+  p_tt_prefix => 't', p_tt_width => 8, p_tt_radix => 16, p_tt_unit => 's',
+  p_tt_alphabet => '0123456789ABCDEF', p_tt_discard_bits => 4,
+  p_tt_epoch => '2026-01-01 00:00:00+00');
+select mk_archive_config('a8t', false);
+
+select results_eq(
+  $$ select text_time_prefix, text_time_width, text_time_radix, text_time_unit,
+            text_time_alphabet, text_time_discard_bits, text_time_epoch
+       from pgpm.config where parent_table = 'public.a8t'::regclass $$,
+  $$ values ('t'::text, 8, 16, 's'::text, '0123456789ABCDEF'::text, 4,
+             timestamptz '2026-01-01 00:00:00+00') $$,
+  'setup: the managed table stores every non-default text_time codec field');
+
+create temporary table a8t_expected as
+select array[
+  pgpm._ts_to_text_time('2026-01-10 00:00:00+00', 't', 8, 16, 's', '0123456789ABCDEF', 4,
+                        '2026-01-01 00:00:00+00'),
+  pgpm._ts_to_text_time('2026-02-10 00:00:00+00', 't', 8, 16, 's', '0123456789ABCDEF', 4,
+                        '2026-01-01 00:00:00+00')
+] as ids;
+
+select is(
+  (select ids from a8t_expected),
+  (select array_agg(id order by id) from public.a8t
+    where id >= pgpm._ts_to_text_time('2026-01-01 00:00:00+00', 't', 8, 16, 's',
+                                      '0123456789ABCDEF', 4, '2026-01-01 00:00:00+00')
+      and id < pgpm._ts_to_text_time('2026-03-01 00:00:00+00', 't', 8, 16, 's',
+                                     '0123456789ABCDEF', 4, '2026-01-01 00:00:00+00')),
+  'setup: the archive range contains the two identified rows');
+
+create temporary table a8t_ndjson_result as
+select (r).* from (select pgpm.archive_to_s3_ndjson(
+  'public.a8t', 'unused', '2026-01-01 00:00:00+00', '2026-03-01 00:00:00+00') r) s;
+
+select is(
+  pgpm_test08.fetch_ndjson_ids('public.a8t', (select s3_key from a8t_ndjson_result)),
+  (select ids from a8t_expected),
+  'NDJSON text_time archive contains exactly the two in-range row identities');
+
+select ok(
+  (select rows_archived = 2 and s3_key like '%.ndjson' and etag is not null from a8t_ndjson_result),
+  'NDJSON text_time strategy reports the live two-row upload');
+
+create temporary table a8t_parquet_result as
+select (r).* from (select pgpm.archive_to_s3_parquet(
+  'public.a8t', 'unused', '2026-01-01 00:00:00+00', '2026-03-01 00:00:00+00') r) s;
+
+select ok(
+  (select rows_archived = 2 and s3_key like '%.parquet' and etag is not null from a8t_parquet_result),
+  'Parquet text_time strategy reports the same live two-row range');
 
 select * from finish();

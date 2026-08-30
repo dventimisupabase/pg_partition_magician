@@ -1940,8 +1940,14 @@ begin
   execute format(
     'select coalesce(string_agg(row_to_json(t)::text, e''\n'' order by t.%I), ''''), count(*)
        from %I.%I t where t.%I >= %L and t.%I < %L',
-    pcfg.control_column, v_nsp, v_rel, pcfg.control_column, pgpm._encode(pcfg.control_kind, p_lo),
-    pcfg.control_column, pgpm._encode(pcfg.control_kind, p_hi))
+    pcfg.control_column, v_nsp, v_rel, pcfg.control_column,
+    pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
+                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
+    pcfg.control_column,
+    pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
+                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch))
     into v_payload, v_rows;
 
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
@@ -1996,12 +2002,24 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  v_payload := archive._pq_to_parquet_range(p_parent, pcfg.control_column,
-                                            pgpm._encode(pcfg.control_kind, p_lo), pgpm._encode(pcfg.control_kind, p_hi),
-                                            p_compress);
+  v_payload := archive._pq_to_parquet_range(
+    p_parent, pcfg.control_column,
+    pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
+                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
+    pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
+                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
+    p_compress);
   execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                 v_nsp, v_rel, pcfg.control_column, pgpm._encode(pcfg.control_kind, p_lo),
-                 pcfg.control_column, pgpm._encode(pcfg.control_kind, p_hi))
+                  v_nsp, v_rel, pcfg.control_column,
+                  pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
+                               pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                               pcfg.text_time_discard_bits, pcfg.text_time_epoch),
+                  pcfg.control_column,
+                  pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
+                               pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                               pcfg.text_time_discard_bits, pcfg.text_time_epoch))
     into v_rows;
 
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
