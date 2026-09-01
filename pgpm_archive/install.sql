@@ -1604,8 +1604,13 @@ begin
       if arr_bool[i] is not null then present_bools := present_bools || arr_bool[i]; end if;
     end loop;
     values_payload := archive._pq_plain_boolean_array(present_bools);
-  elsif p_pgtype = 'text' then
-    execute format('select array_agg(%I::text order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_text;
+  elsif p_pgtype in ('text', 'array_json') then
+    execute format(
+      case when p_pgtype = 'array_json'
+        then 'select array_agg(array_to_json(%I)::text order by %s) from %s'
+        else 'select array_agg(%I::text order by %s) from %s'
+      end,
+      p_col, p_order_by, p_from_sql) into arr_text;
     n := coalesce(array_length(arr_text,1),0);
     for i in 1..n loop
       is_present[i] := (arr_text[i] is not null);
@@ -1685,7 +1690,7 @@ begin
   v_from_sql := format('%I.%I', v_schema, v_table);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname, a.atttypmod
+    select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_relation and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1693,7 +1698,14 @@ begin
     v_col_names := v_col_names || v_col.attname;
     v_col_nullable := v_col_nullable || (not v_col.attnotnull);
 
-    case v_col.typname
+    if v_col.typtype = 'e' then
+      v_col_pgtypes := v_col_pgtypes || 'text'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    elsif v_col.typcategory = 'A' and v_col.typelem <> 0 then
+      v_col_pgtypes := v_col_pgtypes || 'array_json'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    else
+      case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
                               v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
@@ -1722,8 +1734,9 @@ begin
         v_scale := (v_col.atttypmod - 4) & 65535;
         v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
         v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
-      else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
-    end case;
+        else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
+      end case;
+    end if;
   end loop;
 
   v_ncols := array_length(v_col_names, 1);
@@ -1821,7 +1834,7 @@ begin
                         v_schema, v_table, p_control, p_lo, p_control, p_hi);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname, a.atttypmod
+    select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_parent and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1829,7 +1842,14 @@ begin
     v_col_names := v_col_names || v_col.attname;
     v_col_nullable := v_col_nullable || (not v_col.attnotnull);
 
-    case v_col.typname
+    if v_col.typtype = 'e' then
+      v_col_pgtypes := v_col_pgtypes || 'text'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    elsif v_col.typcategory = 'A' and v_col.typelem <> 0 then
+      v_col_pgtypes := v_col_pgtypes || 'array_json'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    else
+      case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
                               v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
@@ -1858,8 +1878,9 @@ begin
         v_scale := (v_col.atttypmod - 4) & 65535;
         v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
         v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
-      else raise exception 'archive._pq_to_parquet_range: unsupported column type % for column %', v_col.typname, v_col.attname;
-    end case;
+        else raise exception 'archive._pq_to_parquet_range: unsupported column type % for column %', v_col.typname, v_col.attname;
+      end case;
+    end if;
   end loop;
 
   v_ncols := array_length(v_col_names, 1);

@@ -66,13 +66,14 @@ near-incompressible data.
 
 ## Limits
 
-- **Parquet supports nine types**: `int4`, `int8`, `float8`, `boolean`, `text`,
+- **Parquet supports eleven types**: `int4`, `int8`, `float8`, `boolean`, `text`,
   `timestamp`/`timestamptz`, `uuid` (as fixed-size binary, not a typed UUID -- readers get the raw
   16 bytes), `json`/`jsonb` (as text, tagged as JSON), and `numeric(p,s)` as a real DECIMAL --
   `numeric` with no declared precision/scale is refused, since Parquet DECIMAL needs one fixed
-  precision/scale for the whole column. Arrays and composite types are refused outright; cast to a
-  supported type in a view if you need one archived this way. One row group, no dictionary
-  encoding, no statistics.
+  precision/scale for the whole column. PostgreSQL enums are UTF-8 strings; arrays are JSON-tagged
+  strings because this flat writer does not emit Parquet's nested `LIST` structure. Array dimensions
+  and non-default lower bounds are not preserved. Composite types are refused outright. One row group,
+  no dictionary encoding, no statistics.
 - **Payload size**: `archive.to_s3` (NDJSON) streams through S3 multipart in bounded memory once a
   partition exceeds one ~8MiB part, so it handles any size. `archive.to_s3_parquet` has no
   multipart path and would not benefit from one -- a Parquet file's footer needs every row group's

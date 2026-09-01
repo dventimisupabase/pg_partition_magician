@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
+  strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
+  null elements, multidimensional values, and element escaping. Both whole-table and automatic
+  range archival use catalog type metadata, so schema-qualified and mixed-case enum names work.
+
 ## [0.3.0] - 2026-08-26
 
 - **`uuidv7`'s forward frontier no longer stalls on a data drought (issue #325).** Every other kind's
