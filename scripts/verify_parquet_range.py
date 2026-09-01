@@ -21,6 +21,7 @@ Defaults to the docker-compose archive service (localhost:5520), the PG17 +
 pgsql-http image pgpm_archive's own CI track uses.
 """
 import datetime
+import json
 import os
 import sys
 import tempfile
@@ -46,6 +47,17 @@ def to_parquet_range_bytes(conn, parent, control, lo, hi, compress=False):
     rows = run(conn, "select archive._pq_to_parquet_range(%s::regclass, %s, %s, %s, %s)",
                (parent, control, lo, hi, compress))
     return bytes(rows[0][0])
+
+
+def annotations_of(raw):
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        schema = pq.ParquetFile(path).schema
+        return {schema.column(i).name: schema.column(i).converted_type for i in range(len(schema))}
+    finally:
+        os.unlink(path)
 
 
 def read_with_both_readers(raw):
@@ -383,6 +395,50 @@ def test_range_compressed_across_children(conn):
     check("gzip-compressed range spanning p1+p2", expected, arrow_rows, duck_rows)
 
 
+def test_range_enum_and_array(conn):
+    run(conn, "drop table if exists t_range_enum_array")
+    run(conn, 'drop type if exists "RangePromptStatus"')
+    run(conn, 'create type "RangePromptStatus" as enum (\'queued\', \'running\', \'done\')')
+    run(conn, '''
+        create table t_range_enum_array (
+          id int4 not null,
+          ts timestamptz not null,
+          status "RangePromptStatus",
+          contact_ids text[],
+          primary key (ts, id)
+        ) partition by range (ts)
+    ''')
+    run(conn, "create table t_range_enum_array_p1 partition of t_range_enum_array for values from ('2026-01-01') to ('2026-02-01')")
+    run(conn, "create table t_range_enum_array_p2 partition of t_range_enum_array for values from ('2026-02-01') to ('2026-03-01')")
+    run(conn, "create table t_range_enum_array_p3 partition of t_range_enum_array for values from ('2026-03-01') to ('2026-04-01')")
+    special = ['quote"', 'back\\slash', 'comma,brace{}', 'line\nbreak', 'snowman \u2603']
+    run(conn, "insert into t_range_enum_array values (4, '2026-03-10', 'done', array['outside'])")
+    run(conn, "insert into t_range_enum_array values (3, '2026-02-10', 'done', %s)", (special,))
+    run(conn, "insert into t_range_enum_array values (2, '2026-01-20', 'running', array['alpha', null, 'NULL'])")
+    run(conn, "insert into t_range_enum_array values (1, '2026-01-10', 'queued', null)")
+    run(conn, "insert into t_range_enum_array values (5, '2026-02-20', null, '{}'::text[])")
+    conn.commit()
+
+    raw = to_parquet_range_bytes(conn, "t_range_enum_array", "ts", "2026-01-01", "2026-03-01")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = [
+        {"id": 1, "status": "queued", "contact_ids": None},
+        {"id": 2, "status": "running", "contact_ids": '["alpha",null,"NULL"]'},
+        {"id": 3, "status": "done", "contact_ids": json.dumps(special, ensure_ascii=False, separators=(",", ":"))},
+        {"id": 5, "status": None, "contact_ids": "[]"},
+    ]
+    for rows in (arrow_rows, duck_rows):
+        for row in rows:
+            row.pop("ts", None)
+    check("cross-partition enum and array range", expected, arrow_rows, duck_rows)
+    annotations = annotations_of(raw)
+    if annotations.get("status") == "UTF8" and annotations.get("contact_ids") == "JSON":
+        print("PASS: range enum and array Parquet annotations are UTF8 and JSON")
+    else:
+        FAILURES.append(f"range enum/array annotations: {annotations}")
+        print("FAIL: range enum and array Parquet annotations are UTF8 and JSON")
+
+
 def main():
     conn = psycopg2.connect(DSN)
     conn.autocommit = False
@@ -400,6 +456,7 @@ def main():
         test_range_keyless_refused,
         test_range_pruning_skips_untouched_partition,
         test_range_compressed_across_children,
+        test_range_enum_and_array,
     ]
     for t in tests:
         try:
