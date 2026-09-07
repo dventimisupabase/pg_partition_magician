@@ -83,9 +83,15 @@ the budget past a few MiB with compression on.
   byte offset, known only once the whole file is built, so the encoder already holds the entire
   file in memory (Postgres's ~1GB cap) before any upload starts. For a partition whose Parquet
   encoding would exceed that, use the [automatic path](#automatic-vs-manual) instead:
-  `config.archive_fn` chunks by a target byte budget (`config.archive_byte_budget`, default 8 MiB)
-  that's independent of partition size, so no single upload ever needs to hold a whole large
-  partition in memory.
+  `config.archive_fn` chunks by `config.archive_byte_budget` (default 8 MiB), independent of
+  partition size, so no single chunk's encoder input scales with partition size. That budget sizes
+  a **row count**, not the uploaded file: it estimates the average on-disk row size
+  (`pg_column_size`, sampled) and picks roughly `archive_byte_budget / that average` rows per
+  chunk, so an 8 MiB budget does not mean 8 MiB Parquet files -- the actual upload is the *encoded*
+  (and, with `compress` on, *GZIP-compressed*) size of those rows, which is usually smaller than
+  the budget and never exactly equal to it. See
+  [Byte-budget chunked archiving](../docs/reference.md#byte-budget-chunked-archiving) for the row
+  math and the compression cost that scales with it.
 - **On Supabase**: Storage enforces the project's upload size limit (default 50MB) on the S3
   protocol too, and `statement_timeout` is 2 minutes -- both apply to a single manual call. The
   automatic path's chunking keeps each upload well under both.
