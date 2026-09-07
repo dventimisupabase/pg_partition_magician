@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **Regrain no longer stalls on a table's outgoing foreign key (issue #348).** A fine child is created
+  via `like ... including constraints`, which never copies a `FOREIGN KEY` (no `LIKE` option does), so
+  every fine child reached the swap's `ATTACH PARTITION` with no matching constraint at all. PostgreSQL
+  then validated the parent's outgoing FK for that partition from scratch, inside the `ATTACH`
+  statement, under whatever lock it already holds and with no timeout of its own -- in production this
+  reached the session's `statement_timeout` outright and the swap never completed. Fixed by giving each
+  fine child its own outgoing FK, added and validated while the child is still empty (the same moment
+  the bound `CHECK` is added), so the scan costs nothing and the swap's `ATTACH` adopts the
+  already-validated constraint instead of re-scanning -- the same adoption `transmute` already relies on
+  for the monolith. Measured: attaching a 90,000-row partition with the FK pre-validated took 0.69ms;
+  the identical attach without pre-validating took 16.9ms for the same row count.
+
 - **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
   strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
   null elements, multidimensional values, and element escaping. Both whole-table and automatic
