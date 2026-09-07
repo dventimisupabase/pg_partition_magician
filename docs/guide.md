@@ -472,8 +472,10 @@ select pgpm.set_archive_fn('public.events', 'myschema.my_archiver(regclass,name,
 ```
 
 `null` (the default) means no archiving: a write-blocked partition is immediately drop-ready. With
-`archive_fn` set, `pgpm.maintain()` archives each eligible child in bounded chunks on its own schedule
-(sized by `config.archive_byte_budget`), and
+`archive_fn` set, `pgpm.maintain()` archives eligible children in bounded chunks on its own schedule
+(sized by `config.archive_byte_budget`) -- one partition at a time, oldest first, by default
+(`config.archive_batch`, default `1`; raise it or set it `null` if a large backlog catching up
+faster matters more than that bound -- see [the reference](reference.md#byte-budget-chunked-archiving)) -- and
 `pgpm.retire()` will not drop a child until `pgpm._archive_fully_covered` confirms every chunk has
 landed -- a child mid-archive is a normal, retryable state, not a failure, and nothing here fails
 loudly the way a hook used to; `retire()` just returns `false` and tries again next tick. See [the
