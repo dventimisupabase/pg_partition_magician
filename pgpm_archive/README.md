@@ -62,7 +62,10 @@ contract and the [guide](../docs/guide.md#archiving-before-a-drop) for the opera
 
 GZIP compression applies to either format (`archive.config.compress`, off by default). It's not
 free: real compression time runs from ~50ms/MB on compressible data up to ~2.6s/MB on
-near-incompressible data.
+near-incompressible data. On the automatic `archive_fn` path this compounds with
+`pgpm.config.archive_byte_budget` (the per-tick chunk size) with no timeout of its own -- see
+[Byte-budget chunked archiving](../docs/reference.md#byte-budget-chunked-archiving) before raising
+the budget past a few MiB with compression on.
 
 ## Limits
 

@@ -804,6 +804,19 @@ archive a whole large partition as one giant operation, chunk it instead.
 - `config.archive_byte_budget` (default 8 MiB) and `config.archive_probe_sample` (default 1000) --
   the same two knobs the original chunker took as parameters -- estimate how many rows fit the
   budget via a sampled average row width.
+- **Raising `archive_byte_budget` raises how long the tick's `archive_fn` call runs for, and
+  `pgpm.maintain()` applies no timeout of its own to that call.** With `pgpm.archive_to_s3_parquet`
+  and `archive.config.compress` on, that time is dominated by `pgpm_archive`'s own from-scratch
+  GZIP writer, pure PL/pgSQL and CPU-bound: real compression time runs from ~50ms/MB on
+  compressible data up to ~2.6s/MB on near-incompressible data (see
+  [`pgpm_archive/README.md`](../pgpm_archive/README.md#ndjson-or-parquet)), scaling roughly linearly
+  with the budget. An 8 MiB budget is already several seconds of CPU on the low end of that range;
+  doubling it can double the tick's duration and cross whatever `statement_timeout` the connection
+  running `maintain()` has, surfacing as the tick failing outright rather than as a slow tick.
+  Size `archive_byte_budget` with that per-MB cost and the maintaining session's
+  `statement_timeout` in mind, not just S3 part-size or file-count preferences -- if a tick is
+  timing out, lowering `archive_byte_budget` (or turning `compress` off, or switching to
+  `pgpm.archive_to_s3_ndjson`) is the fix, not raising any lock or statement timeout.
 - `pgpm.archive_ledger` (successor to `pgpm_archive`'s `archive.ledger`, same shape:
   `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`, `rows_archived`, `archived_at`) records
   one row per chunk. `s3_key`/`etag` come straight from the `archive_fn` call's own
