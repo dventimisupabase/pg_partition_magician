@@ -25,14 +25,16 @@ insert into public.a8 (id, payload) select g, 'z' from generate_series(7001, 700
 insert into public.a8 (id, payload) values (11000, 'frontier');   -- advances the frontier to 11000
 
 select mk_archive_config('a8', false);
-update pgpm.config set retain_batch = 0 where parent_table = 'public.a8'::regclass;
+update pgpm.config set retain_batch = 0, archive_batch = null where parent_table = 'public.a8'::regclass;
 select pgpm.set_archive_fn('public.a8', 'pgpm.archive_to_s3_ndjson(regclass,name,text,text)'::regprocedure);
 
 -- boundary = grid_floor(11000 - 3000, 1000) = 8000: eligible = monolith [0,6000), [6000,7000),
 -- [7000,8000), the same shape as 04's own Part A fixture (transplanted directly so the
 -- eligibility math is already proven). One maintain() tick both write-blocks every eligible
 -- child (#235) and archives each of them in a single chunk (the default 8 MiB byte budget
--- comfortably covers each one).
+-- comfortably covers each one) -- archive_batch is explicitly set to null (unlimited) above so
+-- this stays true; the DEFAULT (1, issue #351) would only archive one of the three per tick,
+-- which tests/93 covers.
 call pgpm.maintain('public.a8');
 
 select is(
@@ -102,7 +104,7 @@ insert into public.a8p (id, payload) select g, 'z' from generate_series(7001, 70
 insert into public.a8p (id, payload) values (11000, 'frontier');
 
 select mk_archive_config('a8p', false);
-update pgpm.config set retain_batch = 0 where parent_table = 'public.a8p'::regclass;
+update pgpm.config set retain_batch = 0, archive_batch = null where parent_table = 'public.a8p'::regclass;
 select pgpm.set_archive_fn('public.a8p', 'pgpm.archive_to_s3_parquet(regclass,name,text,text)'::regprocedure);
 
 call pgpm.maintain('public.a8p');
