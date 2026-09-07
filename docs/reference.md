@@ -840,6 +840,22 @@ archive a whole large partition as one giant operation, chunk it instead.
   archiving strictly sequential: one partition fully archived, and so retirable, before the next is
   even touched. Raise it, or set it `null`, if a large backlog catching up faster matters more than
   that bound.
+- **`archive_batch` and `archive_byte_budget` are fungible for speed and risk, but not for file
+  shape.** Per-tick duration is roughly `archive_batch x archive_byte_budget x (cost per byte)`
+  (compression scales close to linearly with chunk size), and so is how many ticks it takes to
+  clear a backlog: `_archive_step`'s query is a sliding window over the oldest not-yet-covered
+  partitions, so total chunk-advancements needed is fixed and each tick contributes `archive_batch`
+  of them. Both quantities depend on the same product, so `archive_batch=1` with a bigger budget
+  and `archive_batch=N` with a smaller one, chosen so the product matches, land on roughly the same
+  per-tick duration and the same backlog-convergence speed. They are NOT interchangeable for the
+  *shape* of what gets uploaded: `pgpm._next_archive_chunk` reads only `archive_byte_budget` (never
+  `archive_batch`) to decide how many rows make up one chunk, and one chunk is one uploaded file --
+  `archive_batch` cannot make files bigger or smaller, or change how many chunks it takes to cover
+  one partition, only how many *different* partitions' independent chunk sequences advance in the
+  same tick. Pick `archive_byte_budget` first, for the file size (and per-chunk risk) you actually
+  want; use `archive_batch` to buy back backlog-convergence speed at that fixed shape, rather than
+  raising `archive_byte_budget` alone and reintroducing the per-partition timeout risk to get the
+  same speed `archive_batch` would have bought for free on that axis.
 
 ### Real S3 archive strategies
 
