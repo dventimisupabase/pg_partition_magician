@@ -12,7 +12,10 @@
   the bound `CHECK` is added), so the scan costs nothing and the swap's `ATTACH` adopts the
   already-validated constraint instead of re-scanning -- the same adoption `transmute` already relies on
   for the monolith. Measured: attaching a 90,000-row partition with the FK pre-validated took 0.69ms;
-  the identical attach without pre-validating took 16.9ms for the same row count.
+  the identical attach without pre-validating took 16.9ms for the same row count. Guarded by
+  `bench/regrain_outgoing_fk_lock.sh` (`./test.sh perf`), with a paired mutation
+  (`regrain_no_outgoing_fk` in `bench/mutations/mutate.py`) so `./test.sh discriminate` proves the
+  guard actually catches the regression.
 
 - **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
   strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
