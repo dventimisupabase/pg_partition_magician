@@ -818,11 +818,28 @@ archive a whole large partition as one giant operation, chunk it instead.
 - `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
   that child reach its own `hi` (or the strategy is `none`) -- `retire()`'s archive-coverage drop
   precondition (see [`retire`](#retire)).
-- `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: for every
-  attached child that **already has the write-block trigger installed** (checked directly, not
-  re-derived from the boundary formula) and is not yet fully covered, it picks the next chunk, runs
+- `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: among
+  attached children that **already have the write-block trigger installed** (checked directly, not
+  re-derived from the boundary formula) and are not yet fully covered, it picks up to
+  `config.archive_batch` of them, **oldest first**, and for each picks the next chunk, runs
   `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
   trigger yet is never touched, however far past the byte budget's reach it sits.
+- `config.archive_batch` (default **1**; `null` = unbounded) caps how many *different* partitions
+  one `_archive_step` call touches -- the same shape as `retain_batch` (nullable `int`, `null`
+  means unlimited, caps attempts not successes), but a different default, and for a reason worth
+  spelling out: `retain_batch`'s unlimited default is safe because its unit of work, `DROP TABLE`,
+  is cheap and roughly constant-cost regardless of how many run per tick. Archiving's unit of work
+  is not -- each partition costs a real table read, an encode pass, and, with a real S3 strategy and
+  `archive.config.compress` on, a CPU-bound compression pass (see the note on `archive_byte_budget`
+  above). Fanning out over every eligible partition in one tick makes a single `maintain()` call's
+  duration scale with the size of the *backlog*, not just with `archive_byte_budget`'s own
+  per-partition cost -- invisible in steady state (one partition becomes eligible per rollover
+  interval), but very visible the moment a bulk regrain or backfill leaves many partitions
+  simultaneously eligible at once, at which point the aggregate cost can cross `statement_timeout`
+  regardless of how conservatively the per-partition budget is tuned. Defaulting to `1` makes
+  archiving strictly sequential: one partition fully archived, and so retirable, before the next is
+  even touched. Raise it, or set it `null`, if a large backlog catching up faster matters more than
+  that bound.
 
 ### Real S3 archive strategies
 
@@ -1135,6 +1152,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining) |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
+| `archive_batch` | `int` | max partitions one `_archive_step` call touches, oldest first (default 1; null = unbounded -- see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 | `text_time_prefix` / `text_time_width` / `text_time_radix` / `text_time_unit` | `text` / `int` / `int` / `text` | the declared shape for a `text_time` control column (null for every other kind); see `p_tt_prefix` etc. above |
 | `text_time_alphabet` / `text_time_discard_bits` / `text_time_epoch` | `text` / `int` / `timestamptz` | non-default digit set, bits to discard, and epoch for a `text_time` column (null/0/Unix epoch for cuid/ULID-shaped ones; see `p_tt_alphabet` etc. above) |
 

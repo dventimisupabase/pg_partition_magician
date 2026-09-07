@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **Chunked archiving now paces itself across partitions, not just within one (issue #351).**
+  `_archive_step` used to loop over every write-blocked, not-yet-covered partition on every
+  `maintain()` tick with no cap -- fine when one new partition becomes eligible per rollover
+  interval, but a single tick's duration scaled with the size of the archiving *backlog* the moment
+  a bulk regrain or backfill left many partitions eligible at once, which could itself cross
+  `statement_timeout` regardless of how conservatively `archive_byte_budget` was tuned. New
+  `config.archive_batch` (default `1`; `null` = unbounded) caps how many different partitions one
+  call touches, oldest first -- the same shape as `retain_batch`, but a different default:
+  `retain_batch`'s unlimited default is safe because `DROP TABLE` is cheap and constant-cost
+  regardless of volume, while archiving a partition is a real read, encode, and (with compression
+  on) CPU-bound pass. Defaulting to `1` makes archiving strictly sequential: one partition fully
+  archived, and so retirable, before the next is even touched.
+
 - **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
   strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
   null elements, multidimensional values, and element escaping. Both whole-table and automatic
