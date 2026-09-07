@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **Parquet column encoding is no longer O(n^2) (issue #353).** `archive._pq_encode_column_data`
+  built each column's data page by growing a `bytea` (or, for `bool`, a `boolean[]`) one row at a
+  time with `:=`/`||` inside a PL/pgSQL loop -- every append reallocated and copied the entire
+  accumulated buffer, costing O(n^2) total for n rows, regardless of `archive.config.compress`
+  (this ran identically either way, before compression ever saw the result). Rewritten to derive
+  both the column's null bitmap and its encoded bytes with real SQL aggregates
+  (`string_agg`/`array_agg` over `unnest(...) with ordinality`), mirroring the pattern this file
+  already used correctly elsewhere for list/array encoding. Verified byte-for-byte identical output
+  against the prior implementation across all eight supported types, both nullable states, and
+  empty/single-row/all-null/all-present edge cases (40 cases, zero mismatches). Measured: encoding
+  a 100,000-row text column dropped from 22.96s to 189ms (~121x), and scaling from 100K to 500K
+  rows is now close to linear (4.9x for 5x rows) rather than the ~29.5x it was.
+
 - **Chunked archiving now paces itself across partitions, not just within one (issue #351).**
   `_archive_step` used to loop over every write-blocked, not-yet-covered partition on every
   `maintain()` tick with no cap -- fine when one new partition becomes eligible per rollover
