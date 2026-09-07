@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- **S3 archive uploads no longer break on a table name that needs quoting.** `archive._encode_upload_ndjson_single`/`_encode_upload_parquet` build their S3 key from `p_parent::text`, which Postgres renders with a literal `"` for any identifier that needs it (mixed case, a reserved word) -- a Prisma-style `PascalCase` table, for one. That quote rode straight into the request path unencoded: the canonical request used for SigV4 signing diverged from what actually went out over the wire, and every upload failed `403 SignatureDoesNotMatch`. Fixed by `archive._s3_encode_path`, applied to the S3 key in both signer functions (`archive.s3_signed_request`/`s3_signed_request_bytea`): percent-encodes each path segment via the existing `archive.s3_url_encode`, while leaving `/` alone as the path separator, matching AWS's own S3 canonical-URI rule.
+
 - **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
   strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
   null elements, multidimensional values, and element escaping. Both whole-table and automatic
