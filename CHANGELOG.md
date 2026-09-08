@@ -13,6 +13,16 @@
   `p_bound_headroom` parameter description and `docs/guide.md`'s transmute walkthrough; no code
   changed.
 
+- **Docs: sizing `archive_byte_budget` (issue #354).** Added a "Sizing `archive_byte_budget`:
+  there is no single optimal size" subsection to [Byte-budget chunked
+  archiving](docs/reference.md#byte-budget-chunked-archiving) -- the four considerations that pull
+  in different directions (the DEFLATE compression window's 32 KB floor, the `statement_timeout`
+  ceiling, query-engine pruning being file-level only, and per-file overhead), a sizing method
+  (tie the budget to a meaningful partition boundary, measure real per-row cost rather than assume
+  it, prefer `archive_batch` over `archive_byte_budget` for throughput), and why the ~1 GiB
+  in-memory ceiling documented in `pgpm_archive/README.md` isn't the one that actually binds.
+  Linked from [docs/guide.md](docs/guide.md#archiving-before-a-drop) too.
+
 - **S3 archive uploads no longer break on a table name that needs quoting.** `archive._encode_upload_ndjson_single`/`_encode_upload_parquet` build their S3 key from `p_parent::text`, which Postgres renders with a literal `"` for any identifier that needs it (mixed case, a reserved word) -- a Prisma-style `PascalCase` table, for one. That quote rode straight into the request path unencoded: the canonical request used for SigV4 signing diverged from what actually went out over the wire, and every upload failed `403 SignatureDoesNotMatch`. Fixed by `archive._s3_encode_path`, applied to the S3 key in both signer functions (`archive.s3_signed_request`/`s3_signed_request_bytea`): percent-encodes each path segment via the existing `archive.s3_url_encode`, while leaving `/` alone as the path separator, matching AWS's own S3 canonical-URI rule.
 
 - **Regrain no longer stalls on a table's outgoing foreign key (issue #348).** A fine child is created

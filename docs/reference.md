@@ -882,6 +882,74 @@ archive a whole large partition as one giant operation, chunk it instead.
   raising `archive_byte_budget` alone and reintroducing the per-partition timeout risk to get the
   same speed `archive_batch` would have bought for free on that axis.
 
+#### Sizing `archive_byte_budget`: there is no single optimal size
+
+Four considerations pull in different directions, and no formula resolves all of them at once --
+picking a value is a tradeoff, not a lookup.
+
+1. **A floor, from the Parquet writer's compression window.** Its DEFLATE implementation has a
+   hard-coded 32,768-byte LZ77 backreference window. Compression only benefits from repeated
+   content that recurs within roughly every 32 KB *of a single column's own data stream* -- content
+   repeating further apart than that is out of the window's reach and compresses as if it were
+   unique. A chunk should be big enough to comfortably clear this floor for whatever repetition
+   actually exists in the data, or cheap compression is left on the table. For ordinary tabular
+   data this floor is low (a few hundred KB to low single-digit MB) and rarely the binding
+   constraint on its own.
+2. **A ceiling, from `statement_timeout`.** As the note above on `archive_byte_budget` describes,
+   `_archive_step`'s per-tick call has no timeout of its own. With compression enabled, real
+   measurement across several row counts on a synthetic table showed per-chunk time growing
+   somewhat faster than the byte budget itself -- not dramatically, but enough that doubling the
+   budget should be expected to more than double a chunk's processing time, not exactly double it.
+   Treat the roughly-linear estimate above as an optimistic floor, not a guarantee, and measure a
+   real chunk at the actual table's scale before sizing a budget close to `statement_timeout`.
+3. **A query-pattern consideration, from having no internal pruning at all.** The writer documents
+   "one row group, no dictionary encoding, no statistics" (see
+   [`pgpm_archive/README.md`](../pgpm_archive/README.md#limits)). That means Athena, DuckDB, and
+   similar engines have no min/max metadata to skip *within* a file regardless of its size -- the
+   only skip mechanism available is skipping whole *files*, by naming or partitioning. Broad-scan
+   workloads (queries that touch most or all of the archived history) are indifferent to this and
+   benefit from fewer, bigger files (less per-file open/list overhead). Selective, range-scoped
+   workloads (e.g. "just last month") are hurt by oversized files: a file spanning many periods
+   can't be partially skipped internally, so a query touching a fraction of it still pays to scan
+   the whole thing. These two workload shapes want opposite answers -- there is no way to pick one
+   without knowing which describes the actual query pattern.
+4. **A minimum-count consideration, from S3/Athena's own per-file overhead.** Too many small files
+   costs real list/open/task overhead in the query engine, independent of everything above -- this
+   is the one consideration that is a fairly universal "not too small," rather than
+   workload-dependent.
+
+**Tie the budget to a meaningful boundary, not an arbitrary byte count.** The most useful sizing
+method is not a number, it's a way of picking one:
+
+- Size `archive_byte_budget` against a boundary that is already meaningful to the retention/query
+  granularity in use -- e.g. "one managed partition archives in as few chunks as
+  `statement_timeout` safely allows, ideally one" -- rather than picking a byte target divorced
+  from how the data is organized. This gives files that line up with the one pruning mechanism
+  these query engines actually have (file-level, via naming), for free.
+- Measure the actual per-row cost and compressibility rather than assuming them. Pull an
+  already-archived file's size against its `rows_archived` (`pgpm.archive_ledger`) for a real
+  compression ratio, and time a real chunk (via `pgpm.archive_ledger.archived_at` deltas, or a
+  manual timed call) rather than extrapolating from a generic benchmark -- both vary widely with
+  actual data shape.
+- If a single partition's data is too large to safely fit in one chunk even at a conservative
+  budget, accept multiple files per partition rather than forcing one -- `archive_batch`'s
+  sequential-by-default pacing already means only that one partition's cost is at stake per tick,
+  not the whole backlog's.
+- Prefer raising `archive_batch` over `archive_byte_budget` to recover throughput when both are
+  options: `archive_batch`'s effect on total tick time is linear (it multiplies independent,
+  separately-sized chunk operations), while `archive_byte_budget`'s effect on a single chunk's own
+  cost is somewhat worse than linear whenever compression is enabled (consideration 2 above). The
+  same throughput gain carries less risk when bought via `archive_batch` than via
+  `archive_byte_budget`.
+
+**The ~1 GiB Postgres `bytea` ceiling documented in
+[`pgpm_archive/README.md`](../pgpm_archive/README.md#limits) is not the ceiling that binds in
+practice.** The whole encoded file is held in memory before upload, capping it at roughly 1 GiB, but
+reaching that in one synchronous call is measured to take on the order of many minutes at minimum
+with compression on -- `statement_timeout` is reached first, by orders of magnitude, under any
+realistic timeout setting. The 1 GiB figure is real but should not factor into how
+`archive_byte_budget` actually gets sized; `statement_timeout` does.
+
 ### Real S3 archive strategies
 
 `pgpm_archive` (the optional module, `pgpm_archive/install.sql`) ships two `archive_fn`-conforming
