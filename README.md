@@ -12,10 +12,11 @@ and manages the whole lifecycle:
 
 - **`transmute`**: convert a live, unpartitioned table to partitioned **with no row movement**. The
   original is renamed aside and attached intact as one bounded **monolith** child; a fresh `DEFAULT` is the
-  safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no row rewrite. The table
-  is **locked for the duration of that scan**, so size a maintenance window from its row count (see
-  [the guide](docs/guide.md#the-cutover-moves-no-rows)). Reversible with **`untransmute`** until the
-  history outgrows the monolith.
+  safety net. The cutover is one read-only scan plus a metadata flip: no rebuild, no row rewrite, and **no
+  lock that scales with row count** -- the scan runs under a lock that blocks neither readers nor writers
+  (see [the guide](docs/guide.md#the-cutover-moves-no-rows)). What it does cost is a write ceiling for the
+  scan's duration: writes outside the certified bound are rejected outright, not queued. Reversible with
+  **`untransmute`** until the history outgrows the monolith.
 - **`obtain`**: keep N partitions ahead of the write frontier.
 - **`regrain`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
