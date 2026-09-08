@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **Docs: `p_bound_headroom` permanently delays regrain eligibility, undocumented (issue #342).**
+  Headroom widens the monolith's upper bound `hi` before the bound `CHECK` is added in `transmute`'s
+  phase 1, and that same `hi` becomes the monolith's permanent, attached partition bound at cutover
+  (Postgres's zero-scan `ATTACH PARTITION` requires the validated `CHECK` to exactly imply the
+  attached bound, so there is no cheaper way to widen the transient write-ceiling protection alone).
+  `regrain_step`'s frozen precondition is a whole-child test against that same `hi`, so headroom
+  sized to cover a write-ceiling window lasting seconds to minutes also delays regrain eligibility
+  for the entire monolith by the same number of grid steps. Documented in both `docs/reference.md`'s
+  `p_bound_headroom` parameter description and `docs/guide.md`'s transmute walkthrough; no code
+  changed.
+
 - **S3 archive uploads no longer break on a table name that needs quoting.** `archive._encode_upload_ndjson_single`/`_encode_upload_parquet` build their S3 key from `p_parent::text`, which Postgres renders with a literal `"` for any identifier that needs it (mixed case, a reserved word) -- a Prisma-style `PascalCase` table, for one. That quote rode straight into the request path unencoded: the canonical request used for SigV4 signing diverged from what actually went out over the wire, and every upload failed `403 SignatureDoesNotMatch`. Fixed by `archive._s3_encode_path`, applied to the S3 key in both signer functions (`archive.s3_signed_request`/`s3_signed_request_bytea`): percent-encodes each path segment via the existing `archive.s3_url_encode`, while leaving `/` alone as the path separator, matching AWS's own S3 canonical-URI rule.
 
 - **Regrain no longer stalls on a table's outgoing foreign key (issue #348).** A fine child is created

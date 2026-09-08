@@ -132,7 +132,17 @@ Parameters:
 - `p_bound_headroom` -- push the monolith's upper bound `hi` this many grid steps further out. The bound
   `CHECK` refuses writes at or past `hi` for the whole conversion, so raise this if the frontier could
   cross `hi` while the validation scan runs. `0` (the default) puts `hi` at the first grid boundary above
-  the frontier.
+  the frontier. **This `hi` is not scoped to the conversion: it becomes the monolith's permanent, attached
+  partition bound at cutover.** Postgres's zero-scan `ATTACH PARTITION` requires the already-validated
+  `CHECK` to exactly imply the attached bound, so whatever gets certified here is the only bound the
+  cutover can use -- there is no cheaper way to widen the transient write-ceiling protection without
+  also widening the monolith's permanent range. `regrain_step`'s frozen precondition (see
+  [`regrain_step`](#regrain_step)) is a whole-child test against that same `hi`, so headroom sized to
+  cover a write-ceiling window lasting seconds to minutes also delays regrain eligibility for the
+  *entire* monolith by the same number of grid steps -- a full extra week on a weekly grid, for
+  `p_bound_headroom => 1` -- even though almost all of its rows are, by the time the frontier reaches
+  that point, unambiguously historical. Weigh that against the write-ceiling risk headroom is actually
+  buying; raising it is not free.
 - `p_lock_timeout` -- how long each phase waits for a lock before giving up (`'5s'` by default; any
   `lock_timeout` value). This bounds a wait, it does not shorten one: the locks themselves are brief. It
   matters because a *pending* `ACCESS EXCLUSIVE` request blocks every lock request queued behind it, so
