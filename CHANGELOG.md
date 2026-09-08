@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Regrain no longer stalls on a table's outgoing foreign key (issue #348).** A fine child is created
+  via `like ... including constraints`, which never copies a `FOREIGN KEY` (no `LIKE` option does), so
+  every fine child reached the swap's `ATTACH PARTITION` with no matching constraint at all. PostgreSQL
+  then validated the parent's outgoing FK for that partition from scratch, inside the `ATTACH`
+  statement, under whatever lock it already holds and with no timeout of its own -- in production this
+  reached the session's `statement_timeout` outright and the swap never completed. Fixed by giving each
+  fine child its own outgoing FK, added and validated while the child is still empty (the same moment
+  the bound `CHECK` is added), so the scan costs nothing and the swap's `ATTACH` adopts the
+  already-validated constraint instead of re-scanning -- the same adoption `transmute` already relies on
+  for the monolith. Measured: attaching a 90,000-row partition with the FK pre-validated took 0.69ms;
+  the identical attach without pre-validating took 16.9ms for the same row count. Guarded by
+  `bench/regrain_outgoing_fk_lock.sh` (`./test.sh perf`), with a paired mutation
+  (`regrain_no_outgoing_fk` in `bench/mutations/mutate.py`) so `./test.sh discriminate` proves the
+  guard actually catches the regression.
+
 - **Parquet column encoding is no longer O(n^2) (issue #353).** `archive._pq_encode_column_data`
   built each column's data page by growing a `bytea` (or, for `bool`, a `boolean[]`) one row at a
   time with `:=`/`||` inside a PL/pgSQL loop -- every append reallocated and copied the entire

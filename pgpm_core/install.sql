@@ -2081,6 +2081,26 @@ begin
                      v_nsp, v_sub_name, v_nsp, v_rel);
       execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                      v_nsp, v_sub_name, (v_sub_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
+      -- #348: give the fine child its own already-validated copy of every outgoing FK the parent
+      -- has, the same trick the bound CHECK above uses. The child is still empty here (this runs
+      -- before the first row is copied in below), so VALIDATE costs nothing -- exactly how an empty
+      -- CHECK validates for free. Every row copied in afterward is checked at INSERT time by the
+      -- ordinary FK machinery regardless, so this one-time, zero-row validation is the only one this
+      -- constraint will ever need; by the swap's ATTACH (below), Postgres adopts it instead of
+      -- re-scanning, the same adoption transmute already relies on for the monolith
+      -- (install.sql:2841-2851). A NOT VALID outgoing FK on the parent is left alone (the
+      -- convalidated filter skips it): that matches today's behavior for it exactly, and transmute
+      -- already refuses a NOT VALID outgoing FK at conversion time, so this only matters if one was
+      -- added directly to the parent afterward.
+      for r in
+        select conname, pg_get_constraintdef(oid) as def
+          from pg_constraint
+         where conrelid = p_parent and contype = 'f' and confrelid <> p_parent and conparentid = 0
+           and convalidated
+      loop
+        execute format('alter table %I.%I add constraint %I %s not valid', v_nsp, v_sub_name, r.conname, r.def);
+        execute format('alter table %I.%I validate constraint %I', v_nsp, v_sub_name, r.conname);
+      end loop;
       insert into pgpm.part (parent_table, child_name, lo, hi, attached)
         values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
     end if;

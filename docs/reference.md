@@ -668,9 +668,11 @@ source stays whole and **attached** until that swap, so a read of the parent is 
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
 complete, K children attached), or a soft no-progress status: `active` (not frozen yet)
 (a stray sits in the range), or `nosubdiv` (the step does not subdivide). This is the unit `maintain`
-paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its
-one FK touch is the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that
-single transaction.
+paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its incoming-FK touch is
+the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that single transaction.
+It also gives each fine child its own already-validated copy of every outgoing FK the parent has, at
+creation time while the child is still empty, so the swap's `ATTACH` adopts it metadata-only instead of
+validating it under lock (issue #348).
 
 Committed DML against the source while a regrain is in flight is honoured. A trigger on the source records
 changed keys into a per-parent delta table, and a reconcile pass treats the **source** as the authority for
