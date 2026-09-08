@@ -177,6 +177,18 @@ returns text language sql immutable as $$
           from generate_series(0, octet_length(convert_to(p_raw, 'UTF8')) - 1) i) b;
 $$;
 
+-- The S3 *path* needs per-segment percent-encoding, not whole-string: '/' must stay literal (it
+-- separates path segments; AWS's SigV4 spec calls this out explicitly for the S3 canonical URI),
+-- while every other reserved character within a segment -- including a literal '"' from a
+-- quoted-identifier table name landing in an S3 key, hit in production -- has to be
+-- percent-encoded, or the canonical request used for signing diverges from what actually goes
+-- out over the wire and S3 replies 403 SignatureDoesNotMatch.
+create or replace function archive._s3_encode_path(p_key text)
+returns text language sql immutable as $$
+  select string_agg(archive.s3_url_encode(seg), '/' order by ord)
+    from unnest(string_to_array(p_key, '/')) with ordinality as t(seg, ord);
+$$;
+
 -- One signed S3 request. p_query must already be the CANONICAL query string (keys sorted,
 -- keys and values percent-encoded, '' for none); it is used verbatim in both the signature
 -- and the URL, so they cannot drift apart.
@@ -194,14 +206,14 @@ declare
 begin
   if p_endpoint is null then
     v_host := p_bucket || '.s3.' || p_region || '.amazonaws.com';   -- virtual-hosted style
-    v_uri  := '/' || p_key;
+    v_uri  := '/' || archive._s3_encode_path(p_key);
   else
     -- path style (MinIO, Supabase Storage, et al.); the endpoint may carry a path prefix
     v_host := regexp_replace(p_endpoint, '^https?://([^/]+).*$', '\1');
-    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || p_key;
+    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || archive._s3_encode_path(p_key);
   end if;
   v_url := case when p_endpoint is null then 'https://' || v_host || v_uri
-                else p_endpoint || '/' || p_bucket || '/' || p_key end
+                else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
   v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
@@ -263,13 +275,13 @@ declare
 begin
   if p_endpoint is null then
     v_host := p_bucket || '.s3.' || p_region || '.amazonaws.com';
-    v_uri  := '/' || p_key;
+    v_uri  := '/' || archive._s3_encode_path(p_key);
   else
     v_host := regexp_replace(p_endpoint, '^https?://([^/]+).*$', '\1');
-    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || p_key;
+    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || archive._s3_encode_path(p_key);
   end if;
   v_url := case when p_endpoint is null then 'https://' || v_host || v_uri
-                else p_endpoint || '/' || p_bucket || '/' || p_key end
+                else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
   v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
