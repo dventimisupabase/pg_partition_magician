@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **Docs: `p_bound_headroom` permanently delays regrain eligibility, undocumented (issue #342).**
+  Headroom widens the monolith's upper bound `hi` before the bound `CHECK` is added in `transmute`'s
+  phase 1, and that same `hi` becomes the monolith's permanent, attached partition bound at cutover
+  (Postgres's zero-scan `ATTACH PARTITION` requires the validated `CHECK` to exactly imply the
+  attached bound, so there is no cheaper way to widen the transient write-ceiling protection alone).
+  `regrain_step`'s frozen precondition is a whole-child test against that same `hi`, so headroom
+  sized to cover a write-ceiling window lasting seconds to minutes also delays regrain eligibility
+  for the entire monolith by the same number of grid steps. Documented in both `docs/reference.md`'s
+  `p_bound_headroom` parameter description and `docs/guide.md`'s transmute walkthrough; no code
+  changed.
+
 - **Docs: sizing `archive_byte_budget` (issue #354).** Added a "Sizing `archive_byte_budget`:
   there is no single optimal size" subsection to [Byte-budget chunked
   archiving](docs/reference.md#byte-budget-chunked-archiving) -- the four considerations that pull

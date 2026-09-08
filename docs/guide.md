@@ -230,6 +230,12 @@ plan for is a fast writer that would cross `hi` while the scan runs: pass `p_bou
 `hi` that many grid steps further out. `lo` is the grid floor of the current minimum, so a *backdated*
 write below it is refused for the same window.
 
+**Headroom is not scoped to the conversion: `hi` becomes the monolith's permanent partition bound**, and
+regraining the monolith cannot begin until the frontier passes that same `hi` -- so `p_bound_headroom`
+also delays how soon *any* of its history becomes eligible for regraining, by the same number of grid
+steps. See [`transmute`'s `p_bound_headroom`](reference.md#transmute-time--uuidv7--text_time-grid) for
+the tradeoff in full.
+
 **Each phase gives up rather than queueing.** `p_lock_timeout` (`'5s'` by default) bounds how long the
 conversion waits for a lock. The locks it takes are brief; what this protects you from is the *wait*,
 because a pending `ACCESS EXCLUSIVE` request blocks every lock request behind it, so without a bound one
