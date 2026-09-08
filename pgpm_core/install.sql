@@ -138,6 +138,20 @@ alter table pgpm.config add column if not exists archive_fn regprocedure;
 -- rows that sample scans. Same defaults as the original. Ignored entirely by a 'none' strategy.
 alter table pgpm.config add column if not exists archive_byte_budget bigint not null default 8 * 1024 * 1024;
 alter table pgpm.config add column if not exists archive_probe_sample int not null default 1000;
+-- caps how many DIFFERENT partitions one _archive_step call touches (issue #351; same shape as
+-- retain_batch, same "caps attempts, not successes" semantics, and the same null-means-unlimited
+-- escape hatch), but a different default: retain_batch's own unlimited default is safe because DROP TABLE is
+-- cheap and roughly constant-cost regardless of how many run per tick. Archiving is not -- each
+-- partition costs a real read, encode and (with compress on) CPU-bound compression pass, so
+-- fanning out over every eligible partition in one tick makes a single maintain() call's duration
+-- scale with the SIZE OF THE BACKLOG, not just archive_byte_budget's own per-partition cost. That
+-- is invisible until a bulk regrain or backfill leaves many partitions simultaneously eligible at
+-- once, at which point it can itself cross statement_timeout regardless of how conservatively
+-- archive_byte_budget is tuned. Defaulting to 1 makes archiving strictly sequential -- one
+-- partition fully archived (and so retirable) before the next one is even touched -- at the cost
+-- of a large backlog taking longer to fully catch up than fanning out would. Raise it (or set it
+-- null for the old unlimited behavior) if faster catch-up matters more than that bound.
+alter table pgpm.config add column if not exists archive_batch int default 1;
 
 -- Registry of managed partitions (excludes the DEFAULT). lo/hi are NATIVE-grid
 -- values as text (timestamptz for time/uuidv7, numeric for id).
@@ -1411,12 +1425,14 @@ begin
 end;
 $$;
 
--- one maintenance tick's worth of chunked archiving: for every attached child that ALREADY has the
--- write-block trigger installed (checked directly against pg_trigger, not re-derived from the
--- boundary formula -- this is what keeps archiving from ever running ahead of write-blocking) and is
--- not yet fully covered, pick its next chunk, run the configured strategy, and record progress.
--- Returns how many chunks were recorded this call. A 'none' strategy (archive_fn null) has nothing
--- to do -- every child is already "covered" per _archive_fully_covered above.
+-- one maintenance tick's worth of chunked archiving: picks up to config.archive_batch (default 1;
+-- null = unlimited, same escape hatch retain_batch already has -- issue #351) attached children
+-- that ALREADY have the write-block trigger installed (checked directly against pg_trigger, not
+-- re-derived from the boundary formula -- this is what keeps archiving from ever running ahead of
+-- write-blocking) and are not yet fully covered, oldest first, and for each picks its next chunk,
+-- runs the configured strategy, and records progress. Returns how many chunks were recorded this
+-- call. A 'none' strategy (archive_fn null) has nothing to do -- every child is already "covered"
+-- per _archive_fully_covered above.
 create or replace function pgpm._archive_step(p_parent regclass)
 returns int language plpgsql as $$
 declare
@@ -1428,14 +1444,20 @@ begin
 
   v_ncast := pgpm._native_type(cfg.control_kind);
 
-  -- oldest first, matching retain()'s own convention -- archiving history in age order, though each
-  -- child's progress is independent of the others' either way.
+  -- oldest first, matching retain()'s own convention -- archiving history in age order. The
+  -- eligibility checks live in the WHERE clause (not a `continue` inside the loop, the old shape)
+  -- specifically so `limit` bounds the right set: every row this query returns is a genuine
+  -- candidate, so archive_batch caps how many DIFFERENT partitions get a turn this call, not how
+  -- many rows happen to be scanned before finding that many.
   for r in execute format(
-    'select p.child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached order by p.lo::%s',
-    p_parent::text, v_ncast)
+    'select p.child_name from pgpm.part p
+      where p.parent_table = %L::regclass and p.attached
+        and pgpm._is_write_blocked(%L::regclass, p.child_name)
+        and not pgpm._archive_fully_covered(%L::regclass, p.child_name)
+      order by p.lo::%s
+      limit %s',
+    p_parent::text, p_parent::text, p_parent::text, v_ncast, coalesce(cfg.archive_batch::text, 'all'))
   loop
-    if not pgpm._is_write_blocked(p_parent, r.child_name) then continue; end if;
-    if pgpm._archive_fully_covered(p_parent, r.child_name) then continue; end if;
 
     select * into v_range from pgpm._next_archive_chunk(p_parent, r.child_name);
     if not found then continue; end if;
@@ -2059,6 +2081,26 @@ begin
                      v_nsp, v_sub_name, v_nsp, v_rel);
       execute format('alter table %I.%I add constraint %I check (%I >= %L and %I < %L)',
                      v_nsp, v_sub_name, (v_sub_name || '_ck'), cfg.control_column, v_lo_lit, cfg.control_column, v_hi_lit);
+      -- #348: give the fine child its own already-validated copy of every outgoing FK the parent
+      -- has, the same trick the bound CHECK above uses. The child is still empty here (this runs
+      -- before the first row is copied in below), so VALIDATE costs nothing -- exactly how an empty
+      -- CHECK validates for free. Every row copied in afterward is checked at INSERT time by the
+      -- ordinary FK machinery regardless, so this one-time, zero-row validation is the only one this
+      -- constraint will ever need; by the swap's ATTACH (below), Postgres adopts it instead of
+      -- re-scanning, the same adoption transmute already relies on for the monolith
+      -- (install.sql:2841-2851). A NOT VALID outgoing FK on the parent is left alone (the
+      -- convalidated filter skips it): that matches today's behavior for it exactly, and transmute
+      -- already refuses a NOT VALID outgoing FK at conversion time, so this only matters if one was
+      -- added directly to the parent afterward.
+      for r in
+        select conname, pg_get_constraintdef(oid) as def
+          from pg_constraint
+         where conrelid = p_parent and contype = 'f' and confrelid <> p_parent and conparentid = 0
+           and convalidated
+      loop
+        execute format('alter table %I.%I add constraint %I %s not valid', v_nsp, v_sub_name, r.conname, r.def);
+        execute format('alter table %I.%I validate constraint %I', v_nsp, v_sub_name, r.conname);
+      end loop;
       insert into pgpm.part (parent_table, child_name, lo, hi, attached)
         values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
     end if;

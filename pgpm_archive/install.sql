@@ -1574,6 +1574,18 @@ $$;
 -- p_decimal_scale/p_decimal_bytes are only meaningful (and only passed) for p_pgtype = 'numeric':
 -- the scale to multiply by before rounding to an integer, and the fixed byte width
 -- _pq_decimal_byte_width already sized to the column's own declared precision.
+-- Builds one column's data page: a per-row null bitmap (is_present) plus the concatenated
+-- PLAIN-encoded bytes of every non-null value, in p_order_by order. Each branch fetches the
+-- column into a typed array with one real SQL aggregate (array_agg), then derives both outputs
+-- from that array with a SECOND real aggregate (string_agg, or array_agg again for bool) over
+-- unnest(...) with ordinality -- never a PL/pgSQL loop that grows values_payload with `||`. That
+-- distinction matters: `:=`-with-`||` reassigns an immutable bytea/array value, so N appends copy
+-- the entire accumulated buffer each time (O(n^2) total); string_agg/array_agg are real aggregates
+-- with amortized-growth internals, the same reason array_agg's own fetch immediately above was
+-- never part of the problem. Mirrors the pattern this file already uses correctly elsewhere for
+-- list/array encoding (archive._pq_write_list_struct/_pq_write_list_i32/_pq_write_list_binary).
+-- string_agg/array_agg skip NULL inputs on their own; `filter (where v is not null)` makes that
+-- explicit and is what replaces each old loop's `if ... is not null then` guard.
 create or replace function archive._pq_encode_column_data(
   p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid',
   p_decimal_scale int4 default null, p_decimal_bytes int4 default null
@@ -1585,36 +1597,31 @@ declare
   arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
   arr_uuid uuid[]; arr_num numeric[];
   present_bools boolean[] := '{}';
-  i int4; n int4;
 begin
   if p_pgtype = 'int4' then
     execute format('select array_agg(%I::int4 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i4;
-    n := coalesce(array_length(arr_i4,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i4[i] is not null);
-      if arr_i4[i] is not null then values_payload := values_payload || archive._pq_plain_int32(arr_i4[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int32(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_i4) with ordinality as u(v, ord);
   elsif p_pgtype = 'int8' then
     execute format('select array_agg(%I::int8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i8;
-    n := coalesce(array_length(arr_i8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i8[i] is not null);
-      if arr_i8[i] is not null then values_payload := values_payload || archive._pq_plain_int64(arr_i8[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int64(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_i8) with ordinality as u(v, ord);
   elsif p_pgtype = 'float8' then
     execute format('select array_agg(%I::float8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_f8;
-    n := coalesce(array_length(arr_f8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_f8[i] is not null);
-      if arr_f8[i] is not null then values_payload := values_payload || archive._pq_plain_double(arr_f8[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_double(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_f8) with ordinality as u(v, ord);
   elsif p_pgtype = 'bool' then
     execute format('select array_agg(%I::boolean order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_bool;
-    n := coalesce(array_length(arr_bool,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_bool[i] is not null);
-      if arr_bool[i] is not null then present_bools := present_bools || arr_bool[i]; end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(array_agg(v order by ord) filter (where v is not null), '{}'::boolean[])
+      into is_present, present_bools
+      from unnest(arr_bool) with ordinality as u(v, ord);
     values_payload := archive._pq_plain_boolean_array(present_bools);
   elsif p_pgtype in ('text', 'array_json') then
     execute format(
@@ -1623,36 +1630,28 @@ begin
         else 'select array_agg(%I::text order by %s) from %s'
       end,
       p_col, p_order_by, p_from_sql) into arr_text;
-    n := coalesce(array_length(arr_text,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_text[i] is not null);
-      if arr_text[i] is not null then values_payload := values_payload || archive._pq_plain_text(arr_text[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_text(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_text) with ordinality as u(v, ord);
   elsif p_pgtype in ('timestamptz','timestamp') then
     execute format('select array_agg(%I::timestamptz order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_ts;
-    n := coalesce(array_length(arr_ts,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_ts[i] is not null);
-      if arr_ts[i] is not null then
-        values_payload := values_payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
-      end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from v) * 1000000)::int8), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_ts) with ordinality as u(v, ord);
   elsif p_pgtype = 'uuid' then
     execute format('select array_agg(%I::uuid order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_uuid;
-    n := coalesce(array_length(arr_uuid,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_uuid[i] is not null);
-      if arr_uuid[i] is not null then values_payload := values_payload || archive._pq_plain_uuid(arr_uuid[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_uuid(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_uuid) with ordinality as u(v, ord);
   elsif p_pgtype = 'numeric' then
     execute format('select array_agg(%I::numeric order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_num;
-    n := coalesce(array_length(arr_num,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_num[i] is not null);
-      if arr_num[i] is not null then
-        values_payload := values_payload || archive._pq_plain_decimal(arr_num[i], p_decimal_scale, p_decimal_bytes);
-      end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_decimal(v, p_decimal_scale, p_decimal_bytes), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_num) with ordinality as u(v, ord);
   else
     raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
   end if;
