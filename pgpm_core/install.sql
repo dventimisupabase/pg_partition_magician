@@ -1179,6 +1179,13 @@ $$;
 -- reusing the exact _retain_boundary() retire() itself checks so "eligible to write-block" and
 -- "eligible to drop" can never disagree. A table with no retention policy (config.retain null) has
 -- no boundary at all, so nothing is ever eligible and nothing is ever blocked.
+--
+-- Each child's install/remove attempt is isolated in its own exception scope (issue #360): a lock
+-- timeout (or any other failure) on one child logs skip_write_block for that child alone and moves
+-- on, rather than raising out of the whole loop and leaving every child after it -- lock-contended
+-- or not -- untouched for the entire tick. `order by hi asc` means that even when repeated
+-- contention does limit how far one tick's pass gets, the oldest (most overdue) children are always
+-- the ones attempted first, matching _archive_step's existing oldest-first convention (#237).
 create or replace function pgpm._enforce_write_blocks(p_parent regclass)
 returns void language plpgsql as $$
 declare
@@ -1189,13 +1196,19 @@ begin
   v_boundary := pgpm._retain_boundary(cfg);
 
   for r in select child_name, hi from pgpm.part where parent_table = p_parent and attached
+    order by hi asc
   loop
-    v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
-    if v_eligible then
-      perform pgpm._install_write_block(p_parent, r.child_name);
-    else
-      perform pgpm._remove_write_block(p_parent, r.child_name);
-    end if;
+    begin
+      v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
+      if v_eligible then
+        perform pgpm._install_write_block(p_parent, r.child_name);
+      else
+        perform pgpm._remove_write_block(p_parent, r.child_name);
+      end if;
+    exception when others then
+      insert into pgpm.log (parent_table, action, hi, method)
+        values (p_parent, 'skip_write_block', r.hi, left(sqlerrm, 200));
+    end;
   end loop;
 end;
 $$;
@@ -1781,6 +1794,10 @@ $$;
 -- down capture it can prove is orphaned, never one that might still be live.
 --
 -- Mirrors _enforce_write_blocks: reconcile every child's state against current policy, once per tick.
+-- Same per-child isolation as _enforce_write_blocks (issue #360), and for the same reason: the
+-- `drop trigger` below takes a lock, and one child's failure to acquire it must not stop the janitor
+-- from reaching every other child this tick. Logged as skip_regrain_capture, distinct from
+-- skip_write_block, so pgpm.log does not conflate which of the two actually failed.
 create or replace function pgpm._enforce_regrain_capture(p_parent regclass)
 returns void language plpgsql as $$
 declare cfg pgpm.config; v_nsp name; v_keep boolean; r record;
@@ -1791,15 +1808,20 @@ begin
 
   for r in select child_name, lo, hi from pgpm.part where parent_table = p_parent
   loop
-    if not pgpm._regrain_capture_active(p_parent, r.child_name) then continue; end if;
-    v_keep := cfg.regrain_cursor is not null
-          and not pgpm._native_gt(cfg.control_kind, r.lo, cfg.regrain_cursor)       -- lo <= cursor
-          and not pgpm._native_gt(cfg.control_kind, cfg.regrain_cursor, r.hi);      -- cursor <= hi
-    if not v_keep then
-      execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+    begin
+      if not pgpm._regrain_capture_active(p_parent, r.child_name) then continue; end if;
+      v_keep := cfg.regrain_cursor is not null
+            and not pgpm._native_gt(cfg.control_kind, r.lo, cfg.regrain_cursor)       -- lo <= cursor
+            and not pgpm._native_gt(cfg.control_kind, cfg.regrain_cursor, r.hi);      -- cursor <= hi
+      if not v_keep then
+        execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+        insert into pgpm.log (parent_table, action, lo, hi, method)
+          values (p_parent, 'regrain_capture_orphan', r.lo, r.hi, r.child_name);
+      end if;
+    exception when others then
       insert into pgpm.log (parent_table, action, lo, hi, method)
-        values (p_parent, 'regrain_capture_orphan', r.lo, r.hi, r.child_name);
-    end if;
+        values (p_parent, 'skip_regrain_capture', r.lo, r.hi, left(sqlerrm, 200));
+    end;
   end loop;
 end;
 $$;
@@ -3539,15 +3561,14 @@ begin
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
   -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
   --
-  -- obtain/retain get a VERY SHORT lock_timeout. Obtaining a future partition's first step
-  -- (ADD CONSTRAINT on the default, for the scan-skip path) takes ACCESS EXCLUSIVE on the default
-  -- -- which the live workload's inserts hold almost continuously. A long timeout there is doubly
-  -- bad: it blocks the workload for the whole wait (the pending ACCESS EXCLUSIVE queues every new
-  -- locker behind it), AND if it does win the lock it goes on to VALIDATE-scan the entire default
-  -- before the CREATE -- a scan that is wasted whenever the CREATE then can't get its lock. Failing
-  -- fast makes a deferral nearly free: no long block, and it bails before that scan. obtain is
-  -- optional (the future cells aren't written yet; the DEFAULT catches anything), so it simply
-  -- retries when the workload next has a gap.
+  -- obtain/retain get a VERY SHORT lock_timeout. obtain's _create_partition is a single
+  -- `CREATE TABLE ... PARTITION OF`, taking ACCESS EXCLUSIVE on the PARENT (issue #288 -- there is
+  -- no DEFAULT partition to hold anything anymore) and scanning nothing. That ACCESS EXCLUSIVE
+  -- still blocks every ordinary read or write through the parent for as long as the wait lasts, and
+  -- a pending one queues every new locker behind it, so failing fast keeps a deferral nearly free:
+  -- no long block, and obtain simply retries once maintain() next has a gap. obtain is pgpm's only
+  -- defence against a write with nowhere to go (there is no DEFAULT to catch one), but the future
+  -- cells it creates aren't written yet, so deferring one tick costs nothing but time.
   perform set_config('lock_timeout', '200ms', true);
 
   -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write

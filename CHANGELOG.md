@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+- **One partition's lock timeout no longer stalls write-blocking (and regrain-capture cleanup)
+  for every other eligible partition that tick (issue #360).** `_enforce_write_blocks` and
+  `_enforce_regrain_capture` each looped over every eligible child with no per-iteration exception
+  handling, so a lock timeout (or any other failure) on any single child raised out of the whole
+  loop, leaving every other child that tick -- lock-contended or not -- untouched. Since `retain`
+  only drops a child once it is write-blocked, this could turn one recurring point of lock
+  contention into a compounding retention backlog. Fixed by isolating each child's attempt in its
+  own exception scope (a failure now logs `skip_write_block` / `skip_regrain_capture`, attributed
+  to that child's own `hi`, and the loop moves on) and adding `order by hi asc` to
+  `_enforce_write_blocks`'s cursor so forward progress always prioritizes the oldest, most overdue
+  partitions first, matching `_archive_step`'s existing convention. Verified directly: a
+  deliberately "poisoned" middle child (its underlying table dropped out from under an
+  otherwise-normal `pgpm.part` row) no longer prevents children before *or* after it from being
+  correctly write-blocked -- against the old code, the same fixture failed to block even the
+  oldest eligible child, since the old query had no ordering guarantee at all.
+
+- **Docs: corrected a stale comment describing `obtain`'s `lock_timeout` rationale (issue #361).**
+  The comment justifying `obtain`'s 200ms lock timeout in `maintain()` described the pre-#288
+  `ADD CONSTRAINT`/`VALIDATE` exclusion-constraint dance against a `DEFAULT` partition -- a
+  mechanism issue #288 removed. Rewritten to describe what `obtain` actually does today (a single
+  `CREATE TABLE ... PARTITION OF`, taking `ACCESS EXCLUSIVE` on the parent itself and scanning
+  nothing). No behavior changed; the timeout value itself is unchanged.
+
 - **Docs: `p_bound_headroom` permanently delays regrain eligibility, undocumented (issue #342).**
   Headroom widens the monolith's upper bound `hi` before the bound `CHECK` is added in `transmute`'s
   phase 1, and that same `hi` becomes the monolith's permanent, attached partition bound at cutover
