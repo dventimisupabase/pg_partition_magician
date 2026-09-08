@@ -1,4 +1,4 @@
 comment = 'Pure-SQL online RANGE-partition manager (time / id / uuidv7 / text_time), pg_cron-driven'
-default_version = '0.3.0'
+default_version = '0.4.0'
 relocatable = false
 requires = 'pg_cron'
