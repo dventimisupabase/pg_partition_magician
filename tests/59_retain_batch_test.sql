@@ -68,7 +68,11 @@ select is(
 
 -- configure a real archive strategy but do not run it yet -- the head of the backlog is provably
 -- not yet archive-covered, a normal and expected (not a failure) reason for retain() to skip it.
-update pgpm.config set archive_fn = 'pgpm._archive_noop(regclass,name,text,text)'::regprocedure
+-- archive_batch is set to null (unbounded) so the single _archive_step call below covers BOTH
+-- remaining backlogged partitions in one pass, matching this test's own setup comment; the default
+-- (1, issue #351) would only cover one of them per call, which is not what this file is testing.
+update pgpm.config set archive_fn = 'pgpm._archive_noop(regclass,name,text,text)'::regprocedure,
+       archive_batch = null
   where parent_table = 'public.rb9'::regclass;
 update pgpm.config set retain_batch = 1 where parent_table = 'public.rb9'::regclass;
 
