@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-08
+
+**Upgrading in place? Read this first.** This release adds `config.archive_batch`, backfilled onto
+every existing managed table with a default of `1`. If you currently rely on `_archive_step`
+fanning out across every eligible partition in one `maintain()` tick (the only behavior earlier
+versions had), that default silently makes archiving strictly sequential -- one partition at a
+time -- immediately after upgrading. Set `archive_batch = null` for any table where you want to
+keep the old unbounded behavior; see [Byte-budget chunked
+archiving](docs/reference.md#byte-budget-chunked-archiving) for the tradeoff. Everything else in
+this release is additive or a pure bug/doc fix with no behavior change for an existing install.
+
 - **One partition's lock timeout no longer stalls write-blocking (and regrain-capture cleanup)
   for every other eligible partition that tick (issue #360).** `_enforce_write_blocks` and
   `_enforce_regrain_capture` each looped over every eligible child with no per-iteration exception
