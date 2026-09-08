@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+- **S3 archive uploads no longer break on a table name that needs quoting.** `archive._encode_upload_ndjson_single`/`_encode_upload_parquet` build their S3 key from `p_parent::text`, which Postgres renders with a literal `"` for any identifier that needs it (mixed case, a reserved word) -- a Prisma-style `PascalCase` table, for one. That quote rode straight into the request path unencoded: the canonical request used for SigV4 signing diverged from what actually went out over the wire, and every upload failed `403 SignatureDoesNotMatch`. Fixed by `archive._s3_encode_path`, applied to the S3 key in both signer functions (`archive.s3_signed_request`/`s3_signed_request_bytea`): percent-encodes each path segment via the existing `archive.s3_url_encode`, while leaving `/` alone as the path separator, matching AWS's own S3 canonical-URI rule.
+
+- **Regrain no longer stalls on a table's outgoing foreign key (issue #348).** A fine child is created
+  via `like ... including constraints`, which never copies a `FOREIGN KEY` (no `LIKE` option does), so
+  every fine child reached the swap's `ATTACH PARTITION` with no matching constraint at all. PostgreSQL
+  then validated the parent's outgoing FK for that partition from scratch, inside the `ATTACH`
+  statement, under whatever lock it already holds and with no timeout of its own -- in production this
+  reached the session's `statement_timeout` outright and the swap never completed. Fixed by giving each
+  fine child its own outgoing FK, added and validated while the child is still empty (the same moment
+  the bound `CHECK` is added), so the scan costs nothing and the swap's `ATTACH` adopts the
+  already-validated constraint instead of re-scanning -- the same adoption `transmute` already relies on
+  for the monolith. Measured: attaching a 90,000-row partition with the FK pre-validated took 0.69ms;
+  the identical attach without pre-validating took 16.9ms for the same row count. Guarded by
+  `bench/regrain_outgoing_fk_lock.sh` (`./test.sh perf`), with a paired mutation
+  (`regrain_no_outgoing_fk` in `bench/mutations/mutate.py`) so `./test.sh discriminate` proves the
+  guard actually catches the regression.
+
+- **Parquet column encoding is no longer O(n^2) (issue #353).** `archive._pq_encode_column_data`
+  built each column's data page by growing a `bytea` (or, for `bool`, a `boolean[]`) one row at a
+  time with `:=`/`||` inside a PL/pgSQL loop -- every append reallocated and copied the entire
+  accumulated buffer, costing O(n^2) total for n rows, regardless of `archive.config.compress`
+  (this ran identically either way, before compression ever saw the result). Rewritten to derive
+  both the column's null bitmap and its encoded bytes with real SQL aggregates
+  (`string_agg`/`array_agg` over `unnest(...) with ordinality`), mirroring the pattern this file
+  already used correctly elsewhere for list/array encoding. Verified byte-for-byte identical output
+  against the prior implementation across all eight supported types, both nullable states, and
+  empty/single-row/all-null/all-present edge cases (40 cases, zero mismatches). Measured: encoding
+  a 100,000-row text column dropped from 22.96s to 189ms (~121x), and scaling from 100K to 500K
+  rows is now close to linear (4.9x for 5x rows) rather than the ~29.5x it was.
+
+- **Chunked archiving now paces itself across partitions, not just within one (issue #351).**
+  `_archive_step` used to loop over every write-blocked, not-yet-covered partition on every
+  `maintain()` tick with no cap -- fine when one new partition becomes eligible per rollover
+  interval, but a single tick's duration scaled with the size of the archiving *backlog* the moment
+  a bulk regrain or backfill left many partitions eligible at once, which could itself cross
+  `statement_timeout` regardless of how conservatively `archive_byte_budget` was tuned. New
+  `config.archive_batch` (default `1`; `null` = unbounded) caps how many different partitions one
+  call touches, oldest first -- the same shape as `retain_batch`, but a different default:
+  `retain_batch`'s unlimited default is safe because `DROP TABLE` is cheap and constant-cost
+  regardless of volume, while archiving a partition is a real read, encode, and (with compression
+  on) CPU-bound pass. Defaulting to `1` makes archiving strictly sequential: one partition fully
+  archived, and so retirable, before the next is even touched.
+
+- **Parquet archival supports PostgreSQL enums and arrays (issue #339).** Enums are written as UTF-8
+  strings, while arrays are written as JSON-tagged strings that preserve null arrays, empty arrays,
+  null elements, multidimensional values, and element escaping. Both whole-table and automatic
+  range archival use catalog type metadata, so schema-qualified and mixed-case enum names work.
+
 ## [0.3.0] - 2026-08-26
 
 - **`uuidv7`'s forward frontier no longer stalls on a data drought (issue #325).** Every other kind's

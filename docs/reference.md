@@ -668,9 +668,11 @@ source stays whole and **attached** until that swap, so a read of the parent is 
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
 complete, K children attached), or a soft no-progress status: `active` (not frozen yet)
 (a stray sits in the range), or `nosubdiv` (the step does not subdivide). This is the unit `maintain`
-paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its
-one FK touch is the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that
-single transaction.
+paces across ticks; because it copies, the cross-tick path opens **no** read gap. Its incoming-FK touch is
+the swap's `DETACH`, which transiently drops and re-adds any incoming FK within that single transaction.
+It also gives each fine child its own already-validated copy of every outgoing FK the parent has, at
+creation time while the child is still empty, so the swap's `ATTACH` adopts it metadata-only instead of
+validating it under lock (issue #348).
 
 Committed DML against the source while a regrain is in flight is honoured. A trigger on the source records
 changed keys into a per-parent delta table, and a reconcile pass treats the **source** as the authority for
@@ -804,6 +806,19 @@ archive a whole large partition as one giant operation, chunk it instead.
 - `config.archive_byte_budget` (default 8 MiB) and `config.archive_probe_sample` (default 1000) --
   the same two knobs the original chunker took as parameters -- estimate how many rows fit the
   budget via a sampled average row width.
+- **Raising `archive_byte_budget` raises how long the tick's `archive_fn` call runs for, and
+  `pgpm.maintain()` applies no timeout of its own to that call.** With `pgpm.archive_to_s3_parquet`
+  and `archive.config.compress` on, that time is dominated by `pgpm_archive`'s own from-scratch
+  GZIP writer, pure PL/pgSQL and CPU-bound: real compression time runs from ~50ms/MB on
+  compressible data up to ~2.6s/MB on near-incompressible data (see
+  [`pgpm_archive/README.md`](../pgpm_archive/README.md#ndjson-or-parquet)), scaling roughly linearly
+  with the budget. An 8 MiB budget is already several seconds of CPU on the low end of that range;
+  doubling it can double the tick's duration and cross whatever `statement_timeout` the connection
+  running `maintain()` has, surfacing as the tick failing outright rather than as a slow tick.
+  Size `archive_byte_budget` with that per-MB cost and the maintaining session's
+  `statement_timeout` in mind, not just S3 part-size or file-count preferences -- if a tick is
+  timing out, lowering `archive_byte_budget` (or turning `compress` off, or switching to
+  `pgpm.archive_to_s3_ndjson`) is the fix, not raising any lock or statement timeout.
 - `pgpm.archive_ledger` (successor to `pgpm_archive`'s `archive.ledger`, same shape:
   `parent_table`, `lo`, `hi`, `child_name`, `s3_key`, `etag`, `rows_archived`, `archived_at`) records
   one row per chunk. `s3_key`/`etag` come straight from the `archive_fn` call's own
@@ -818,11 +833,44 @@ archive a whole large partition as one giant operation, chunk it instead.
 - `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
   that child reach its own `hi` (or the strategy is `none`) -- `retire()`'s archive-coverage drop
   precondition (see [`retire`](#retire)).
-- `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: for every
-  attached child that **already has the write-block trigger installed** (checked directly, not
-  re-derived from the boundary formula) and is not yet fully covered, it picks the next chunk, runs
+- `pgpm._archive_step(p_parent)`, called once per `maintain()` tick, is the orchestrator: among
+  attached children that **already have the write-block trigger installed** (checked directly, not
+  re-derived from the boundary formula) and are not yet fully covered, it picks up to
+  `config.archive_batch` of them, **oldest first**, and for each picks the next chunk, runs
   `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
   trigger yet is never touched, however far past the byte budget's reach it sits.
+- `config.archive_batch` (default **1**; `null` = unbounded) caps how many *different* partitions
+  one `_archive_step` call touches -- the same shape as `retain_batch` (nullable `int`, `null`
+  means unlimited, caps attempts not successes), but a different default, and for a reason worth
+  spelling out: `retain_batch`'s unlimited default is safe because its unit of work, `DROP TABLE`,
+  is cheap and roughly constant-cost regardless of how many run per tick. Archiving's unit of work
+  is not -- each partition costs a real table read, an encode pass, and, with a real S3 strategy and
+  `archive.config.compress` on, a CPU-bound compression pass (see the note on `archive_byte_budget`
+  above). Fanning out over every eligible partition in one tick makes a single `maintain()` call's
+  duration scale with the size of the *backlog*, not just with `archive_byte_budget`'s own
+  per-partition cost -- invisible in steady state (one partition becomes eligible per rollover
+  interval), but very visible the moment a bulk regrain or backfill leaves many partitions
+  simultaneously eligible at once, at which point the aggregate cost can cross `statement_timeout`
+  regardless of how conservatively the per-partition budget is tuned. Defaulting to `1` makes
+  archiving strictly sequential: one partition fully archived, and so retirable, before the next is
+  even touched. Raise it, or set it `null`, if a large backlog catching up faster matters more than
+  that bound.
+- **`archive_batch` and `archive_byte_budget` are fungible for speed and risk, but not for file
+  shape.** Per-tick duration is roughly `archive_batch x archive_byte_budget x (cost per byte)`
+  (compression scales close to linearly with chunk size), and so is how many ticks it takes to
+  clear a backlog: `_archive_step`'s query is a sliding window over the oldest not-yet-covered
+  partitions, so total chunk-advancements needed is fixed and each tick contributes `archive_batch`
+  of them. Both quantities depend on the same product, so `archive_batch=1` with a bigger budget
+  and `archive_batch=N` with a smaller one, chosen so the product matches, land on roughly the same
+  per-tick duration and the same backlog-convergence speed. They are NOT interchangeable for the
+  *shape* of what gets uploaded: `pgpm._next_archive_chunk` reads only `archive_byte_budget` (never
+  `archive_batch`) to decide how many rows make up one chunk, and one chunk is one uploaded file --
+  `archive_batch` cannot make files bigger or smaller, or change how many chunks it takes to cover
+  one partition, only how many *different* partitions' independent chunk sequences advance in the
+  same tick. Pick `archive_byte_budget` first, for the file size (and per-chunk risk) you actually
+  want; use `archive_batch` to buy back backlog-convergence speed at that fixed shape, rather than
+  raising `archive_byte_budget` alone and reintroducing the per-partition timeout risk to get the
+  same speed `archive_batch` would have bought for free on that axis.
 
 ### Real S3 archive strategies
 
@@ -1135,6 +1183,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining) |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
+| `archive_batch` | `int` | max partitions one `_archive_step` call touches, oldest first (default 1; null = unbounded -- see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 | `text_time_prefix` / `text_time_width` / `text_time_radix` / `text_time_unit` | `text` / `int` / `int` / `text` | the declared shape for a `text_time` control column (null for every other kind); see `p_tt_prefix` etc. above |
 | `text_time_alphabet` / `text_time_discard_bits` / `text_time_epoch` | `text` / `int` / `timestamptz` | non-default digit set, bits to discard, and epoch for a `text_time` column (null/0/Unix epoch for cuid/ULID-shaped ones; see `p_tt_alphabet` etc. above) |
 

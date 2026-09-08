@@ -177,6 +177,18 @@ returns text language sql immutable as $$
           from generate_series(0, octet_length(convert_to(p_raw, 'UTF8')) - 1) i) b;
 $$;
 
+-- The S3 *path* needs per-segment percent-encoding, not whole-string: '/' must stay literal (it
+-- separates path segments; AWS's SigV4 spec calls this out explicitly for the S3 canonical URI),
+-- while every other reserved character within a segment -- including a literal '"' from a
+-- quoted-identifier table name landing in an S3 key, hit in production -- has to be
+-- percent-encoded, or the canonical request used for signing diverges from what actually goes
+-- out over the wire and S3 replies 403 SignatureDoesNotMatch.
+create or replace function archive._s3_encode_path(p_key text)
+returns text language sql immutable as $$
+  select string_agg(archive.s3_url_encode(seg), '/' order by ord)
+    from unnest(string_to_array(p_key, '/')) with ordinality as t(seg, ord);
+$$;
+
 -- One signed S3 request. p_query must already be the CANONICAL query string (keys sorted,
 -- keys and values percent-encoded, '' for none); it is used verbatim in both the signature
 -- and the URL, so they cannot drift apart.
@@ -194,14 +206,14 @@ declare
 begin
   if p_endpoint is null then
     v_host := p_bucket || '.s3.' || p_region || '.amazonaws.com';   -- virtual-hosted style
-    v_uri  := '/' || p_key;
+    v_uri  := '/' || archive._s3_encode_path(p_key);
   else
     -- path style (MinIO, Supabase Storage, et al.); the endpoint may carry a path prefix
     v_host := regexp_replace(p_endpoint, '^https?://([^/]+).*$', '\1');
-    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || p_key;
+    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || archive._s3_encode_path(p_key);
   end if;
   v_url := case when p_endpoint is null then 'https://' || v_host || v_uri
-                else p_endpoint || '/' || p_bucket || '/' || p_key end
+                else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
   v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
@@ -263,13 +275,13 @@ declare
 begin
   if p_endpoint is null then
     v_host := p_bucket || '.s3.' || p_region || '.amazonaws.com';
-    v_uri  := '/' || p_key;
+    v_uri  := '/' || archive._s3_encode_path(p_key);
   else
     v_host := regexp_replace(p_endpoint, '^https?://([^/]+).*$', '\1');
-    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || p_key;
+    v_uri  := regexp_replace(p_endpoint, '^https?://[^/]+', '') || '/' || p_bucket || '/' || archive._s3_encode_path(p_key);
   end if;
   v_url := case when p_endpoint is null then 'https://' || v_host || v_uri
-                else p_endpoint || '/' || p_bucket || '/' || p_key end
+                else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
   v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
@@ -1562,6 +1574,18 @@ $$;
 -- p_decimal_scale/p_decimal_bytes are only meaningful (and only passed) for p_pgtype = 'numeric':
 -- the scale to multiply by before rounding to an integer, and the fixed byte width
 -- _pq_decimal_byte_width already sized to the column's own declared precision.
+-- Builds one column's data page: a per-row null bitmap (is_present) plus the concatenated
+-- PLAIN-encoded bytes of every non-null value, in p_order_by order. Each branch fetches the
+-- column into a typed array with one real SQL aggregate (array_agg), then derives both outputs
+-- from that array with a SECOND real aggregate (string_agg, or array_agg again for bool) over
+-- unnest(...) with ordinality -- never a PL/pgSQL loop that grows values_payload with `||`. That
+-- distinction matters: `:=`-with-`||` reassigns an immutable bytea/array value, so N appends copy
+-- the entire accumulated buffer each time (O(n^2) total); string_agg/array_agg are real aggregates
+-- with amortized-growth internals, the same reason array_agg's own fetch immediately above was
+-- never part of the problem. Mirrors the pattern this file already uses correctly elsewhere for
+-- list/array encoding (archive._pq_write_list_struct/_pq_write_list_i32/_pq_write_list_binary).
+-- string_agg/array_agg skip NULL inputs on their own; `filter (where v is not null)` makes that
+-- explicit and is what replaces each old loop's `if ... is not null then` guard.
 create or replace function archive._pq_encode_column_data(
   p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid',
   p_decimal_scale int4 default null, p_decimal_bytes int4 default null
@@ -1573,69 +1597,61 @@ declare
   arr_i4 int4[]; arr_i8 int8[]; arr_f8 float8[]; arr_bool boolean[]; arr_text text[]; arr_ts timestamptz[];
   arr_uuid uuid[]; arr_num numeric[];
   present_bools boolean[] := '{}';
-  i int4; n int4;
 begin
   if p_pgtype = 'int4' then
     execute format('select array_agg(%I::int4 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i4;
-    n := coalesce(array_length(arr_i4,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i4[i] is not null);
-      if arr_i4[i] is not null then values_payload := values_payload || archive._pq_plain_int32(arr_i4[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int32(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_i4) with ordinality as u(v, ord);
   elsif p_pgtype = 'int8' then
     execute format('select array_agg(%I::int8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_i8;
-    n := coalesce(array_length(arr_i8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_i8[i] is not null);
-      if arr_i8[i] is not null then values_payload := values_payload || archive._pq_plain_int64(arr_i8[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int64(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_i8) with ordinality as u(v, ord);
   elsif p_pgtype = 'float8' then
     execute format('select array_agg(%I::float8 order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_f8;
-    n := coalesce(array_length(arr_f8,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_f8[i] is not null);
-      if arr_f8[i] is not null then values_payload := values_payload || archive._pq_plain_double(arr_f8[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_double(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_f8) with ordinality as u(v, ord);
   elsif p_pgtype = 'bool' then
     execute format('select array_agg(%I::boolean order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_bool;
-    n := coalesce(array_length(arr_bool,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_bool[i] is not null);
-      if arr_bool[i] is not null then present_bools := present_bools || arr_bool[i]; end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(array_agg(v order by ord) filter (where v is not null), '{}'::boolean[])
+      into is_present, present_bools
+      from unnest(arr_bool) with ordinality as u(v, ord);
     values_payload := archive._pq_plain_boolean_array(present_bools);
-  elsif p_pgtype = 'text' then
-    execute format('select array_agg(%I::text order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_text;
-    n := coalesce(array_length(arr_text,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_text[i] is not null);
-      if arr_text[i] is not null then values_payload := values_payload || archive._pq_plain_text(arr_text[i]); end if;
-    end loop;
+  elsif p_pgtype in ('text', 'array_json') then
+    execute format(
+      case when p_pgtype = 'array_json'
+        then 'select array_agg(array_to_json(%I)::text order by %s) from %s'
+        else 'select array_agg(%I::text order by %s) from %s'
+      end,
+      p_col, p_order_by, p_from_sql) into arr_text;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_text(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_text) with ordinality as u(v, ord);
   elsif p_pgtype in ('timestamptz','timestamp') then
     execute format('select array_agg(%I::timestamptz order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_ts;
-    n := coalesce(array_length(arr_ts,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_ts[i] is not null);
-      if arr_ts[i] is not null then
-        values_payload := values_payload || archive._pq_plain_int64(round(extract(epoch from arr_ts[i]) * 1000000)::int8);
-      end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from v) * 1000000)::int8), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_ts) with ordinality as u(v, ord);
   elsif p_pgtype = 'uuid' then
     execute format('select array_agg(%I::uuid order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_uuid;
-    n := coalesce(array_length(arr_uuid,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_uuid[i] is not null);
-      if arr_uuid[i] is not null then values_payload := values_payload || archive._pq_plain_uuid(arr_uuid[i]); end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_uuid(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_uuid) with ordinality as u(v, ord);
   elsif p_pgtype = 'numeric' then
     execute format('select array_agg(%I::numeric order by %s) from %s', p_col, p_order_by, p_from_sql) into arr_num;
-    n := coalesce(array_length(arr_num,1),0);
-    for i in 1..n loop
-      is_present[i] := (arr_num[i] is not null);
-      if arr_num[i] is not null then
-        values_payload := values_payload || archive._pq_plain_decimal(arr_num[i], p_decimal_scale, p_decimal_bytes);
-      end if;
-    end loop;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_decimal(v, p_decimal_scale, p_decimal_bytes), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_num) with ordinality as u(v, ord);
   else
     raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
   end if;
@@ -1685,7 +1701,7 @@ begin
   v_from_sql := format('%I.%I', v_schema, v_table);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname, a.atttypmod
+    select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_relation and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1693,7 +1709,14 @@ begin
     v_col_names := v_col_names || v_col.attname;
     v_col_nullable := v_col_nullable || (not v_col.attnotnull);
 
-    case v_col.typname
+    if v_col.typtype = 'e' then
+      v_col_pgtypes := v_col_pgtypes || 'text'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    elsif v_col.typcategory = 'A' and v_col.typelem <> 0 then
+      v_col_pgtypes := v_col_pgtypes || 'array_json'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    else
+      case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
                               v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
@@ -1722,8 +1745,9 @@ begin
         v_scale := (v_col.atttypmod - 4) & 65535;
         v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
         v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
-      else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
-    end case;
+        else raise exception 'archive._pq_to_parquet: unsupported column type % for column %', v_col.typname, v_col.attname;
+      end case;
+    end if;
   end loop;
 
   v_ncols := array_length(v_col_names, 1);
@@ -1821,7 +1845,7 @@ begin
                         v_schema, v_table, p_control, p_lo, p_control, p_hi);
 
   for v_col in
-    select a.attname, a.attnotnull, t.typname, a.atttypmod
+    select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
     from pg_attribute a join pg_type t on t.oid = a.atttypid
     where a.attrelid = p_parent and a.attnum > 0 and not a.attisdropped
     order by a.attnum
@@ -1829,7 +1853,14 @@ begin
     v_col_names := v_col_names || v_col.attname;
     v_col_nullable := v_col_nullable || (not v_col.attnotnull);
 
-    case v_col.typname
+    if v_col.typtype = 'e' then
+      v_col_pgtypes := v_col_pgtypes || 'text'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 0;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    elsif v_col.typcategory = 'A' and v_col.typelem <> 0 then
+      v_col_pgtypes := v_col_pgtypes || 'array_json'::text; v_col_ptypes := v_col_ptypes || 6; v_col_converted := v_col_converted || 19;
+      v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
+    else
+      case v_col.typname
       when 'int4'        then v_col_pgtypes := v_col_pgtypes || 'int4'::text;        v_col_ptypes := v_col_ptypes || 1; v_col_converted := v_col_converted || -1;
                               v_col_typelen := v_col_typelen || null::int4; v_col_scale := v_col_scale || null::int4; v_col_precision := v_col_precision || null::int4;
       when 'int8'        then v_col_pgtypes := v_col_pgtypes || 'int8'::text;        v_col_ptypes := v_col_ptypes || 2; v_col_converted := v_col_converted || -1;
@@ -1858,8 +1889,9 @@ begin
         v_scale := (v_col.atttypmod - 4) & 65535;
         v_col_pgtypes := v_col_pgtypes || 'numeric'::text; v_col_ptypes := v_col_ptypes || 7; v_col_converted := v_col_converted || 5;
         v_col_typelen := v_col_typelen || archive._pq_decimal_byte_width(v_precision); v_col_scale := v_col_scale || v_scale; v_col_precision := v_col_precision || v_precision;
-      else raise exception 'archive._pq_to_parquet_range: unsupported column type % for column %', v_col.typname, v_col.attname;
-    end case;
+        else raise exception 'archive._pq_to_parquet_range: unsupported column type % for column %', v_col.typname, v_col.attname;
+      end case;
+    end if;
   end loop;
 
   v_ncols := array_length(v_col_names, 1);

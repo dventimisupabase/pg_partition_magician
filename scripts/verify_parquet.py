@@ -19,6 +19,7 @@ Defaults to the docker-compose archive service (localhost:5520), the PG17 +
 pgsql-http image pgpm_archive's own CI track uses.
 """
 import datetime
+import json
 import os
 import sys
 import tempfile
@@ -60,6 +61,17 @@ def codec_of(raw):
         path = f.name
     try:
         return str(pq.ParquetFile(path).metadata.row_group(0).column(0).compression)
+    finally:
+        os.unlink(path)
+
+
+def annotations_of(raw):
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        schema = pq.ParquetFile(path).schema
+        return {schema.column(i).name: schema.column(i).converted_type for i in range(len(schema))}
     finally:
         os.unlink(path)
 
@@ -279,9 +291,7 @@ def test_large_row_count(conn):
 
 
 def test_unsupported_type_refused(conn):
-    # arrays are the "hard" tier deliberately not built (real LIST/repetition-level support);
-    # jsonb/uuid/numeric(p,s) are all supported now, so this can no longer use jsonb.
-    make_table(conn, "t_unsupported", "n int4 not null, arr int4[] not null", None)
+    make_table(conn, "t_unsupported", "n int4 not null, location point not null", None)
     try:
         to_parquet_bytes(conn, "t_unsupported")
         FAILURES.append("unsupported type: expected an exception, got none")
@@ -293,6 +303,41 @@ def test_unsupported_type_refused(conn):
         else:
             FAILURES.append(f"unsupported type: wrong error: {e}")
             print("FAIL: unsupported type correctly refused")
+
+
+def test_enum_and_array(conn):
+    run(conn, 'drop table if exists t_enum_array')
+    run(conn, 'drop type if exists "PromptRunStatus"')
+    run(conn, 'create type "PromptRunStatus" as enum (\'queued\', \'running\', \'done\')')
+    run(conn, '''
+        create table t_enum_array (
+          id int4 not null,
+          status "PromptRunStatus",
+          contact_ids text[]
+        )
+    ''')
+    run(conn, "insert into t_enum_array values (1, 'queued', null)")
+    run(conn, "insert into t_enum_array values (2, null, '{}'::text[])")
+    run(conn, "insert into t_enum_array values (3, 'running', array['alpha', null, 'NULL'])")
+    special = ['quote"', 'back\\slash', 'comma,brace{}', 'line\nbreak', 'snowman \u2603']
+    run(conn, "insert into t_enum_array values (4, 'done', %s)", (special,))
+    conn.commit()
+
+    raw = to_parquet_bytes(conn, "t_enum_array")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = [
+        {"id": 1, "status": "queued", "contact_ids": None},
+        {"id": 2, "status": None, "contact_ids": "[]"},
+        {"id": 3, "status": "running", "contact_ids": '["alpha",null,"NULL"]'},
+        {"id": 4, "status": "done", "contact_ids": json.dumps(special, ensure_ascii=False, separators=(",", ":"))},
+    ]
+    check("enum as UTF-8 and array as JSON text", expected, arrow_rows, duck_rows)
+    annotations = annotations_of(raw)
+    if annotations.get("status") == "UTF8" and annotations.get("contact_ids") == "JSON":
+        print("PASS: enum and array Parquet annotations are UTF8 and JSON")
+    else:
+        FAILURES.append(f"enum/array annotations: {annotations}")
+        print("FAIL: enum and array Parquet annotations are UTF8 and JSON")
 
 
 def test_nullable_int4_mixed(conn):
@@ -632,6 +677,7 @@ def main():
         test_many_columns_long_form_header,
         test_quoted_identifiers,
         test_large_row_count,
+        test_enum_and_array,
         test_unsupported_type_refused,
         test_nullable_int4_mixed,
         test_nullable_all_null,

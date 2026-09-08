@@ -62,26 +62,36 @@ contract and the [guide](../docs/guide.md#archiving-before-a-drop) for the opera
 
 GZIP compression applies to either format (`archive.config.compress`, off by default). It's not
 free: real compression time runs from ~50ms/MB on compressible data up to ~2.6s/MB on
-near-incompressible data.
+near-incompressible data. On the automatic `archive_fn` path this compounds with
+`pgpm.config.archive_byte_budget` (the per-tick chunk size) with no timeout of its own -- see
+[Byte-budget chunked archiving](../docs/reference.md#byte-budget-chunked-archiving) before raising
+the budget past a few MiB with compression on.
 
 ## Limits
 
-- **Parquet supports nine types**: `int4`, `int8`, `float8`, `boolean`, `text`,
+- **Parquet supports eleven types**: `int4`, `int8`, `float8`, `boolean`, `text`,
   `timestamp`/`timestamptz`, `uuid` (as fixed-size binary, not a typed UUID -- readers get the raw
   16 bytes), `json`/`jsonb` (as text, tagged as JSON), and `numeric(p,s)` as a real DECIMAL --
   `numeric` with no declared precision/scale is refused, since Parquet DECIMAL needs one fixed
-  precision/scale for the whole column. Arrays and composite types are refused outright; cast to a
-  supported type in a view if you need one archived this way. One row group, no dictionary
-  encoding, no statistics.
+  precision/scale for the whole column. PostgreSQL enums are UTF-8 strings; arrays are JSON-tagged
+  strings because this flat writer does not emit Parquet's nested `LIST` structure. Array dimensions
+  and non-default lower bounds are not preserved. Composite types are refused outright. One row group,
+  no dictionary encoding, no statistics.
 - **Payload size**: `archive.to_s3` (NDJSON) streams through S3 multipart in bounded memory once a
   partition exceeds one ~8MiB part, so it handles any size. `archive.to_s3_parquet` has no
   multipart path and would not benefit from one -- a Parquet file's footer needs every row group's
   byte offset, known only once the whole file is built, so the encoder already holds the entire
   file in memory (Postgres's ~1GB cap) before any upload starts. For a partition whose Parquet
   encoding would exceed that, use the [automatic path](#automatic-vs-manual) instead:
-  `config.archive_fn` chunks by a target byte budget (`config.archive_byte_budget`, default 8 MiB)
-  that's independent of partition size, so no single upload ever needs to hold a whole large
-  partition in memory.
+  `config.archive_fn` chunks by `config.archive_byte_budget` (default 8 MiB), independent of
+  partition size, so no single chunk's encoder input scales with partition size. That budget sizes
+  a **row count**, not the uploaded file: it estimates the average on-disk row size
+  (`pg_column_size`, sampled) and picks roughly `archive_byte_budget / that average` rows per
+  chunk, so an 8 MiB budget does not mean 8 MiB Parquet files -- the actual upload is the *encoded*
+  (and, with `compress` on, *GZIP-compressed*) size of those rows, which is usually smaller than
+  the budget and never exactly equal to it. See
+  [Byte-budget chunked archiving](../docs/reference.md#byte-budget-chunked-archiving) for the row
+  math and the compression cost that scales with it.
 - **On Supabase**: Storage enforces the project's upload size limit (default 50MB) on the S3
   protocol too, and `statement_timeout` is 2 minutes -- both apply to a single manual call. The
   automatic path's chunking keeps each upload well under both.
