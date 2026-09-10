@@ -413,6 +413,9 @@ run_archive() {
   .venv-verify/bin/python scripts/verify_parquet_range.py "postgresql://postgres:postgres@localhost:5520/postgres" \
     || fail=1
 
+  echo "--- LZ77 match-finder memory guard (issue #366) ---"
+  bash "$(dirname "$0")/bench/archive_lz77_memory.sh" pgpm_test-archive pgpm_lz77mem || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"
@@ -453,9 +456,18 @@ run_perf() {
 # separate track because it runs every guard a second time and so costs about double the perf track.
 run_discriminate() {
   local prof="pg17" svc="postgres17" c="pgpm_test-17"
+  # The one archive-scoped mutation (#366) needs the archive track's own image (pgsql-http isn't
+  # in the plain core image postgres17 uses) -- brought up alongside, the same way run_archive
+  # does. MinIO comes up with it (both share profiles: ["archive"] in docker-compose.yml) but
+  # goes unused: the LZ77 memory guard never touches S3.
+  local aprof="archive" asvc="archive" ca="pgpm_test-archive"
   $DC --profile "$prof" up -d --wait "$svc"
+  $DC --profile "$aprof" build $BUILD_PROGRESS "$asvc"
+  $DC --profile "$aprof" up -d
+  wait_pg "$aprof" "$asvc" 60
   local rc=0
-  bash "$(dirname "$0")/bench/discriminate.sh" "$c" || rc=1
+  bash "$(dirname "$0")/bench/discriminate.sh" "$c" "$ca" || rc=1
+  $DC --profile "$aprof" down -v
   $DC --profile "$prof" down -v
   return "$rc"
 }

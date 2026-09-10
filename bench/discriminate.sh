@@ -14,29 +14,43 @@
 # bench/mutations/, build a copy of install.sql with the defect back in, run the guard against it, and
 # require the guard to FAIL. A guard that stays green on its own mutant is not testing anything.
 #
-# Usage: discriminate.sh <container>
+# Usage: discriminate.sh <container> [<archive container>]
+# The second container is only needed for mutations scoped to pgpm_archive/install.sql (which
+# requires the archive track's own image -- pgsql-http isn't in the plain core image); a mutation
+# whose src needs it, with no such container supplied, is a FAILURE of this check, not a skip --
+# same principle as a stale pattern: a guard this script never actually ran is unverified.
 set -uo pipefail
 C="${1:?container}"
+CA="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/bench/results/mutants"       # gitignored
 mkdir -p "$OUT"
 fail=0
 i=0
 
-while IFS=$'\t' read -r name guard why; do
+while IFS=$'\t' read -r name guard why src; do
   i=$((i + 1))
   db="pgpm_mut$i"
-  printf '\n--- %s\n    breaks: %s\n    defect: %s\n' "$name" "$guard" "$why"
+  printf '\n--- %s\n    breaks: %s\n    src: %s\n    defect: %s\n' "$name" "$guard" "$src" "$why"
+
+  case "$src" in
+    pgpm_archive/install.sql) target_c="$CA" ;;
+    *) target_c="$C" ;;
+  esac
+  if [ -z "$target_c" ]; then
+    printf 'FAIL  no container supplied for src %s; guard %s is unverified\n' "$src" "$guard"
+    fail=1; continue
+  fi
 
   # A stale pattern must not quietly yield an unmutated copy: mutate.py exits non-zero instead, and a
   # mutant we could not build is a failure of this check, not a skip.
-  if ! python3 "$ROOT/bench/mutations/mutate.py" "$name" "$ROOT/pgpm_core/install.sql" "$OUT/$name.sql"; then
+  if ! python3 "$ROOT/bench/mutations/mutate.py" "$name" "$ROOT/$src" "$OUT/$name.sql"; then
     printf 'FAIL  could not build the mutant (see above); guard %s is unverified\n' "$guard"
     fail=1; continue
   fi
 
   # The repo is bind-mounted at /repo, so the mutant is reachable by the same relative path inside.
-  if bash "$ROOT/$guard" "$C" "$db" "/repo/bench/results/mutants/$name.sql" >"$OUT/$name.log" 2>&1; then
+  if bash "$ROOT/$guard" "$target_c" "$db" "/repo/bench/results/mutants/$name.sql" >"$OUT/$name.log" 2>&1; then
     printf 'FAIL  %s PASSED against its own defect: it does not discriminate\n' "$guard"
     sed 's/^/      /' "$OUT/$name.log"
     fail=1
@@ -44,7 +58,7 @@ while IFS=$'\t' read -r name guard why; do
     printf 'PASS  %s fails when the defect is present\n' "$guard"
     grep '^FAIL' "$OUT/$name.log" | sed 's/^/      /'
   fi
-  docker exec "$C" psql -U postgres -q -c "drop database if exists $db" >/dev/null 2>&1
+  docker exec "$target_c" psql -U postgres -q -c "drop database if exists $db" >/dev/null 2>&1
 done < <(python3 "$ROOT/bench/mutations/mutate.py" --list)
 
 echo

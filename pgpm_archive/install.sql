@@ -652,14 +652,6 @@ begin
 end;
 $$;
 
--- one row per position 0..length(data)-3: a 3-byte rolling "hash" (the exact 3-byte value
--- itself, so no collisions -- cheap enough at this alphabet size and simpler than a lossy hash)
-create or replace function archive._pq_lz_pos_hashes(data bytea) returns table(pos int4, h int4)
-language sql immutable as $$
-  select i, (get_byte(data,i)<<16) | (get_byte(data,i+1)<<8) | get_byte(data,i+2)
-  from generate_series(0, length(data)-3) i;
-$$;
-
 -- longest k in [0, max_len] with substr(data,a+1,k) = substr(data,b+1,k): a binary search over
 -- native substr-equality comparisons (each a C-level memcmp regardless of k), not a byte-by-byte
 -- extend loop -- O(log max_len) comparisons instead of O(max_len).
@@ -690,27 +682,20 @@ begin
 end;
 $$;
 
--- DEFLATE-encode `payload` as one final, fixed-Huffman block (RFC 1951 3.2.3/3.2.6). Builds its
--- own scratch hash table per call (one call per column page; matching never crosses column
--- boundaries) -- a hardcoded table name, not a regclass/text parameter passed through EXECUTE:
--- dynamic SQL measured ~2.5x slower per lookup than a plain statement referencing a fixed name,
--- for exactly the reason invoking any function has overhead -- EXECUTE just adds more of it.
+-- DEFLATE-encode `payload` as one final, fixed-Huffman block (RFC 1951 3.2.3/3.2.6). Consumes
+-- archive._pq_lz77_tokens's token stream -- the same LZ77 matcher the dynamic-Huffman path uses
+-- (see that function for the match-finding strategy, #366) -- rather than keeping a second, inline
+-- copy of the matching loop.
 create or replace function archive._pq_deflate_encode(payload bytea) returns bytea
 language plpgsql as $$
 declare
-  n int4 := length(payload);
-  v_pos int4 := 0;
-  v_hash int4; v_candidate int4; v_mlen int4;
+  v_tok record;
   v_acc int4 := 0; v_acc_n int4 := 0; v_bytes int4[] := '{}';
   v_code int4; v_nbits int4; v_rev int4;
   v_lcode int4; v_lextra_bits int4; v_lextra_val int4;
   v_dcode int4; v_dextra_bits int4; v_dextra_val int4;
   v_dist int4; v_len int4; v_sym int4;
 begin
-  drop table if exists pq_deflate_hash_scratch;
-  create temp table pq_deflate_hash_scratch as select * from archive._pq_lz_pos_hashes(payload);
-  create index on pq_deflate_hash_scratch (h, pos);
-
   -- block header: BFINAL=1, BTYPE=01 (fixed Huffman) -- raw, LSB-of-value-first (the OPPOSITE
   -- convention from Huffman codes, which are MSB-of-the-code-first; RFC 1951 3.1.1 splits these
   -- two conventions and it is easy to invert one for the other by accident).
@@ -719,23 +704,10 @@ begin
     v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
   end loop;
 
-  while v_pos < n loop
-    v_candidate := null;
-    if v_pos <= n - 3 then
-      v_hash := (get_byte(payload,v_pos)<<16) | (get_byte(payload,v_pos+1)<<8) | get_byte(payload,v_pos+2);
-      select pos into v_candidate from pq_deflate_hash_scratch
-       where h = v_hash and pos < v_pos and v_pos - pos <= 32768
-       order by pos desc limit 1;
-    end if;
-    if v_candidate is not null then
-      v_mlen := archive._pq_lz_match_len(payload, v_pos, v_candidate, least(258, n - v_pos));
-    else
-      v_mlen := 0;
-    end if;
-
-    if v_mlen >= 3 then
-      v_dist := v_pos - v_candidate;
-      v_len := v_mlen;
+  for v_tok in select * from archive._pq_lz77_tokens(payload) loop
+    if v_tok.is_match then
+      v_len := v_tok.val1;
+      v_dist := v_tok.val2;
 
       -- length code (RFC 1951 3.2.5), inlined rather than a separate lookup function -- see the
       -- section header note on OUT-parameter call overhead.
@@ -800,10 +772,8 @@ begin
           v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
         end loop;
       end if;
-
-      v_pos := v_pos + v_mlen;
     else
-      v_sym := get_byte(payload, v_pos);
+      v_sym := v_tok.val1;
       if v_sym <= 143 then v_code := 48+v_sym; v_nbits := 8;
       elsif v_sym <= 255 then v_code := 400+(v_sym-144); v_nbits := 9;
       elsif v_sym <= 279 then v_code := v_sym-256; v_nbits := 7;
@@ -814,7 +784,6 @@ begin
       while v_acc_n >= 8 loop
         v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
       end loop;
-      v_pos := v_pos + 1;
     end if;
   end loop;
 
@@ -826,7 +795,6 @@ begin
   end loop;
   if v_acc_n > 0 then v_bytes := array_append(v_bytes, v_acc & 255); end if;   -- pad final byte
 
-  drop table pq_deflate_hash_scratch;
   return (select decode(string_agg(lpad(to_hex(x), 2, '0'), '' order by ord), 'hex')
           from unnest(v_bytes) with ordinality as t(x, ord));
 end;
@@ -1085,17 +1053,33 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Dynamic Huffman coding (issue #206), step 2 of 2: the full BTYPE=10 block
 -- encoder. Factors the LZ77 matcher out of archive._pq_deflate_encode into its own
--- function (archive._pq_deflate_encode itself is untouched, still fixed-Huffman-only
--- -- a valid, simpler rung, not replaced) so both encoders share one matching
--- implementation rather than risking a second, subtly different copy.
+-- function so both encoders share one matching implementation rather than risking
+-- a second, subtly different copy.
 -- ---------------------------------------------------------------------------
 
--- Same matching algorithm as archive._pq_deflate_encode's inline loop (single most-
--- recent candidate per 3-byte hash, precomputed over the whole buffer via
--- archive._pq_lz_pos_hashes, greedy, window 32768, max match 258) -- factored out so
--- archive._pq_deflate_encode_dynamic below can reuse it verbatim. Returns one row per
--- token in stream order: literal (is_match=false, val1=byte 0-255) or match
+-- The LZ77 matcher shared by archive._pq_deflate_encode and archive._pq_deflate_encode_dynamic:
+-- single most-recent candidate per 3-byte hash, greedy, window 32768, max match 258. Returns one
+-- row per token in stream order: literal (is_match=false, val1=byte 0-255) or match
 -- (is_match=true, val1=length, val2=distance).
+--
+-- #366: candidates come from a fixed-size, in-place hash table (v_table), not a per-position temp
+-- table + btree index -- that materialized one row per byte of the ENTIRE input up front, ~40x the
+-- input size in peak memory, and degraded further across repeated calls in one backend session
+-- (archive_batch > 1). v_table is one int4 slot per possible 3-byte value (2^24 = 16,777,216
+-- entries, ~64 MiB, initialized to -1 = "no entry"), holding only the MOST RECENT position seen
+-- for that exact 3-byte value -- sized to the full hash domain, not just the 32768-byte window,
+-- specifically so there are zero collisions and a lookup is exactly "the largest pos < v_pos with
+-- this exact hash", matching what the old exhaustive index computed, byte for byte. A table sized
+-- to the window instead (the conventional zlib-style choice) would collide different 3-byte values
+-- into the same slot and could silently hide a real, older match behind a newer, unrelated one --
+-- still valid DEFLATE, but not byte-identical to today's output.
+--
+-- The old temp table held an entry for every position 0..n-3 regardless of whether the main loop's
+-- greedy skip-ahead (v_pos := v_pos + v_mlen) ever visited it. A hash table that only records
+-- positions the loop actually LANDS ON would silently skip the ones a match jumps over, finding
+-- fewer candidates than before and producing valid but not byte-identical output. So a match's
+-- branch below backfills v_table for every position it consumes (v_pos..v_pos+v_mlen-1), in
+-- ascending order so ties resolve to the largest position -- not just advancing past them.
 create or replace function archive._pq_lz77_tokens(payload bytea)
 returns table(is_match boolean, val1 int4, val2 int4)
 language plpgsql as $$
@@ -1103,18 +1087,17 @@ declare
   n int4 := length(payload);
   v_pos int4 := 0;
   v_hash int4; v_candidate int4; v_mlen int4;
+  v_table int4[] := array_fill(-1, array[16777216]);
+  v_end int4; v_j int4; v_h int4;
 begin
-  drop table if exists archive_lz77_hash_scratch;
-  create temp table archive_lz77_hash_scratch as select * from archive._pq_lz_pos_hashes(payload);
-  create index on archive_lz77_hash_scratch (h, pos);
-
   while v_pos < n loop
     v_candidate := null;
     if v_pos <= n - 3 then
       v_hash := (get_byte(payload,v_pos)<<16) | (get_byte(payload,v_pos+1)<<8) | get_byte(payload,v_pos+2);
-      select pos into v_candidate from archive_lz77_hash_scratch
-       where h = v_hash and pos < v_pos and v_pos - pos <= 32768
-       order by pos desc limit 1;
+      v_candidate := v_table[v_hash + 1];
+      if v_candidate = -1 or v_pos - v_candidate > 32768 then
+        v_candidate := null;
+      end if;
     end if;
     if v_candidate is not null then
       v_mlen := archive._pq_lz_match_len(payload, v_pos, v_candidate, least(258, n - v_pos));
@@ -1125,15 +1108,25 @@ begin
     if v_mlen >= 3 then
       is_match := true; val1 := v_mlen; val2 := v_pos - v_candidate;
       return next;
+      -- backfill every position this match consumes, including v_pos's own (never written
+      -- before the lookup above) -- see the header note on why skipped positions still need
+      -- an entry.
+      v_end := least(v_pos + v_mlen - 1, n - 3);
+      for v_j in v_pos..v_end loop
+        v_h := (get_byte(payload,v_j)<<16) | (get_byte(payload,v_j+1)<<8) | get_byte(payload,v_j+2);
+        v_table[v_h + 1] := v_j;
+      end loop;
       v_pos := v_pos + v_mlen;
     else
       is_match := false; val1 := get_byte(payload, v_pos); val2 := null;
       return next;
+      if v_pos <= n - 3 then
+        v_table[v_hash + 1] := v_pos;
+      end if;
       v_pos := v_pos + 1;
     end if;
   end loop;
 
-  drop table archive_lz77_hash_scratch;
   return;
 end;
 $$;
