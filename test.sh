@@ -416,6 +416,9 @@ run_archive() {
   echo "--- LZ77 match-finder memory guard (issue #366) ---"
   bash "$(dirname "$0")/bench/archive_lz77_memory.sh" pgpm_test-archive pgpm_lz77mem || fail=1
 
+  echo "--- column encode memory guard (issue #368) ---"
+  bash "$(dirname "$0")/bench/archive_encode_memory.sh" pgpm_test-archive pgpm_encodemem || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"

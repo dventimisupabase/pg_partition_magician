@@ -337,6 +337,46 @@ $$;''',
             1,
         )],
     ),
+    "archive_encode_array_agg_unnest": (
+        "bench/archive_encode_memory.sh",
+        "Pre-#368 archive._pq_encode_column_data (text/array_json branch): fetches the whole "
+        "column into an array_agg, then re-aggregates it a SECOND time over unnest(...) with "
+        "ordinality to derive is_present and the PLAIN-encoded payload -- two full-size copies of "
+        "the column alive at overlapping times, instead of one dynamic query that aggregates both "
+        "directly from the source relation. Measured at ~6x the raw column size in peak RSS "
+        "instead of the fix's ~1.2x-2.8x.",
+        [(
+            """  elsif p_pgtype in ('text', 'array_json') then
+    execute format(
+      case when p_pgtype = 'array_json'
+        then 'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
+                     coalesce(string_agg(archive._pq_plain_text(array_to_json(%I)::text), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
+                from %s'
+        else 'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
+                     coalesce(string_agg(archive._pq_plain_text(%I::text), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
+                from %s'
+      end,
+      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      into is_present, values_payload;
+""",
+            """  elsif p_pgtype in ('text', 'array_json') then
+    declare arr_text text[];
+    begin
+    execute format(
+      case when p_pgtype = 'array_json'
+        then 'select array_agg(array_to_json(%I)::text order by %s) from %s'
+        else 'select array_agg(%I::text order by %s) from %s'
+      end,
+      p_col, p_order_by, p_from_sql) into arr_text;
+    select coalesce(array_agg(v is not null order by ord), '{}'::boolean[]),
+           coalesce(string_agg(archive._pq_plain_text(v), ''::bytea order by ord) filter (where v is not null), ''::bytea)
+      into is_present, values_payload
+      from unnest(arr_text) with ordinality as u(v, ord);
+    end;
+""",
+            1,
+        )],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -344,6 +384,7 @@ $$;''',
 # mutation's guard needs; anything not listed here defaults to the core install + core container.
 MUTATION_SRC = {
     "archive_lz77_hash_scratch": "pgpm_archive/install.sql",
+    "archive_encode_array_agg_unnest": "pgpm_archive/install.sql",
 }
 
 
