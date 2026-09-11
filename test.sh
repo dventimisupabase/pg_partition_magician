@@ -419,6 +419,9 @@ run_archive() {
   echo "--- column encode memory guard (issue #368) ---"
   bash "$(dirname "$0")/bench/archive_encode_memory.sh" pgpm_test-archive pgpm_encodemem || fail=1
 
+  echo "--- DEFLATE encoder memory guard (issue #370) ---"
+  bash "$(dirname "$0")/bench/archive_deflate_memory.sh" pgpm_test-archive pgpm_deflatemem || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"

@@ -686,11 +686,24 @@ $$;
 -- archive._pq_lz77_tokens's token stream -- the same LZ77 matcher the dynamic-Huffman path uses
 -- (see that function for the match-finding strategy, #366) -- rather than keeping a second, inline
 -- copy of the matching loop.
-create or replace function archive._pq_deflate_encode(payload bytea) returns bytea
+--
+-- #370: emits fixed-size chunks via `return next` (pre-sized once, filled with set_byte, never
+-- grown -- archive._pq_plain_boolean_array's idiom) instead of appending one int4 per OUTPUT byte
+-- to a growing v_bytes int4[] and hex-round-tripping it at the end -- that old shape cost 4 bytes
+-- of int4[] storage per compressed byte, scaling with compressed OUTPUT size independent of #366's
+-- token-count fix. archive._pq_deflate_encode (below) does the final string_agg aggregate over
+-- this function's chunk stream, the same "return next, real aggregate downstream" shape
+-- archive._pq_lz77_tokens already uses for its own token stream.
+create or replace function archive._pq_deflate_encode_chunks(payload bytea)
+returns table(chunk bytea)
 language plpgsql as $$
 declare
   v_tok record;
-  v_acc int4 := 0; v_acc_n int4 := 0; v_bytes int4[] := '{}';
+  v_acc int4 := 0; v_acc_n int4 := 0;
+  v_chunk_size constant int4 := 8192;
+  v_chunk_empty constant bytea := decode(repeat('00', v_chunk_size), 'hex');
+  v_chunk bytea := v_chunk_empty;
+  v_chunk_pos int4 := 0;
   v_code int4; v_nbits int4; v_rev int4;
   v_lcode int4; v_lextra_bits int4; v_lextra_val int4;
   v_dcode int4; v_dextra_bits int4; v_dextra_val int4;
@@ -701,7 +714,9 @@ begin
   -- two conventions and it is easy to invert one for the other by accident).
   v_acc := v_acc | (3 << v_acc_n); v_acc_n := v_acc_n + 3;
   while v_acc_n >= 8 loop
-    v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+    v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+    v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+    if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
   end loop;
 
   for v_tok in select * from archive._pq_lz77_tokens(payload) loop
@@ -749,13 +764,17 @@ begin
       v_rev := archive._pq_bit_reverse(v_code, v_nbits);
       v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
       while v_acc_n >= 8 loop
-        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+        v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
       end loop;
 
       if v_lextra_bits > 0 then
         v_acc := v_acc | (v_lextra_val << v_acc_n); v_acc_n := v_acc_n + v_lextra_bits;
         while v_acc_n >= 8 loop
-          v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+          v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+          v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+          if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
         end loop;
       end if;
 
@@ -763,13 +782,17 @@ begin
       v_rev := archive._pq_bit_reverse(v_dcode, 5);
       v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + 5;
       while v_acc_n >= 8 loop
-        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+        v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
       end loop;
 
       if v_dextra_bits > 0 then
         v_acc := v_acc | (v_dextra_val << v_acc_n); v_acc_n := v_acc_n + v_dextra_bits;
         while v_acc_n >= 8 loop
-          v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+          v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+          v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+          if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
         end loop;
       end if;
     else
@@ -782,7 +805,9 @@ begin
       v_rev := archive._pq_bit_reverse(v_code, v_nbits);
       v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
       while v_acc_n >= 8 loop
-        v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+        v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+        if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
       end loop;
     end if;
   end loop;
@@ -791,13 +816,25 @@ begin
   v_rev := archive._pq_bit_reverse(0, 7);
   v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + 7;
   while v_acc_n >= 8 loop
-    v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+    v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+    v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8;
+    if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
   end loop;
-  if v_acc_n > 0 then v_bytes := array_append(v_bytes, v_acc & 255); end if;   -- pad final byte
+  if v_acc_n > 0 then   -- pad final byte
+    v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+    if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
+  end if;
 
-  return (select decode(string_agg(lpad(to_hex(x), 2, '0'), '' order by ord), 'hex')
-          from unnest(v_bytes) with ordinality as t(x, ord));
+  if v_chunk_pos > 0 then
+    chunk := substr(v_chunk, 1, v_chunk_pos); return next;
+  end if;
+  return;
 end;
+$$;
+
+create or replace function archive._pq_deflate_encode(payload bytea) returns bytea
+language sql as $$
+  select coalesce((select string_agg(chunk, ''::bytea) from archive._pq_deflate_encode_chunks(payload)), ''::bytea);
 $$;
 
 -- the full RFC 1952 gzip container Parquet's GZIP codec expects (confirmed empirically: a real
@@ -1200,26 +1237,32 @@ end;
 $$;
 
 -- The full dynamic-Huffman (BTYPE=10) block encoder: tokenizes via
--- archive._pq_lz77_tokens (pass 1, also tallying the real litlen/distance symbol
+-- archive._pq_lz77_tokens (pass 1, tallying the real litlen/distance symbol
 -- frequencies), builds a genuine per-block Huffman code for each alphabet
 -- (archive._pq_huffman_lengths/_canonical_codes -- pass 2), transmits both via the
 -- code-length meta-alphabet (archive._pq_clc_rle, Huffman-coded the same way), then
--- emits the actual token stream under the new codes (pass 3). Same bit-
+-- re-tokenizes and emits the token stream under the new codes (pass 3). Same bit-
 -- accumulator convention as archive._pq_deflate_encode (LSB-first byte packing,
 -- Huffman codes bit-reversed via archive._pq_bit_reverse before packing since they're
 -- conventionally written MSB-first, raw fields/extra-bits pushed unreversed).
-create or replace function archive._pq_deflate_encode_dynamic(payload bytea) returns bytea
+--
+-- #370: pass 3 calls archive._pq_lz77_tokens a SECOND time and recomputes each token's
+-- length/distance code inline (duplicating pass 1's case blocks, the same way
+-- archive._pq_deflate_encode already computes-and-immediately-uses these per token without
+-- storing them) instead of replaying six parallel int4[] arrays (v_litlen_sym/_extra_val/
+-- _extra_bits, v_dist_sym/_extra_val/_extra_bits) that pass 1 used to fill, one element per
+-- LZ77 token. On poorly-compressible input (near one token per byte) those six arrays could
+-- exceed Postgres's ~1GB single-value ceiling well before the raw payload did -- exactly
+-- what production hit archiving a prompts."PromptRunLog" chunk. Re-running the matcher is a
+-- bounded, cheap cost since #366 made it O(1) memory and fast; this trades that for removing
+-- an O(token count) memory cost entirely. Also emits fixed-size chunks via `return next`,
+-- same as archive._pq_deflate_encode_chunks above, instead of a growing v_bytes int4[] --
+-- see that function's comment for why.
+create or replace function archive._pq_deflate_encode_dynamic_chunks(payload bytea)
+returns table(chunk bytea)
 language plpgsql as $$
 declare
   v_tok record;
-  v_k int4 := 0;
-  v_litlen_sym int4[] := '{}';
-  v_litlen_extra_val int4[] := '{}';
-  v_litlen_extra_bits int4[] := '{}';
-  v_dist_sym int4[] := '{}';
-  v_dist_extra_val int4[] := '{}';
-  v_dist_extra_bits int4[] := '{}';
-
   v_litlen_freq bigint[] := array_fill(0::bigint, array[286]);
   v_dist_freq bigint[] := array_fill(0::bigint, array[30]);
 
@@ -1230,7 +1273,11 @@ declare
   v_dcode int4; v_dextra_bits int4; v_dextra_val int4;
   v_len int4; v_dist int4;
 
-  v_acc int4 := 0; v_acc_n int4 := 0; v_bytes int4[] := '{}';
+  v_acc int4 := 0; v_acc_n int4 := 0;
+  v_chunk_size constant int4 := 8192;
+  v_chunk_empty constant bytea := decode(repeat('00', v_chunk_size), 'hex');
+  v_chunk bytea := v_chunk_empty;
+  v_chunk_pos int4 := 0;
 
   v_combined_lengths int4[];
   v_litlen_hi int4; v_dist_hi int4;
@@ -1242,9 +1289,8 @@ declare
   v_hclen int4;
   i int4; v_sym int4; v_code int4; v_nbits int4; v_rev int4;
 begin
-  -- ---- pass 1: tokenize, tally frequencies ----
+  -- ---- pass 1: tokenize, tally frequencies only (#370: no per-token array storage) ----
   for v_tok in select * from archive._pq_lz77_tokens(payload) loop
-    v_k := v_k + 1;
     if v_tok.is_match then
       v_len := v_tok.val1; v_dist := v_tok.val2;
 
@@ -1275,15 +1321,9 @@ begin
         else v_dcode := 28+(v_dist-16385)/8192; v_dextra_bits := 13; v_dextra_val := (v_dist-16385)%8192;
       end case;
 
-      v_litlen_sym[v_k] := v_lcode; v_litlen_extra_val[v_k] := v_lextra_val; v_litlen_extra_bits[v_k] := v_lextra_bits;
-      v_dist_sym[v_k] := v_dcode; v_dist_extra_val[v_k] := v_dextra_val; v_dist_extra_bits[v_k] := v_dextra_bits;
-
       v_litlen_freq[v_lcode+1] := v_litlen_freq[v_lcode+1] + 1;
       v_dist_freq[v_dcode+1] := v_dist_freq[v_dcode+1] + 1;
     else
-      v_litlen_sym[v_k] := v_tok.val1; v_litlen_extra_val[v_k] := 0; v_litlen_extra_bits[v_k] := 0;
-      v_dist_sym[v_k] := null;
-
       v_litlen_freq[v_tok.val1+1] := v_litlen_freq[v_tok.val1+1] + 1;
     end if;
   end loop;
@@ -1326,22 +1366,22 @@ begin
     v_hclen := v_hclen - 1;
   end loop;
 
-  -- ---- pass 3: emit bits ----
+  -- ---- pass 3: re-tokenize, emit bits under the now-known dynamic codes ----
   v_acc := v_acc | (1 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BFINAL=1
   v_acc := v_acc | (0 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BTYPE low bit
   v_acc := v_acc | (1 << v_acc_n); v_acc_n := v_acc_n + 1;                 -- BTYPE high bit (=10, dynamic)
-  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
 
   v_acc := v_acc | (v_hlit << v_acc_n); v_acc_n := v_acc_n + 5;
-  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
   v_acc := v_acc | (v_hdist << v_acc_n); v_acc_n := v_acc_n + 5;
-  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
   v_acc := v_acc | ((v_hclen - 4) << v_acc_n); v_acc_n := v_acc_n + 4;
-  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
 
   for i in 1..v_hclen loop
     v_acc := v_acc | (v_clc_lengths[v_clc_order[i]+1] << v_acc_n); v_acc_n := v_acc_n + 3;
-    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+    while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
   end loop;
 
   for i in 1..array_length(v_clc_sym, 1) loop
@@ -1350,39 +1390,75 @@ begin
     v_code := v_clc_codes[v_sym+1];
     v_rev := archive._pq_bit_reverse(v_code, v_nbits);
     v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
-    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+    while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
 
     if v_clc_extra_bits[i] > 0 then
       v_acc := v_acc | (v_clc_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_clc_extra_bits[i];
-      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+      while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
     end if;
   end loop;
 
-  for i in 1..v_k loop
-    v_sym := v_litlen_sym[i];
-    v_nbits := v_litlen_lengths[v_sym+1];
-    v_code := v_litlen_codes[v_sym+1];
-    v_rev := archive._pq_bit_reverse(v_code, v_nbits);
-    v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
-    while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  for v_tok in select * from archive._pq_lz77_tokens(payload) loop
+    if v_tok.is_match then
+      v_len := v_tok.val1; v_dist := v_tok.val2;
 
-    if v_litlen_extra_bits[i] > 0 then
-      v_acc := v_acc | (v_litlen_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_litlen_extra_bits[i];
-      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
-    end if;
+      case
+        when v_len between 3 and 10 then v_lcode := 257+(v_len-3); v_lextra_bits := 0; v_lextra_val := 0;
+        when v_len between 11 and 18 then v_lcode := 265+(v_len-11)/2; v_lextra_bits := 1; v_lextra_val := (v_len-11)%2;
+        when v_len between 19 and 34 then v_lcode := 269+(v_len-19)/4; v_lextra_bits := 2; v_lextra_val := (v_len-19)%4;
+        when v_len between 35 and 66 then v_lcode := 273+(v_len-35)/8; v_lextra_bits := 3; v_lextra_val := (v_len-35)%8;
+        when v_len between 67 and 130 then v_lcode := 277+(v_len-67)/16; v_lextra_bits := 4; v_lextra_val := (v_len-67)%16;
+        when v_len between 131 and 257 then v_lcode := 281+(v_len-131)/32; v_lextra_bits := 5; v_lextra_val := (v_len-131)%32;
+        else v_lcode := 285; v_lextra_bits := 0; v_lextra_val := 0;
+      end case;
 
-    if v_dist_sym[i] is not null then
-      v_sym := v_dist_sym[i];
+      case
+        when v_dist between 1 and 4 then v_dcode := v_dist-1; v_dextra_bits := 0; v_dextra_val := 0;
+        when v_dist between 5 and 8 then v_dcode := 4+(v_dist-5)/2; v_dextra_bits := 1; v_dextra_val := (v_dist-5)%2;
+        when v_dist between 9 and 16 then v_dcode := 6+(v_dist-9)/4; v_dextra_bits := 2; v_dextra_val := (v_dist-9)%4;
+        when v_dist between 17 and 32 then v_dcode := 8+(v_dist-17)/8; v_dextra_bits := 3; v_dextra_val := (v_dist-17)%8;
+        when v_dist between 33 and 64 then v_dcode := 10+(v_dist-33)/16; v_dextra_bits := 4; v_dextra_val := (v_dist-33)%16;
+        when v_dist between 65 and 128 then v_dcode := 12+(v_dist-65)/32; v_dextra_bits := 5; v_dextra_val := (v_dist-65)%32;
+        when v_dist between 129 and 256 then v_dcode := 14+(v_dist-129)/64; v_dextra_bits := 6; v_dextra_val := (v_dist-129)%64;
+        when v_dist between 257 and 512 then v_dcode := 16+(v_dist-257)/128; v_dextra_bits := 7; v_dextra_val := (v_dist-257)%128;
+        when v_dist between 513 and 1024 then v_dcode := 18+(v_dist-513)/256; v_dextra_bits := 8; v_dextra_val := (v_dist-513)%256;
+        when v_dist between 1025 and 2048 then v_dcode := 20+(v_dist-1025)/512; v_dextra_bits := 9; v_dextra_val := (v_dist-1025)%512;
+        when v_dist between 2049 and 4096 then v_dcode := 22+(v_dist-2049)/1024; v_dextra_bits := 10; v_dextra_val := (v_dist-2049)%1024;
+        when v_dist between 4097 and 8192 then v_dcode := 24+(v_dist-4097)/2048; v_dextra_bits := 11; v_dextra_val := (v_dist-4097)%2048;
+        when v_dist between 8193 and 16384 then v_dcode := 26+(v_dist-8193)/4096; v_dextra_bits := 12; v_dextra_val := (v_dist-8193)%4096;
+        else v_dcode := 28+(v_dist-16385)/8192; v_dextra_bits := 13; v_dextra_val := (v_dist-16385)%8192;
+      end case;
+
+      v_sym := v_lcode;
+      v_nbits := v_litlen_lengths[v_sym+1];
+      v_code := v_litlen_codes[v_sym+1];
+      v_rev := archive._pq_bit_reverse(v_code, v_nbits);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+      while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
+
+      if v_lextra_bits > 0 then
+        v_acc := v_acc | (v_lextra_val << v_acc_n); v_acc_n := v_acc_n + v_lextra_bits;
+        while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
+      end if;
+
+      v_sym := v_dcode;
       v_nbits := v_dist_lengths[v_sym+1];
       v_code := v_dist_codes[v_sym+1];
       v_rev := archive._pq_bit_reverse(v_code, v_nbits);
       v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
-      while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+      while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
 
-      if v_dist_extra_bits[i] > 0 then
-        v_acc := v_acc | (v_dist_extra_val[i] << v_acc_n); v_acc_n := v_acc_n + v_dist_extra_bits[i];
-        while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+      if v_dextra_bits > 0 then
+        v_acc := v_acc | (v_dextra_val << v_acc_n); v_acc_n := v_acc_n + v_dextra_bits;
+        while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
       end if;
+    else
+      v_sym := v_tok.val1;
+      v_nbits := v_litlen_lengths[v_sym+1];
+      v_code := v_litlen_codes[v_sym+1];
+      v_rev := archive._pq_bit_reverse(v_code, v_nbits);
+      v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
+      while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
     end if;
   end loop;
 
@@ -1391,13 +1467,23 @@ begin
   v_code := v_litlen_codes[257];
   v_rev := archive._pq_bit_reverse(v_code, v_nbits);
   v_acc := v_acc | (v_rev << v_acc_n); v_acc_n := v_acc_n + v_nbits;
-  while v_acc_n >= 8 loop v_bytes := array_append(v_bytes, v_acc & 255); v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; end loop;
+  while v_acc_n >= 8 loop v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1; v_acc := v_acc >> 8; v_acc_n := v_acc_n - 8; if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if; end loop;
 
-  if v_acc_n > 0 then v_bytes := array_append(v_bytes, v_acc & 255); end if;
+  if v_acc_n > 0 then
+    v_chunk := set_byte(v_chunk, v_chunk_pos, v_acc & 255); v_chunk_pos := v_chunk_pos + 1;
+    if v_chunk_pos = v_chunk_size then chunk := v_chunk; return next; v_chunk := v_chunk_empty; v_chunk_pos := 0; end if;
+  end if;
 
-  return (select decode(string_agg(lpad(to_hex(x), 2, '0'), '' order by ord), 'hex')
-          from unnest(v_bytes) with ordinality as t(x, ord));
+  if v_chunk_pos > 0 then
+    chunk := substr(v_chunk, 1, v_chunk_pos); return next;
+  end if;
+  return;
 end;
+$$;
+
+create or replace function archive._pq_deflate_encode_dynamic(payload bytea) returns bytea
+language sql as $$
+  select coalesce((select string_agg(chunk, ''::bytea) from archive._pq_deflate_encode_dynamic_chunks(payload)), ''::bytea);
 $$;
 
 -- Same RFC 1952 gzip container as archive._pq_gzip_compress, wrapping the dynamic-Huffman
