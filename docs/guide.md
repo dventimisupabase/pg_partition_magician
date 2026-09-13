@@ -10,6 +10,7 @@ see the [explainer](https://dventimisupabase.github.io/pg_partition_magician/).
 - [Install](#install)
 - [Transmute a table](#transmute-a-table)
 - [Run it](#run-it)
+- [Extend the grid past the lookahead ceiling](#extend-the-grid-past-the-lookahead-ceiling)
 - [Regrain the history](#regrain-the-history)
 - [Monitor](#monitor)
 - [Retain](#retain)
@@ -89,7 +90,9 @@ per table:
   partition. Pure catalog work: there is no `DEFAULT` to scan, so nothing is proven and nothing is moved.
   This is also pgpm's *only* protection against a write with nowhere to go, since a row outside the grid
   is refused rather than parked. `config.obtain x partition_step` is therefore both your slack if
-  maintenance stalls and a ceiling on how far ahead you may write.
+  maintenance stalls and a ceiling on how far ahead you may write. `pgpm.extend_to(parent, value)` is the
+  manual escape hatch when a write is going to land beyond that ceiling on purpose (see
+  [Extend the grid past the lookahead ceiling](#extend-the-grid-past-the-lookahead-ceiling)).
 - **retain**: drop partitions older than your policy.
 - **regrain** (optional): split the coarse monolith into finer partitions, on demand or paced across ticks.
 
@@ -322,6 +325,36 @@ Regrain's pace is set by `config.regrain_batch`, the rows copied per microbatch,
 `regrain_max_blocks` cap so wide rows cannot make one batch huge. It is a fixed rate you set, not one that
 reacts to load: regrain copies old, frozen data, so the work is bounded by the size of the coarse child
 rather than by your write rate, and you can size a batch from what your disk will absorb.
+
+## Extend the grid past the lookahead ceiling
+
+`obtain` keeps `config.obtain` partitions ahead of the frontier, and that lookahead is the only thing
+standing between a write and `no partition of relation ... found for row`. For `time`/`uuidv7`/`text_time`
+grids the frontier tracks the clock, so the ceiling advances predictably and rarely matters. An `id` grid's
+frontier is DATA-driven, and data can jump: a sequence restart or `setval`, a Snowflake or ULID generator
+whose ids are not dense, a bulk import or backfill carrying its own high ids. Once a write like that lands
+past the ceiling, there is no recovery -- the write that would advance the frontier is the write that fails.
+
+`pgpm.extend_to(p_parent, p_value, p_max default 10000)` is the relief valve: name a value you know is
+coming, and it builds every missing partition on the existing grid up to and including the one that would
+hold it, before you ever attempt the write.
+
+```sql
+-- a bulk import is about to carry ids up to 50000000, well past the current lookahead
+select pgpm.extend_to('public.events', '50000000');
+```
+
+`p_value` is in the control column's own representation: a bare id for `id`, a `uuid` literal (as text) for
+`uuidv7`, the encoded text id for `text_time`, anything `timestamptz` accepts for `time`. It never moves the
+frontier or touches data -- it only makes the future write legal -- and it is idempotent: partitions that
+already exist are left alone, and the return value is how many new ones it actually created.
+
+`p_max` bounds how many new partitions ONE call may create, checked up front before any are: a typo'd
+value that would need more than `p_max` is refused loudly, creating nothing, rather than silently stopping
+partway to the value you actually asked for. Raise `p_max` for a legitimately large jump.
+
+Extending forward is unrelated to your retention floor, so extending far ahead and then lowering `retain`
+can leave a wide grid above the frontier; that is harmless, just worth knowing.
 
 ## Regrain the history
 

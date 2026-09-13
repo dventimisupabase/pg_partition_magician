@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **`pgpm.extend_to(p_parent, p_value, p_max default 10000)` pre-extends the forward grid past
+  `obtain`'s lookahead ceiling (issue #290).** Since #288 removed the `DEFAULT` partition, `obtain`'s
+  `config.obtain x partition_step` lookahead is the only thing standing between a write and `no
+  partition of relation ... found for row`, and for an `id` grid the frontier is data-driven and can
+  jump past it with no recovery path: a sequence restart, a non-dense Snowflake/ULID generator, a
+  bulk import, a backfill. `extend_to` is the relief valve -- name a value you know is coming and it
+  builds every missing partition on the existing grid up to and including the one that would hold it,
+  without moving the frontier or touching data. It never partially extends: the number of new
+  partitions needed is checked up front, before any DDL, and a target needing more than `p_max`
+  (default 10000) is refused loudly rather than silently stopping short. Idempotent; returns how many
+  partitions it actually created.
+
 - **`set_regrain` now refuses a target step coarser than `partition_step` (issue #341).** Accepting
   one used to silently wedge auto-regrain forever: `maintain()`'s auto-regrain candidate query
   calls a child "coarse" whenever it is wider than one `partition_step` (hardcoded, not

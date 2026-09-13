@@ -529,6 +529,30 @@ concurrent `obtain` defers instead of interfering, and it reports failures throu
 than raising: `maintain` cannot wrap it in an exception handler, since transaction control is illegal
 below one.
 
+### `extend_to`
+
+```sql
+pgpm.extend_to(p_parent regclass, p_value text, p_max int default 10000) returns int
+```
+
+Builds every missing partition on the existing grid, from the current forward edge up to and including
+the one that would hold `p_value`, and returns how many it created. Manual and explicit, like `obtain`:
+`maintain` never calls it. It exists because `obtain`'s lookahead (`config.obtain x partition_step`) is a
+hard ceiling now that there is no `DEFAULT`, and an `id` grid's frontier is data-driven and can jump past
+it -- a sequence restart, a non-dense Snowflake/ULID generator, a bulk import, a backfill -- with no way to
+recover, since the write that would advance the frontier past the ceiling is the write that fails.
+
+`p_value` is in the control column's own representation: a bare id for `id`, a `uuid` literal (as text)
+for `uuidv7`, the encoded text id for `text_time`, anything `timestamptz` accepts for `time`. It is decoded
+the same way `_frontier_native` decodes `max(control)`, so a caller passes exactly what it would insert.
+
+It never moves the frontier or touches data, only creates empty partitions, and is idempotent: partitions
+that already exist (or overlap an attached one, like the monolith) are left alone. `p_max` bounds how many
+NEW partitions one call may create, checked with a dry count before any DDL runs, so a wildly-off
+`p_value` is refused loudly and immediately -- creating nothing -- rather than silently stopping `p_max`
+partitions short of the value actually asked for. Like `obtain`, it stops (here, raises) if the next grid
+boundary cannot be expressed (the `uuidv7`/`text_time` ceilings described above).
+
 ### `retain`
 
 ```sql
