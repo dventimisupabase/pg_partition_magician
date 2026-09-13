@@ -73,9 +73,14 @@ services:
   # pg15-18 matrix images stay exactly as they were. test.sh's own one-off `docker run --network`
   # calls (for MinIO bucket setup via the mc client, which has no service of its own) rely on the
   # network name pinned below rather than guessing Compose's auto-generated one.
+  #
+  # Pulled from quay.io, not Docker Hub: minio/minio on Docker Hub now returns "pull access denied,
+  # repository does not exist or may require 'docker login'" for an unauthenticated pull, reproduced
+  # both on GitHub-hosted runners and locally, so it is not a per-runner rate limit. quay.io/minio/minio
+  # is MinIO's own maintained mirror and still pulls anonymously.
   minio:
     profiles: ["archive"]
-    image: minio/minio
+    image: quay.io/minio/minio
     container_name: pgpm_test-archive-minio
     environment:
       MINIO_ROOT_USER: minioadmin
