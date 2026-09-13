@@ -17,7 +17,8 @@ and manages the whole lifecycle:
   (see [the guide](docs/guide.md#the-cutover-moves-no-rows)). What it does cost is a write ceiling for the
   scan's duration: writes outside the certified bound are rejected outright, not queued. Reversible with
   **`untransmute`** until the history outgrows the monolith.
-- **`obtain`**: keep N partitions ahead of the write frontier.
+- **`obtain`**: keep N partitions ahead of the write frontier. **`extend_to`**: pre-extend the grid past
+  that lookahead to cover a known future value (an `id` grid that jumped ahead of the ceiling, say).
 - **`regrain`**: split the monolith into fine partitions on demand, by **copying** (no dead tuples, no
   vacuum). Optional, a coarse monolith is a correct permanent state.
 - **`retain`**: drop partitions past a policy. Set `config.archive_fn` to a resumable archive
@@ -30,9 +31,10 @@ The schema is `pgpm`. Think "a slice of `pg_partman`, installable as plain SQL."
 Two caveats, both covered in the [guide](docs/guide.md). There is **no `DEFAULT` partition**: `obtain`
 keeps a grid of real partitions ahead of the write frontier, and a write beyond that grid is *refused*
 rather than parked somewhere. `config.obtain x partition_step` is therefore both your slack if maintenance
-stalls and a ceiling on how far ahead you may write. And **incoming foreign keys** are preserved, not
-ignored (`transmute` never rewrites your key; `p_incoming_fks => 'preserve'` re-adds each one once the
-table is quiescent).
+stalls and a ceiling on how far ahead you may write -- if you know a value is coming that jumps past it
+(a sequence restart, a bulk import carrying its own ids), call `pgpm.extend_to(parent, value)` to build the
+grid out to cover it ahead of time. And **incoming foreign keys** are preserved, not ignored (`transmute`
+never rewrites your key; `p_incoming_fks => 'preserve'` re-adds each one once the table is quiescent).
 
 ## Why it exists
 

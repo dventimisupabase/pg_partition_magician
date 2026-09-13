@@ -740,6 +740,91 @@ begin
 end;
 $$;
 
+-- extend_to(): pre-extend the forward grid to cover a known future value (issue #290).
+--
+-- obtain() is pgpm's ONLY defence against a write with nowhere to go, and its lookahead
+-- (config.obtain x partition_step) is a hard ceiling since the DEFAULT partition is gone (#288). That
+-- ceiling is fine for `time`/`uuidv7`/`text_time` grids, whose frontier is wall-clock driven and advances
+-- predictably, but an `id` grid's frontier is DATA-driven and can jump arbitrarily (a sequence restart, a
+-- non-dense Snowflake/ULID generator, a bulk import, a backfill) -- and the write that would advance the
+-- frontier past the ceiling is the write that fails, permanently, with no recovery path. extend_to is the
+-- relief valve: an operator or application names a value it KNOWS is coming, and pgpm builds every
+-- missing partition on the existing grid up to and including the range that would hold it. It never moves
+-- the frontier or touches data -- it only makes a future write legal.
+--
+-- p_value is in the CONTROL COLUMN's own representation (a uuid literal, a text_time id, a bigint id, a
+-- timestamptz-parseable string) -- decoded the same way pgpm._frontier_native decodes max(control), so a
+-- caller passes exactly what it would have inserted.
+--
+-- p_max caps how many NEW partitions this call may create. The check runs BEFORE any DDL: a wildly-off
+-- p_value (a typo, an off-by-a-few-zeros id) is refused loudly and immediately, creating nothing, rather
+-- than silently truncated to p_max partitions short of the requested value -- the house rule about not
+-- trading a loud failure for a silent one.
+create or replace function pgpm.extend_to(p_parent regclass, p_value text, p_max int default 10000)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_rel name;
+  v_native text; v_target_lo text;
+  v_frontier text; v_lo text; v_hi text; v_name name;
+  v_needed int := 0; v_made int := 0;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  v_native := pgpm._decode(cfg.control_kind, p_value,
+                cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+  v_target_lo := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_native);
+
+  v_frontier := pgpm._frontier_native(p_parent);
+  v_lo       := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
+
+  -- count-only dry run: how many grid steps stand between the current forward edge and the target.
+  -- Deliberately ignorant of which of those already exist (a conservative, cheap upper bound) -- the
+  -- point is refusing BEFORE touching the catalog, not computing the tightest possible cap.
+  while pgpm._native_gt(cfg.control_kind, v_target_lo, v_lo) loop
+    v_lo := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
+    v_needed := v_needed + 1;
+    exit when v_needed > p_max;
+  end loop;
+  if v_needed > p_max then
+    raise exception 'pg_partition_magician: extend_to(%, %) would need more than % new partitions to reach it; refusing rather than partially extending (raise p_max, or check p_value for a typo)',
+      p_parent, p_value, p_max;
+  end if;
+
+  v_lo := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_frontier);
+  loop
+    v_hi := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_lo);
+    -- the grid can run out (#299): a uuidv7 grid stops at the 48-bit ceiling. obtain() exits quietly
+    -- there because its lookahead is opportunistic, but here the caller named a specific value it needs
+    -- covered, so silence would hide a real failure -- raise instead.
+    begin
+      perform pgpm._encode(cfg.control_kind, v_hi,
+                            cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
+    exception when datetime_field_overflow or numeric_value_out_of_range then
+      raise exception 'pg_partition_magician: extend_to(%, %) reaches the % grid''s ceiling before covering it; cannot extend that far',
+        p_parent, p_value, cfg.control_kind;
+    end;
+    v_name := pgpm._part_name(v_rel, cfg.control_kind, cfg.partition_step, v_lo, v_hi);
+    if to_regclass(format('%I.%I', v_nsp, v_name)) is null
+       and not exists (
+         select 1 from pgpm.part p
+          where p.parent_table = p_parent and p.attached
+            and pgpm._native_gt(cfg.control_kind, p.hi, v_lo)
+            and pgpm._native_gt(cfg.control_kind, v_hi, p.lo))
+    then
+      perform pgpm._create_partition(cfg, v_nsp, v_rel, null, v_name, v_lo, v_hi);
+      v_made := v_made + 1;
+    end if;
+    exit when not pgpm._native_gt(cfg.control_kind, v_target_lo, v_lo);
+    v_lo := v_hi;
+  end loop;
+
+  return v_made;
+end;
+$$;
+
 -- drain_step / drain_all removed with the DEFAULT partition (#288). With a complete forward grid there
 -- is nothing for a row to land in except a real partition, so there is nothing to evacuate.
 

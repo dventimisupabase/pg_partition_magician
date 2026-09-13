@@ -221,8 +221,16 @@ succeed unless you actually want that data kept.
    select jobname, active from cron.job where jobname like 'pgpm%';
    ```
 
-2. If maintenance is healthy and you simply need more headroom, raise the lookahead. It is cheap:
-   partitions are empty and creating one is pure catalog work.
+2. If maintenance is healthy and you know the specific value that needs covering (a bulk import's high
+   ids, say), extend the grid directly to it. It is cheap: partitions are empty and creating one is pure
+   catalog work, and it is bounded up front (`p_max`, default 10000) so a typo'd value is refused loudly
+   rather than silently building far more than you meant:
+
+   ```sql
+   select pgpm.extend_to('public.events', '50000000');
+   ```
+
+   If you just want more general headroom rather than a specific known value, raise the lookahead instead:
 
    ```sql
    update pgpm.config set obtain = 90 where parent_table = 'public.events'::regclass;
