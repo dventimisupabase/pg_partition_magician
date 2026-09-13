@@ -361,7 +361,9 @@ run_archive() {
     docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1 && break
     sleep 1
   done
-  docker run --rm --network "$net" --entrypoint sh minio/mc -c \
+  # quay.io, not Docker Hub: minio/mc hit the same "pull access denied" break as the minio/minio
+  # server image did (docker-compose.yml), for the same reason -- see the comment there.
+  docker run --rm --network "$net" --entrypoint sh quay.io/minio/mc -c \
     "mc alias set local http://minio:9000 minioadmin minioadmin && mc mb -p local/archive-test-bucket" >/dev/null
 
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
