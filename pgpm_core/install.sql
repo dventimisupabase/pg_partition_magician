@@ -3465,12 +3465,37 @@ drop function if exists pgpm.feathering_validation(regclass, interval, interval)
 -- bigint step as text for id) turns it on: each maintenance tick feathers the oldest frozen coarse child
 -- one budget-sized microbatch toward that granularity. null turns it off (regrain stays operator-driven via
 -- regrain()/regrain_history()). This only PACES regraining across ticks; regrain_step enforces its own
--- preconditions (frozen, default-clear), so enabling it is always safe.
+-- preconditions (frozen, default-clear), so enabling it is always safe -- PROVIDED p_target_step is no
+-- coarser than partition_step (issue #341, see the guard below).
 create or replace function pgpm.set_regrain(p_parent regclass, p_target_step text default null)
 returns void language plpgsql as $$
+declare
+  cfg pgpm.config;
 begin
-  update pgpm.config set regrain_to = p_target_step where parent_table = p_parent;
+  select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+
+  -- #341: a p_target_step COARSER than partition_step makes progress once, then wedges forever.
+  -- maintain()'s auto-regrain candidate query calls a child "coarse" whenever it is wider than one
+  -- partition_step, but regrain_step's own 'nosubdiv' guard refuses to split a child already at (or
+  -- narrower than) p_target_step. Once a coarse child is split down to a regrain_to wider than
+  -- partition_step, it is still "coarse" by the candidate query's definition, so every later tick
+  -- reselects that same unsplittable child and makes no further progress -- silently, forever.
+  -- Reject it here instead, at call time. Equal-or-finer stays allowed, matching every existing call
+  -- site. partition_anchor is on-grid for ANY step (grid_floor(anchor, step, anchor) = anchor), so
+  -- it is a safe shared point to compare the two steps' widths without a specific child row.
+  if p_target_step is not null and pgpm._native_gt(
+       cfg.control_kind,
+       pgpm._grid_next(cfg.control_kind, p_target_step, cfg.partition_anchor),
+       pgpm._grid_next(cfg.control_kind, cfg.partition_step, cfg.partition_anchor))
+  then
+    raise exception
+      'pg_partition_magician: regrain target step % is coarser than partition_step % for % -- '
+      'this would wedge auto-regrain permanently; use regrain()/regrain_history() for a one-off '
+      'hierarchical split instead', p_target_step, cfg.partition_step, p_parent;
+  end if;
+
+  update pgpm.config set regrain_to = p_target_step where parent_table = p_parent;
 end;
 $$;
 

@@ -360,6 +360,12 @@ child toward the target step, sized by `config.regrain_batch`. It is off by defa
 (`set_regrain(parent, null)` turns it back off) and always safe to enable: it only paces regraining; it
 never starts on a child that is not frozen.
 
+`set_regrain` refuses a target step **coarser** than `partition_step`: that combination makes progress once
+and then wedges auto-regrain forever, with no error, since the resulting child is still "coarse" by the
+candidate query's definition but no longer subdividable toward the (coarser) target. Equal-or-finer targets
+are unrestricted. For a genuinely hierarchical split (monolith to yearly to monthly, to bound transient
+disk), drive it by hand with `pgpm.regrain()`/`regrain_history()` instead -- those stay fully general.
+
 Regrain **copies**; it never deletes from the source. The coarse child stays whole and attached until one
 atomic swap detaches it, attaches the fine children, and drops it. So a regrain -- the
 paced, cross-tick auto-regrain included -- never undercounts: every row stays visible in the monolith the
