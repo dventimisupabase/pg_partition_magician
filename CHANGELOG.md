@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **`set_regrain` now refuses a target step coarser than `partition_step` (issue #341).** Accepting
+  one used to silently wedge auto-regrain forever: `maintain()`'s auto-regrain candidate query
+  calls a child "coarse" whenever it is wider than one `partition_step` (hardcoded, not
+  `regrain_to`), while `regrain_step`'s own `'nosubdiv'` guard refuses to split a child already at
+  (or narrower than) the configured target. With `regrain_to` coarser than `partition_step`, a
+  coarse child got split down to `regrain_to`-wide pieces exactly once; those pieces were still
+  wider than `partition_step`, so the candidate query kept reselecting the same now-unsplittable
+  child every tick, forever, with nothing raised and no log signal beyond the routine no-progress
+  status. `set_regrain` now rejects a coarser target at call time instead. Equal-or-finer targets
+  are unaffected -- every existing call site in this repo (`README.md`, `docs/guide.md`,
+  `docs/runbook.md`, all five tests, all three bench scripts) already passes one. The one-off
+  manual functions, `pgpm.regrain()` and `pgpm.regrain_history()`, are untouched and remain fully
+  general: `docs/runbook.md`'s disk-pressure workflow deliberately regrains to a step coarser than
+  the final grid through those, and it is single-shot, not a perpetual tick loop, so it never hits
+  this failure mode.
+
 ## [0.4.0] - 2026-09-08
 
 **Upgrading in place? Read this first.** This release adds `config.archive_batch`, backfilled onto
