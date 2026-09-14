@@ -7,20 +7,53 @@
 #
 # THE QUESTION. regrain_step's swap runs `suspend_incoming_fks` -> DETACH -> a reconcile backstop
 # -> the attach loop -> drop the old coarse child -> `restore_incoming_fks`, all in ONE
-# transaction, all while the DETACH's ACCESS EXCLUSIVE is held on the WHOLE managed parent (every
-# partition, not just the child being split -- wider blast radius than transmute's cutover, which
-# locks only the one table being converted). `restore_incoming_fks` runs inside that same
-# transaction *deliberately* (install.sql:2253-2257: "so no other session ever observes RI off"),
-# unlike transmute's incoming-FK handling, which tolerates a visible window and restores on a
-# later tick. This measures whether that cost is large enough to justify a lower-blast-radius
-# redesign -- it does NOT pre-suppose one, and deferring restore_incoming_fks to a later tick
-# (copying transmute's pattern) would reintroduce exactly the gap this design avoids; see the
-# comment above for why that is not "just" a fix.
+# transaction. Only DETACH onward runs under the parent's own ACCESS EXCLUSIVE (every partition,
+# not just the child being split -- wider blast radius than transmute's cutover, which locks only
+# the one table being converted): `suspend_incoming_fks` runs BEFORE the DETACH and takes nothing
+# stronger than ACCESS SHARE on the parent itself, confirmed directly (a plain SELECT/INSERT
+# against the parent completed instantly while an earlier version of this script's probe sat
+# blocked inside `suspend_incoming_fks` -- that version wrongly contended the referencing table
+# before the swap call even started, which only delays how soon the real locked window begins,
+# and never blocks any other session's access to the parent itself). So the number worth
+# measuring is contention landing DURING the actually-locked window -- DETACH through
+# `restore_fk` -- not before it. `restore_incoming_fks` runs inside that locked window
+# *deliberately* (install.sql:2253-2257: "so no other session ever observes RI off"), unlike
+# transmute's incoming-FK handling, which tolerates a visible window and restores on a later
+# tick. This measures whether that cost is large enough to justify a lower-blast-radius redesign
+# -- it does NOT pre-suppose one, and deferring restore_incoming_fks to a later tick (copying
+# transmute's pattern) would reintroduce exactly the gap this design avoids.
 #
 # restore_incoming_fks's re-add is deliberately NOT VALID (install.sql:4513-4526; VALIDATE is left
 # to a later maintain() tick), so its cost here is a metadata-only ADD CONSTRAINT, not a scan --
 # the number worth measuring is LOCK WAIT under contention on the referencing table, not a
 # row-count-scaling cost. That is what the contended/uncontended matrix below is for.
+#
+# HOW THE CONTENDED CASE LANDS ITS CONTENTION IN THE RIGHT WINDOW, DETERMINISTICALLY. A first
+# version of this script tried to catch the moment by having a second session poll pg_locks for
+# the parent's own ACCESS EXCLUSIVE lock (which appears the instant DETACH runs) and race to grab
+# the referencing table's lock before restore_fk got there. That race was lost consistently, even
+# after eliminating every avoidable source of latency (warming up the poll query's plan cache,
+# pre-warming the lock acquisition itself): actually acquiring a fresh ACCESS EXCLUSIVE table lock
+# measured ~13-40ms in this environment, comfortably larger than the whole detach-to-restore_fk
+# window for any realistic (small) fine-child count. Widening the fixture to thousands of fine
+# children did make the race winnable, but for the wrong reason -- it turned out to make
+# `restore_incoming_fks`'s own "gate 2" preamble (a pg_class scan whose cost grows with existing
+# partition count) and Postgres's own per-partition ATTACH overhead so slow on their own that the
+# *uncontended* baseline already exceeded the "was this actually contended?" threshold. That would
+# have been a false-positive result reported with confidence -- exactly the passing-for-the-
+# wrong-reason failure mode this project's CLAUDE.md warns about, just surfacing in a measurement
+# script rather than a guard.
+#
+# The fix is to not race at all. `suspend_incoming_fks` only touches `pgpm.dropped_fk` rows with
+# `restored_at IS NOT NULL` (currently-restored FKs); `restore_incoming_fks` only touches rows
+# with `restored_at IS NULL` (not yet restored). So one FK -- the LAST one processed -- is
+# deliberately left (or put back) in the "not yet restored" state before the swap ever starts:
+# `suspend_incoming_fks` will never touch its referencing table at all (it isn't in the restored
+# set), so a lock pre-acquired on it, before the swap call even begins, is *structurally*
+# incapable of contending `suspend_fk` -- and `restore_incoming_fks` WILL try to re-add exactly
+# that FK, later, from inside the real locked window, and queue behind the pre-held lock. No
+# timing, no polling, no race: the isolation is guaranteed by which processing set each function
+# reads from, not by which statement happens to run faster.
 #
 # FIXTURE GOTCHA (read before changing this script): suspend_incoming_fks/restore_incoming_fks
 # operate on pgpm.dropped_fk rows, not on pg_constraint generically. An FK added directly on the
@@ -106,6 +139,13 @@ bucketed as (
       when query ~* '^alter table .*attach partition .*for values'
         or query ~* 'drop constraint .*_ck'                                             then 'attach_loop'
       when query ~* '^alter table .*add constraint .*foreign key.*not valid'            then 'restore_fk'
+      -- restore_incoming_fks's OWN "gate 2" preamble (install.sql ~4463-4479: is any not-yet-
+      -- attached child in flight?) scans pg_class filtering by partition-name pattern -- a plain
+      -- SELECT, not matched by any DDL pattern above, so it fell into `other` uncategorized.
+      -- Found by diagnosing why `other` grew with fine-child count even after excluding every
+      -- other nested-wrapper row: it is O(existing partitions), same shape as attach_loop's own
+      -- scaling, and belongs to restore_fk's own cost, not a mystery residual.
+      when query ~* '^select c\.relname\s+from pg_class c'                              then 'restore_fk'
       -- suspend_fk's drop is on the REFERENCING table, generic name (no _ck suffix); the
       -- attach loop's constraint drop above is matched first and always ends in _ck, so this
       -- catches only the FK suspend.
@@ -132,12 +172,32 @@ SQL
 run_case() {
   local label="$1" rows="$2" n_fk="$3" contended="$4"
   local DB="${DBPFX}_${label}"
-  local target_step=$(( rows / 5 ))
-  local transmute_step=$(( target_step * 6 ))   # 6 sub-ranges: 5 hold data, 1 trailing empty
-  local batch=$(( target_step / 3 ))
+  # A "handful" of fine children, per the issue's own fixture spec -- realistic, not inflated.
+  # Kept the SAME for both contended and uncontended: the contended case no longer needs a wider
+  # window (see header), so there is no reason for its fixture to differ and every reason not to
+  # (a different fixture size would make the two numbers harder to compare).
+  local n_fine=${N_FINE:-10}
+  local target_step=$(( rows / n_fine ))
+  local transmute_step=$(( target_step * (n_fine + 1) ))   # +1 sub-range: trailing, empty
+  # batch must be STRICTLY greater than target_step: regrain_step only advances the cursor past a
+  # sub-range when a tick copies FEWER rows than its batch (`v_moved < v_batch`), so batch ==
+  # target_step exactly needs two ticks per sub-range (the first copies exactly batch and does not
+  # advance, the second finds nothing left and does) -- caught by a run where the setup loop
+  # exceeded its cap needing ~2x the expected tick count.
+  local batch=$(( target_step + 1 ))
 
-  docker exec "$C" psql -U postgres -q -c "drop database if exists $DB" >/dev/null 2>&1
-  docker exec "$C" psql -U postgres -q -c "create database $DB" >/dev/null 2>&1
+  # Terminate any lingering connection before dropping: a prior run's blocker session (backgrounded,
+  # not always fully closed by the time its script exits) can keep a DROP DATABASE from succeeding,
+  # and the DROP's own errors were being silently swallowed -- which means a rerun could silently
+  # operate against a STALE database from an earlier, unrelated attempt instead of a fresh one.
+  # Caught exactly this way: a stale run's leftover fine-child tables tripped
+  # restore_incoming_fks's own "in-flight child" gate and made it return early with no error.
+  docker exec "$C" psql -U postgres -qtA -c "select pg_terminate_backend(pid) from pg_stat_activity where datname = '$DB'" >/dev/null 2>&1
+  sleep 0.2
+  docker exec "$C" psql -U postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $DB" \
+    || { echo "FATAL: could not drop database $DB (stale connection?)"; exit 1; }
+  docker exec "$C" psql -U postgres -v ON_ERROR_STOP=1 -q -c "create database $DB" \
+    || { echo "FATAL: could not create database $DB"; exit 1; }
   docker exec "$C" psql -U postgres -d "$DB" -v ON_ERROR_STOP=1 -q -f "$INSTALL" >/dev/null
   q "create extension if not exists pg_stat_statements" >/dev/null
 
@@ -149,6 +209,12 @@ run_case() {
       echo "create table public.rgt_ref_$i (id int primary key, rgt_id bigint references public.rgt(id));"
       echo "insert into public.rgt_ref_$i select g, g from generate_series(1,1000) g;"
     done
+    if [ "$contended" = "1" ]; then
+      # see below: a hidden extra FK, not part of N_INCOMING_FK, that exists purely so
+      # suspend_incoming_fks always has something to suspend in this swap.
+      echo "create table public.rgt_ref_trigger (id int primary key, rgt_id bigint references public.rgt(id));"
+      echo "insert into public.rgt_ref_trigger select g, g from generate_series(1,1000) g;"
+    fi
   } | docker exec -i "$C" psql -U postgres -d "$DB" -q -v ON_ERROR_STOP=1 -f - >/dev/null
 
   q "vacuum analyze public.rgt" >/dev/null
@@ -158,6 +224,33 @@ run_case() {
     echo "FATAL: transmute failed for case '$label':"; cat /tmp/rgt_bench_${label}.log; exit 1
   fi
   q "select pgpm.restore_incoming_fks('public.rgt'::regclass)" >/dev/null
+
+  # CONTENDED ONLY: put the LAST FK (rgt_ref_$n_fk) back into the "not yet restored" state --
+  # actually drop its constraint (not just forge the bookkeeping row, which would make
+  # restore_incoming_fks's later re-add collide with a constraint that still exists) and clear
+  # its dropped_fk.restored_at. suspend_incoming_fks reads only restored_at IS NOT NULL rows, so
+  # it will never touch this one; restore_incoming_fks reads only restored_at IS NULL rows, so it
+  # WILL try to re-add this one, later, from inside the real locked window. This is what lets a
+  # lock pre-acquired before the swap even starts contend restore_fk specifically, with no race.
+  #
+  # rgt_ref_trigger stays normally restored throughout, on purpose: regrain_step's swap only
+  # calls restore_incoming_fks AT ALL when suspend_incoming_fks suspended at least one FK in that
+  # SAME call (`if v_fk > 0`, install.sql ~2289). For N_INCOMING_FK=1, holding back the only real
+  # FK left suspend_incoming_fks with nothing to do (v_fk=0), so restore_incoming_fks was never
+  # even called and the whole contended run silently measured nothing -- caught because the swap
+  # returned in ~8ms with no wait at all despite a "successful" precondition check. The trigger FK
+  # guarantees v_fk >= 1 regardless of N_INCOMING_FK, without being part of the reported count.
+  if [ "$contended" = "1" ]; then
+    local held_conname
+    held_conname=$(q "select constraint_name from pgpm.dropped_fk
+                        where parent_table = 'public.rgt'::regclass
+                          and referencing_table = 'public.rgt_ref_${n_fk}'::regclass")
+    qraw "alter table public.rgt_ref_${n_fk} drop constraint ${held_conname}" >/dev/null
+    qraw "update pgpm.dropped_fk set restored_at = null
+           where parent_table = 'public.rgt'::regclass
+             and referencing_table = 'public.rgt_ref_${n_fk}'::regclass" >/dev/null
+  fi
+
   # freeze the monolith: advance max(id) past its hi so the frontier's grid floor moves beyond it
   # (obtain's default forward grid, built by transmute above, already covers this id).
   q "insert into public.rgt values ($((transmute_step + 1)), 'frontier')" >/dev/null
@@ -178,7 +271,7 @@ run_case() {
        where parent_table = 'public.rgt'::regclass and attached and lo::numeric = 0;
       s := pgpm.regrain_step('public.rgt'::regclass, v_child, '$target_step', $batch);
       n := n + 1;
-      if n > 500 then raise exception 'regrain setup did not converge (last status: %)', s; end if;
+      if n > $((n_fine + 100)) then raise exception 'regrain setup did not converge (last status: %)', s; end if;
     end loop;
   end \$setup\$;" >/tmp/rgt_setup_${label}.log 2>&1
   if [ $? -ne 0 ]; then
@@ -188,16 +281,32 @@ run_case() {
   local v_child
   v_child=$(q "select child_name from pgpm.part where parent_table = 'public.rgt'::regclass and attached and lo::numeric = 0")
 
+  # PRECONDITION CHECK (contended only): confirm the fixture manipulation actually left things in
+  # the state the whole design depends on -- (n_fk-1) real FKs restored plus the trigger FK, so
+  # n_fk total restored, and exactly 1 not (the held-back real FK) -- before spending time on the
+  # timed call. A cheap, fast-failing sanity check rather than a confusing report.
+  if [ "$contended" = "1" ]; then
+    local restored_n unrestored_n
+    restored_n=$(q "select count(*) from pgpm.dropped_fk where parent_table='public.rgt'::regclass and restored_at is not null")
+    unrestored_n=$(q "select count(*) from pgpm.dropped_fk where parent_table='public.rgt'::regclass and restored_at is null")
+    if [ "$restored_n" != "$n_fk" ] || [ "$unrestored_n" != "1" ]; then
+      echo "FATAL: case '$label' -- fixture precondition failed (restored=$restored_n, unrestored=$unrestored_n,"
+      echo "expected restored=$n_fk, unrestored=1). The isolation this design depends on is not in place."
+      exit 1
+    fi
+  fi
+
   local BLOCKER=""
   if [ "$contended" = "1" ]; then
     docker exec "$C" psql -U postgres -d "$DB" -qtA \
       -c "set application_name = 'pgpm_swap_blocker'" \
-      -c "begin; select count(*) from public.rgt_ref_1; select pg_sleep(3); commit;" >/dev/null 2>&1 &
+      -c "begin; lock table public.rgt_ref_${n_fk} in access exclusive mode; select pg_sleep(3); commit;" \
+      >/tmp/rgt_blocker_${label}.log 2>&1 &
     BLOCKER=$!
     local HELD=false
     for _ in $(seq 1 50); do
       n=$(q "select count(*) from pg_locks l join pg_class c on c.oid = l.relation
-              where c.relname = 'rgt_ref_1' and l.granted
+              where c.relname = 'rgt_ref_${n_fk}' and l.granted
                 and l.pid = (select pid from pg_stat_activity where application_name = 'pgpm_swap_blocker')")
       if [ "${n:-0}" -ge 1 ]; then HELD=true; break; fi
       sleep 0.1
@@ -223,12 +332,29 @@ run_case() {
     exit 1
   fi
 
+  local BUCKET_OUT
+  BUCKET_OUT=$(docker exec "$C" psql -U postgres -d "$DB" -qtA -F'|' -c "$BUCKET_SQL")
+
+  # LIVENESS WITNESS: the isolation is guaranteed by construction (see header), but the CONTENTION
+  # itself still has to actually be observed, not assumed -- confirm restore_fk's measured time
+  # reflects having waited out the blocker's ~3s hold, rather than reporting a number that could,
+  # for some unrelated reason, have come back small anyway.
+  if [ "$contended" = "1" ]; then
+    local RESTORE_FK_MS
+    RESTORE_FK_MS=$(echo "$BUCKET_OUT" | awk -F'|' '$1 == "restore_fk" {print $2}')
+    if [ -z "$RESTORE_FK_MS" ] || ! awk -v v="${RESTORE_FK_MS:-0}" 'BEGIN{exit !(v > 1000)}'; then
+      echo "FATAL: contended case '$label' -- restore_fk's measured time (${RESTORE_FK_MS:-<missing>} ms)"
+      echo "does not reflect having waited out the blocker's ~3s hold on rgt_ref_${n_fk}."
+      exit 1
+    fi
+  fi
+
   echo
   echo "### $label (ROWS=$rows TARGET_STEP=$target_step N_INCOMING_FK=$n_fk contended=$contended)"
   echo
   echo "| bucket | ms | % of swap total |"
   echo "|---|---|---|"
-  docker exec "$C" psql -U postgres -d "$DB" -qtA -F'|' -c "$BUCKET_SQL" | while IFS='|' read -r bucket ms pct; do
+  echo "$BUCKET_OUT" | while IFS='|' read -r bucket ms pct; do
     [ -z "$bucket" ] && continue
     echo "| $bucket | $ms | $pct |"
   done
