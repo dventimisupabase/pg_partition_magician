@@ -1960,6 +1960,7 @@ declare
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
+  v_fk_ids bigint[];
   v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_i int; v_delta_name name; v_busy name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -2255,6 +2256,19 @@ begin
   -- THIS one transaction, so no other session ever observes RI off. force=true since the copy did not
   -- suspend; v_fk=0 means there was no live preserve-managed FK to drop -- either the table has none, or
   -- the conversion's drop has not been restored yet -- so leave the re-add to restore_incoming_fks.
+  --
+  -- #378: snapshot exactly which rows are about to be suspended, BEFORE suspending them, and pass
+  -- that exact set to restore_incoming_fks below -- not every not-yet-restored row for the parent.
+  -- Without this, a pre-existing "stale" FK (one this swap never suspended, e.g. left unrestored by
+  -- an earlier failed restore attempt) gets swept up by restore_incoming_fks's own "restore
+  -- everything unrestored" default, and re-adding it needs a FRESH lock on its referencing table,
+  -- taken while the managed parent is already under ACCESS EXCLUSIVE from the DETACH below -- so a
+  -- contended referencing table blocks every other session on the parent too. Scoping to what THIS
+  -- call suspended costs nothing (those tables' locks are already held by the suspend below, so
+  -- restoring them is never a fresh acquisition) and leaves the stale FK for the next tick's own
+  -- restore_incoming_fks call, exactly like the existing v_fk=0 case already does above.
+  select array_agg(id) into v_fk_ids from pgpm.dropped_fk
+   where parent_table = p_parent and restored_at is not null;
   v_fk := pgpm.suspend_incoming_fks(p_parent, true);
   execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
   -- #267: the correctness backstop. The DETACH above holds ACCESS EXCLUSIVE on the source, so no further
@@ -2285,8 +2299,9 @@ begin
   end if;
   -- re-add the FK(s) this swap dropped, against the new parent (the copies now hold every key). Only if WE
   -- dropped them (v_fk > 0): v_fk = 0 means there was nothing live to drop, so there is nothing here to put
-  -- back -- restore_incoming_fks owns any FK still suspended from the conversion.
-  if v_fk > 0 then perform pgpm.restore_incoming_fks(p_parent); end if;
+  -- back -- restore_incoming_fks owns any FK still suspended from the conversion. Scoped to v_fk_ids (#378):
+  -- exactly what was snapshotted above, before the suspend -- not every not-yet-restored row for the parent.
+  if v_fk > 0 then perform pgpm.restore_incoming_fks(p_parent, v_fk_ids); end if;
   update pgpm.config set regrain_cursor = null where parent_table = p_parent;
   insert into pgpm.log (parent_table, action, lo, hi, rows, method) values (p_parent, 'regrain', v_lo, v_hi, v_made, 'copy_swap_drop');
   return 'swapped:' || v_made;
@@ -4439,14 +4454,21 @@ end $$;
 -- surfaced via status().fks_unvalidated -- rather than rolling the re-add back into a permanent silent
 -- brick. Returns the number re-added; 0 (a no-op) while a regrain copy-child is still unattached, so
 -- `maintain` can call it every tick and it acts only when the table is ready.
-create or replace function pgpm.restore_incoming_fks(p_parent regclass)
+-- p_ids (#378): restricts the re-add to specific pgpm.dropped_fk rows, instead of every
+-- not-yet-restored row for the parent. Used by regrain_step's swap, which snapshots exactly which
+-- rows it is about to suspend and passes that exact set here, so a pre-existing "stale" unrestored
+-- FK (one this swap never touched via suspend_incoming_fks) is left for the next tick's own,
+-- unscoped call instead of being swept up under the swap's own lock. null (the default) preserves
+-- today's "restore everything unrestored for this parent" behavior for every other caller.
+create or replace function pgpm.restore_incoming_fks(p_parent regclass, p_ids bigint[] default null)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_closed bigint; v_inflight name;
   r pgpm.dropped_fk%rowtype; v_n int := 0; v_is_part boolean; v_readded boolean;
 begin
   if not exists (select 1 from pgpm.dropped_fk
-                  where parent_table = p_parent and restored_at is null) then
+                  where parent_table = p_parent and restored_at is null
+                    and (p_ids is null or id = any(p_ids))) then
     return 0;
   end if;
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -4487,7 +4509,9 @@ begin
   -- pgpm.incoming_fk_orphans() and cleared with pgpm.validate_incoming_fks() once the operator removes
   -- them. The recorded definition already names the parent (captured before the rename).
   for r in select * from pgpm.dropped_fk
-            where parent_table = p_parent and restored_at is null order by id loop
+            where parent_table = p_parent and restored_at is null
+              and (p_ids is null or id = any(p_ids))
+            order by id loop
     v_is_part := (select relkind from pg_class where oid = r.referencing_table) = 'p';
     v_readded := false;
     begin

@@ -5,6 +5,16 @@
 # MEASUREMENT ONLY: prints numbers and exits 0 as long as it completed. Not wired into
 # `./test.sh perf`/`discriminate` -- there is no known-good threshold to assert against.
 #
+# POST-#378 STATUS: the fix landed (regrain_step's swap now scopes its own restore_incoming_fks
+# call to exactly the FK(s) it suspended in that same call, install.sql, rather than opportunistically
+# restoring every not-yet-restored row for the parent). The contended case's fixture is unchanged
+# (a "held-back" FK, never suspended by this swap, with a lock pre-acquired on its referencing
+# table before the swap even starts) -- what changed is the expected outcome. Before the fix, this
+# showed restore_fk eating ~99% of swap duration; after, the swap never goes near that table at
+# all, so restore_fk should look just like the uncontended case despite the blocker's lock. The
+# liveness witness at the bottom of run_case asserts exactly that, and fails loudly on a
+# regression back to the old behavior.
+#
 # THE QUESTION. regrain_step's swap runs `suspend_incoming_fks` -> DETACH -> a reconcile backstop
 # -> the attach loop -> drop the old coarse child -> `restore_incoming_fks`, all in ONE
 # transaction. Only DETACH onward runs under the parent's own ACCESS EXCLUSIVE (every partition,
@@ -335,16 +345,23 @@ run_case() {
   local BUCKET_OUT
   BUCKET_OUT=$(docker exec "$C" psql -U postgres -d "$DB" -qtA -F'|' -c "$BUCKET_SQL")
 
-  # LIVENESS WITNESS: the isolation is guaranteed by construction (see header), but the CONTENTION
-  # itself still has to actually be observed, not assumed -- confirm restore_fk's measured time
-  # reflects having waited out the blocker's ~3s hold, rather than reporting a number that could,
-  # for some unrelated reason, have come back small anyway.
+  # LIVENESS WITNESS (post-#378 fix): regrain_step's swap now scopes its own restore_incoming_fks
+  # call to exactly the FK(s) it suspended in this same call (snapshotted before suspending), so
+  # the held-back FK on rgt_ref_${n_fk} -- never suspended by this swap, since it was already
+  # unrestored going in -- is never touched by the swap at all anymore. The blocker's lock on it
+  # should therefore have NO EFFECT: confirm restore_fk's measured time stays near its uncontended
+  # baseline despite the blocker holding a conflicting lock on it for ~3s. Before the fix, this
+  # same fixture showed restore_fk at ~99% of swap duration (the risk #378 asked about); after the
+  # fix, it should look just like the uncontended case, because the swap no longer goes near that
+  # table. Treat a jump back to the old behavior as FATAL, not a silent regression.
   if [ "$contended" = "1" ]; then
     local RESTORE_FK_MS
     RESTORE_FK_MS=$(echo "$BUCKET_OUT" | awk -F'|' '$1 == "restore_fk" {print $2}')
-    if [ -z "$RESTORE_FK_MS" ] || ! awk -v v="${RESTORE_FK_MS:-0}" 'BEGIN{exit !(v > 1000)}'; then
+    if [ -z "$RESTORE_FK_MS" ] || ! awk -v v="${RESTORE_FK_MS:-0}" 'BEGIN{exit !(v < 1000)}'; then
       echo "FATAL: contended case '$label' -- restore_fk's measured time (${RESTORE_FK_MS:-<missing>} ms)"
-      echo "does not reflect having waited out the blocker's ~3s hold on rgt_ref_${n_fk}."
+      echo "reflects having waited on the blocker's ~3s hold on rgt_ref_${n_fk} -- the swap should"
+      echo "never touch that table at all post-#378 fix. This looks like a regression back to the"
+      echo "pre-fix behavior, not the fix working."
       exit 1
     fi
   fi
