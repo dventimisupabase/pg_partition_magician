@@ -1233,11 +1233,17 @@ others are operator tools.
 ### `restore_incoming_fks`
 
 ```sql
-pgpm.restore_incoming_fks(p_parent regclass) returns int
+pgpm.restore_incoming_fks(p_parent regclass, p_ids bigint[] default null) returns int
 ```
 
 Re-adds each dropped preserve-managed FK against the new parent, returning the number re-added. Self-gates
 on quiescence: a no-op while an in-flight, not-yet-attached regrain child remains.
+
+`p_ids` restricts the re-add to specific `pgpm.dropped_fk.id` values instead of every not-yet-restored row
+for the parent. Operators calling this directly should leave it at the default (`null`, restore
+everything); it exists for `regrain_step`'s own swap, which passes the exact set of rows it just
+suspended so a pre-existing, unrelated unrestored FK is left for the next tick's unscoped call instead of
+being re-added under the swap's own lock (issue #378).
 
 It re-adds each FK `NOT VALID` and **stops there**. `NOT VALID` already enforces every *new* write, so
 referential integrity is live the moment this returns; only pre-existing rows are unverified, which
