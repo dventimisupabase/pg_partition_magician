@@ -83,8 +83,9 @@ leave you a backlog to discover later. The trade is that `config.obtain x partit
 slack if maintenance stalls and a ceiling on how far ahead you may write, so size it for your grid:
 30 steps is a month on a daily one.
 
-**The lifecycle (what maintenance does).** One scheduled procedure, `pgpm.maintain_all()`, drives these
-per table:
+**The lifecycle (what maintenance does).** Two scheduled procedures drive these per table:
+`pgpm.maintain_obtain_all()` runs obtain, on its own cadence so a slow step elsewhere never delays it;
+`pgpm.maintain_all()` runs the rest:
 
 - **obtain**: create up to N partitions ahead of the frontier, so live writes always land in a real
   partition. Pure catalog work: there is no `DEFAULT` to scan, so nothing is proven and nothing is moved.
@@ -297,25 +298,37 @@ row lands outside the monolith (the frontier crosses `B`) or you regrain it.
 
 ## Run it
 
-Schedule maintenance with `pgpm.schedule()`, a thin wrapper around `pg_cron` for the one job pgpm needs.
-It stays idle while the table is paused, so inspect with [`status()`](#monitor) first, then `resume`:
+Schedule maintenance with `pgpm.schedule()`, a thin wrapper around `pg_cron` for the two jobs pgpm needs.
+Both stay idle while the table is paused, so inspect with [`status()`](#monitor) first, then `resume`:
 
 ```sql
-select pgpm.schedule();                   -- one pg_cron job (every minute) drives maintain_all() for all tables
+select pgpm.schedule();                   -- two pg_cron jobs (every minute) drive maintain_all() and maintain_obtain_all()
 select * from pgpm.status();              -- looks right?
 select pgpm.resume('public.events');      -- go live
 ```
 
-`pgpm.schedule(p_every)` takes a `pg_cron` schedule (`'* * * * *'` every minute is the default;
-`'*/5 * * * *'` every 5 minutes; `'30 seconds'` for pg_cron's sub-minute syntax). pg_cron does not accept
-`'1 minute'`-style interval strings; minute cadence goes through cron syntax. It registers one job named
-`pgpm` that calls `maintain_all()` for every managed table in the current database, and re-running it
-updates the cadence in place. `pgpm.unschedule()` removes it. Run these from the database where `pg_cron`
-is installed. The raw equivalent is `cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')`.
+`pgpm.schedule(p_every, p_obtain_every)` takes two independent `pg_cron` schedules (`'* * * * *'` every
+minute is the default for both; `'*/5 * * * *'` every 5 minutes; `'30 seconds'` for pg_cron's sub-minute
+syntax). pg_cron does not accept `'1 minute'`-style interval strings; minute cadence goes through cron
+syntax. It registers a job named `pgpm` that calls `maintain_all()` (write-block, archive, retain,
+auto-regrain, FK restore/validate) on `p_every`, and a second job named `pgpm_obtain` that calls
+`maintain_obtain_all()` on its own `p_obtain_every` cadence -- so a slow archive/retain/regrain for one
+table can never delay obtain for another, since obtain is the one step where falling behind means a
+write is rejected outright rather than merely delayed. Re-running `schedule()` updates both cadences in
+place. `pgpm.unschedule()` removes both jobs (plus `pgpm_detach`, below). Run these from the database
+where `pg_cron` is installed. The raw equivalent is
+`cron.schedule('pgpm', '* * * * *', 'call pgpm.maintain_all()')` and
+`cron.schedule('pgpm_obtain', '* * * * *', 'call pgpm.maintain_obtain_all()')`.
 
-From there, each tick obtains ahead, archives and applies retention, restores any preserved incoming
-foreign key, and (if auto-regrain is on) advances one regrain microbatch. You can also transmute with `p_paused => false` to go
-live immediately and skip `resume`.
+**Upgrading from a version before this split:** if you already called `pgpm.schedule()` before
+upgrading, you must re-run it once to register the new `pgpm_obtain` job -- `maintain()` no longer
+obtains at all, so without it obtain silently stops running until the forward grid runs out and writes
+start failing. `maintain_all()` also logs a `warn_obtain_unscheduled` row to `pgpm.log` once per sweep
+as a backstop if you miss this.
+
+From there, one job's tick obtains ahead, the other's archives and applies retention, restores any
+preserved incoming foreign key, and (if auto-regrain is on) advances one regrain microbatch. You can
+also transmute with `p_paused => false` to go live immediately and skip `resume`.
 
 To convert and split a table synchronously (tests, one-shot migrations) instead of waiting for the paced
 cron, drive it by hand: `obtain` the forward partitions, then `regrain` the monolith once it has frozen

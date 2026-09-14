@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **`obtain` split out of `maintain()`/`maintain_all()` into its own procedure and its own `pg_cron`
+  job (issue #347).** `maintain_all()` loops over every managed table sequentially in one session,
+  calling `maintain()` for each; a slow `archive`/`retain`/`regrain_step` for one table used to delay
+  `obtain` for every table after it in the same tick, purely because of loop order. Every other step
+  degrades gracefully if delayed; only `obtain` turns "ran late" into "writes started failing," since
+  there is no `DEFAULT` partition (#288) to catch a write past the forward grid. `pgpm.maintain_obtain(p_parent,
+  inout p_status)` and `pgpm.maintain_obtain_all()` now carry `obtain` on their own, and
+  `pgpm.schedule()` takes a second, independent cadence parameter, `p_obtain_every` (default
+  unchanged), registering a new `pgpm_obtain` job alongside the existing `pgpm` and `pgpm_detach`
+  ones; `pgpm.unschedule()` removes all three. `pgpm.obtain()` itself, and `maintain_all()`'s
+  structure, are untouched. `maintain()`'s returned status string no longer includes `obtained=`
+  (unchanged: `pgpm.log`'s `obtain`/`skip_obtain` action values, which now originate from
+  `maintain_obtain()` instead).
+  **Upgrade hazard:** `schedule()` is operator-invoked, never automatic -- an installation that
+  already called it before upgrading past this change will NOT pick up the new `pgpm_obtain` job on
+  its own, and `obtain` will silently stop running until the forward grid runs out and writes start
+  failing. **Anyone with an existing `pgpm.schedule()` must re-run it after upgrading.**
+  `maintain_all()` also logs a `warn_obtain_unscheduled` row to `pgpm.log` once per sweep as a
+  backstop for anyone who misses this. (tests/31, tests/78)
+
 - **`pgpm.set_obtain(p_parent, p_obtain)` and `pgpm.set_retain(p_parent, p_retain default null)`
   (issue #326).** `obtain`/`retain` were settable only at `transmute` time; changing either
   afterward meant a raw `update pgpm.config`, with no validation and no test coverage -- the only
