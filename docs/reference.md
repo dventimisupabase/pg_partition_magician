@@ -1080,6 +1080,35 @@ step as text for id) lets each `maintain` tick feather the oldest frozen coarse 
 toward that granularity; `null` turns it off (regrain stays operator-driven). Enabling it is always safe:
 `regrain_step` enforces its own preconditions, so an un-meetable tick simply retries.
 
+### `set_obtain`
+
+```sql
+pgpm.set_obtain(p_parent regclass, p_obtain int) returns void
+```
+
+Change `config.obtain`, the number of partitions `obtain` keeps built ahead of the write frontier.
+Refuses a negative `p_obtain`: `obtain`'s lookahead loop (`for k in 0 .. cfg.obtain`) simply never runs
+when `cfg.obtain` is negative, so a negative value would silently and permanently disable lookahead
+with nothing raised. `0` is allowed (no lookahead beyond the partition the frontier is already in).
+
+### `set_retain`
+
+```sql
+pgpm.set_retain(p_parent regclass, p_retain text default null) returns void
+```
+
+Change `config.retain`, the retention horizon `retain()` drops partitions past (`null` = keep forever).
+`p_retain` is validated against `control_kind` the same way `transmute` does: `numeric` for `id`, an
+interval for `time`/`uuidv7`/`text_time`.
+
+`retain` is the destructive knob -- it decides what gets `DROP`ped -- so `set_retain` **refuses**,
+rather than warns, whenever the new value would make the very next `retain()` tick drop a partition
+the *old* value still kept. The check compares `_retain_boundary` under the current config against
+the same function with `p_retain` substituted in, before writing anything. Loosening (a larger
+interval/count, or `null`) can never trip it: a wider horizon only ever keeps a superset of what a
+narrower one kept. A tighter value that happens to grid-floor to the same boundary as before (nothing
+newly eligible) is also allowed -- the refusal is about what would actually drop, not the raw number.
+
 ## Observability
 
 ### `status`

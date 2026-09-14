@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **`pgpm.set_obtain(p_parent, p_obtain)` and `pgpm.set_retain(p_parent, p_retain default null)`
+  (issue #326).** `obtain`/`retain` were settable only at `transmute` time; changing either
+  afterward meant a raw `update pgpm.config`, with no validation and no test coverage -- the only
+  other `update pgpm.config set obtain/retain...` anywhere was the internal backoff writer.
+  `set_obtain` refuses a negative `p_obtain`, which would otherwise silently and permanently disable
+  lookahead (`obtain`'s `for k in 0 .. cfg.obtain` loop never runs when `cfg.obtain < 0`). `set_retain`
+  validates `p_retain`'s shape against `control_kind` the same way `transmute` does (`numeric` for
+  `id`, an interval otherwise), and -- since `retain` is the destructive knob that decides what
+  `retain()` `DROP`s -- **refuses**, not merely warns, whenever the new value would make the very
+  next `retain()` tick drop a partition the *old* value still kept. Loosening (a bigger
+  interval/count, or `null` = keep forever) can never trip that refusal. (tests/97, tests/98)
+
 - **`pgpm.extend_to(p_parent, p_value, p_max default 10000)` pre-extends the forward grid past
   `obtain`'s lookahead ceiling (issue #290).** Since #288 removed the `DEFAULT` partition, `obtain`'s
   `config.obtain x partition_step` lookahead is the only thing standing between a write and `no

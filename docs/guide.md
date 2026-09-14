@@ -356,6 +356,10 @@ partway to the value you actually asked for. Raise `p_max` for a legitimately la
 Extending forward is unrelated to your retention floor, so extending far ahead and then lowering `retain`
 can leave a wide grid above the frontier; that is harmless, just worth knowing.
 
+To change the steady-state lookahead itself rather than pre-extend past it once, use
+`pgpm.set_obtain(p_parent, p_obtain)`. It refuses a negative `p_obtain`, which would otherwise silently
+and permanently disable lookahead (see [reference](reference.md#set_obtain)).
+
 ## Regrain the history
 
 After transmute, the history is one coarse monolith. **Regraining** splits it into proper, fine-grained
@@ -460,13 +464,18 @@ clear error until PGFR is installed. See the
 
 ## Retain
 
-Set a policy at transmute time (`p_retain`) or later via `config.retain`, and maintenance drops partitions
-past it. Retain is an interval for `time`/`uuidv7`/`text_time` and a count of intervals for `id`. `null` keeps
-everything.
+Set a policy at transmute time (`p_retain`) or later with `pgpm.set_retain(p_parent, p_retain)`, and
+maintenance drops partitions past it. Retain is an interval for `time`/`uuidv7`/`text_time` and a count
+of intervals for `id`. `null` keeps everything.
 
 ```sql
-update pgpm.config set retain = '90 days' where parent_table = 'public.events'::regclass;
+select pgpm.set_retain('public.events', '90 days');
 ```
+
+`retain` is the destructive knob -- it decides what gets dropped -- so `set_retain` validates
+`p_retain`'s shape against `control_kind` and **refuses** (does not merely warn) a tighter value that
+would make the very next `retain()` tick drop a partition the old value still kept. Loosening, or
+setting `null` to keep everything, is always safe. See [reference](reference.md#set_retain).
 
 Retain drops a partition only when its **whole range** is older than the horizon, using plain `DROP` (a
 brief lock) when nothing references the table. Two consequences in the monolith model:

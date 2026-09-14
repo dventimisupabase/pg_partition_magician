@@ -233,7 +233,7 @@ succeed unless you actually want that data kept.
    If you just want more general headroom rather than a specific known value, raise the lookahead instead:
 
    ```sql
-   update pgpm.config set obtain = 90 where parent_table = 'public.events'::regclass;
+   select pgpm.set_obtain('public.events', 90);
    select pgpm.obtain('public.events');
    ```
 
