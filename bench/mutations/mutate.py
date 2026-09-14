@@ -43,6 +43,112 @@ RESTORE_INLINE = """    if v_readded and not v_is_part then
     -- The VALIDATE deliberately does NOT happen here (#265)."""
 
 # name -> (guard it must break, why this is the right defect, [(find, replace, expected_count)])
+# #344's hoist: the new parent's CREATE TABLE ... PARTITION BY RANGE, identity, owner, grants,
+# RLS, policies and comments, moved to run BEFORE either rename so none of it adds to the outage.
+TRANSMUTE_CUTOVER_HOIST = """  -- #344: everything below that only touches the NEW parent -- not the original/monolith relation -- runs
+  -- BEFORE either rename, under a staging name (v_staging, collision-checked earlier alongside the
+  -- orphan-name guard). None of it needs the original table's lock: CREATE TABLE ... LIKE only takes
+  -- ACCESS SHARE on p_parent (a rename changes no column/default/constraint, so building it from p_parent
+  -- now is byte-for-byte the same as building it from the monolith name later), and everything after that
+  -- targets the not-yet-visible staging relation. This is what shrinks the outage: previously all of it
+  -- ran AFTER the rename, adding directly to how long the live table was unavailable.
+
+  -- 5. create the partitioned parent under the STAGING name (no PK yet). INCLUDING CONSTRAINTS carries the
+  -- user's CHECK constraints onto the parent so every partition (the monolith, the DEFAULT, and future
+  -- forward children) enforces them -- without it, only the monolith would. LIKE also copies the transient
+  -- pgpm_monolith_bound CHECK (already validated on p_parent by phase 2), which must NOT constrain the
+  -- parent (it would reject any row at/after B), so drop it from the parent immediately; the monolith keeps
+  -- its own copy for the metadata-only attach below, dropped separately afterward.
+  execute format('create table %I.%I (like %s including defaults including generated including storage including constraints) partition by range (%I)',
+                 v_nsp, v_staging, p_parent::text, p_control);
+  v_parent := format('%I.%I', v_nsp, v_staging)::regclass;
+  execute format('alter table %s drop constraint if exists pgpm_monolith_bound', v_parent::text);
+
+  -- 6. re-establish identity on the parent, in the SAME form it had (#308). The kind is not cosmetic:
+  -- ALWAYS rejects an insert that supplies the column, BY DEFAULT accepts it, so re-adding an ALWAYS
+  -- column BY DEFAULT silently starts accepting writes the operator's schema was written to refuse.
+  -- The %s carries a keyword, not user input: v_idkinds comes from pg_attribute.attidentity, which
+  -- Postgres constrains to 'a' or 'd'.
+  if v_idcols is not null then
+    for v_i in 1 .. array_length(v_idcols, 1) loop
+      execute format('alter table %s alter column %I add generated %s as identity',
+                     v_parent::text, v_idcols[v_i],
+                     case when v_idkinds[v_i] = 'a' then 'always' else 'by default' end);
+    end loop;
+  end if;
+
+  -- 7b (moved before the renames -- #344). Replay everything captured at 0b onto the staging parent,
+  -- EXCEPT triggers: that is the one step that needs the LIVE name in place, not just the right OID (see
+  -- 0b), so it stays below, after both renames.
+  execute format('alter table %s owner to %I', v_parent::text, v_owner);
+
+  -- Grants. aclexplode turns relacl into (grantor, grantee, privilege, grantable) rows; a NULL relacl
+  -- means the owner's implicit defaults, which the OWNER TO above already restores. grantee = 0 is
+  -- PUBLIC, which has no role name.
+  for v_g in
+    select a.grantee, a.privilege_type, a.is_grantable
+      from pg_class c, aclexplode(c.relacl) a where c.oid = p_parent and c.relacl is not null
+  loop
+    execute format('grant %s on %s to %s%s', v_g.privilege_type, v_parent::text,
+                   case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
+                   case when v_g.is_grantable then ' with grant option' else '' end);
+  end loop;
+  -- COLUMN-level grants, which relacl does not carry at all: they live in pg_attribute.attacl.
+  for v_g in
+    select att.attname, a.grantee, a.privilege_type, a.is_grantable
+      from pg_attribute att, aclexplode(att.attacl) a
+     where att.attrelid = p_parent and att.attnum > 0 and not att.attisdropped and att.attacl is not null
+  loop
+    execute format('grant %s (%I) on %s to %s%s', v_g.privilege_type, v_g.attname, v_parent::text,
+                   case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
+                   case when v_g.is_grantable then ' with grant option' else '' end);
+  end loop;
+
+  -- RLS. FORCE matters as much as ENABLE: without it the table owner bypasses every policy, so an
+  -- owner-run query would see all rows and the isolation would be silently absent for exactly the role
+  -- most likely to be running reports.
+  if v_rls then
+    execute format('alter table %s enable row level security', v_parent::text);
+  end if;
+  if v_rls_force then
+    execute format('alter table %s force row level security', v_parent::text);
+  end if;
+  -- Policies live on the PARENT and only on the parent (measured: a parent policy governs parent-routed
+  -- reads into a partition, with no policy on the partition at all). Do not "fix" the apparent gap by
+  -- scattering copies onto children; direct partition access needs grants that live on the parent anyway.
+  for v_pol in
+    select polname, polcmd, polpermissive,
+           case when polroles = '{0}'::oid[] then 'public'
+                else (select string_agg(quote_ident(rolname), ', ' order by rolname)
+                        from pg_roles where oid = any(polroles)) end as roles,
+           pg_get_expr(polqual, polrelid)      as qual,
+           pg_get_expr(polwithcheck, polrelid) as withcheck
+      from pg_policy where polrelid = p_parent
+  loop
+    execute format('create policy %I on %s as %s for %s to %s%s%s',
+      v_pol.polname, v_parent::text,
+      case when v_pol.polpermissive then 'permissive' else 'restrictive' end,
+      case v_pol.polcmd when 'r' then 'select' when 'a' then 'insert' when 'w' then 'update'
+                        when 'd' then 'delete' else 'all' end,
+      v_pol.roles,
+      case when v_pol.qual is not null then ' using (' || v_pol.qual || ')' else '' end,
+      case when v_pol.withcheck is not null then ' with check (' || v_pol.withcheck || ')' else '' end);
+  end loop;
+
+  if v_comment is not null then
+    execute format('comment on table %s is %L', v_parent::text, v_comment);
+  end if;
+  for v_colcom in
+    select a.attname, col_description(p_parent, a.attnum) as c
+      from pg_attribute a
+     where a.attrelid = p_parent and a.attnum > 0 and not a.attisdropped
+       and col_description(p_parent, a.attnum) is not null
+  loop
+    execute format('comment on column %s.%I is %L', v_parent::text, v_colcom.attname, v_colcom.c);
+  end loop;
+
+"""
+
 MUTATIONS = {
     "transmute_no_commits": (
         "bench/transmute_lock.sh",
@@ -100,6 +206,16 @@ MUTATIONS = {
           "  if not exists (select 1 from pg_constraint\n", 1),
          ("  perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT\n",
           "", 2)],
+    ),
+    "transmute_cutover_late_build": (
+        "bench/transmute_cutover_order.sh",
+        "Pre-#344 transmute: the new parent's CREATE TABLE/identity/grants/RLS/policies/comments ran "
+        "AFTER the rename, adding directly to the outage even though none of it touches the original "
+        "table. Moves the exact hoisted block back to after both renames (right before the trigger "
+        "replay, where the equivalent code sat before #344) -- the guard only asserts order against "
+        "the FIRST rename, which relocating this one block alone already flips.",
+        [(TRANSMUTE_CUTOVER_HOIST, "", 1),
+         ("  -- 7b (triggers).", TRANSMUTE_CUTOVER_HOIST + "  -- 7b (triggers).", 1)],
     ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",

@@ -2395,7 +2395,7 @@ create or replace procedure pgpm._transmute(
 )
 language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_default name; v_parent regclass;
+  v_nsp name; v_rel name; v_default name; v_staging name; v_parent regclass;
   v_lo_prev text; v_hi_prev text; v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
@@ -2442,6 +2442,7 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_default := (v_rel || '_default')::name;
+  v_staging := (v_rel || '_pgpm_new')::name;
 
   -- control column type vs kind (and the float guard)
   select t.typname into v_typname
@@ -2517,6 +2518,15 @@ begin
         v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
     end if;
   end;
+
+  -- Staging-name collision guard (#344): phase 3 builds the new parent under a temporary name BEFORE
+  -- either rename (so that none of its setup work adds to the outage), which means that name must be
+  -- free. Refuse up front, same shape as the orphan-child check just above and the <index>_pgpm check
+  -- below -- most likely a leftover from an interrupted prior attempt.
+  if to_regclass(format('%I.%I', v_nsp, v_staging)) is not null then
+    raise exception 'pg_partition_magician: %.% already exists, and transmute needs it as a staging name for the new parent. Most likely a leftover from an interrupted run. Drop it (drop table %.%) and retry transmute.',
+      v_nsp, v_staging, quote_ident(v_nsp), quote_ident(v_staging);
+  end if;
 
   -- uuidv7 sanity check (issue #96): a uuid control column is TREATED as uuidv7 on assumption, so we
   -- sample it. Genuine UUIDv7/ULID decodes to plausible recent timestamps (~1.0); random UUIDv4 scores
@@ -2936,13 +2946,14 @@ begin
   perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT
 
   -- 0b. capture what CREATE TABLE ... LIKE will NOT carry (#277): owner, grants, RLS, policies, comments
-  -- and triggers. Captured HERE, before the rename, and replayed below in this same transaction. Both
+  -- and triggers. Captured HERE, before either rename, and replayed below in this same transaction. Both
   -- halves have to be inside the cutover: a parent that is briefly reachable with RLS off is the same
   -- security defect as one that never gets its policies, with a shorter fuse.
   --
-  -- Trigger definitions get a free ride. pg_get_triggerdef emits "... ON public.<original name>", and
-  -- after the rename below that name IS the new parent, so the captured text replays verbatim with no
-  -- rewriting. Policies get no such help (there is no pg_get_policydef) and are rebuilt from pg_policy.
+  -- Trigger definitions get a free ride, but only once BOTH renames have happened (#344): pg_get_triggerdef
+  -- emits "... ON public.<original name>", and that name only resolves to the new parent once the staging
+  -- parent has taken it, so the captured text replays verbatim with no rewriting. Policies get no such
+  -- help (there is no pg_get_policydef) and are rebuilt from pg_policy.
   select pg_get_userbyid(relowner), relacl, relrowsecurity, relforcerowsecurity
     into v_owner, v_acl, v_rls, v_rls_force
     from pg_class where oid = p_parent;
@@ -2950,36 +2961,23 @@ begin
   select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
     into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
 
-  -- 1. rename the live table to the MONOLITH (coarse child) name
-  execute format('alter table %s rename to %I', p_parent::text, v_monolith);
-  v_monreg := format('%I.%I', v_nsp, v_monolith)::regclass;
+  -- #344: everything below that only touches the NEW parent -- not the original/monolith relation -- runs
+  -- BEFORE either rename, under a staging name (v_staging, collision-checked earlier alongside the
+  -- orphan-name guard). None of it needs the original table's lock: CREATE TABLE ... LIKE only takes
+  -- ACCESS SHARE on p_parent (a rename changes no column/default/constraint, so building it from p_parent
+  -- now is byte-for-byte the same as building it from the monolith name later), and everything after that
+  -- targets the not-yet-visible staging relation. This is what shrinks the outage: previously all of it
+  -- ran AFTER the rename, adding directly to how long the live table was unavailable.
 
-  -- 2. the existing PK is KEPT in place; step 8 reconciles the monolith's promoted index (metadata-only).
-
-  -- 3. drop identity on the monolith; key columns NOT NULL (metadata no-ops: PK => NOT NULL)
-  if v_idcols is not null then
-    foreach v_col in array v_idcols loop
-      execute format('alter table %s alter column %I drop identity if exists', v_monreg::text, v_col);
-    end loop;
-  end if;
-  execute format('alter table %s alter column %I set not null', v_monreg::text, p_control);
-  -- only a reused PRIMARY KEY makes its other columns NOT NULL; a reused UNIQUE constraint legitimately
-  -- permits nullable non-control columns, so leave those as they are (and never scan them).
-  if v_add_pk and v_pkcols is not null then
-    foreach v_col in array v_pkcols loop
-      execute format('alter table %s alter column %I set not null', v_monreg::text, v_col);
-    end loop;
-  end if;
-
-  -- 5. create the partitioned parent under the original name (no PK yet). INCLUDING CONSTRAINTS carries the
+  -- 5. create the partitioned parent under the STAGING name (no PK yet). INCLUDING CONSTRAINTS carries the
   -- user's CHECK constraints onto the parent so every partition (the monolith, the DEFAULT, and future
   -- forward children) enforces them -- without it, only the monolith would. LIKE also copies the transient
-  -- pgpm_monolith_bound CHECK (it is on the monolith at this point), which must NOT constrain the parent
-  -- (it would reject any row at/after B), so drop it from the parent immediately; the monolith keeps its
-  -- own copy for the metadata-only attach below, dropped separately afterward.
+  -- pgpm_monolith_bound CHECK (already validated on p_parent by phase 2), which must NOT constrain the
+  -- parent (it would reject any row at/after B), so drop it from the parent immediately; the monolith keeps
+  -- its own copy for the metadata-only attach below, dropped separately afterward.
   execute format('create table %I.%I (like %s including defaults including generated including storage including constraints) partition by range (%I)',
-                 v_nsp, v_rel, v_monreg::text, p_control);
-  v_parent := format('%I.%I', v_nsp, v_rel)::regclass;
+                 v_nsp, v_staging, p_parent::text, p_control);
+  v_parent := format('%I.%I', v_nsp, v_staging)::regclass;
   execute format('alter table %s drop constraint if exists pgpm_monolith_bound', v_parent::text);
 
   -- 6. re-establish identity on the parent, in the SAME form it had (#308). The kind is not cosmetic:
@@ -2995,28 +2993,9 @@ begin
     end loop;
   end if;
 
-  -- 7. attach the original as the bounded MONOLITH child (metadata-only via the validated CHECK), then
-  -- drop the now-redundant CHECK (the partition bound enforces it).
-  execute format('alter table %s attach partition %s for values from (%L) to (%L)',
-                 v_parent::text, v_monreg::text,
-                 pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch), pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
-  execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
-
-  -- 7a. re-add the outgoing foreign keys at the PARENT (#263), so they cover every partition instead of
-  -- only the monolith. This is metadata-only: PostgreSQL ADOPTS a partition's equivalent already-validated
-  -- key rather than rescanning, and the monolith's copy is the original, validated constraint. Measured on
-  -- PG 17.10: 0.8 ms against a 200k-row monolith, and the resulting parent constraint is convalidated with
-  -- the monolith's demoted to a child (conparentid <> 0). Empty forward partitions cost nothing either.
-  -- Same transaction as the attach, so no session ever observes the parent without its keys.
-  if v_out_names is not null then
-    for v_i2 in 1 .. array_length(v_out_names, 1) loop
-      execute format('alter table %s add constraint %I %s',
-                     v_parent::text, v_out_names[v_i2], v_out_defs[v_i2]);
-    end loop;
-  end if;
-
-  -- 7b. replay everything captured at 0b onto the new parent (#277). Same transaction as the rename and
-  -- the attach, so the parent is never reachable without its policies.
+  -- 7b (moved before the renames -- #344). Replay everything captured at 0b onto the staging parent,
+  -- EXCEPT triggers: that is the one step that needs the LIVE name in place, not just the right OID (see
+  -- 0b), so it stays below, after both renames.
   execute format('alter table %s owner to %I', v_parent::text, v_owner);
 
   -- Grants. aclexplode turns relacl into (grantor, grantee, privilege, grantable) rows; a NULL relacl
@@ -3024,7 +3003,7 @@ begin
   -- PUBLIC, which has no role name.
   for v_g in
     select a.grantee, a.privilege_type, a.is_grantable
-      from pg_class c, aclexplode(c.relacl) a where c.oid = v_monreg and c.relacl is not null
+      from pg_class c, aclexplode(c.relacl) a where c.oid = p_parent and c.relacl is not null
   loop
     execute format('grant %s on %s to %s%s', v_g.privilege_type, v_parent::text,
                    case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
@@ -3034,7 +3013,7 @@ begin
   for v_g in
     select att.attname, a.grantee, a.privilege_type, a.is_grantable
       from pg_attribute att, aclexplode(att.attacl) a
-     where att.attrelid = v_monreg and att.attnum > 0 and not att.attisdropped and att.attacl is not null
+     where att.attrelid = p_parent and att.attnum > 0 and not att.attisdropped and att.attacl is not null
   loop
     execute format('grant %s (%I) on %s to %s%s', v_g.privilege_type, v_g.attname, v_parent::text,
                    case when v_g.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(v_g.grantee)) end,
@@ -3060,7 +3039,7 @@ begin
                         from pg_roles where oid = any(polroles)) end as roles,
            pg_get_expr(polqual, polrelid)      as qual,
            pg_get_expr(polwithcheck, polrelid) as withcheck
-      from pg_policy where polrelid = v_monreg
+      from pg_policy where polrelid = p_parent
   loop
     execute format('create policy %I on %s as %s for %s to %s%s%s',
       v_pol.polname, v_parent::text,
@@ -3076,17 +3055,64 @@ begin
     execute format('comment on table %s is %L', v_parent::text, v_comment);
   end if;
   for v_colcom in
-    select a.attname, col_description(v_monreg, a.attnum) as c
+    select a.attname, col_description(p_parent, a.attnum) as c
       from pg_attribute a
-     where a.attrelid = v_monreg and a.attnum > 0 and not a.attisdropped
-       and col_description(v_monreg, a.attnum) is not null
+     where a.attrelid = p_parent and a.attnum > 0 and not a.attisdropped
+       and col_description(p_parent, a.attnum) is not null
   loop
     execute format('comment on column %s.%I is %L', v_parent::text, v_colcom.attname, v_colcom.c);
   end loop;
 
-  -- Triggers LAST, and the monolith's own originals are dropped FIRST. Creating on the parent clones the
-  -- trigger onto every partition including the monolith, so leaving the original in place would give the
-  -- monolith two and fire it twice for every row routed there. Order is the whole correctness argument.
+  -- 1. THE TWO RENAMES, BACK-TO-BACK (#344). The first is the ACCESS EXCLUSIVE-acquiring statement that
+  -- starts the outage; doing the second immediately after -- before anything else runs -- means the live
+  -- name already resolves to the correctly-positioned parent by the time the trigger replay below (the one
+  -- step that needs the literal name, not just the OID) executes.
+  execute format('alter table %s rename to %I', p_parent::text, v_monolith);
+  v_monreg := format('%I.%I', v_nsp, v_monolith)::regclass;
+  execute format('alter table %s rename to %I', v_parent::text, v_rel);
+
+  -- 2. the existing PK is KEPT in place; step 8 reconciles the monolith's promoted index (metadata-only).
+
+  -- 3. drop identity on the monolith; key columns NOT NULL (metadata no-ops: PK => NOT NULL)
+  if v_idcols is not null then
+    foreach v_col in array v_idcols loop
+      execute format('alter table %s alter column %I drop identity if exists', v_monreg::text, v_col);
+    end loop;
+  end if;
+  execute format('alter table %s alter column %I set not null', v_monreg::text, p_control);
+  -- only a reused PRIMARY KEY makes its other columns NOT NULL; a reused UNIQUE constraint legitimately
+  -- permits nullable non-control columns, so leave those as they are (and never scan them).
+  if v_add_pk and v_pkcols is not null then
+    foreach v_col in array v_pkcols loop
+      execute format('alter table %s alter column %I set not null', v_monreg::text, v_col);
+    end loop;
+  end if;
+
+  -- 7. attach the original as the bounded MONOLITH child (metadata-only via the validated CHECK), then
+  -- drop the now-redundant CHECK (the partition bound enforces it).
+  execute format('alter table %s attach partition %s for values from (%L) to (%L)',
+                 v_parent::text, v_monreg::text,
+                 pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch), pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
+  execute format('alter table %s drop constraint pgpm_monolith_bound', v_monreg::text);
+
+  -- 7a. re-add the outgoing foreign keys at the PARENT (#263), so they cover every partition instead of
+  -- only the monolith. This is metadata-only: PostgreSQL ADOPTS a partition's equivalent already-validated
+  -- key rather than rescanning, and the monolith's copy is the original, validated constraint. Measured on
+  -- PG 17.10: 0.8 ms against a 200k-row monolith, and the resulting parent constraint is convalidated with
+  -- the monolith's demoted to a child (conparentid <> 0). Empty forward partitions cost nothing either.
+  -- Same transaction as the attach, so no session ever observes the parent without its keys.
+  if v_out_names is not null then
+    for v_i2 in 1 .. array_length(v_out_names, 1) loop
+      execute format('alter table %s add constraint %I %s',
+                     v_parent::text, v_out_names[v_i2], v_out_defs[v_i2]);
+    end loop;
+  end if;
+
+  -- 7b (triggers). Last of the replay from 0b, and only now that both renames are done: the captured text
+  -- names the ORIGINAL table, which only resolves to the parent once the live name is in place. The
+  -- monolith's own originals are dropped FIRST -- creating on the parent clones the trigger onto every
+  -- partition including the monolith, so leaving the original in place would give the monolith two and
+  -- fire it twice for every row routed there. Order is the whole correctness argument.
   if array_length(v_trgdefs, 1) > 0 then
     for v_trg in select tgname from pg_trigger where tgrelid = v_monreg and not tgisinternal loop
       execute format('drop trigger %I on %s', v_trg.tgname, v_monreg::text);
