@@ -3584,6 +3584,87 @@ begin
 end;
 $$;
 
+-- Operator switch for obtain's forward lookahead (issue #326). obtain/retain used to be settable
+-- only at transmute time, and changing either afterward meant a raw `update pgpm.config`, with no
+-- validation. p_obtain < 0 is not merely wrong, it is a SILENT no-op: obtain()'s
+-- `for k in 0 .. cfg.obtain loop` never executes when cfg.obtain is negative (plpgsql's `lo .. hi`
+-- is empty once lo > hi), so a negative value quietly disables all future lookahead with nothing
+-- raised, ever. Refuse it here instead, before it reaches config.
+create or replace function pgpm.set_obtain(p_parent regclass, p_obtain int)
+returns void language plpgsql as $$
+begin
+  if p_obtain is null or p_obtain < 0 then
+    raise exception 'pg_partition_magician: p_obtain must be a non-negative integer (got %)', p_obtain;
+  end if;
+  update pgpm.config set obtain = p_obtain where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+end;
+$$;
+
+-- Operator switch for retention (issue #326). retain is the DESTRUCTIVE knob: it decides what
+-- retain() DROPs, and a hand-written `update pgpm.config set retain = ...` has no validation at all
+-- -- not the units check transmute applies (numeric for id, an interval everywhere else -- see
+-- _retain_boundary), and no protection against a value that arms the very next maintain/retain tick
+-- to drop a partition the current value still keeps.
+--
+-- Locked-in decision: REFUSE that case, not merely warn. This matches the house rule already applied
+-- to set_regrain's coarser-target refusal and extend_to's p_max cap -- loud failure over a silently
+-- armed destructive change. Loosening (a bigger interval/count, or null = keep forever) can never
+-- trip it: a wider horizon only ever keeps a superset of what the narrower one kept, so the check
+-- below is comparing _retain_boundary of the OLD config against the same function on a HYPOTHETICAL
+-- one with p_retain substituted in, before anything is written.
+create or replace function pgpm.set_retain(p_parent regclass, p_retain text default null)
+returns void language plpgsql as $$
+declare
+  cfg pgpm.config;
+  v_old_boundary text;
+  v_new_boundary text;
+  v_hit name;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+
+  if p_retain is not null then
+    if cfg.control_kind = 'id' then
+      begin
+        perform p_retain::numeric;
+      exception when others then
+        raise exception 'pg_partition_magician: p_retain must be numeric for control_kind id (got %): %', p_retain, sqlerrm;
+      end;
+    else
+      begin
+        perform p_retain::interval;
+      exception when others then
+        raise exception 'pg_partition_magician: p_retain must be a valid interval for control_kind % (got %): %', cfg.control_kind, p_retain, sqlerrm;
+      end;
+    end if;
+  end if;
+
+  v_old_boundary := pgpm._retain_boundary(cfg);
+  cfg.retain := p_retain;
+  v_new_boundary := pgpm._retain_boundary(cfg);
+
+  if v_new_boundary is not null then
+    select p.child_name into v_hit
+      from pgpm.part p
+     where p.parent_table = p_parent and p.attached
+       and (v_old_boundary is null or pgpm._native_gt(cfg.control_kind, p.hi, v_old_boundary))
+       and not pgpm._native_gt(cfg.control_kind, p.hi, v_new_boundary)
+     order by p.lo
+     limit 1;
+    if found then
+      raise exception
+        'pg_partition_magician: set_retain(%, %) refused for % -- the next retain() tick would drop '
+        '% (and possibly others), which the current retain value still keeps. retain is the '
+        'destructive knob, so this is refused rather than silently armed for the next tick.',
+        p_parent, p_retain, p_parent, v_hit;
+    end if;
+  end if;
+
+  update pgpm.config set retain = p_retain where parent_table = p_parent;
+end;
+$$;
+
 -- Operator switch for the archive-before-drop strategy (issue #236's config.archive_fn contract).
 -- p_archive_fn names any (p_parent regclass, p_child name, p_lo text, p_hi text) returns
 -- pgpm.archive_result function -- pgpm_archive ships two (pgpm.archive_to_s3_ndjson/
