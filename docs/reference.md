@@ -9,7 +9,8 @@ by renaming the original aside and attaching it, with **zero row movement**, as 
 child (covering `[grid_floor(min), B)`), and laying down a **forward grid** of real, bounded partitions
 above it. There is no `DEFAULT`: a write no partition covers is refused. Going forward, `obtain` keeps the
 grid ahead of the write frontier, `retain` drops whole partitions past a policy, and `regrain` splits the
-coarse monolith into finer partitions on demand. `maintain` is the one procedure `pg_cron` runs.
+coarse monolith into finer partitions on demand. `pg_cron` runs two procedures: `maintain_obtain` (just
+`obtain`, on its own cadence) and `maintain` (everything else).
 
 Conventions used below: `p_parent` is the partitioned parent (a `regclass`); a native grid value is a
 `timestamptz` for the `time`, `uuidv7` and `text_time` kinds and a `numeric` for the `id` kind; "the
@@ -752,22 +753,21 @@ chosen steps.
 call pgpm.maintain(p_parent regclass, inout p_status text default null)
 ```
 
-The per-table tick: `obtain`, enforce write-blocks on every attached child against the retention
-boundary, one chunked-archiving step, `retain`, restore any preserved FK once the table is quiescent,
-and -- when auto-regrain is on (`config.regrain_to`) -- one `regrain_step` on the
-oldest frozen coarse child. A no-op while paused. Every step is isolated in its own subtransaction
-under a short `lock_timeout`, so it never blocks or deadlocks the live workload; a step that loses a
-lock race is deferred and retried next tick.
+The per-table tick for everything except `obtain` (issue #347 split `obtain` out into its own
+procedure, [`maintain_obtain`](#maintain_obtain), and its own cron job -- see [Scheduling](#scheduling)):
+enforce write-blocks on every attached child against the retention boundary, one chunked-archiving
+step, `retain`, restore any preserved FK once the table is quiescent, and -- when auto-regrain is on
+(`config.regrain_to`) -- one `regrain_step` on the oldest frozen coarse child. A no-op while paused.
+Every step is isolated in its own subtransaction under a short `lock_timeout`, so it never blocks or
+deadlocks the live workload; a step that loses a lock race is deferred and retried next tick.
 
-A procedure, and each step commits before the next begins, so no step's locks outlive it. This
-matters most for `obtain`, which takes `ACCESS EXCLUSIVE` on the parent when it creates a partition: in a
-single-transaction tick that lock would be held across the rest of the tick as well, stalling the whole
-table (readers included) until the tick finished. Those commits also mean `maintain` and `maintain_all`,
-like `transmute`, must be called at the **top level**, never inside a surrounding transaction; `pg_cron`
-runs its command as a top-level statement, so the scheduled path satisfies this for free.
+A procedure, and each step commits before the next begins, so no step's locks outlive it. Those commits
+mean `maintain` and `maintain_all`, like `transmute`, must be called at the **top level**, never inside
+a surrounding transaction; `pg_cron` runs its command as a top-level statement, so the scheduled path
+satisfies this for free.
 
 `p_status` reports a one-line summary, for example
-`obtained=2 archived=1 dropped=0 restored_fk=0 regrain=copied:5000`. Call
+`archived=1 dropped=0 restored_fk=0 regrain=copied:5000`. Call
 it as `call pgpm.maintain('public.events')` and the summary comes back as a result row; from
 PL/pgSQL, pass a variable to receive it.
 
@@ -791,7 +791,40 @@ precondition.
 call pgpm.maintain_all()
 ```
 
-A procedure that calls `maintain` for every managed table. This is what the scheduled job runs.
+A procedure that calls `maintain` for every managed table. This is what the `pgpm` scheduled job runs.
+
+### `maintain_obtain`
+
+```sql
+call pgpm.maintain_obtain(p_parent regclass, inout p_status text default null)
+```
+
+The per-table `obtain` tick, pulled out of `maintain` (issue #347): takes `ACCESS EXCLUSIVE` on the
+parent under a short `lock_timeout` when it creates a partition, so a lock race is deferred and retried
+next tick rather than blocking the live workload; a deferral starts `config.obtain_retry_after`
+back-off so sustained contention does not retry every tick. A no-op while paused. Independently honors
+`paused` -- it does not assume `maintain` ran first, or at all, in the same tick, since it now runs on
+its own cadence. `pgpm.obtain()` itself is unchanged; this is the same operational wrapper (lock
+timeout, backoff, exception handling, logging, transaction boundary) `maintain` already provides for
+`retain`/`_archive_step`/`regrain_step`.
+
+A procedure, and it commits internally for the same top-level-only reason `maintain` does.
+
+`p_status` reports a one-line summary, for example `obtained=2`. Call it as
+`call pgpm.maintain_obtain('public.events')` and the summary comes back as a result row; from
+PL/pgSQL, pass a variable to receive it.
+
+### `maintain_obtain_all`
+
+```sql
+call pgpm.maintain_obtain_all()
+```
+
+A procedure that calls `maintain_obtain` for every managed table, in the same table order as
+`maintain_all`. This is what the `pgpm_obtain` scheduled job runs. Unlike `maintain_all`, it does not
+run the crash-recovery reaping (`_transmute_reap`/`_detach_reap`) -- `obtain` does not depend on either
+having run, and the `pgpm` job still performs them on its own cadence regardless of whether this job
+also runs.
 
 ## Archive strategy contract
 
@@ -1001,19 +1034,32 @@ either, since `pgpm._next_archive_chunk` bounds every call to `config.archive_by
 ### `schedule`
 
 ```sql
-pgpm.schedule(p_every text default '* * * * *') returns bigint
+pgpm.schedule(p_every text default '* * * * *', p_obtain_every text default '* * * * *') returns bigint
 ```
 
 Creates (or replaces) the `pg_cron` job named `pgpm` that runs `call pgpm.maintain_all()` on the
-`p_every` cron schedule in the current database, returning the job id. One job covers every managed table
-and is idle while they are paused. Raises if `pg_cron` is not installed.
+`p_every` cron schedule in the current database, returning the job id. One job covers every managed
+table and is idle while they are paused. Raises if `pg_cron` is not installed.
 
-It also creates a second job, `pgpm_detach`, on the same schedule and **idle** (`select 1`). That one is
-machinery for the referenced-partition path: `retire` rewrites its command in place when a partition an incoming foreign key
-references needs `DETACH PARTITION ... CONCURRENTLY`, which PostgreSQL refuses to execute from a function,
-and returns it to idle once the drop lands. One standing job is rewritten rather than one scheduled per
-retirement, because `pg_cron` has no one-shot schedule. Retiring a referenced partition does not work
-without it; if you scheduled pgpm before upgrading, re-run `pgpm.schedule()` once.
+It also creates a second job, `pgpm_obtain` (issue #347), that runs `call pgpm.maintain_obtain_all()` on
+its own, independent `p_obtain_every` cron schedule. obtain is split onto its own job because it is the
+one step where falling behind has a hard consequence: with no `DEFAULT` partition (#288), a write past
+the forward grid is rejected outright, not queued, and `maintain_all()`'s single-session sweep would
+otherwise let a slow archive/retain/regrain for one table delay obtain for every table after it in the
+same tick. `pgpm.maintain()` itself no longer obtains at all.
+
+**Upgrade hazard.** `schedule()` is operator-invoked, never automatic. If you already called
+`pgpm.schedule()` before upgrading to a version with this split, re-run it once -- the new `pgpm_obtain`
+job is not created for you, and without it obtain will not run at all until you do, silently, until the
+forward grid runs out and writes start failing. `maintain_all()` also logs a `warn_obtain_unscheduled`
+row to `pgpm.log` once per sweep as a backstop for anyone who misses this.
+
+It also creates a third job, `pgpm_detach`, on the `p_every` schedule and **idle** (`select 1`). That one
+is machinery for the referenced-partition path: `retire` rewrites its command in place when a partition
+an incoming foreign key references needs `DETACH PARTITION ... CONCURRENTLY`, which PostgreSQL refuses
+to execute from a function, and returns it to idle once the drop lands. One standing job is rewritten
+rather than one scheduled per retirement, because `pg_cron` has no one-shot schedule. Retiring a
+referenced partition does not work without it.
 
 ### `unschedule`
 
@@ -1021,8 +1067,8 @@ without it; if you scheduled pgpm before upgrading, re-run `pgpm.schedule()` onc
 pgpm.unschedule() returns int
 ```
 
-Removes the `pgpm` and `pgpm_detach` cron jobs (returns the number removed, so `2` for a fully scheduled
-install; `0` if `pg_cron` is absent or nothing was scheduled).
+Removes the `pgpm`, `pgpm_obtain` and `pgpm_detach` cron jobs (returns the number removed, so `3` for a
+fully scheduled install; `0` if `pg_cron` is absent or nothing was scheduled).
 
 ## Control
 

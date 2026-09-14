@@ -79,7 +79,8 @@ call pgpm.transmute(
   p_retain   => '90 days'             -- drop partitions older than this (null = keep)
 );
 
--- 2. Schedule maintenance (one job covers every managed table):
+-- 2. Schedule maintenance (one job covers every managed table; a second, independently paced,
+--    keeps obtain from ever being delayed by a slow archive/retain/regrain):
 select pgpm.schedule();
 
 -- 3. Inspect, then go live:

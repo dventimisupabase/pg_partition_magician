@@ -22,7 +22,7 @@ import sys
 # lock_timeout, since `set local` does not survive a COMMIT. Matching the whole block keeps the mutant
 # readable rather than leaving orphaned comments explaining a commit that is no longer there.
 BOUNDARY_RE = re.compile(
-    r"^  -- BOUNDARY \(#279\).*?\n  commit;\n(?:  perform set_config\('lock_timeout'.*?\n)?",
+    r"^  -- BOUNDARY \(#(?:279|265)\).*?\n  commit;\n(?:  perform set_config\('lock_timeout'.*?\n)?",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -159,15 +159,24 @@ MUTATIONS = {
     ),
     "maintain_no_commits": (
         "bench/maintain_lock.sh",
-        "Pre-#279 maintain: one transaction per tick, so obtain's ACCESS EXCLUSIVE on the parent is "
-        "held across the drain. Also strips the #280 boundaries inside obtain, because after #280 "
-        "obtain commits on its own and maintain's boundaries alone no longer decide this.",
-        # EVERY boundary inside maintain(), not just the one before the drain. Removing only the first
-        # leaves obtain's lock released at the SECOND boundary a few statements later, which is a short
-        # window the guard rightly does not object to -- the guard then passed against this mutant and
-        # discriminate.sh reported it as non-discriminating. The defect being modelled is "the tick is
-        # one transaction", so the mutant has to actually make it one.
-        [(BOUNDARY_RE, "", 5)],
+        "Pre-#279 maintain_all: one transaction for the WHOLE sweep, so a step's ACCESS EXCLUSIVE for "
+        "one table is held across every table after it, including the long regrain copy. Issue #347 "
+        "moved obtain into its own procedure/job, so this mutant no longer touches it (maintain() has "
+        "no obtain step to strip); the guard now drives a retain-drop on a throwaway table ahead of "
+        "the regrain table in the sweep, so this needs ALL THREE of maintain()'s own 5 remaining "
+        "internal boundaries (write-block, archive, retain, regrain, and the #265 one before "
+        "FK-validate -- that one runs unconditionally every tick even with no incoming FK, so it is "
+        "just as much a leak point as the #279 ones) AND maintain_all()'s outer per-parent commit "
+        "stripped -- any ONE of those left in place still releases the lock before the next table's "
+        "turn, which is exactly what made this mutant look non-discriminating the first three times "
+        "the count/pattern here was updated.",
+        # EVERY remaining boundary inside maintain(), not just the one before regrain -- same
+        # discriminate.sh lesson as before, restated: removing only one still releases the lock a few
+        # statements later, at the NEXT boundary or (failing that) the outer loop's own per-parent
+        # commit, which the guard rightly does not object to.
+        [(BOUNDARY_RE, "", 5),
+         ("    call pgpm.maintain(r.parent_table, v_status);\n    commit;\n",
+          "    call pgpm.maintain(r.parent_table, v_status);\n", 1)],
     ),
     "restore_fk_inline_validate": (
         "bench/restore_fk_lock.sh",

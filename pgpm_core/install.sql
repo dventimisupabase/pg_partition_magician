@@ -3776,7 +3776,7 @@ create or replace procedure pgpm.maintain(p_parent regclass, inout p_status text
 language plpgsql as $$
 declare
   cfg pgpm.config;
-  v_made int := 0; v_archived int := 0; v_dropped int := 0; v_restored int := 0;
+  v_archived int := 0; v_dropped int := 0; v_restored int := 0;
   v_regrain text := 'skipped'; v_regrain_child name; v_validated int := 0;
   v_note text := '';
   v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int; v_deferred boolean;
@@ -3791,46 +3791,11 @@ begin
 
   -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
-  -- is DEFERRED (retried next tick) WITHOUT aborting the drain.
-  --
-  -- obtain/retain get a VERY SHORT lock_timeout. obtain's _create_partition is a single
-  -- `CREATE TABLE ... PARTITION OF`, taking ACCESS EXCLUSIVE on the PARENT (issue #288 -- there is
-  -- no DEFAULT partition to hold anything anymore) and scanning nothing. That ACCESS EXCLUSIVE
-  -- still blocks every ordinary read or write through the parent for as long as the wait lasts, and
-  -- a pending one queues every new locker behind it, so failing fast keeps a deferral nearly free:
-  -- no long block, and obtain simply retries once maintain() next has a gap. obtain is pgpm's only
-  -- defence against a write with nowhere to go (there is no DEFAULT to catch one), but the future
-  -- cells it creates aren't written yet, so deferring one tick costs nothing but time.
+  -- is DEFERRED (retried next tick) WITHOUT aborting the drain. obtain has its own procedure and
+  -- its own cron job now (maintain_obtain(), issue #347), so a slow step here never delays it in
+  -- turn; what remains -- write-block, archive, retain, auto-regrain, FK restore/validate -- still
+  -- gets the same short lock_timeout treatment.
   perform set_config('lock_timeout', '200ms', true);
-
-  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write
-  -- contention obtain can't win the lock for minutes, and each attempt risks a wasted default
-  -- scan. Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches
-  -- them), so deferring obtain is harmless. A successful obtain clears the back-off.
-  if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
-    -- Back inside a handler (#288). obtain no longer commits -- with no DEFAULT there is no
-    -- exclusion-constraint dance and no phases -- so the wrapper is legal again, and a lock race here is
-    -- deferred like any other step. This is now the ONLY thing standing between the workload and a write
-    -- with nowhere to go, so a deferral also starts the back-off rather than retrying every tick.
-    begin
-      v_made := pgpm.obtain(p_parent);
-      if cfg.obtain_retry_after is not null then
-        update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
-      end if;
-    exception when others then
-      v_note := v_note || ' obtain_deferred';
-      update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
-        where parent_table = p_parent;
-      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
-    end;
-  else
-    v_note := v_note || ' obtain_backoff';
-  end if;
-
-  -- BOUNDARY (#279). This is the one that matters: it drops obtain's ACCESS EXCLUSIVE on the parent and
-  -- the DEFAULT before the drain, so the stall lasts obtain's own duration instead of the whole tick.
-  commit;
-  perform set_config('lock_timeout', '200ms', true);   -- `set local` did not survive the COMMIT
 
   -- Write-block on retain-eligibility (issue #235), ahead of retain()'s own drop logic: a partition
   -- is blocked from writes the instant it crosses the boundary, whether or not (or how far along)
@@ -3954,8 +3919,8 @@ begin
     insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_validate_fk', left(sqlerrm, 200));
   end;
 
-  p_status := format('obtained=%s archived=%s dropped=%s restored_fk=%s regrain=%s%s',
-                     v_made, v_archived, v_dropped, v_restored, v_regrain, v_note);
+  p_status := format('archived=%s dropped=%s restored_fk=%s regrain=%s%s',
+                     v_archived, v_dropped, v_restored, v_regrain, v_note);
 end;
 $$;
 
@@ -3964,7 +3929,7 @@ language plpgsql as $$
 -- v_status exists only to receive maintain()'s INOUT: PL/pgSQL requires a writable argument for an
 -- output parameter, so the parameter's default cannot be relied on here. The sweep discards it; the
 -- per-parent detail is already in pgpm.log.
-declare r record; v_status text;
+declare r record; v_status text; v_warn boolean;
 begin
   -- #275: undo any conversion whose session died mid-way, before anything else. Independent of
   -- pgpm.config on purpose: a half-converted table is not registered yet.
@@ -3973,6 +3938,26 @@ begin
   -- urgency -- a partition left pending has its rows already invisible through the parent.
   perform pgpm._detach_reap();
   commit;
+
+  -- #347: maintain() no longer obtains at all -- obtain() only still runs if the 'pgpm_obtain' job
+  -- also got scheduled. schedule() is operator-invoked, never automatic, so an installation that
+  -- already called it before upgrading past this change will NOT pick up the new job on its own.
+  -- Warn once per sweep rather than silently obtaining here as a fallback: a fallback would just
+  -- reintroduce, hidden, the exact "one slow table hostages another's obtain" problem this issue
+  -- removes. Dynamic EXECUTE: cron.job is only resolved at call time, so this file still installs
+  -- cleanly where pg_cron is not enabled (see pgpm._dispatch_detach).
+  begin
+    execute 'select exists (select 1 from cron.job where jobname = ''pgpm'' and database = current_database())'
+         || ' and not exists (select 1 from cron.job where jobname = ''pgpm_obtain'' and database = current_database())'
+      into v_warn;
+  exception when others then
+    v_warn := false;   -- no pg_cron, or no privilege on cron.job: nothing to warn about
+  end;
+  if v_warn then
+    insert into pgpm.log (action, method)
+      values ('warn_obtain_unscheduled',
+              'pgpm_obtain cron job missing; re-run pgpm.schedule() to restore obtain (issue #347)');
+  end if;
 
   -- One transaction per parent, not one for the whole sweep (#279). Two reasons. Locks: without it,
   -- every parent's locks accumulate until the last one is done, so a ten-table sweep ends holding ten
@@ -3993,22 +3978,116 @@ begin
 end;
 $$;
 
--- schedule()/unschedule(): a thin convenience wrapper around pg_cron for the two jobs pgpm needs, so the
+-- maintain_obtain()/maintain_obtain_all() (issue #347): obtain, pulled out of maintain()/maintain_all()
+-- into its own procedure and its own cron job. maintain_all() loops over every managed table
+-- sequentially in one session; a slow archive/retain/regrain for one table used to delay obtain for
+-- every table after it in the same tick, and unlike those other steps, a late obtain has a hard
+-- consequence -- with no DEFAULT partition (#288), a write past the forward grid is rejected outright,
+-- not queued. obtain's own backoff (cfg.obtain_retry_after) is per-parent, persisted state, not
+-- in-memory, so it already coordinates correctly regardless of which session calls pgpm.obtain(); this
+-- split introduces no new coordination problem. pgpm.obtain() itself is untouched -- it stays the pure
+-- engine underneath, same as retain()/_archive_step()/regrain_step() are underneath maintain().
+create or replace procedure pgpm.maintain_obtain(p_parent regclass, inout p_status text default null)
+language plpgsql as $$
+declare
+  cfg pgpm.config;
+  v_made int := 0;
+  v_note text := '';
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
+  -- Independently honor paused: this now runs on its own cadence and cannot assume maintain() ran
+  -- first, or at all, in the same tick.
+  if cfg.paused then p_status := 'paused'; return; end if;
+
+  -- obtain gets a VERY SHORT lock_timeout. Its _create_partition is a single
+  -- `CREATE TABLE ... PARTITION OF`, taking ACCESS EXCLUSIVE on the PARENT (issue #288 -- there is
+  -- no DEFAULT partition to hold anything anymore) and scanning nothing. That ACCESS EXCLUSIVE still
+  -- blocks every ordinary read or write through the parent for as long as the wait lasts, and a
+  -- pending one queues every new locker behind it, so failing fast keeps a deferral nearly free: no
+  -- long block, and obtain simply retries once this next has a gap. obtain is pgpm's only defence
+  -- against a write with nowhere to go (there is no DEFAULT to catch one), but the future cells it
+  -- creates aren't written yet, so deferring one tick costs nothing but time.
+  perform set_config('lock_timeout', '200ms', true);
+
+  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write
+  -- contention obtain can't win the lock for minutes, and each attempt risks a wasted default scan.
+  -- Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches them), so
+  -- deferring obtain is harmless. A successful obtain clears the back-off.
+  if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+    -- Back inside a handler (#288). obtain no longer commits -- with no DEFAULT there is no
+    -- exclusion-constraint dance and no phases -- so the wrapper is legal again, and a lock race here
+    -- is deferred like any other step. This is the ONLY thing standing between the workload and a
+    -- write with nowhere to go, so a deferral also starts the back-off rather than retrying every tick.
+    begin
+      v_made := pgpm.obtain(p_parent);
+      if cfg.obtain_retry_after is not null then
+        update pgpm.config set obtain_retry_after = null where parent_table = p_parent;
+      end if;
+    exception when others then
+      v_note := v_note || ' obtain_deferred';
+      update pgpm.config set obtain_retry_after = clock_timestamp() + interval '30 seconds'
+        where parent_table = p_parent;
+      insert into pgpm.log (parent_table, action, method) values (p_parent, 'skip_obtain', left(sqlerrm, 200));
+    end;
+  else
+    v_note := v_note || ' obtain_backoff';
+  end if;
+
+  -- Drops obtain's ACCESS EXCLUSIVE on the parent (and, before #288, the DEFAULT) promptly rather
+  -- than holding it until whatever calls this next commits.
+  commit;
+
+  p_status := format('obtained=%s%s', v_made, v_note);
+end;
+$$;
+
+create or replace procedure pgpm.maintain_obtain_all()
+language plpgsql as $$
+-- Mirrors maintain_all()'s loop shape exactly (ordered for reproducibility, no exception handler
+-- around the call -- maintain_obtain() already isolates its own failure). Deliberately does NOT
+-- duplicate maintain_all()'s crash-recovery reaping (_transmute_reap()/_detach_reap()): obtain does
+-- not depend on either having run, and the main maintain_all() job still performs them on its own
+-- cadence regardless of whether this job also runs.
+declare r record; v_status text;
+begin
+  for r in select parent_table from pgpm.config order by parent_table loop
+    call pgpm.maintain_obtain(r.parent_table, v_status);
+    commit;
+  end loop;
+end;
+$$;
+
+-- schedule()/unschedule(): a thin convenience wrapper around pg_cron for the three jobs pgpm needs, so the
 -- operator does not hand-write the cron incantation. pgpm never schedules on its own (transmute stays
--- pg_cron-free, and a tick can be driven by hand with maintain/maintain_all); this is the deliberate,
--- discoverable way to turn the scheduled lifecycle on. One canonical job named 'pgpm' calls
--- maintain_all() for ALL managed tables, so it is scheduled once, not per table, and re-scheduling
--- updates the interval rather than duplicating. The second, 'pgpm_detach', is idle machinery for
--- issue #268 and is described at its creation below; it is required only for retiring a partition
--- that an incoming foreign key references. It targets current_database() via schedule_in_database,
--- so the job runs against the database pgpm lives in whether or not that is the cron database. The cron
--- calls are dynamic (EXECUTE) on purpose: the cron schema is only resolved at call time, so this file
--- still installs cleanly where pg_cron is not enabled yet. Run it FROM the database where pg_cron is
--- installed (its `cron` schema must be present); uninstall.sql already unschedules every 'pgpm%' job.
--- p_every is a pg_cron schedule: standard 5-field cron ('* * * * *' = every minute, the default;
--- '*/5 * * * *' = every 5 min) or pg_cron's seconds interval ('30 seconds'). Note pg_cron does NOT
--- accept '1 minute'-style interval strings; minute cadence goes through cron syntax.
-create or replace function pgpm.schedule(p_every text default '* * * * *')
+-- pg_cron-free, and a tick can be driven by hand with maintain/maintain_all/maintain_obtain_all); this
+-- is the deliberate, discoverable way to turn the scheduled lifecycle on. One canonical job named 'pgpm'
+-- calls maintain_all() for ALL managed tables, so it is scheduled once, not per table, and re-scheduling
+-- updates the interval rather than duplicating. 'pgpm_obtain' (issue #347) calls maintain_obtain_all()
+-- on its own, independent cadence (p_obtain_every), so a slow archive/retain/regrain for one table can
+-- never delay obtain for another. The third, 'pgpm_detach', is idle machinery for issue #268 and is
+-- described at its creation below; it is required only for retiring a partition that an incoming
+-- foreign key references, and its cadence stays tied to p_every, not p_obtain_every. All three target
+-- current_database() via schedule_in_database, so they run against the database pgpm lives in whether
+-- or not that is the cron database. The cron calls are dynamic (EXECUTE) on purpose: the cron schema is
+-- only resolved at call time, so this file still installs cleanly where pg_cron is not enabled yet. Run
+-- it FROM the database where pg_cron is installed (its `cron` schema must be present); uninstall.sql
+-- already unschedules every 'pgpm%' job. p_every/p_obtain_every are pg_cron schedules: standard 5-field
+-- cron ('* * * * *' = every minute, the default; '*/5 * * * *' = every 5 min) or pg_cron's seconds
+-- interval ('30 seconds'). Note pg_cron does NOT accept '1 minute'-style interval strings; minute
+-- cadence goes through cron syntax.
+--
+-- UPGRADE HAZARD (issue #347): schedule() is operator-invoked, never automatic. An installation that
+-- already called pgpm.schedule() before upgrading to a version with this split will NOT pick up the new
+-- 'pgpm_obtain' job just by installing a newer install.sql -- maintain() no longer obtains at all, so
+-- obtain silently stops running for that installation until the forward grid runs out and writes start
+-- failing. There is no automatic migration for this, by design (a fallback that ran obtain from
+-- maintain_all() when 'pgpm_obtain' is missing would just reintroduce the same hostage problem, hidden).
+-- ANYONE UPGRADING PAST THIS CHANGE WHO HAS ALREADY RUN pgpm.schedule() MUST RE-RUN IT. maintain_all()
+-- also logs a 'warn_obtain_unscheduled' row to pgpm.log once per sweep as a backstop for anyone who
+-- misses this note.
+create or replace function pgpm.schedule(p_every text default '* * * * *',
+                                          p_obtain_every text default '* * * * *')
 returns bigint language plpgsql as $$
 declare v_jobid bigint;
 begin
@@ -4018,7 +4097,12 @@ begin
   execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
                  'pgpm', p_every, 'call pgpm.maintain_all()', current_database())
     into v_jobid;
-  -- The second job exists solely as a place for retire() to put a `DETACH PARTITION ... CONCURRENTLY`
+  -- Independent cadence from 'pgpm' on purpose (issue #347): obtain is the one step where falling
+  -- behind has a hard consequence (no DEFAULT partition since #288, so a late write is rejected
+  -- outright, not queued), so it gets its own job rather than sharing the main sweep's schedule.
+  execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
+                 'pgpm_obtain', p_obtain_every, 'call pgpm.maintain_obtain_all()', current_database());
+  -- This job exists solely as a place for retire() to put a `DETACH PARTITION ... CONCURRENTLY`
   -- (issue #268), which PostgreSQL refuses to execute from a function but a cron job runs as a
   -- top-level statement. It is created IDLE and stays idle until a REFERENCED partition needs
   -- retiring, at which point retire() rewrites its command in place and returns it to `select 1` once
@@ -4038,7 +4122,7 @@ begin
     return 0;   -- nothing scheduled if pg_cron is not here
   end if;
   execute 'select count(*)::int from (select cron.unschedule(jobid) from cron.job '
-       || 'where jobname in (''pgpm'', ''pgpm_detach'') and database = current_database()) s' into v_n;
+       || 'where jobname in (''pgpm'', ''pgpm_obtain'', ''pgpm_detach'') and database = current_database()) s' into v_n;
   return v_n;
 end;
 $$;

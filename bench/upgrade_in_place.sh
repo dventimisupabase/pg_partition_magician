@@ -31,10 +31,11 @@
 #      upgrade did not quietly reset the managed table's settings to defaults.
 #   5. The upgrade was RECORDED: pgpm.installed holds two rows, the second one this version. Distinct
 #      from 2: it separates "the file ran to the end" from "the schema happens to look right".
-#   6. LIVENESS WITNESS: the machine still runs afterwards. maintain() on the table that existed BEFORE
-#      the upgrade mints a new partition, named. A structurally perfect install that can no longer
-#      obtain is not an upgrade anyone wants, and every assertion above it is satisfied by a database
-#      that merely sits there.
+#   6. LIVENESS WITNESS: the machine still runs afterwards. maintain_obtain() (issue #347 split obtain
+#      out of maintain()/maintain_all(), so this is now the call that mints partitions) on the table
+#      that existed BEFORE the upgrade mints a new partition, named. A structurally perfect install
+#      that can no longer obtain is not an upgrade anyone wants, and every assertion above it is
+#      satisfied by a database that merely sits there.
 #
 # Usage: upgrade_in_place.sh <container> <db> [install.sql]
 # The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
@@ -123,6 +124,7 @@ run "$DB" "insert into public.up_t (id, body) values (10, 'keep-a'), (20, 'doome
 run "$DB" "delete from public.up_t where body = 'doomed'" >/dev/null
 run "$DB" "call pgpm.transmute('public.up_t', 'id', 1000::bigint, p_obtain => 1)" >/dev/null
 run "$DB" "select pgpm.resume('public.up_t')" >/dev/null
+run "$DB" "call pgpm.maintain_obtain('public.up_t')" >/dev/null
 run "$DB" "call pgpm.maintain('public.up_t')" >/dev/null
 
 BODIES_BEFORE=$(q "$DB" "select string_agg(body, ',' order by body) from public.up_t")
@@ -162,15 +164,15 @@ check "the upgrade run was recorded"                     "$(q "$DB" "select coun
 # beyond the last one is rejected rather than extending the grid, so the frontier is always inside it.
 FRONTIER=$(q "$DB" "select max(hi)::bigint - 1 from pgpm.part where parent_table = 'public.up_t'::regclass")
 run "$DB" "insert into public.up_t (id, body) values ($FRONTIER, 'post-upgrade')" >/dev/null
-run "$DB" "call pgpm.maintain('public.up_t')" >/dev/null
+run "$DB" "call pgpm.maintain_obtain('public.up_t')" >/dev/null
 CHILDREN_AFTER=$(q "$DB" "select string_agg(child_name, ',' order by child_name) from pgpm.part
                            where parent_table = 'public.up_t'::regclass")
 new=$(comm -13 <(echo "$CHILDREN_BEFORE" | tr ',' '\n' | sort) \
                <(echo "$CHILDREN_AFTER"  | tr ',' '\n' | sort) | tr '\n' ' ')
 if [ -n "${new// /}" ]; then
-  printf 'PASS  %-58s %s\n' "maintain() still mints partitions after the upgrade" "new: ${new% }"
+  printf 'PASS  %-58s %s\n' "maintain_obtain() still mints partitions after the upgrade" "new: ${new% }"
 else
-  printf 'FAIL  %-58s %s\n' "maintain() minted nothing after the upgrade" "children: $CHILDREN_AFTER"
+  printf 'FAIL  %-58s %s\n' "maintain_obtain() minted nothing after the upgrade" "children: $CHILDREN_AFTER"
   fail=1
 fi
 

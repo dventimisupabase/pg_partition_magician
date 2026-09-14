@@ -74,7 +74,7 @@ select is(
   (select command from cron.job where jobname = 'pgpm_detach' and database = current_database()),
   'select 1', 'and returns the job to idle, so it does not re-run a detach that already happened');
 
-select is(pgpm.unschedule(), 2, 'unschedule() removes both jobs');
+select is(pgpm.unschedule(), 3, 'unschedule() removes all three jobs');
 
 -- This file shares the `postgres` database with tests/31 and the uninstall check, so it cleans up its
 -- catalog rows too, not just its tables: a pgpm.config row pointing at a dropped relation would break
