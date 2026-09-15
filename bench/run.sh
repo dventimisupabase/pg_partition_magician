@@ -106,7 +106,14 @@ mkdir -p "$RESULTS"
 # Always reap background load drivers, even on error/interrupt -- an orphaned
 # pgbench keeps holding locks and corrupts the next run.
 BG_PIDS=()
-cleanup() { local p; for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
+cleanup() {
+  local p; for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+  # pgpm's cron jobs stay scheduled through the post phase (below), so an abort anywhere after the convert
+  # phase would otherwise leave them running on the target forever. q is only defined partway down.
+  if declare -F q >/dev/null; then
+    q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
+  fi
+}
 trap cleanup EXIT INT TERM
 
 # ---- psql helpers (DSN passed positionally, never logged) ------------------
@@ -522,7 +529,8 @@ while :; do
   fi
 done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
-q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
+# pgpm's cron jobs are NOT unscheduled here: the post phase writes too, and with no DEFAULT partition (#288)
+# a write past obtain's lookahead is refused, so maintenance must keep extending the grid through post.
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
 # if window mode never closed a window (regrain never warmed up), fall back to whole-convert metrics
 if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$conv_win_hi" = 0 ]; then conv_win_lo=0; fi
@@ -551,9 +559,12 @@ if [ "$BENCH_REGRAIN" = "1" ]; then
 fi
 
 # ---- 5. post (partitioned, under load) -------------------------------------
-# Pure observer: no operator VACUUM here. pgpm tuned autovacuum aggressively on the
-# default at transmute, so post observes the real post-conversion steady state as it settles.
+# Pure observer: no operator VACUUM here, so post observes the real post-conversion steady state as it
+# settles -- including pgpm's own maintenance, which keeps running exactly as it would in production.
+# Unscheduling it before this phase (as the harness did while a DEFAULT partition caught overflow writes)
+# starves obtain: the workload writes past the forward grid within seconds and every client aborts.
 run_phase post "$BENCH_PHASE_SECS"
+q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
 
 # ---- 7. report -------------------------------------------------------------
 say "report"
