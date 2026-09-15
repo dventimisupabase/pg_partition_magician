@@ -334,14 +334,43 @@ MUTATIONS = {
         "itself intact: the defect being modelled is 'the back-off ignores headroom', not 'there is no "
         "back-off'. A mutant that dropped the back-off entirely would fail the guard's ample-headroom "
         "assertion instead and look like a catch for the wrong reason.",
-        [("  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();\n"
-          "  if not v_try then\n"
+        [("  if not v_try then\n"
           "    begin\n"
-          "      select count(*) into v_ahead\n",
-          "  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();\n"
+          "      -- the first grid boundary past the frontier's own cell, and the top of attached coverage\n",
           "  if false then\n"
           "    begin\n"
-          "      select count(*) into v_ahead\n", 1)],
+          "      -- the first grid boundary past the frontier's own cell, and the top of attached coverage\n", 1)],
+    ),
+    "obtain_headroom_ignores_monolith": (
+        "bench/obtain_backoff_headroom.sh",
+        "The first cut of the low-headroom bypass (review on #386): headroom counted as attached partitions "
+        "whose lo starts past the frontier's own cell. A monolith widened by transmute's p_bound_headroom "
+        "covers several complete steps beyond the frontier, but its lo is far behind, so none of that room "
+        "is counted and the back-off is bypassed every tick, retrying obtain's ACCESS EXCLUSIVE under "
+        "contention while the table still has grid. Swaps the coverage walk back for that row count and "
+        "leaves the bypass itself intact, so the guard's forward-grid assertions still pass and only the "
+        "monolith-headroom one can catch it.",
+        [("      -- the first grid boundary past the frontier's own cell, and the top of attached coverage\n"
+          "      v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step,\n"
+          "                  pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,\n"
+          "                                   pgpm._frontier_native(p_parent)));\n"
+          "      execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',\n"
+          "                     pgpm._native_type(cfg.control_kind), p_parent::text) into v_top;\n"
+          "      v_ahead := 0;\n"
+          "      while v_top is not null and v_ahead < ceil(cfg.obtain / 2.0)\n"
+          "            and not pgpm._native_gt(cfg.control_kind,\n"
+          "                  pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell), v_top) loop\n"
+          "        v_ahead := v_ahead + 1;\n"
+          "        v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell);\n"
+          "      end loop;\n",
+          "      select count(*) into v_ahead\n"
+          "        from pgpm.part p\n"
+          "       where p.parent_table = p_parent and p.attached\n"
+          "         and not pgpm._native_gt(cfg.control_kind,\n"
+          "               pgpm._grid_next(cfg.control_kind, cfg.partition_step,\n"
+          "                 pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,\n"
+          "                                  pgpm._frontier_native(p_parent))),\n"
+          "               p.lo);\n", 1)],
     ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",

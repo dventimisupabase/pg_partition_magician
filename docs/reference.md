@@ -803,8 +803,9 @@ The per-table `obtain` tick, pulled out of `maintain` (issue #347): takes `ACCES
 parent under a short `lock_timeout` when it creates a partition, so a lock race is deferred and retried
 next tick rather than blocking the live workload; a deferral starts a 30-second
 `config.obtain_retry_after` back-off so sustained contention does not retry every tick. The back-off is
-honored only while at least `ceil(obtain / 2)` complete partitions remain ahead of the frontier's own
-partition: with no `DEFAULT` to catch a write past the grid, a back-off that outlasted the lookahead would
+honored only while at least `ceil(obtain / 2)` complete grid steps of attached coverage remain beyond the
+frontier's own grid cell (coverage, not partitions: grid inside a monolith widened by `p_bound_headroom`
+counts): with no `DEFAULT` to catch a write past the grid, a back-off that outlasted the lookahead would
 turn a lost lock race into refused writes, so below that threshold obtain runs anyway and the status
 notes `obtain_backoff_bypassed`. A no-op while paused. Independently honors
 `paused` -- it does not assume `maintain` ran first, or at all, in the same tick, since it now runs on
