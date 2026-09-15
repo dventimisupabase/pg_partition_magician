@@ -422,6 +422,7 @@ echo "  scheduled pgpm.maintain_all + maintain_obtain_all on pg_cron every '$BEN
 : > "$RESULTS/drain.progress.csv"
 echo "observed_s,default_rows,partitions,coarse,regrain_copies,rows_copied,last_regrain_age_s,budget,ambient_waiters,ambient_baseline,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
+obs_start_local=$(date +%s)   # client clock: only for the cap check when a poll fails (no server timestamp then)
 regrain_started=0; coarse_seen=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 surge_pid=""; surge_launched=0; surge_active=0
 while :; do
@@ -430,9 +431,12 @@ while :; do
   # stands, 0 after the swap). The adaptive-feathering samples this poll used to carry (the per-tick
   # drain_budget, _ambient_lock_waiters() and config.drain_ambient_baseline) are gone with that closed loop
   # (#288, #304); the function and the column no longer exist, so reading them errored rather than reporting.
+  # The same went for the second field, n_live_tup of bench.events_default: that partition went with #288
+  # too, and a regclass cast of a missing relation raises, so EVERY poll failed. It stays in the output as a
+  # constant -1 so drain.progress.csv keeps its column layout (plot_results.py skips -1).
   poll=$(q "with s as (select * from pgpm.status() where parent='bench.events'::regclass)
             select extract(epoch from clock_timestamp())::bigint
-            ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
+            ||'|'|| -1
             ||'|'|| (select count(*) from pg_inherits where inhparent='bench.events'::regclass)
             ||'|'|| coalesce((select coarse_partitions from s),-1)
             ||'|'|| coalesce((select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='regrain_copy'),0)
@@ -440,7 +444,12 @@ while :; do
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
                               from pgpm.log where parent_table='bench.events'::regclass and action in ('regrain_copy','regrain_attach','regrain')),-1)
             " 2>/dev/null) \
-    || { echo "  (observe poll failed -- retrying)"; continue; }
+    || { echo "  (observe poll failed -- retrying)"
+         # A failing poll must not outlive the cap: the backstop below is never reached on this path.
+         if [ $(( $(date +%s) - obs_start_local )) -gt "$BENCH_DRAIN_MAX_SECS" ]; then
+           echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s with the poll still failing; stopping"; break
+         fi
+         continue; }
   IFS='|' read -r now_s drows nparts coarse copies copied refage budget waiters baseline <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
 
