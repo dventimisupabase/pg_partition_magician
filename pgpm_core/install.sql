@@ -3985,6 +3985,10 @@ declare
   cfg pgpm.config;
   v_made int := 0;
   v_note text := '';
+  v_try boolean;
+  v_ahead int;
+  v_cell text;
+  v_top text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -4002,11 +4006,48 @@ begin
   -- creates aren't written yet, so deferring one tick costs nothing but time.
   perform set_config('lock_timeout', '200ms', true);
 
-  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write
-  -- contention obtain can't win the lock for minutes, and each attempt risks a wasted default scan.
-  -- Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches them), so
-  -- deferring obtain is harmless. A successful obtain clears the back-off.
-  if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write contention
+  -- obtain can lose the lock race tick after tick, and each attempt queues an ACCESS EXCLUSIVE behind the
+  -- workload for up to lock_timeout. A successful obtain clears the back-off.
+  --
+  -- The back-off must never outlast the grid. It dates from when a DEFAULT partition caught writes past
+  -- the grid, which made deferring obtain harmless; since #288 such a write is refused. A load test at
+  -- ~42k ids/s against a 3-partition lookahead (~14 s) lost one race, backed off 30 s, and every client
+  -- aborted. So the back-off is honored only while at least ceil(obtain / 2) complete grid steps of attached
+  -- coverage remain beyond the frontier's own grid cell; below that, obtain runs regardless.
+  --
+  -- COVERAGE, not a count of partitions that start past the frontier: transmute's p_bound_headroom gives
+  -- the monolith a permanent hi several steps beyond the frontier, and that room is real even though the
+  -- monolith's lo is far behind. Counting only partitions whose lo is ahead saw none of it, so such a table
+  -- bypassed the back-off every tick and retried obtain's ACCESS EXCLUSIVE while it still had room (review
+  -- on #386). Steps are walked from the frontier's cell up to max(hi), which assumes attached coverage is
+  -- contiguous there: obtain and extend_to build it end to end, and retain only drops the oldest cells.
+  -- The walk stops at the threshold, so it costs at most ceil(obtain / 2) grid steps. Counted only while a
+  -- back-off is active, so a healthy tick pays nothing extra, and guarded so a failure to count (a dropped
+  -- parent, say) falls back to the back-off rather than aborting the sweep.
+  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();
+  if not v_try then
+    begin
+      -- the first grid boundary past the frontier's own cell, and the top of attached coverage
+      v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step,
+                  pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                   pgpm._frontier_native(p_parent)));
+      execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
+                     pgpm._native_type(cfg.control_kind), p_parent::text) into v_top;
+      v_ahead := 0;
+      while v_top is not null and v_ahead < ceil(cfg.obtain / 2.0)
+            and not pgpm._native_gt(cfg.control_kind,
+                  pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell), v_top) loop
+        v_ahead := v_ahead + 1;
+        v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell);
+      end loop;
+      v_try := v_ahead < ceil(cfg.obtain / 2.0);
+      if v_try then v_note := v_note || ' obtain_backoff_bypassed'; end if;
+    exception when others then
+      v_try := false;
+    end;
+  end if;
+  if v_try then
     -- Back inside a handler (#288). obtain no longer commits -- with no DEFAULT there is no
     -- exclusion-constraint dance and no phases -- so the wrapper is legal again, and a lock race here
     -- is deferred like any other step. This is the ONLY thing standing between the workload and a
