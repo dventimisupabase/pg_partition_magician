@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- **Leftovers from the `DEFAULT`/drain removal (#288) cleaned out of `pgpm_core/install.sql`.** Two
+  error messages named machinery that no longer exists: `pgpm.schedule()` without `pg_cron` told you to
+  call `drain_all`, and now points at `maintain_all()`/`maintain_obtain_all()`; `transmute`'s orphan-table
+  refusal blamed an "interrupted drain" and now says "interrupted regrain", matching the runbook. Also
+  removed: `regrain()`'s unreachable `default_dirty` branch and about a dozen unused adaptive-feathering
+  variables in `maintain()`; comments that still described the drain now describe regrain.
+
 - **`obtain` split out of `maintain()`/`maintain_all()` into its own procedure and its own `pg_cron`
   job (issue #347).** `maintain_all()` loops over every managed table sequentially in one session,
   calling `maintain()` for each; a slow `archive`/`retain`/`regrain_step` for one table used to delay
