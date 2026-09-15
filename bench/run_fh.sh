@@ -362,7 +362,7 @@ begin
     commit;
     v_steps := v_steps + 1;
     exit when v_status like 'swapped:%';
-    if v_status in ('active','default_dirty','nosubdiv','nokey','idle') then
+    if v_status in ('active','nosubdiv','nokey','idle') then
       raise exception 'regrain driver: regrain_step returned % -- the now()-shadow did not take', v_status;
     end if;
     if v_steps > 10000000 then raise exception 'regrain driver: safety limit'; end if;
