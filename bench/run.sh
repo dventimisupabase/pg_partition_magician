@@ -405,10 +405,13 @@ fi
 load_pid=$!; BG_PIDS+=("$load_pid")
 convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
 
-# 4d. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives regrain (+ obtain + drain).
-q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+# 4d. schedule pgpm's maintenance on pg_cron -- THIS is how pgpm self-drives regrain and obtain. Two jobs, the
+#     same shape pgpm.schedule() registers: since #347, maintain_all() no longer obtains, so without the
+#     second job the forward grid is never extended and writes past it are refused mid-run.
+q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
 q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_all()')" >/dev/null
-echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now regraining itself"
+q "select cron.schedule('pgpm_obtain_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_obtain_all()')" >/dev/null
+echo "  scheduled pgpm.maintain_all + maintain_obtain_all on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now regraining itself"
 
 # 4e. OBSERVE. settle mode -> watch until regrain STARTS (>=1 copy microbatch) then the coarse monolith is
 #     GONE (coarse_partitions: 1 -> 0, the atomic swap completed, history fully split into fine children).
@@ -510,7 +513,7 @@ while :; do
   fi
 done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
-q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
 # if window mode never closed a window (regrain never warmed up), fall back to whole-convert metrics
 if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$conv_win_hi" = 0 ]; then conv_win_lo=0; fi
