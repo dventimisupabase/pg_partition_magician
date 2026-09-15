@@ -3985,6 +3985,8 @@ declare
   cfg pgpm.config;
   v_made int := 0;
   v_note text := '';
+  v_try boolean;
+  v_ahead int;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -4002,11 +4004,35 @@ begin
   -- creates aren't written yet, so deferring one tick costs nothing but time.
   perform set_config('lock_timeout', '200ms', true);
 
-  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write
-  -- contention obtain can't win the lock for minutes, and each attempt risks a wasted default scan.
-  -- Wait out a back-off window; the future cells aren't written yet (the DEFAULT catches them), so
-  -- deferring obtain is harmless. A successful obtain clears the back-off.
-  if coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp() then
+  -- obtain back-off: once a deferral happens, don't retry every tick -- under sustained write contention
+  -- obtain can lose the lock race tick after tick, and each attempt queues an ACCESS EXCLUSIVE behind the
+  -- workload for up to lock_timeout. A successful obtain clears the back-off.
+  --
+  -- The back-off must never outlast the grid. It dates from when a DEFAULT partition caught writes past
+  -- the grid, which made deferring obtain harmless; since #288 such a write is refused. A load test at
+  -- ~42k ids/s against a 3-partition lookahead (~14 s) lost one race, backed off 30 s, and every client
+  -- aborted. So the back-off is honored only while at least ceil(obtain / 2) complete partitions remain
+  -- ahead of the frontier's own partition; below that, obtain runs regardless. Counted only while a
+  -- back-off is active, so a healthy tick pays nothing extra, and guarded so a failure to count (a dropped
+  -- parent, say) falls back to the back-off rather than aborting the sweep.
+  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();
+  if not v_try then
+    begin
+      select count(*) into v_ahead
+        from pgpm.part p
+       where p.parent_table = p_parent and p.attached
+         and not pgpm._native_gt(cfg.control_kind,
+               pgpm._grid_next(cfg.control_kind, cfg.partition_step,
+                 pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
+                                  pgpm._frontier_native(p_parent))),
+               p.lo);
+      v_try := v_ahead < ceil(cfg.obtain / 2.0);
+      if v_try then v_note := v_note || ' obtain_backoff_bypassed'; end if;
+    exception when others then
+      v_try := false;
+    end;
+  end if;
+  if v_try then
     -- Back inside a handler (#288). obtain no longer commits -- with no DEFAULT there is no
     -- exclusion-constraint dance and no phases -- so the wrapper is legal again, and a lock race here
     -- is deferred like any other step. This is the ONLY thing standing between the workload and a

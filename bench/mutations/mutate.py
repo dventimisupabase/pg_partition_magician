@@ -325,6 +325,24 @@ MUTATIONS = {
       end loop;
 """, "", 1)],
     ),
+    "obtain_backoff_ignores_headroom": (
+        "bench/obtain_backoff_headroom.sh",
+        "Pre-fix maintain_obtain: a lock-timeout deferral's obtain_retry_after back-off is honored however "
+        "little forward grid is left. Harmless while a DEFAULT partition caught writes past the grid; since "
+        "#288 such a write is refused, so a 30 s back-off that outlasts the lookahead turns one lost lock "
+        "race into every writer aborting. Removes only the low-headroom bypass and leaves the back-off "
+        "itself intact: the defect being modelled is 'the back-off ignores headroom', not 'there is no "
+        "back-off'. A mutant that dropped the back-off entirely would fail the guard's ample-headroom "
+        "assertion instead and look like a catch for the wrong reason.",
+        [("  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();\n"
+          "  if not v_try then\n"
+          "    begin\n"
+          "      select count(*) into v_ahead\n",
+          "  v_try := coalesce(cfg.obtain_retry_after, '-infinity'::timestamptz) <= clock_timestamp();\n"
+          "  if false then\n"
+          "    begin\n"
+          "      select count(*) into v_ahead\n", 1)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "

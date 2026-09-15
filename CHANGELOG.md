@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- **`maintain_obtain()` no longer lets its back-off outlast the forward grid.** One lost `lock_timeout`
+  race sets a 30-second `config.obtain_retry_after` back-off, and obtain was skipped for all of it, however
+  little grid was left. That was harmless while a `DEFAULT` partition caught writes past the grid; since
+  #288 such a write is refused. A local load test at ~42k ids/s against a 3-partition lookahead (~14 s)
+  lost one race and every client aborted with `no partition of relation ... found for row`. The back-off
+  is now honored only while at least `ceil(obtain / 2)` complete partitions remain ahead of the frontier's
+  own partition; below that, obtain runs anyway (status note `obtain_backoff_bypassed`). The count runs
+  only while a back-off is active. (tests/100, bench/obtain_backoff_headroom.sh)
+
 - **Leftovers from the `DEFAULT`/drain removal (#288) cleaned out of `pgpm_core/install.sql`.** Two
   error messages named machinery that no longer exists: `pgpm.schedule()` without `pg_cron` told you to
   call `drain_all`, and now points at `maintain_all()`/`maintain_obtain_all()`; `transmute`'s orphan-table
