@@ -3,8 +3,9 @@
 Welcome. This repo is **`pg_partition_magician`**: a lightweight, **pure-SQL**
 RANGE-partition manager for PostgreSQL whose only runtime dependency is **pg_cron**.
 It transmutes an existing (possibly huge, live) table into a native partitioned table
-*online*, then manages the lifecycle (obtain, retain, regrain) across three
-partition-key dimensions: **time**, **integer/bigint id**, and **UUIDv7/ULID**.
+*online*, then manages the lifecycle (obtain, retain, regrain) across four
+partition-key kinds: **time**, **integer/bigint id**, **UUIDv7/ULID**, and **text-encoded
+time-ordered ids** (cuid, KSUID, ULID-as-text, MongoDB ObjectId).
 
 For *what it does and how to use it*, read [`README.md`](./README.md) and the
 [user guide](./docs/guide.md). This file is about *working in the repo*.
@@ -17,7 +18,7 @@ psql, or other tooling needed on the host.
 ```bash
 ./test.sh 15        # PG 15: build a pg_cron+pgtap image, install each channel,
                     # load fixtures, run the pgTAP suite, verify uninstall
-./test.sh           # the full matrix: PG 15, 16, 17, 18
+./test.sh           # the version matrix: PG 15, 16, 17, 18 (versions only, not the tracks below)
 ./test.sh timescale # the from_hypertable track: TimescaleDB 2.9.1 + 2.16.1 / PG15
                     # (the big fleet clusters), its own image, NOT in the default matrix
                     # (TS_VERSIONS='2.9.1' ./test.sh timescale runs just one)
@@ -25,6 +26,9 @@ psql, or other tooling needed on the host.
                     # NOT in the default matrix
 ./test.sh archive   # the pgpm_archive track: PG17 + pgsql-http against a MinIO stand-in
                     # for S3, its own image, NOT in the default matrix
+./test.sh perf      # the data-coupled lock and work guards under bench/ (PG17)
+./test.sh discriminate  # prove each perf guard FAILS against its bench/mutations/ defect
+./test.sh ci        # EVERY track CI runs, each as its own child run (use before pushing)
 ```
 
 `test.sh` exercises all three install channels (`psql`, bundle, dbdev) against a
@@ -46,7 +50,7 @@ docker compose --profile pg15 down -v
 |---|---|
 | `pgpm_core/install.sql` | **The product.** The entire tool: schema `pgpm`, tables, functions, views. Pure SQL, idempotent. **Single source of truth.** |
 | `pgpm_hypertable/install.sql` | Optional TimescaleDB-only add-on: migrate a hypertable to a pgpm-managed partition set. Loaded on top of the core, only where `timescaledb` exists |
-| `pgpm_archive/` | Optional archival add-on, deliberately **not referenced from this repo's own `README.md`**: it supplies S3 transport (connection settings in `archive.config`: bucket, region, endpoint, prefix, vault key names, compression) for two archive strategies -- `pgpm.config.archive_fn` (the normal, automatic path: `pgpm.maintain()` drives bounded chunks, `retire()` won't drop until fully covered) and `archive.to_s3`/`archive.to_s3_parquet` (synchronous functions, called directly, no automatic tie to a drop). `README.md` is its own front door and holds the narrative/honest-limits/verification content directly (no separate `docs/` subfolder) |
+| `pgpm_archive/` | Optional archival add-on (introduced in the root `README.md`'s Archiving section): it supplies S3 transport (connection settings in `archive.config`: bucket, region, endpoint, prefix, vault key names, compression) for two archive strategies -- `pgpm.config.archive_fn` set to `pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet` (the normal, automatic path: `pgpm.maintain()` drives bounded chunks, `retire()` won't drop until fully covered) and `archive.to_s3`/`archive.to_s3_parquet` (synchronous functions, called directly, no automatic tie to a drop). `README.md` is its own front door and holds the narrative/honest-limits/verification content directly (no separate `docs/` subfolder) |
 | `pgpm_core/uninstall.sql` | Teardown (drops the `pgpm` schema + its cron jobs; leaves your data) |
 | `pgpm_core/extension.control` | TLE metadata (`requires = 'pg_cron'`) for dbdev / CREATE EXTENSION |
 | `scripts/build_install_bundle.sh` / `build_dbdev_package.sh` | Build the bundle / minified dbdev channel artifacts from the source |
@@ -68,8 +72,9 @@ You can't convert a table to partitioned in place, so `transmute()` renames it a
 makes a partitioned parent under the original name, and attaches the old table **intact**
 as one bounded **monolith** child (zero data movement). Alongside it, transmute lays down a
 **forward grid**: real, bounded partitions running ahead of the write frontier, which
-`obtain` keeps extending. There is no `DEFAULT`: a write no partition covers is **refused**
-rather than parked, so `obtain x partition_step` is both the slack if maintenance stalls and
+`obtain` keeps extending from its own pg_cron job (`pgpm_obtain`, separate from the main
+`pgpm` job so a slow archive/retain/regrain on one table can never delay it). There is no
+`DEFAULT`: a write no partition covers is **refused** rather than parked, so `obtain x partition_step` is both the slack if maintenance stalls and
 a ceiling on how far ahead you may write. The historical bulk stays in the monolith until you
 **regrain** it into proper partitions on demand, by copying (so no dead tuples, no vacuum).
 The unifying idea is the **frontier** (`now()` for time, `max(control)` for id/uuidv7): a
@@ -91,7 +96,8 @@ needs to be kept in sync.
 # edit pgpm_core/install.sql, then:
 ./test.sh 15                  # one version, all channels (~3-5 min on a cold image)
 ./test.sh 15 --channel=psql   # fastest: just the psql channel
-./test.sh                     # full matrix PG 15-18 (what CI runs) before pushing
+./test.sh all                 # full version matrix PG 15-18
+./test.sh ci                  # every CI track, before pushing anything touching pgpm_core
 ```
 
 Each run starts from a fresh container and tears it down, so tests never depend on

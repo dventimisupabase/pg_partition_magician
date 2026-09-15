@@ -2,11 +2,11 @@
 # At-scale load test for pg_partition_magician.
 #
 # pgpm is self-driving: you call transmute() once and pgpm's own pg_cron maintenance
-# obtains + drains the default autonomously, inside the database. So this harness only
+# obtains and regrains autonomously, inside the database. So this harness only
 # (1) generates the bulk data SERVER-SIDE, (2) drives an ambient OLTP workload that has
 # nothing to do with pgpm, (3) triggers the conversion once (transmute + schedule
-# pgpm.maintain) and marks the phase boundaries, and (4) writes a report. It never
-# drives drain_step/obtain itself; the conversion runs server-side.
+# pgpm's maintenance) and marks the phase boundaries, and (4) writes a report. It never
+# drives regrain_step/obtain itself; the conversion runs server-side.
 #
 # The SYSTEM metrics (WAL, checkpoints, pg_stat_io, wait/lock events, table sizes) are
 # pg_flight_recorder's job -- it records them continuously and server-side, and the report
@@ -33,7 +33,7 @@ BENCH_CHUNK="${BENCH_CHUNK:-2000000}"       # generator commit chunk
 BENCH_GEN_JOBS="${BENCH_GEN_JOBS:-1}"       # parallel generator sessions (one INSERT..SELECT is single-core; fan out to use all cores)
 BENCH_PREFREEZE="${BENCH_PREFREEZE:-0}"     # 1 = VACUUM(FREEZE,ANALYZE) after generation so the post-bulk-load
                                             #     freeze/hint-bit WAL settles BEFORE measuring (gentle arm: keeps the
-                                            #     load aftermath out of the window so windowed I/O reflects the drain)
+                                            #     load aftermath out of the window so windowed I/O reflects the regrain)
 BENCH_INTERVAL="${BENCH_INTERVAL:-1 month}" # partition width
 BENCH_OBTAIN="${BENCH_OBTAIN:-3}"
 
@@ -44,30 +44,30 @@ BENCH_PHASE_SECS="${BENCH_PHASE_SECS:-120}" # per-phase load duration (baseline/
 BENCH_TRANSMUTE_WARM="${BENCH_TRANSMUTE_WARM:-15}"  # load lead-in before firing transmute
 BENCH_MAX_FAIL_PCT="${BENCH_MAX_FAIL_PCT:-5}"  # abort if baseline workload exceeds this failure % (mis-calibrated BENCH_OPS)
 
-BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per drain_step (configured on transmute; pgpm uses it)
+BENCH_DRAIN_BATCH="${BENCH_DRAIN_BATCH:-20000}"  # rows per regrain microbatch (passed to transmute as p_regrain_batch)
 BENCH_DRAIN_MAX_SECS="${BENCH_DRAIN_MAX_SECS:-3600}"  # safety cap on the observation window
-BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for pgpm.maintain (pgpm self-drives the drain)
-BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm drains
-BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # drain is "settled" after this long with no pgpm drain activity
+BENCH_MAINT_INTERVAL="${BENCH_MAINT_INTERVAL:-5 seconds}"  # pg_cron schedule for maintain_all + maintain_obtain_all
+BENCH_OBSERVE_INTERVAL="${BENCH_OBSERVE_INTERVAL:-15}"     # how often (s) the harness samples while pgpm regrains
+BENCH_DRAIN_IDLE_SECS="${BENCH_DRAIN_IDLE_SECS:-120}"      # transmute-only runs (BENCH_REGRAIN=0): stop observing after this long
 
 # How the convert phase decides it's done observing:
-#   settle  -- run until pgpm fully drains the closed tail (the aggressive/"stress" arm: drive the
-#              drain hard so it completes within the run, then confirm it settled). Default.
-#   window  -- the GENTLE/steady-state arm: a gentle drain on a large table never finishes inside a
-#              benchmark window, and it doesn't need to. Warm up until the drain is steadily running,
+#   settle  -- run until pgpm fully regrains the monolith (the aggressive/"stress" arm: drive the
+#              regrain hard so it completes within the run, then confirm it settled). Default.
+#   window  -- the GENTLE/steady-state arm: a gentle regrain of a large table never finishes inside a
+#              benchmark window, and it doesn't need to. Warm up until the regrain is steadily running,
 #              then measure the workload for a fixed window and compare it to baseline -- the question
-#              is "is the drain unnoticeable?", not "is it done yet?". Convert metrics are restricted
+#              is "is the regrain unnoticeable?", not "is it done yet?". Convert metrics are restricted
 #              to the measurement window (the one-time transmute cutover is excluded by the warm-up).
 BENCH_OBSERVE_MODE="${BENCH_OBSERVE_MODE:-settle}"          # settle | window
-BENCH_CONVERT_WARMUP_SECS="${BENCH_CONVERT_WARMUP_SECS:-30}"  # window mode: let the drain reach steady state before measuring
+BENCH_CONVERT_WARMUP_SECS="${BENCH_CONVERT_WARMUP_SECS:-30}"  # window mode: let the regrain reach steady state before measuring
 BENCH_CONVERT_WINDOW_SECS="${BENCH_CONVERT_WINDOW_SECS:-300}" # window mode: measure the workload for this long
 
-# Ambient-surge injection (demonstrates adaptive feathering yielding to a write spike). During the
-# convert observe phase, BENCH_SURGE_AFTER_SECS in, launch a write-heavy pgbench burst for
-# BENCH_SURGE_SECS, then stop it -- the "Monday morning everybody logs in" moment. The drain_budget
-# trace in drain.progress.csv should dip while the surge is live and recover after. Write-heavy on
-# purpose: the controller senses WAL, and the drain dominates WAL, so only a WAL-heavy surge moves the
-# signal enough to trigger a clean backoff (a read/CPU-heavy surge would contend without raising WAL).
+# Ambient-surge injection. During the convert observe phase, BENCH_SURGE_AFTER_SECS in, launch a
+# write-heavy pgbench burst for BENCH_SURGE_SECS, then stop it -- the "Monday morning everybody logs in"
+# moment. It was built to show adaptive feathering backing the old drain off under a WAL spike; that
+# controller went with the drain (#288), so there is no budget to watch dip any more, and regrain runs at
+# its fixed batch. What the surge still shows is how the regrain and a write spike contend, in the
+# workload's latency and pgfr's WAL/checkpoint series.
 BENCH_SURGE_CLIENTS="${BENCH_SURGE_CLIENTS:-0}"      # 0 = no surge; >0 = extra write-heavy clients
 BENCH_SURGE_AFTER_SECS="${BENCH_SURGE_AFTER_SECS:-180}"  # seconds into the observe phase to start the surge
 BENCH_SURGE_SECS="${BENCH_SURGE_SECS:-180}"         # how long the surge lasts
@@ -113,7 +113,7 @@ trap cleanup EXIT INT TERM
 # Managed Postgres (e.g. Supabase) injects a per-connection statement_timeout
 # (2min) that ALTER DATABASE/ROLE can't override and the pooler drops startup
 # `options`, so disable it (+ lock_timeout) in-session on every connection. The
-# long statements here -- bulk generate, transmute's index build, the drain's
+# long statements here -- bulk generate, transmute's index build, transmute's
 # VALIDATE CONSTRAINT scan, the final VACUUM -- all exceed a 2min cap. The SETs
 # go in their OWN -c so the actual command runs in its own implicit transaction:
 # folding them into one -c string would wrap everything in a single transaction,
@@ -198,7 +198,7 @@ pctiles() {
 
 # tps + avg-latency for a label DERIVED from the pgbench --log (the convert pgbench is killed
 # and prints no summary). Optional epoch window [lo,hi] (args 2,3) restricts to that slice, so
-# window mode measures only steady-state draining. Emits "tps = ...|latency average = ... ms".
+# window mode measures only steady-state regraining. Emits "tps = ...|latency average = ... ms".
 pgbench_log_summary() {
   local label="$1" lo="${2:-0}" hi="${3:-0}" files
   files=$(ls "$RESULTS/pgb_$label".* 2>/dev/null || true)
@@ -335,8 +335,8 @@ else
     # Settle the post-bulk-load freeze/hint-bit WAL NOW, synchronously, before baseline. A fresh
     # bulk load leaves tens of millions of unfrozen tuples; the first autovacuum rewrites every
     # page (FPIs -> WAL), which at scale fires forced checkpoints and temp during the convert
-    # WINDOW and reads as drain I/O. Freezing here pushes that aftermath outside the window so the
-    # windowed pgfr metrics reflect the gentle drain, not the load. (ANALYZE folded in.)
+    # WINDOW and reads as regrain I/O. Freezing here pushes that aftermath outside the window so the
+    # windowed pgfr metrics reflect the gentle regrain, not the load. (ANALYZE folded in.)
     echo "  pre-freeze: VACUUM (FREEZE, ANALYZE) bench.events -- settle load aftermath out of the window..."
     q "vacuum (freeze, analyze) bench.events" >/dev/null
   else
@@ -348,14 +348,14 @@ echo "  events: $(q "select count(*) from bench.events") rows, $(q "select pg_si
 
 # ---- 3. baseline (unpartitioned, under load) -------------------------------
 run_phase baseline "$BENCH_PHASE_SECS"
-assert_workload_healthy baseline   # bail now if the workload is timing out, before transmute/drain/post
+assert_workload_healthy baseline   # bail now if the workload is timing out, before transmute/regrain/post
 
 # ---- 4. conversion: transmute, FREEZE the monolith, then OBSERVE pgpm regrain it under load ----
 # The benchmark does NOT perform the partitioning. It sets pgpm up the way an operator does --
-# transmute() once (unpaused), enable auto-regrain, schedule pgpm.maintain on pg_cron -- and then pgpm's
-# OWN cron job regrains the monolith (and obtains/drains) autonomously, inside the database. The harness
+# transmute() once (unpaused), enable auto-regrain, schedule maintenance on pg_cron -- and then pgpm's
+# OWN cron jobs regrain the monolith (and obtain) autonomously, inside the database. The harness
 # only runs the ambient workload and OBSERVES (samples + watches pgpm.log) until the regrain completes.
-# Nothing here calls regrain_step/drain_step/obtain in the loop; a dropped observer connection can't stop
+# Nothing here calls regrain_step/obtain in the loop; a dropped observer connection can't stop
 # the conversion. See the BENCH_ID_STEP/BENCH_REGRAIN notes above for why this is an id-key, frozen-monolith run.
 say "conversion: transmute(id) + freeze the monolith, then observe pgpm auto-regrain it under load"
 pgss_reset
@@ -405,10 +405,13 @@ fi
 load_pid=$!; BG_PIDS+=("$load_pid")
 convert_start=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window start (for slicing pgfr)
 
-# 4d. schedule pgpm.maintain on pg_cron -- THIS is how pgpm self-drives regrain (+ obtain + drain).
-q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+# 4d. schedule pgpm's maintenance on pg_cron -- THIS is how pgpm self-drives regrain and obtain. Two jobs, the
+#     same shape pgpm.schedule() registers: since #347, maintain_all() no longer obtains, so without the
+#     second job the forward grid is never extended and writes past it are refused mid-run.
+q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
 q "select cron.schedule('pgpm_maint_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_all()')" >/dev/null
-echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now regraining itself"
+q "select cron.schedule('pgpm_obtain_bench', '$BENCH_MAINT_INTERVAL', 'call pgpm.maintain_obtain_all()')" >/dev/null
+echo "  scheduled pgpm.maintain_all + maintain_obtain_all on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm is now regraining itself"
 
 # 4e. OBSERVE. settle mode -> watch until regrain STARTS (>=1 copy microbatch) then the coarse monolith is
 #     GONE (coarse_partitions: 1 -> 0, the atomic swap completed, history fully split into fine children).
@@ -419,6 +422,7 @@ echo "  scheduled pgpm.maintain on pg_cron every '$BENCH_MAINT_INTERVAL' -- pgpm
 : > "$RESULTS/drain.progress.csv"
 echo "observed_s,default_rows,partitions,coarse,regrain_copies,rows_copied,last_regrain_age_s,budget,ambient_waiters,ambient_baseline,surge_active" >> "$RESULTS/drain.progress.csv"
 obs_start=$(q "select extract(epoch from clock_timestamp())")
+obs_start_local=$(date +%s)   # client clock: only for the cap check when a poll fails (no server timestamp then)
 regrain_started=0; coarse_seen=0; warned_stall=0; window_start=0; conv_win_lo=0; conv_win_hi=0
 surge_pid=""; surge_launched=0; surge_active=0
 while :; do
@@ -427,9 +431,12 @@ while :; do
   # stands, 0 after the swap). The adaptive-feathering samples this poll used to carry (the per-tick
   # drain_budget, _ambient_lock_waiters() and config.drain_ambient_baseline) are gone with that closed loop
   # (#288, #304); the function and the column no longer exist, so reading them errored rather than reporting.
+  # The same went for the second field, n_live_tup of bench.events_default: that partition went with #288
+  # too, and a regclass cast of a missing relation raises, so EVERY poll failed. It stays in the output as a
+  # constant -1 so drain.progress.csv keeps its column layout (plot_results.py skips -1).
   poll=$(q "with s as (select * from pgpm.status() where parent='bench.events'::regclass)
             select extract(epoch from clock_timestamp())::bigint
-            ||'|'|| coalesce((select n_live_tup from pg_stat_user_tables where relid='bench.events_default'::regclass),-1)
+            ||'|'|| -1
             ||'|'|| (select count(*) from pg_inherits where inhparent='bench.events'::regclass)
             ||'|'|| coalesce((select coarse_partitions from s),-1)
             ||'|'|| coalesce((select count(*) from pgpm.log where parent_table='bench.events'::regclass and action='regrain_copy'),0)
@@ -437,12 +444,17 @@ while :; do
             ||'|'|| coalesce((select round(extract(epoch from (clock_timestamp()-max(at))))::int
                               from pgpm.log where parent_table='bench.events'::regclass and action in ('regrain_copy','regrain_attach','regrain')),-1)
             " 2>/dev/null) \
-    || { echo "  (observe poll failed -- retrying)"; continue; }
+    || { echo "  (observe poll failed -- retrying)"
+         # A failing poll must not outlive the cap: the backstop below is never reached on this path.
+         if [ $(( $(date +%s) - obs_start_local )) -gt "$BENCH_DRAIN_MAX_SECS" ]; then
+           echo "  observation hit cap ${BENCH_DRAIN_MAX_SECS}s with the poll still failing; stopping"; break
+         fi
+         continue; }
   IFS='|' read -r now_s drows nparts coarse copies copied refage budget waiters baseline <<<"$poll"
   elapsed=$(awk -v a="$obs_start" -v b="$now_s" 'BEGIN{printf "%.0f", b-a}')
 
   # ambient write-surge: launch a write-heavy pgbench burst BENCH_SURGE_AFTER_SECS into the observe
-  # phase, stop it BENCH_SURGE_SECS later. The budget column should dip while surge_active=1.
+  # phase, stop it BENCH_SURGE_SECS later (surge_active=1 marks the window in drain.progress.csv).
   if [ "${BENCH_SURGE_CLIENTS:-0}" -gt 0 ]; then
     if [ "$surge_launched" = 0 ] && [ "$elapsed" -ge "$BENCH_SURGE_AFTER_SECS" ]; then
       say "AMBIENT SURGE: launching $BENCH_SURGE_CLIENTS write-heavy clients for ${BENCH_SURGE_SECS}s (rows/call=$BENCH_SURGE_ROWS)"
@@ -510,7 +522,7 @@ while :; do
   fi
 done
 kill "$load_pid" 2>/dev/null || true; wait "$load_pid" 2>/dev/null || true
-q "select cron.unschedule(jobid) from cron.job where jobname='pgpm_maint_bench'" >/dev/null 2>&1 || true
+q "select cron.unschedule(jobid) from cron.job where jobname in ('pgpm_maint_bench','pgpm_obtain_bench')" >/dev/null 2>&1 || true
 convert_end=$(q "select to_char(now(),'YYYY-MM-DD HH24:MI:SS')")   # conversion window end (for slicing pgfr)
 # if window mode never closed a window (regrain never warmed up), fall back to whole-convert metrics
 if [ "$BENCH_OBSERVE_MODE" = window ] && [ "$conv_win_hi" = 0 ]; then conv_win_lo=0; fi

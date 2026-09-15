@@ -110,7 +110,7 @@ alter table pgpm.config add column if not exists regrain_max_blocks int;
 alter table pgpm.config add column if not exists regrain_to text;
 -- regrain copy progress (REDESIGN.md section 10): the NATIVE-grid lo of the sub-range currently being
 -- copied out of the coarse child under regraining -- a cross-tick high-water mark. regrain COPIES (never
--- deletes), so the source never shrinks and cannot drive progress the way the drain's deletes do; this
+-- deletes), so the source never shrinks and cannot drive progress the way deletes would; this
 -- cursor is the explicit progress state instead. null = no regrain in flight; reset to null at the swap.
 alter table pgpm.config add column if not exists regrain_cursor text;
 -- retain() pacing (issue #189): cap how many eligible partitions ONE retain() call will attempt
@@ -161,11 +161,11 @@ create table if not exists pgpm.part (
   lo           text        not null,
   hi           text        not null,
   created_at   timestamptz not null default now(),
-  -- false while the drain is still moving rows into this child (created standalone, not yet ATTACHed to
-  -- the parent); flipped true at the attach. Lets an in-flight (or stalled, or interrupted) drain child
+  -- false while regrain is still copying rows into this child (created standalone, not yet ATTACHed to
+  -- the parent); flipped true at the swap. Lets an in-flight (or stalled, or interrupted) regrain child
   -- be tracked in pgpm's catalog and surfaced by status(), instead of being discoverable only by
   -- scanning pg_class for the name pattern. obtain creates partitions already attached, so the default
-  -- is true; only the drain inserts a row with attached=false. (issue #94)
+  -- is true; only regrain inserts a row with attached=false. (issue #94)
   attached     boolean     not null default true,
   -- When retirement of this child BEGAN -- set as retire() dispatches a CONCURRENT DETACH for it, never
   -- refreshed by a retry, and cleared with the row when the drop completes (issue #268). It doubles as
@@ -230,7 +230,7 @@ create table if not exists pgpm.dropped_fk (
   constraint_name     name        not null,
   definition          text        not null,
   -- lifecycle markers for a preserve-managed incoming FK (issue #95):
-  --   restored_at null                     => DROPPED (RI off: during the drain, or initially after transmute).
+  --   restored_at null                     => DROPPED (RI off: after the transmute cutover, until restored).
   --   restored_at set, validated_at null   => RE-ADDED as NOT VALID: enforces RI for all NEW writes, but
   --                                            pre-existing rows are not yet verified (orphans, if any,
   --                                            are tolerated-but-flagged -- surfaced by status().fks_unvalidated
@@ -620,7 +620,7 @@ $$;
 
 -- ANALYZE a freshly minted + bulk-loaded table so the planner has real row stats before anything relies
 -- on it. A CREATE TABLE LIKE'd child that has just been INSERT'd into still shows reltuples = -1 (unknown)
--- until autovacuum catches up, so any plan that touches it in the interim -- a later regrain/drain batch,
+-- until autovacuum catches up, so any plan that touches it in the interim -- a later regrain batch,
 -- the swap/attach, or a user query right after -- misplans against a phantom-empty table. That is exactly
 -- the seqscan that made the from_hypertable cutover reconcile O(rows) (#164/#166). ANALYZE is sampled, so
 -- its cost is bounded by default_statistics_target, not the table size; call it everywhere a table is
@@ -1579,7 +1579,7 @@ $$;
 -- visible through the parent the entire time. The product has no dead tuples (the fine children only ever
 -- receive inserts) and no vacuum (the source's space is reclaimed by the DROP, not by DELETE). Because the
 -- rows are never moved through an unattached child, regrain NEVER opens the snapshot() read gap, and the
--- multi-tick COPY needs no FK leash (the drain's delete-and-move is the one that carries that) -- REDESIGN.md
+-- multi-tick COPY needs no FK leash (only a delete-and-move design would need one) -- REDESIGN.md
 -- sections 9 and 10. The one exception is the swap's DETACH itself: Postgres refuses to detach a partition
 -- whose rows are still referenced by an incoming FK (the keys leave the parent between detach and the
 -- re-attach of the copies, which it will not look past), so the swap transiently drops the incoming FK(s)
@@ -1588,7 +1588,7 @@ $$;
 -- retention horizon is NOT copied (it is discarded with the source at the DROP), so retention costs no delete.
 --
 -- The work is a series of resumable microbatches (regrain_step). Because the source is frozen and is never
--- deleted from, it cannot drive progress the way the drain's shrinking DEFAULT does, so progress is tracked
+-- deleted from, it cannot drive progress the way a shrinking source would, so progress is tracked
 -- explicitly by config.regrain_cursor: the native-grid lo of the sub-range currently being copied. A child is
 -- built to completion (one budget batch at a time, resumed from its own high-water mark) before the cursor
 -- advances to the next sub-range; when the cursor reaches the coarse hi every sub-range is copied (or aged
@@ -1950,7 +1950,7 @@ $$;
 -- one resumable microbatch of regrain work on coarse child p_child toward target step p_target_step.
 -- Returns: 'copied:N' (copied N rows into the current fine child), 'swapped:K' (cursor reached hi -> detached
 -- the source, attached K fine children, dropped it: regrain done), or a soft no-progress status ('active' =
--- not frozen yet, 'default_dirty' = a stray sits in the range, 'nosubdiv' = the step does not subdivide).
+-- not frozen yet, 'nosubdiv' = the step does not subdivide).
 create or replace function pgpm.regrain_step(
   p_parent regclass, p_child name, p_target_step text default null, p_batch int default null
 ) returns text language plpgsql as $$
@@ -2095,7 +2095,7 @@ begin
     return 'prepared';
   end if;
 
-  -- retention horizon (matches retain() and the drain's retain_reclaim, issue #91)
+  -- retention horizon (matches retain(), issue #91)
   if cfg.retain is not null then
     if cfg.control_kind = 'id'
       then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
@@ -2325,11 +2325,10 @@ begin
   loop
     v_status := pgpm.regrain_step(p_parent, v_child, p_target_step, null);
     if v_status like 'swapped:%' then return split_part(v_status, ':', 2)::int; end if;
-    if v_status in ('active', 'default_dirty', 'nosubdiv', 'nokey', 'idle') then
+    if v_status in ('active', 'nosubdiv', 'nokey', 'idle') then
       raise exception 'pg_partition_magician: cannot regrain % -- %', p_child,
         case v_status
           when 'active' then 'it is still active (not frozen); wait until the frontier passes its upper bound'
-          when 'default_dirty' then 'the DEFAULT holds rows inside its range; drain them first'
           when 'nosubdiv' then 'the target step does not subdivide its range'
           when 'nokey' then 'it has no primary key or unique constraint, so a resumable copy cannot identify rows; regrain is unavailable for keyless tables (the coarse monolith remains a valid, queryable state)'
           else 'nothing to regrain' end;
@@ -2491,12 +2490,12 @@ begin
     end if;
   end if;
 
-  -- Orphaned-child guard (REDESIGN.md): a drain creates each child partition as a standalone
-  -- table (CREATE TABLE ... LIKE) and only ATTACHes it at the END of that child's drain. An
-  -- interrupted drain therefore leaves an un-attached child -- which DROP TABLE <parent> CASCADE
-  -- does NOT remove (an un-attached table has no dependency on the parent). If the table is later
-  -- recreated/reloaded and re-transmuted, the next drain reuses the orphan by name and INSERTs rows
-  -- whose keys already live in it: a cryptic mid-drain "duplicate key" deep inside drain_step.
+  -- Orphaned-child guard (REDESIGN.md): regrain creates each fine child as a standalone table
+  -- (CREATE TABLE ... LIKE) and only ATTACHes it at the swap. An interrupted regrain therefore
+  -- leaves an un-attached child -- which DROP TABLE <parent> CASCADE does NOT remove (an
+  -- un-attached table has no dependency on the parent). If the table is later recreated/reloaded
+  -- and re-transmuted, the next regrain reuses the orphan by name and INSERTs rows whose keys
+  -- already live in it: a cryptic mid-regrain "duplicate key" deep inside regrain_step.
   -- Refuse up front -- any standalone (un-attached) table in this schema whose name matches this
   -- parent's child-partition naming (<rel>_p<digits...>) is an orphan. starts_with handles the
   -- (un-escaped) rel prefix; the regex only constrains the data-independent suffix.
@@ -2514,7 +2513,7 @@ begin
        and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
      limit 1;
     if v_orphan is not null then
-      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted drain. Drop it (drop table %.%) and retry transmute.',
+      raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted regrain. Drop it (drop table %.%) and retry transmute.',
         v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
     end if;
   end;
@@ -3409,16 +3408,15 @@ begin
 end;
 $$;
 
--- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data and
--- creates no real partitions (obtain does that, later -- see the NOTE in _transmute), so until
--- maintenance/obtain has run the DEFAULT partition still holds 100% of the rows and the original
--- table is sitting there untouched, merely renamed and attached. untransmute exploits that: detach the
--- DEFAULT (it is a complete standalone table again the instant it detaches, because transmute never
--- drops its PK), drop the now-childless parent, rename the DEFAULT back, and undo the few things
--- transmute changed on it (identity moved to the parent, the drain's autovacuum knobs, preserved
--- incoming FKs). It is a one-way door the moment a real partition exists: once obtain has run, live
--- writes route into real partitions (and the drain may have moved rows out of the DEFAULT), so the
--- DEFAULT is no longer the whole table -- untransmute then refuses. Returns the restored table.
+-- Reverse a transmute, exactly while it is still reversible. transmute's cutover moves no data: the
+-- original table is attached intact as the monolith, merely renamed. As long as every row still lives
+-- inside the monolith's [lo, hi), untransmute exploits that: detach the monolith (it is a complete
+-- standalone table again the instant it detaches, because transmute never drops its PK), drop the
+-- parent and its empty forward partitions, rename the monolith back, and undo the few things transmute
+-- changed on it (identity moved to the parent, triggers, preserved incoming FKs). It is a one-way door
+-- the moment any row lives outside the monolith: once the frontier crosses its upper bound, live writes
+-- route into forward partitions, and a regrain splits the monolith itself -- untransmute then refuses.
+-- Returns the restored table.
 --
 -- Fidelity notes: an identity column comes back in the form it had, ALWAYS or BY DEFAULT (#308), and the
 -- control column is left NOT NULL (transmute set it; a nullable partition key is a foot-gun, and we do
@@ -3724,7 +3722,6 @@ $$;
 -- pause/resume the scheduled lifecycle for one table. transmute registers a table paused by default
 -- (the deliberate two-step: convert, inspect, then go live), and maintenance is a no-op while paused.
 -- These are the first-class way to flip config.paused, so operators never hand-edit the catalog.
--- drain_step/drain_all ignore the flag, so you can still drive the drain by hand while paused.
 create or replace function pgpm.resume(p_parent regclass)
 returns void language plpgsql as $$
 begin
@@ -3779,11 +3776,7 @@ declare
   v_archived int := 0; v_dropped int := 0; v_restored int := 0;
   v_regrain text := 'skipped'; v_regrain_child name; v_validated int := 0;
   v_note text := '';
-  v_batch int := null; v_ckpt bigint; v_congested boolean; v_budget int; v_deferred boolean;
-  v_now_lsn pg_lsn; v_now_ts timestamptz; v_secs numeric; v_obs_bps numeric;
-  v_waiters int; v_wal_cong boolean; v_amb_cong boolean; v_reason text;
-  v_lock_surge boolean; v_lock_abs boolean; v_amb_baseline numeric;
-  v_io_time numeric; v_io_blks bigint; v_io_lat numeric; v_io_surge boolean; v_io_baseline numeric;
+  v_batch int := null;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -3791,7 +3784,7 @@ begin
 
   -- Maintenance is a background janitor; it must NEVER block -- let alone deadlock -- the live
   -- workload. Each step is isolated in its own subtransaction, and a step that loses a lock race
-  -- is DEFERRED (retried next tick) WITHOUT aborting the drain. obtain has its own procedure and
+  -- is DEFERRED (retried next tick) WITHOUT aborting the tick. obtain has its own procedure and
   -- its own cron job now (maintain_obtain(), issue #347), so a slow step here never delays it in
   -- turn; what remains -- write-block, archive, retain, auto-regrain, FK restore/validate -- still
   -- gets the same short lock_timeout treatment.
@@ -3828,7 +3821,7 @@ begin
 
   -- BOUNDARY (#279): make a whole tick's archived bytes durable before anything else runs. Chunked
   -- archiving exists so a large child is covered over many ticks; folding a tick's chunk into the same
-  -- transaction as the drain would mean a drain failure discards archive progress that was already paid for.
+  -- transaction as the steps after it would mean a later failure discards archive progress already paid for.
   commit;
   perform set_config('lock_timeout', '200ms', true);
 
@@ -3866,10 +3859,9 @@ begin
   end if;
 
   -- Auto-regrain (REDESIGN.md sec 12): feather the oldest frozen coarse child (found up front as
-  -- v_regrain_child) one budget-sized COPY microbatch toward regrain_to per tick, under the same adaptive
-  -- budget as the drain. Isolated in its own subtransaction; a lock race or a soft status just retries next
-  -- tick. Unlike the drain, regrain COPIES and never deletes: the source stays whole and attached until the
-  -- atomic swap, so it never moves a referenced row out of the parent, never opens the snapshot() gap, and
+  -- v_regrain_child) one COPY microbatch (sized by regrain_batch) toward regrain_to per tick. Isolated in
+  -- its own subtransaction; a lock race or a soft status just retries next tick. regrain COPIES and never
+  -- deletes: the source stays whole and attached until the atomic swap, so it never moves a referenced row out of the parent, never opens the snapshot() gap, and
   -- needs NO FK leash -- it is NOT gated on a live preserve FK and runs whether or not one is suspended.
   if v_regrain_child is not null then
     begin
@@ -4092,7 +4084,7 @@ returns bigint language plpgsql as $$
 declare v_jobid bigint;
 begin
   if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-    raise exception 'pg_partition_magician: pg_cron is not installed in this database; enable it (create extension pg_cron) to schedule maintenance, or drive the drain by hand with drain_all/maintain';
+    raise exception 'pg_partition_magician: pg_cron is not installed in this database; enable it (create extension pg_cron) to schedule maintenance, or call pgpm.maintain_all() and pgpm.maintain_obtain_all() by hand';
   end if;
   execute format('select cron.schedule_in_database(%L, %L, %L, %L)',
                  'pgpm', p_every, 'call pgpm.maintain_all()', current_database())
@@ -4343,7 +4335,7 @@ begin
 
     -- n_partitions = attached (real) partitions; coarse_partitions = the un-regrained coarse children (a
     -- wider-than-one-step range, REDESIGN.md section 14) -- the regraining backlog; inflight = the
-    -- not-yet-attached drain/regrain children.
+    -- not-yet-attached regrain children.
     select count(*) filter (where attached),
            count(*) filter (where attached
                             and pgpm._native_gt(r.control_kind, hi, pgpm._grid_next(r.control_kind, r.partition_step, lo))),
@@ -4358,7 +4350,7 @@ begin
       from pgpm.dropped_fk where parent_table = r.parent_table;
     -- retain_drop_failures: unexpected DROP failures (issue #238; previously pre_drop hook
     -- failures, before pgpm.hook stopped being consulted here) logged AFTER the last successful
-    -- drop, same since-last-progress shape as drain_skips above. Archive coverage not yet complete
+    -- drop (a since-last-progress count). Archive coverage not yet complete
     -- is NOT a failure and is never logged here -- it is the normal, expected reason retain_backlog
     -- stays non-zero while chunked archiving catches up (see retain_backlog below).
     select max(id) into v_last_retain_id from pgpm.log
@@ -4590,8 +4582,8 @@ begin
   -- gate 2: no in-flight (un-attached) child mid-regrain (same shape as transmute's orphan guard). A
   -- regrain copy-child is EXCLUDED (its range is contained in an attached partition): regrain copies without
   -- deleting, so the referenced rows never leave the visible parent, and a copy-regrain never needs the FK
-  -- suspended -- so it must not hold a drain-suspended FK off either (that would reopen the RI window the
-  -- copy design closes). Only a true drain child, in no attached partition's range, blocks the re-add.
+  -- suspended -- so it must not hold the FK off either (that would reopen the RI window the copy design
+  -- closes). Only an un-attached child in no attached partition's range (an orphan) blocks the re-add.
   select c.relname into v_inflight
     from pg_class c
    where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)

@@ -8,12 +8,12 @@
 #
 #   bench/run_rung.sh R0|R1|R2|R3|R4|R5 [stress|gentle]
 #
-# PROFILE (2nd arg, default stress) selects the drain intensity + how we observe:
-#   stress -- aggressive drain (2s maintenance, large batch), run-to-completion (observe until the
-#             closed tail fully drains). The bug-finder / correctness-and-settle arm.
-#   gentle -- representative drain (slow maintenance, small batch sized under work_mem), windowed
+# PROFILE (2nd arg, default stress) selects the regrain intensity + how we observe:
+#   stress -- aggressive regrain (2s maintenance, large batch), run-to-completion (observe until the
+#             monolith is fully regrained). The bug-finder / correctness-and-settle arm.
+#   gentle -- representative regrain (slow maintenance, small batch sized under work_mem), windowed
 #             observation (warm up, then measure the workload over a fixed window without waiting
-#             for the drain to finish). The "is the drain unnoticeable?" arm -- it stays under the
+#             for the regrain to finish). The "is the regrain unnoticeable?" arm -- it stays under the
 #             instance's I/O baseline, so the disk never tires and the measurement is reproducible.
 set -euo pipefail
 
@@ -61,18 +61,19 @@ case "$RUNG" in
   *)  echo "unknown rung '$RUNG' (want R0|R1|R2|R3|R4|R5)"; exit 2 ;;
 esac
 
-# ---- per-profile drain intensity + observe mode (overrides the rung's stress defaults) ----
+# ---- per-profile regrain intensity + observe mode (overrides the rung's stress defaults) ----
 case "$PROFILE" in
   stress) # Pre-freeze too: VACUUM (FREEZE, ANALYZE) after the bulk load settles the post-load
           # autovacuum/FPI storm out of the measurement window, so the convert-phase latency reflects
-          # the drain against a steady-state table (the realistic transmute) rather than load aftermath.
-          # Without it, post-bulk-load autovacuum on the 40M default drove forced-checkpoint I/O freezes
-          # that dominated the tail and had nothing to do with the drain (see bench-gentle-window confound).
+          # the regrain against a steady-state table (the realistic transmute) rather than load aftermath.
+          # Without it (measured back when this harness drove the pre-#288 DEFAULT drain), post-bulk-load
+          # autovacuum on the 40M table drove forced-checkpoint I/O freezes that dominated the tail and had
+          # nothing to do with the conversion (see bench-gentle-window confound).
           export BENCH_MAINT_INTERVAL='2 seconds' BENCH_OBSERVE_MODE=settle BENCH_PREFREEZE=1 ;;
   gentle) # small batch (fits work_mem -> no temp spill), slow cron (stays under I/O baseline),
-          # windowed observe (warm up, then measure -- don't wait for the drain to finish).
+          # windowed observe (warm up, then measure -- don't wait for the regrain to finish).
           # Pre-freeze settles the post-bulk-load autovacuum WAL out of the window so the windowed
-          # pgfr metrics reflect the drain, not the load aftermath (see bench-gentle-window confound).
+          # pgfr metrics reflect the regrain, not the load aftermath (see bench-gentle-window confound).
           export BENCH_MAINT_INTERVAL='20 seconds' BENCH_OBSERVE_MODE=window \
                  BENCH_DRAIN_BATCH=20000 BENCH_CONVERT_WARMUP_SECS=60 \
                  BENCH_CONVERT_WINDOW_SECS=300 BENCH_DRAIN_MAX_SECS=900 BENCH_PREFREEZE=1 ;;

@@ -52,7 +52,7 @@ and the month-spread is unchanged).
 ## The phases (a passive observer)
 
 pgpm is **self-driving**: you call `transmute()` once, enable auto-regrain, and pgpm's own pg_cron
-maintenance regrains the monolith (and obtains/drains) autonomously, inside the database. So this
+maintenance regrains the monolith (and obtains) autonomously, inside the database. So this
 harness does **not** perform the partitioning: it sets pgpm up the way an operator would, drives an
 ambient workload, and *observes*. Three phases:
 
@@ -118,13 +118,13 @@ larger run is only worth doing once the one below it has passed cleanly.
 | `BENCH_OPS` | `50` | server-side ops per `workload_step` call, **calibrate to scale**: each op is disk-bound (~hundreds of ms) once the table exceeds RAM, so a value tuned on a cached table blows `statement_timeout` at scale. Keep it small (e.g. 5–10) for >RAM tables |
 | `BENCH_PHASE_SECS` | `120` | baseline/post observation duration |
 | `BENCH_MAX_FAIL_PCT` | `5` | abort right after baseline if more than this % of transactions failed (catches a mis-calibrated `BENCH_OPS` in minutes instead of hours) |
-| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for `pgpm.maintain`, how often pgpm drives a tick |
+| `BENCH_MAINT_INTERVAL` | `5 seconds` | pg_cron schedule for both maintenance jobs (`pgpm.maintain_all` and `pgpm.maintain_obtain_all`), how often pgpm drives a tick |
 | `BENCH_OBSERVE_INTERVAL` | `15` | how often (s) the harness samples while pgpm works |
-| `BENCH_DRAIN_IDLE_SECS` | `120` | drain is "settled" after this long with no pgpm drain activity in `pgpm.log` |
+| `BENCH_DRAIN_IDLE_SECS` | `120` | transmute-only runs (`BENCH_REGRAIN=0`): stop observing after this long, since there is no regrain to wait for |
 | `BENCH_DRAIN_MAX_SECS` | `3600` | safety cap on the observation window |
-| `BENCH_OBSERVE_MODE` | `settle` | `settle` = observe until the drain fully completes; `window` = warm up then measure a fixed window without waiting for completion (see Profiles) |
-| `BENCH_CONVERT_WARMUP_SECS` | `30` | window mode: let the drain reach steady state before measuring |
-| `BENCH_CONVERT_WINDOW_SECS` | `300` | window mode: measure the workload for this long, then stop (drain left running) |
+| `BENCH_OBSERVE_MODE` | `settle` | `settle` = observe until the regrain fully completes (0 coarse children); `window` = warm up then measure a fixed window without waiting for completion (see Profiles) |
+| `BENCH_CONVERT_WARMUP_SECS` | `30` | window mode: let the regrain reach steady state before measuring |
+| `BENCH_CONVERT_WINDOW_SECS` | `300` | window mode: measure the workload for this long, then stop (regrain left running) |
 | `BENCH_PGFR` / `BENCH_PGFR_DIR` | `0` / `bench/vendor/pg_flight_recorder` | install + enable pg_flight_recorder (record + analyze) for WAL/checkpoint/wait telemetry; clone the repo into `BENCH_PGFR_DIR` first |
 | `BENCH_SKIP_GENERATE` | `0` | reuse already-loaded data |
 
@@ -135,19 +135,19 @@ A single benchmark can't be everything at once, *aggressive* (to find limits and
 contradictory demands. So `bench/run_rung.sh <rung> [profile]` runs the same engine under named
 profiles that bundle drive-intensity + how we observe:
 
-- **`stress`** (default), aggressive drain (2 s maintenance, large batch), **run to completion**
-  (`BENCH_OBSERVE_MODE=settle`): drive the drain hard so it finishes within the run, then confirm
+- **`stress`** (default), aggressive regrain (2 s maintenance, large batch), **run to completion**
+  (`BENCH_OBSERVE_MODE=settle`): drive the regrain hard so it finishes within the run, then confirm
   it settled. This is the *stress test*, it deliberately exceeds production load to surface
-  bugs and limits, and it's how most of pgpm's drain/obtain hardening was found.
-- **`gentle`**, representative drain (20 s maintenance, small batch sized **under `work_mem`** so
-  it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the drain is
+  bugs and limits, and it's how most of pgpm's conversion/obtain hardening was found.
+- **`gentle`**, representative regrain (20 s maintenance, small batch sized **under `work_mem`** so
+  it never spills temp), **windowed** (`BENCH_OBSERVE_MODE=window`): warm up until the regrain is
   steadily running, then measure the workload over a fixed window and compare it to baseline,
-  *without* waiting for completion (a gentle drain of a large table takes hours/days and doesn't
+  *without* waiting for completion (a gentle regrain of a large table takes hours/days and doesn't
   need to finish to answer "is it unnoticeable?"). Kept under the instance's I/O baseline, so the
   EBS burst never depletes and the measurement is reproducible.
 
-The two are complementary, not competing: throttling needs no pgpm change (it's just `drain_batch` and
-the maintenance cadence, pgpm's intended gentle mode), and the stress arm earns its keep as a
+The two are complementary, not competing: throttling needs no pgpm change (it's just the regrain batch size,
+`BENCH_DRAIN_BATCH`, passed to `transmute` as `p_regrain_batch`, and the maintenance cadence, pgpm's intended gentle mode), and the stress arm earns its keep as a
 bug-finder. Profiles compose with the size ladder as a *rung × profile* matrix; results land in
 `results/<rung>-<profile>/`.
 
@@ -159,7 +159,7 @@ to cut that on repeat runs, with an honest caveat on each:
 
 - **Scale the instance up for setup, down to measure (the bigger lever).** Generation is
   CPU/IO/`maintenance_work_mem`-bound, so a larger compute tier builds it far faster, and it is
-  *setup*, not the measurement, so speeding it up doesn't affect the >RAM realism. The drain (the
+  *setup*, not the measurement, so speeding it up doesn't affect the >RAM realism. The regrain (the
   long pole) is the measurement and must stay on the target tier. Compute resize is a **restart**, so
   this can't happen mid-run: do it as *scale up -> generate -> scale down (restart) ->
   `BENCH_SKIP_GENERATE=1` measurement run*. transmute itself is always a metadata-only cutover (it never
@@ -187,15 +187,16 @@ to cut that on repeat runs, with an honest caveat on each:
 ## Output (`bench/results/`)
 
 - `report.md`: the before/during/after comparison, client tps + latency percentiles per
-  phase, a summary of pgpm's own conversion (drain/obtain counts, rows moved, closed-tail
-  remaining, from `pgpm.log`), and a pointer to the pgfr system-metric series sliced to the
+  phase, a summary of pgpm's own conversion (regrain copy/swap and obtain counts, rows copied,
+  coarse children remaining, from `pgpm.log`), a row-conservation check, and a pointer to the pgfr system-metric series sliced to the
   conversion window.
 - `<phase>.pgbench.txt`: raw pgbench summary (tps, latency average).
 - `<phase>.pctiles.txt`: client p50/p95/p99/max from the per-transaction log.
 - `<phase>.pgss.csv`: top server-side workload statements per phase (a scoped
   `pg_stat_statements` reset/dump, WAN-free timing for the workload itself).
-- `drain.progress.csv`: the default-partition drain curve under load (observed_s,
-  default_rows, partitions, drain_ops), pgpm's own conversion progress.
+- `drain.progress.csv`: the regrain progress curve under load (observed_s, coarse,
+  regrain_copies, rows_copied, last_regrain_age_s, ...), pgpm's own conversion progress. The
+  file keeps its historical name; its columns track regrain.
 - **pg_flight_recorder** (when `BENCH_PGFR=1`): `pgfr_report.md`, the `pgfr_analyze`
   narrative for the conversion window (anomalies, wait-event summary, WAL/checkpoint/IO
   snapshots over time).
@@ -220,19 +221,19 @@ query latency). The correlation has its own test track (`./test.sh observe`); se
 
 ## Interpreting the results
 
-- **convert** is the window that matters: pgpm is obtaining + draining the default while
+- **convert** is the window that matters: pgpm is obtaining + regraining the monolith while
   the ambient workload runs. p50/p95 should stay close to baseline; the conversion is
   online. Expect occasional `max` blips: the brief `ACCESS EXCLUSIVE` on the transmute cutover,
   and pgpm's partition `ATTACH`es. If `max` is large or sustained, that's a real finding
   worth chasing (e.g. the transmute's prep wasn't done, so the PK index built in-transaction).
-- **drain progress** is in `drain.progress.csv`: the default shrinks as pgpm drains the
-  closed months, then *grows* once they're gone (the open/current month stays in the
-  default and the ambient workload keeps filling it): that's the drain reaching "settled."
-- **post** reflects the post-conversion steady state; pgpm tuned autovacuum aggressively on
-  the default at transmute, so dead tuples from the drain reclaim over time. The table is larger
+- **regrain progress** is in `drain.progress.csv`: `rows_copied` climbs as pgpm copies the
+  monolith into fine children, and `coarse` drops from 1 to 0 at the atomic swap: that's the
+  regrain reaching "settled."
+- **post** reflects the post-conversion steady state. Regrain copies rather than deletes, so it
+  leaves no dead tuples behind to reclaim. The table is larger
   than at baseline (the workload kept inserting), so compare latency *shape*, not just tps.
 - The conversion runs **server-side via pg_cron** (the harness only observes), so a dropped
-  observer connection is harmless (it retries; pgpm keeps draining).
+  observer connection is harmless (it retries; pgpm keeps regraining).
 
 > Re-running against the **same** database needs a reset first
 > (`drop schema bench cascade; drop schema pgpm cascade;`), the harness never drops
@@ -242,8 +243,8 @@ query latency). The correlation has its own test track (`./test.sh observe`); se
 
 - `psql` and `pgbench` on `PATH` (or set `PSQL` / `PGBENCH`).
 - Target server has `pg_cron` (required by pgpm) and ideally `pg_stat_statements`.
-- Enough disk for the target table size **plus** drain headroom (the drain copies
-  each historical month into a new partition before the default shrinks).
+- Enough disk for the target table size **plus** regrain headroom (regrain copies the
+  monolith into fine partitions before the swap drops it, so history briefly exists twice).
 
 ## Migrating a TimescaleDB hypertable (`run_fh.sh`)
 
