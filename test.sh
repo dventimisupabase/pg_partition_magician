@@ -596,7 +596,8 @@ if [ "$TRACK" = "ci" ]; then
       # Deliberately NOT folded into the PASS line's meaning: this run did not verify that track, and
       # saying so plainly is the whole point of reporting a skip at all.
       echo "ci: PASS, except SKIPPED --$ci_skipped"
-      echo "    That track was NOT verified on this machine. CI still runs it on Linux."
+      echo "    That track was NOT verified: not here, and not by CI either, which has no job"
+      echo "    for it yet (#383 phase 3). Run it on Linux before trusting this PASS."
     else
       echo "ci: PASS (every track CI runs)"
     fi
