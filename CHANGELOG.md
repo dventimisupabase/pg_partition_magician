@@ -13,9 +13,12 @@
   `#265`/`#279` boundary). Measured on correct code: 2 releases and 7 commits in that interval; against
   the mutant, zero of each while every liveness witness still passes. The track runs the guard and its
   mutation together in about 50 seconds. It is a supplement, not a replacement: the reader-probe guards
-  stay as the fast, portable first line, and `./test.sh discriminate` and `ci` are unchanged and still
-  run anywhere, since eBPF needs a privileged container and host kernel headers that Docker Desktop for
-  Mac cannot provide. Linux only. (`bench/lock_trace.sh`, `bench/skip_fastpath_probes.py`,
+  stay as the fast, portable first line, and `./test.sh discriminate` is unchanged and still runs
+  anywhere. `./test.sh ci` runs the track on Linux and reports it as `SKIPPED`, never folded into the
+  `PASS`, on anything else; the condition is the kernel alone, so a Linux box that cannot actually
+  trace FAILS rather than skipping, on the rule that a guard which never ran is unverified. eBPF needs
+  a privileged container and the host's own kernel headers, which Docker Desktop for Mac cannot
+  provide. (`bench/lock_trace.sh`, `bench/skip_fastpath_probes.py`,
   `bench/mutations/mutate.py`'s `maintain_no_commits_trace`, the `locktrace` compose service,
   `Dockerfile`'s `WITH_LOCK_TRACER`)
 

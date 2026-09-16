@@ -14,8 +14,8 @@
 #   ./test.sh locktrace                  # eBPF lock-boundary observation (PG17, Linux only)
 #   ./test.sh ci                         # EVERY track CI runs, in one go
 #
-# `all` means all four PostgreSQL VERSIONS, not all tracks. The timescale, observe, archive, perf and
-# discriminate tracks each need their own image or service, so `./test.sh all` deliberately skips them
+# `all` means all four PostgreSQL VERSIONS, not all tracks. The timescale, observe, archive, perf,
+# discriminate and locktrace tracks each need their own image or service, so `./test.sh all` deliberately skips them
 # and a green run of it does NOT mean CI will be green. That gap is real: a change to
 # pgpm_core/install.sql broke the archive track's fixture while `./test.sh all` stayed green from end
 # to end, and only the PR's archive job caught it. Use `./test.sh ci` before pushing anything that
@@ -566,13 +566,41 @@ if [ "$TRACK" = "ci" ]; then
   # A string, not an array: macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
   # "unbound variable" error -- so the all-passed path would be the one that broke.
   ci_failed=""
+  ci_skipped=""
   for v in 15 16 17 18; do "$0" "$v" || ci_failed="$ci_failed pg$v"; done
   for t in timescale observe archive perf discriminate; do
     "$0" "$t" || ci_failed="$ci_failed $t"
   done
+
+  # locktrace needs eBPF: a privileged container AND the host's own kernel headers. That is fine on
+  # Linux and on GitHub's runners, and structurally impossible on Docker Desktop for Mac, whose
+  # linuxkit VM publishes no headers for its bespoke kernel (#383, confirmed structurally rather than
+  # as a missing package). So it runs wherever it can run, and anywhere else it is reported SKIPPED --
+  # never silently, and never as passed.
+  #
+  # The condition is the KERNEL ALONE, deliberately: not a probe for debugfs, headers or privileged
+  # containers. A Linux box that cannot actually trace should FAIL here, loudly, because "a guard this
+  # never actually ran is unverified" is the rule the rest of this harness already runs on, and a
+  # prerequisite check would quietly convert a broken setup into a green run -- the precise failure
+  # this repo keeps shipping. Non-Linux is the one case where the track is impossible rather than
+  # broken, so it is the one case that skips.
+  if [ "$(uname -s)" = "Linux" ]; then
+    "$0" locktrace || ci_failed="$ci_failed locktrace"
+  else
+    ci_skipped=" locktrace (needs Linux; eBPF cannot run on $(uname -s))"
+  fi
+
   echo; echo "========================================="
   if [ -z "$ci_failed" ]; then
-    echo "ci: PASS (every track CI runs)"
+    if [ -n "$ci_skipped" ]; then
+      # Deliberately NOT folded into the PASS line's meaning: this run did not verify that track, and
+      # saying so plainly is the whole point of reporting a skip at all.
+      echo "ci: PASS, except SKIPPED --$ci_skipped"
+      echo "    That track was NOT verified: not here, and not by CI either, which has no job"
+      echo "    for it yet (#383 phase 3). Run it on Linux before trusting this PASS."
+    else
+      echo "ci: PASS (every track CI runs)"
+    fi
     echo; echo "All requested tests passed."
     exit 0
   fi
