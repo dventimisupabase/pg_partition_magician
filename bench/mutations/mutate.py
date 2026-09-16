@@ -372,6 +372,16 @@ MUTATIONS = {
           "                                  pgpm._frontier_native(p_parent))),\n"
           "               p.lo);\n", 1)],
     ),
+    "obtain_headroom_integer_division": (
+        "bench/obtain_backoff_headroom.sh",
+        "The low-headroom threshold written with integer division instead of ceil: `cfg.obtain / 2` rather "
+        "than `ceil(cfg.obtain / 2.0)`. Invisible at even obtain (ceil(4/2) and 4/2 are both 2), which is why "
+        "the guard and tests/100 both carry an obtain 3 case: ceil(3/2) is 2 but 3/2 is 1, so with exactly "
+        "one complete step of headroom left the real rule bypasses the back-off and this mutant honors it, "
+        "leaving the grid unextended while the frontier keeps advancing. Mutates both sites (the walk's "
+        "bound and the decision) so the mutant is self-consistent rather than a half-applied defect.",
+        [("ceil(cfg.obtain / 2.0)", "cfg.obtain / 2", 2)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "
