@@ -13,7 +13,7 @@ discriminate.sh would report "does not discriminate" for a guard that is in fact
 on a stale pattern is the same liveness-witness discipline the guards themselves follow.
 
 Usage: mutate.py <name> <src install.sql> <dst path>
-       mutate.py --list
+       mutate.py --list [--track=NAME]
 """
 import re
 import sys
@@ -632,11 +632,42 @@ def main() -> int:
                 print(__doc__, file=sys.stderr)
                 return 2
             track = sys.argv[2].split("=", 1)[1]
+
+        # An unknown track must be an ERROR, never an empty listing. A silent empty listing is the
+        # worst possible output from this file: bench/discriminate.sh would run zero mutations and
+        # report "PASS (0 guard(s) verified against their defects)", a green check that verified
+        # nothing -- in the very machinery whose entire purpose is to prove that a green check means
+        # something. Same discipline as a stale pattern below: fail loudly rather than hand back a
+        # result that looks like success.
+        known = {"perf"} | set(MUTATION_TRACK.values())
+        if track not in known:
+            print(
+                f"mutate.py: unknown track {track!r}; known tracks are "
+                f"{', '.join(sorted(known))}.\n"
+                f"  Refusing to print an empty listing, which would make discriminate.sh report a\n"
+                f"  PASS having verified nothing at all.",
+                file=sys.stderr,
+            )
+            return 2
+
+        listed = 0
         for name, (guard, why, _) in MUTATIONS.items():
             if MUTATION_TRACK.get(name, "perf") != track:
                 continue
+            listed += 1
             src = MUTATION_SRC.get(name, "pgpm_core/install.sql")
             print(f"{name}\t{guard}\t{why}\t{src}")
+        if listed == 0:
+            # Reachable only if a track is registered in MUTATION_TRACK and then has its last
+            # mutation removed. That leaves a CI job running happily against nothing, so it is a
+            # failure here rather than a discovery months later.
+            print(
+                f"mutate.py: track {track!r} selected no mutations. A registered track with no\n"
+                f"  mutation left in it is a guard that nothing verifies -- add one back, or remove\n"
+                f"  the track and the job that runs it.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     if len(sys.argv) != 4:
         print(__doc__, file=sys.stderr)
