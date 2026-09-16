@@ -500,7 +500,7 @@ run_discriminate() {
 run_locktrace() {
   local prof="locktrace" svc="locktrace" c="pgpm_test-locktrace"
   echo; echo "========================================="
-  echo "Lock-trace track: eBPF lock boundaries (pg17 + pg-lock-tracer)"
+  echo "Lock-trace track: eBPF lock boundaries (pg17 + bench/lock_probe.py)"
   echo "========================================="
   $DC --profile "$prof" down -v 2>/dev/null || true
   $DC --profile "$prof" build $BUILD_PROGRESS "$svc"

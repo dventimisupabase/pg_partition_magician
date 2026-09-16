@@ -23,7 +23,7 @@ on:
     paths:
       - 'pgpm_core/install.sql'
       - 'bench/lock_trace.sh'
-      - 'bench/skip_fastpath_probes.py'
+      - 'bench/lock_probe.py'
       - 'bench/discriminate.sh'
       - 'bench/mutations/**'
       - 'test.sh'
@@ -35,7 +35,7 @@ on:
     paths:
       - 'pgpm_core/install.sql'
       - 'bench/lock_trace.sh'
-      - 'bench/skip_fastpath_probes.py'
+      - 'bench/lock_probe.py'
       - 'bench/discriminate.sh'
       - 'bench/mutations/**'
       - 'test.sh'

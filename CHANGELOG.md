@@ -14,6 +14,30 @@
   against the defect. `./test.sh ci`'s skip notice and `CLAUDE.md` now say CI covers the skip, which
   before this they could not truthfully say.
 
+  Running it in CI immediately earned its keep by failing, on a defect in the instrument rather than
+  in pgpm, and that failure ended with **pg-lock-tracer being abandoned entirely**. It emitted every
+  lock event for the whole server through a PER-CPU perf buffer and formatted each one as JSON in
+  Python: ~120,000 events per tick to deliver about ten facts. Two consequences followed from that one
+  design choice. Per-CPU buffers deliver out of order across CPUs (measured: 4 inversions in 101,185
+  events, two of them statement markers, which moved a boundary 53,000 positions and silently shrank
+  the window under test to almost nothing), and the Python consumer could not keep up, so the buffer
+  overflowed -- opened with no `lost_cb`, discarding events in complete silence (measured: 4,150 lost
+  in one run, the guard reporting a lock as never released while the commits in the same interval
+  proved it had been).
+
+  `bench/lock_probe.py` replaces it: ~40 lines of BPF C we own, probing `LockRelationOid` and
+  `CommitTransaction` and filtering by relation oid and backend IN THE KERNEL, so dozens of events
+  reach userspace instead of ~120,000. It uses `BPF_RINGBUF` rather than `BPF_PERF_OUTPUT` -- one
+  shared buffer, so records arrive in order and nothing needs sorting, and `ringbuf_reserve()` fails
+  visibly when full, so the probe counts its own drops in the kernel and the guard asserts that count
+  is zero. A truncated stream can no longer masquerade as a complete one. The image drops
+  pg-lock-tracer, four Python libraries and the script that patched its source in two places; only
+  `python3-bpfcc` and version-pinned debug symbols remain. The release path is deliberately not
+  probed: `UnGrantLock` takes a struct pointer, so reading a relation oid from it would mean
+  depending on field offsets that shift between PostgreSQL versions, whereas
+  `LockRelationOid(Oid, LOCKMODE)` passes scalars. A commit releases the lock, so the commit is the
+  honest signal.
+
 - **Lock boundaries are now OBSERVED, not inferred, by a new `./test.sh locktrace` track (issue #383,
   phases 1 and 2).** Every lock guard in `bench/` proves "the lock was released before the next slow
   step" indirectly: a concurrent reader under a short `lock_timeout` either times out or does not.
