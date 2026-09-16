@@ -95,12 +95,12 @@ services:
     container_name: pgpm_test-archive
     ports: ["5520:5432"]
 
-  # The locktrace track (issue #383): PG17 plus eBPF lock tracing via pg-lock-tracer, which attaches
-  # uprobes to the running postgres binary and reports every lock acquire/release as it happens --
-  # continuous observation, where every other lock guard in bench/ infers a lock's lifetime from
-  # whether a concurrent reader timed out. Its own profile, excluded from "all": the image carries bcc,
-  # debug symbols and a Python toolchain that nothing else needs, and the service is PRIVILEGED, which
-  # no other service here is.
+  # The locktrace track (issue #383): PG17 plus eBPF lock observation via bench/lock_probe.py, which
+  # attaches uprobes to the running postgres binary and reports lock acquisitions and commits as they
+  # happen -- continuous observation, where every other lock guard in bench/ infers a lock's lifetime
+  # from whether a concurrent reader timed out. Its own profile, excluded from "all": the image
+  # carries bcc and debug symbols that nothing else needs, and the service is PRIVILEGED, which no
+  # other service here is.
   #
   # Why privileged, and why the three host mounts. BCC compiles its BPF program at run time against the
   # HOST kernel's headers and then loads it, so the container needs /lib/modules and /usr/src from the

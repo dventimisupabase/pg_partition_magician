@@ -20,7 +20,6 @@ ARG PGSQL_HTTP_REF=v1.6.2
 # turning it on neither rebuilds that layer nor adds a single package to the default pg15-18 matrix
 # images. docker-compose.yml's `locktrace` service passes WITH_LOCK_TRACER=true.
 ARG WITH_LOCK_TRACER=false
-ARG PG_LOCK_TRACER_REF=0.7.1
 
 RUN apt-get update \
     && apt-get install -y \
@@ -49,26 +48,22 @@ RUN echo "shared_preload_libraries = 'pg_cron'" >> /usr/share/postgresql/postgre
 # eBPF lock tracing for the locktrace track (bench/lock_trace.sh, issue #383). Its own layer, on
 # purpose: the RUN above builds pg_cron and pgTAP from source for every image in the matrix, and
 # appending to it would invalidate that cache for all four to serve one optional track.
-COPY bench/skip_fastpath_probes.py /usr/local/bin/skip_fastpath_probes.py
+# bcc is the ONLY addition beyond debug symbols. This layer used to install pg-lock-tracer, four
+# Python libraries it needed, and a script that patched two places in its source; all of that is gone
+# (#389). bench/lock_probe.py is ~40 lines of BPF C we own, it filters in the kernel, and it needs
+# nothing but bcc. It is not COPYed in either: the repo is bind-mounted at /repo by the locktrace
+# compose service, so the probe is edited and run straight from the checkout.
+#
+# The dbgsym package is PINNED to the exact postgres already in this image, and is still required:
+# LockRelationOid is exported in .dynsym, but CommitTransaction is not. A build id identifies ONE
+# build, so an unpinned install that floated a point release ahead would resolve nothing and the
+# probe would attach nothing -- a guard reading an empty stream and concluding the locks it watched
+# for never happened. Pinning turns that into a build failure instead.
 RUN if [ "$WITH_LOCK_TRACER" = "true" ]; then \
       set -e; \
       apt-get update; \
-      # The dbgsym package is PINNED to the exact version of the postgres already in this image.
-      # libbcc resolves the tracer's probe targets through /usr/lib/debug/.build-id, and a build id
-      # identifies ONE build -- so an unpinned install that floated a point release ahead would
-      # resolve nothing, the tracer would attach zero probes, and a guard would read an empty stream
-      # and conclude the locks it was watching for never happened. Pinning turns that into a build
-      # failure. Without dbgsym at all, the stock pgdg binary exports only 9 of the tracer's 19 probe
-      # targets and -t LOCK cannot attach at all.
       apt-get install -y --no-install-recommends \
-        python3-bpfcc python3-pip \
+        python3-bpfcc \
         "postgresql-${PG_MAJOR}-dbgsym=$(dpkg-query -W -f='${Version}' "postgresql-${PG_MAJOR}")"; \
-      # Into the SYSTEM python, not a venv: python3-bpfcc is an apt package that is not on PyPI at
-      # all, so the tracer has to run under the interpreter that can already see it. psycopg2 cannot
-      # build from source here (no compiler left by this point, deliberately), hence the binary wheel
-      # and --no-deps.
-      pip install --break-system-packages --no-cache-dir psycopg2-binary prettytable graphviz igraph; \
-      pip install --break-system-packages --no-cache-dir --no-deps "pg-lock-tracer==${PG_LOCK_TRACER_REF}"; \
-      python3 /usr/local/bin/skip_fastpath_probes.py; \
       rm -rf /var/lib/apt/lists/*; \
     fi

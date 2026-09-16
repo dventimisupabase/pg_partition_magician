@@ -7,75 +7,56 @@
 # portable, runs on a laptop -- and inference. It cannot see a lock it did not happen to collide
 # with, and it cannot say WHICH boundary released the lock. That blind spot is not hypothetical:
 # redesigning maintain_lock.sh for #347 left it passing while its own mutation regex never matched a
-# real, unconditional commit boundary (#265, before FK-validate), and finding that took a full
-# session of CALL + pg_sleep() + single-pg_locks-check archaeology, precisely because there was no
-# continuous trace to read.
+# real, unconditional commit boundary (#265, before FK-validate).
 #
-# pg-lock-tracer attaches uprobes to the running postgres binary and reports every lock acquire and
-# release as it happens. So the claim here is not "a reader was not blocked" but the thing itself:
-# mg_ret's ACCESS EXCLUSIVE was RELEASED, and a transaction COMMITTED, before ml's turn began.
+# THE INSTRUMENT is bench/lock_probe.py: a purpose-built eBPF probe on two functions, filtering in
+# the kernel. It replaced pg-lock-tracer, which this guard used first and which proved unsound as a
+# CI foundation for reasons worth not re-learning (#389): it emitted every lock event for the whole
+# server through a PER-CPU perf buffer, which delivers out of order across CPUs (4 inversions in
+# 101,185 events moved a statement marker 53,000 positions and silently shrank the window under test
+# to nothing), and it opened that buffer with no lost_cb, so overflow discarded events in SILENCE
+# (4,150 lost in one run, the guard reporting a lock as never released while the commits in the same
+# interval proved otherwise). Filtering in the kernel turns ~120,000 events per tick into dozens,
+# and BPF_RINGBUF gives one ordered stream plus a drop count the probe reports itself.
 #
-# THE FIXTURE is maintain_lock.sh's, and deliberately so -- two managed tables swept by one
-# maintain_all(), mg_ret first (its name sorts before ml, and pgpm.config is swept `order by
-# parent_table`). mg_ret's retain DROPs take ACCESS EXCLUSIVE on its parent; ml's regrain copy is the
-# long step that follows. For mg_ret's lock to survive into ml's turn, EVERY commit standing between
-# them has to be missing: maintain()'s own internal boundaries, the easily-missed #265 one before
-# FK-validate (unconditional every tick, with or without an incoming FK), and maintain_all()'s outer
-# per-parent commit.
+# THE FIXTURE is maintain_lock.sh's -- two managed tables swept by one maintain_all(), mg_ret first
+# (its name sorts before ml, and pgpm.config is swept `order by parent_table`). mg_ret's retain DROPs
+# take ACCESS EXCLUSIVE on its parent; ml's regrain copy is the long step that follows. For mg_ret's
+# lock to survive into ml's turn, EVERY commit standing between them has to be missing: maintain()'s
+# own internal boundaries, the easily-missed #265 one before FK-validate (unconditional every tick,
+# with or without an incoming FK), and maintain_all()'s outer per-parent commit.
 #
-# It is much SMALLER than maintain_lock.sh's, though, and that is the point of tracing rather than
-# probing. That guard needs MONO=6,000,000 so the regrain copy runs ~2.3 s -- a window wide enough
-# for a reader probe to land inside repeatedly, because its unit of observation costs a whole
-# lock_timeout. A trace has no such cost: the release either appears between the two anchors or it
-# does not, at any fixture size. So this runs on 400k rows and takes well under a minute.
+# It is much SMALLER than maintain_lock.sh's, and that is the point of tracing rather than probing.
+# That guard needs MONO=6,000,000 so the regrain copy runs ~2.3 s -- a window wide enough for a
+# reader probe to land inside repeatedly, because its unit of observation costs a whole lock_timeout.
+# A trace has no such cost: the commit either falls between the two anchors or it does not.
 #
-# THE ANCHORS, both chosen by reading real traces rather than guessed:
+# THE ANCHORS, both parent oids, never partition oids. retain DROPs the partition, so a partition's
+# oid stops resolving the moment the thing under test succeeds; a parent's oid is stable, and it is
+# what a reader of the table would actually block on.
 #
-#   * mg_ret's PARENT oid, never a partition oid. retain DROPs the partition, so a partition's oid
-#     stops resolving in pg_class the moment the thing under test succeeds. The parent's oid is
-#     stable, and it is what a reader of `public.mg_ret` would actually block on.
-#   * ml's PARENT oid, alone -- not "any ml-family relation". Measured: the parent has ZERO lock
-#     events before mg_ret's sweep and 7 after, so it cleanly marks where ml's turn starts, with no
-#     name-prefix matching and no dependence on a partition list that regrain is busy changing.
+# THE ASSERTION: between the LAST AccessExclusiveLock on mg_ret's parent and the FIRST lock of any
+# mode on ml's parent, at least one TRANSACTION_COMMIT occurs in the same backend. That is the
+# boundary vocabulary #265 and #279 are written in, and what #383 specified. A commit releases the
+# lock, so this is the property.
 #
-# THE ORDERING ASSERTION, on one traced tick, restricted to the backend that ran it: between the LAST
-# AccessExclusiveLock grant on mg_ret's parent and the FIRST lock event on ml's parent, there must be
-# (a) an AccessExclusiveLock UNgrant on mg_ret's parent -- the release itself -- and (b) at least one
-# TRANSACTION_COMMIT, which is the boundary vocabulary #265 and #279 are written in. Measured on
-# correct code: 4 releases and 7 commits sit in that interval.
+# The RELEASE is deliberately not asserted, and not even probed. UnGrantLock and RemoveLocalLock take
+# pointers to structs, so recovering a relation oid from them means reading fields at offsets that
+# shift between PostgreSQL versions -- the fragility this instrument exists to avoid.
+# LockRelationOid(Oid, LOCKMODE) passes scalars, which is why it is the one lock probe used here.
 #
-# Four things about the tracer, each learned by getting it wrong:
+# maintain_obtain() runs BEFORE tracing starts, on purpose. It takes ACCESS EXCLUSIVE on ml's parent
+# to create partitions, which would otherwise land in the traced stream ahead of mg_ret's sweep and
+# make "ml's turn" look like it had already begun. The old pg-lock-tracer version excluded it with a
+# query-boundary probe; not probing queries at all is simpler and needs no extra uprobe.
 #
-#   1. Gate on `===> Ready to trace queries`, NEVER on `===> Attaching BPF probes`. init() prints the
-#      latter BEFORE attach_probes() runs and before the perf buffer is open; only the former means
-#      events are being delivered. Starting the tick on the earlier line loses the beginning of it.
-#   2. PYTHONUNBUFFERED=1 is required. Redirected to a file, the tracer's status output is
-#      block-buffered and the log sits at 0 bytes for as long as it takes to fill a block -- measured
-#      at still-empty after 12 s, which makes the gate above look like a hang.
-#   3. Events name themselves LOCK_GRANTED_LOCAL / LOCK_UNGRANTED / LOCK_UNGRANTED_LOCAL. Plain
-#      LOCK_GRANTED (from GrantLock) fired ZERO times in any trace taken here, so a guard written
-#      against that name would pass while observing nothing at all.
-#   4. THE FILE IS NOT IN TIME ORDER. Events arrive through a per-CPU perf ring buffer and are
-#      written in DELIVERY order, so a handful come out transposed. Measured on a real tick: 4
-#      inversions in 101,185 events -- 0.004% -- and two of those four were the QUERY_BEGIN and
-#      QUERY_END markers themselves, which moved maintain_all()'s QUERY_BEGIN from its true position
-#      at index 47,589 to 100,401. Reading the file as written therefore computed a 326-event window
-#      where the real one is 53,391, and put every lock event in the tick into the wrong statement.
-#      So sort by `timestamp` before reasoning about order at all. Note how that failed: not with an
-#      error, but with a window that was merely EMPTY of the things under test -- and it was the
-#      liveness witnesses below, not the ordering assertion, that caught it. An ordering assertion
-#      over an empty interval is vacuously true, and this guard would otherwise have reported the
-#      property holding while measuring nothing whatsoever.
-#
-# AND THE LIVENESS WITNESSES, which matter more here than in any other guard in this directory. An
-# ordering assertion is a claim about an interval; over an EMPTY interval it is vacuously true. A
-# tick with nothing to drop takes no strong lock, produces no anchor, and would sail through. That
-# is not hypothetical either -- it is exactly what happened during the spike, where a fixture
-# exhausted by an earlier run produced zero AccessExclusive events and looked like lost capture. So
-# the guard asserts, before it asserts any ordering: the tracer reached its ready line; the trace is
-# non-empty and contains the tick's own query; both anchors were actually found; and pgpm.log shows
-# the tick DID the work that takes the lock, by exact action name (`retain_drop`, `regrain_copy`,
-# `obtain` -- never a prefix match, since non-success events are prefixed `skip_`/`fail_`).
+# THE LIVENESS WITNESSES matter more here than in any other guard in this directory. An ordering
+# assertion is a claim about an interval, and over an EMPTY interval it is vacuously true. A tick
+# with nothing to drop takes no strong lock, produces no anchor, and would sail through. So the guard
+# asserts, before it asserts any ordering: the probe attached and is delivering; both anchors were
+# found; NO events were dropped (the probe counts that itself, in the kernel, at the instant of the
+# event); and pgpm.log shows the tick DID the work that takes the lock, by exact action name
+# (retain_drop, regrain_copy -- never a prefix, since non-success events are prefixed skip_/fail_).
 #
 # Usage: lock_trace.sh <container> <db> [install.sql]
 # The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
@@ -85,9 +66,8 @@ C="${1:?container}"; DB="${2:?db}"; INSTALL="${3:-/repo/pgpm_core/install.sql}"
 MONO=${MONO:-400000}          # rows in ml before conversion; the monolith covers them
 BATCH=${BATCH:-200000}
 SUB=${SUB:-100000}            # regrain sub-range: small enough that a copy tick happens at all
-PGBIN=${PGBIN:-/usr/lib/postgresql/17/bin/postgres}
-TRACE=/tmp/pgpm_lock_trace.json
-TLOG=/tmp/pgpm_lock_trace.log
+EVENTS=/tmp/pgpm_lock_probe.jsonl
+PLOG=/tmp/pgpm_lock_probe.log
 fail=0
 
 q() { docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$1"; }
@@ -120,8 +100,8 @@ q "update pgpm.config set regrain_batch=$BATCH where parent_table='public.ml'::r
 q "select pgpm.set_regrain('public.ml', '$SUB')" >/dev/null
 
 # One warm-up tick over BOTH tables. A regrain's FIRST tick returns 'prepared': it installs change
-# capture and copies nothing, so there is no long step in it. Tracing that tick would observe no
-# regrain work at all. mg_ret has nothing eligible yet, so this is a no-op for it.
+# capture and copies nothing, so there is no long step in it. mg_ret has nothing eligible yet, so
+# this is a no-op for it.
 q "call pgpm.maintain_all()" >/dev/null
 
 # Now give mg_ret something to drop in the MEASURED tick: advance ITS frontier past its own oldest
@@ -129,150 +109,138 @@ q "call pgpm.maintain_all()" >/dev/null
 HIA=$(q "select max(hi::bigint) from pgpm.part where parent_table='public.mg_ret'::regclass")
 q "insert into public.mg_ret values ($((HIA-1)), 'advances mg_ret past its own oldest partition')" >/dev/null
 
+# obtain BEFORE the probe starts (see the header): its ACCESS EXCLUSIVE on ml's parent must not be in
+# the traced stream, or ml's turn appears to start before mg_ret's sweep.
+q "call pgpm.maintain_obtain('public.ml')" >/dev/null
+
 # Clear the log so the work witnesses below are about the MEASURED tick alone. Without this,
 # transmute's own initial obtain calls and the warm-up tick's entries satisfy them, and they pass on
 # stale evidence -- the same vacuous shape the witnesses exist to catch.
 q "delete from pgpm.log" >/dev/null
 
-# The anchors, resolved from the catalog: parents only (see the header).
 MG_OID=$(q "select 'public.mg_ret'::regclass::oid")
 ML_OID=$(q "select 'public.ml'::regclass::oid")
 
 # --- trace the measured tick -------------------------------------------------------------------
-docker exec "$C" sh -c "rm -f $TRACE $TLOG"
-docker exec -d -e PYTHONUNBUFFERED=1 "$C" sh -c \
-  "pg_lock_tracer -x $PGBIN -j -t LOCK TRANSACTION QUERY -o $TRACE > $TLOG 2>&1"
+docker exec "$C" sh -c "rm -f $EVENTS $PLOG"
+docker exec -d "$C" sh -c \
+  "python3 /repo/bench/lock_probe.py $MG_OID $ML_OID $EVENTS > $PLOG 2>&1"
 
-# No -p filter: the tracer attaches uprobes to the BINARY, so every backend is traced and the tick's
-# own backend does not have to exist yet -- which it must not, since attaching after the tick starts
-# would miss its opening locks. The analysis below picks the tick's pid out of the trace itself.
+# Gate on READY, which the probe prints only once the uprobes are attached AND the ring buffer is
+# open. Starting the tick earlier would lose its opening locks.
 ready=false
 for _ in $(seq 1 90); do
-  if docker exec "$C" grep -q 'Ready to trace queries' "$TLOG" 2>/dev/null; then ready=true; break; fi
+  if docker exec "$C" grep -q '^READY' "$PLOG" 2>/dev/null; then ready=true; break; fi
   sleep 1
 done
-check "the tracer attached and is delivering events" "$ready" "true"
+check "the probe attached and is delivering events" "$ready" "true"
 if [ "$ready" != true ]; then
-  echo "      --- tracer log ---"; docker exec "$C" cat "$TLOG" 2>&1 | sed 's/^/      /'
-  docker exec "$C" pkill -INT -f pg_lock_tracer >/dev/null 2>&1
+  echo "      --- probe log ---"; docker exec "$C" cat "$PLOG" 2>&1 | sed 's/^/      /'
+  docker exec "$C" pkill -INT -f lock_probe.py >/dev/null 2>&1
   exit 1
 fi
 
-# maintain_obtain() and maintain_all() are separate top-level statements (#347: separate cron jobs in
-# production), run back to back in one session the way an operator's worst case would.
-docker exec "$C" psql -U postgres -d "$DB" -qtA \
-  -c "call pgpm.maintain_obtain('public.ml')" -c "call pgpm.maintain_all()" >/dev/null 2>&1
+# The uprobes attach to the BINARY, so the probe sees matching locks from EVERY backend on the server
+# and the analysis below must not mix them: autovacuum touching ml would end the measured interval
+# early and fail a healthy run, and another session's strong lock plus commit could supply the commit
+# this guard looks for while the tick under test held its lock straight through.
+#
+# The backend is identified FROM THE TRACE rather than passed in, because pg_backend_pid() cannot be
+# used for this. It reports the pid inside the CONTAINER's namespace while eBPF reports the initial
+# namespace -- measured on this fixture: 145 versus 71504 for the same backend -- so scoping by it
+# matches nothing at all, which is exactly how the first attempt at this failed.
+docker exec "$C" psql -U postgres -d "$DB" -qtA -c "call pgpm.maintain_all()" >/dev/null 2>&1
 
-# SIGINT, then wait for the process to actually go: the tracer flushes its output on the way out, and
-# reading the file while it is still draining would truncate the very tail this guard reasons about.
-docker exec "$C" pkill -INT -f pg_lock_tracer >/dev/null 2>&1
+# SIGINT, then wait for the process to go: the probe drains the buffer and writes its drop count on
+# the way out, and reading the file while it is still draining would truncate the very tail that
+# says whether anything was lost.
+docker exec "$C" pkill -INT -f lock_probe.py >/dev/null 2>&1
 for _ in $(seq 1 30); do
-  docker exec "$C" pgrep -f pg_lock_tracer >/dev/null 2>&1 || break
+  docker exec "$C" pgrep -f lock_probe.py >/dev/null 2>&1 || break
   sleep 1
 done
 
-# --- analyse the trace -------------------------------------------------------------------------
-# In the container, where python3 and the trace both already are. Emits KEY=VALUE lines so the
-# assertions below stay readable bash, in the same shape as every other guard here.
-eval "$(docker exec -i "$C" python3 - "$MG_OID" "$ML_OID" "$TRACE" <<'PY'
+# --- analyse ------------------------------------------------------------------------------------
+# Dozens of records, already in order, so this is a short linear scan rather than the sort-and-window
+# machinery the old firehose needed.
+eval "$(docker exec -i "$C" python3 - "$MG_OID" "$ML_OID" "$EVENTS" <<'PY'
 import json, sys
 
 mg, ml, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+ACCESS_EXCLUSIVE = 8
 
 def emit(**kw):
     for k, v in kw.items():
         print(f"{k}={v}")
 
 try:
-    events = [json.loads(line) for line in open(path) if line.strip()]
+    records = [json.loads(line) for line in open(path) if line.strip()]
 except FileNotFoundError:
-    emit(TRACE_EVENTS=0, TICK_FOUND="false", MG_GRANTS=0, ML_ANCHOR="false",
-         RELEASE_BEFORE_ML="false", COMMIT_BEFORE_ML="false")
+    emit(EVENT_COUNT=0, DROPPED=-1, MG_GRANTS=0, ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-# In time order, which the file is NOT in (see point 4 in the header): the events come off a per-CPU
-# perf buffer in delivery order, and the few transpositions that causes are enough to move a
-# statement boundary tens of thousands of events away from where it belongs.
-events.sort(key=lambda e: e["timestamp"])
+dropped = next((r["dropped"] for r in records if "dropped" in r), -1)
+events = [r for r in records if "kind" in r]
 
-# The tick's own backend, identified from the trace rather than passed in: the tracer is started
-# before the session exists, so there is no pid to pass, and picking it out here means the guard
-# never reasons over another backend's locks (autovacuum, the pg_cron launcher) by accident.
-pids = [e["pid"] for e in events
-        if e["event"] == "QUERY_BEGIN" and "maintain_all" in e.get("query", "")]
-if not pids:
-    emit(TRACE_EVENTS=len(events), TICK_FOUND="false", MG_GRANTS=0, ML_ANCHOR="false",
-         RELEASE_BEFORE_ML="false", COMMIT_BEFORE_ML="false")
+grants = [i for i, e in enumerate(events)
+          if e["kind"] == "lock" and e["oid"] == mg and e["mode"] == ACCESS_EXCLUSIVE]
+if not grants:
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=0, MG_BACKENDS=0,
+         ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-pid = pids[0]
-own = [e for e in events if e["pid"] == pid]
-
-# Restrict to the maintain_all() statement. A whole tick is ONE query -- one QUERY_BEGIN/QUERY_END
-# pair with tens of thousands of events inside it -- so this window is the statement, not a step.
-# It matters that maintain_obtain() is excluded: its own AccessExclusive grants on ml's parent would
-# otherwise sit before mg_ret's sweep and make "ml's turn" look like it had already started.
-start = next(i for i, e in enumerate(own)
-             if e["event"] == "QUERY_BEGIN" and "maintain_all" in e.get("query", ""))
-ends = [i for i, e in enumerate(own) if i > start and e["event"] == "QUERY_END"]
-win = own[start:(ends[0] + 1) if ends else len(own)]
-
-grants = [i for i, e in enumerate(win)
-          if e.get("oid") == mg and e.get("lock_type") == "AccessExclusiveLock"
-          and e["event"] == "LOCK_GRANTED_LOCAL"]
-ml_hits = [i for i, e in enumerate(win) if e.get("oid") == ml]
-
-if not grants or not ml_hits:
-    emit(TRACE_EVENTS=len(events), TICK_FOUND="true", MG_GRANTS=len(grants),
-         ML_ANCHOR=str(bool(ml_hits)).lower(),
-         RELEASE_BEFORE_ML="false", COMMIT_BEFORE_ML="false")
-    sys.exit(0)
-
-# The interval under test: from the LAST strong-lock grant on mg_ret (retain holds it across every
-# drop in its step, releasing once at that step's commit) to the FIRST time ml's parent is touched.
+# The backend under test, taken from the trace: whoever took mg_ret's strong lock. How many DISTINCT
+# backends did so is reported alongside, and asserted to be one -- if a second session had also taken
+# it, this anchor could be someone else's and the interval would splice two sessions together, which
+# is the direction that PASSES and so the one worth checking rather than assuming.
+backends = {events[i]["pid"] for i in grants}
 last_grant = grants[-1]
-ml_start = [i for i in ml_hits if i > last_grant]
+tick_pid = events[last_grant]["pid"]
+
+# From that LAST strong-lock grant (retain holds it across every drop in its step, releasing once at
+# that step's commit) to the FIRST time the SAME backend touches ml's parent at all.
+ml_start = [i for i, e in enumerate(events)
+            if i > last_grant and e["pid"] == tick_pid
+            and e["kind"] == "lock" and e["oid"] == ml]
 if not ml_start:
-    emit(TRACE_EVENTS=len(events), TICK_FOUND="true", MG_GRANTS=len(grants), ML_ANCHOR="false",
-         RELEASE_BEFORE_ML="false", COMMIT_BEFORE_ML="false")
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+         MG_BACKENDS=len(backends), ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-lo, hi = last_grant, ml_start[0]
-between = win[lo:hi]
-releases = sum(1 for e in between
-               if e.get("oid") == mg and e.get("lock_type") == "AccessExclusiveLock"
-               and e["event"] in ("LOCK_UNGRANTED", "LOCK_UNGRANTED_LOCAL"))
-commits = sum(1 for e in between if e["event"] == "TRANSACTION_COMMIT")
+between = events[last_grant:ml_start[0]]
+commits = sum(1 for e in between if e["kind"] == "commit" and e["pid"] == tick_pid)
 
-emit(TRACE_EVENTS=len(events), TICK_FOUND="true", MG_GRANTS=len(grants), ML_ANCHOR="true",
-     RELEASES_BETWEEN=releases, COMMITS_BETWEEN=commits,
-     RELEASE_BEFORE_ML=str(releases > 0).lower(),
-     COMMIT_BEFORE_ML=str(commits > 0).lower())
+emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+     MG_BACKENDS=len(backends), ML_ANCHOR="true",
+     COMMITS_BETWEEN=commits, COMMIT_BEFORE_ML=str(commits > 0).lower())
 PY
 )"
 
 # --- the witnesses that the ordering assertion is about a non-empty interval --------------------
-check "the trace is non-empty"                       "$([ "${TRACE_EVENTS:-0}" -gt 0 ] && echo true || echo false)" "true"
-check "the traced tick is the one under test"        "${TICK_FOUND:-false}" "true"
-check "mg_ret took ACCESS EXCLUSIVE in the tick"     "$([ "${MG_GRANTS:-0}" -gt 0 ] && echo true || echo false)" "true"
-check "ml's turn is visible in the same tick"        "${ML_ANCHOR:-false}" "true"
-# A tick starved of its locks logs skip_retain/skip_obtain, takes no strong lock, and would leave the
-# interval above empty. Exact action values, never a prefix: non-success events are prefixed
-# (skip_drain, fail_retain_drop), precisely so `retain%` cannot match a deferral.
+check "the probe captured events"                 "$([ "${EVENT_COUNT:-0}" -gt 0 ] && echo true || echo false)" "true"
+check "mg_ret took ACCESS EXCLUSIVE in the tick"  "$([ "${MG_GRANTS:-0}" -gt 0 ] && echo true || echo false)" "true"
+# The anchor identifies the backend under test, so a second backend holding mg_ret's strong lock in
+# the same window would let the interval splice two sessions together -- and that is the direction
+# that PASSES, since the other session would supply the commit. Asserted, not assumed.
+check "exactly one backend took mg_ret's strong lock" "${MG_BACKENDS:-0}" "1"
+check "ml's turn is visible in the same tick"     "${ML_ANCHOR:-false}" "true"
+# Counted in the kernel, at the instant of the event, by the probe itself. Every assertion here is a
+# claim about which events are present, so a stream with holes is not evidence of anything -- and
+# unlike the tool this replaced, a hole cannot go unreported.
+check "no events were dropped"                    "${DROPPED:--1}" "0"
+# A tick starved of its locks logs skip_retain, takes no strong lock, and would leave the interval
+# above empty. Exact action values, never a prefix: non-success events are prefixed (skip_drain,
+# fail_retain_drop), precisely so `retain%` cannot match a deferral.
 check "the tick did the work that takes the lock (retain)" \
       "$(q "select (count(*) > 0)::text from pgpm.log
              where parent_table='public.mg_ret'::regclass and action = 'retain_drop'")" "true"
 check "and regrained ml in the same tick" \
       "$(q "select (count(*) > 0)::text from pgpm.log
              where parent_table='public.ml'::regclass and action = 'regrain_copy'")" "true"
-check "and obtained for ml" \
-      "$(q "select (count(*) > 0)::text from pgpm.log
-             where parent_table='public.ml'::regclass and action = 'obtain'")" "true"
 
 # --- the property itself -----------------------------------------------------------------------
-check "mg_ret's ACCESS EXCLUSIVE is released before ml's turn" "${RELEASE_BEFORE_ML:-false}" "true"
-check "and a transaction commits in between"                   "${COMMIT_BEFORE_ML:-false}" "true"
-printf '      observed: %s release(s) and %s commit(s) between mg_ret'"'"'s last ACCESS EXCLUSIVE grant and ml'"'"'s first lock\n' \
-       "${RELEASES_BETWEEN:-0}" "${COMMITS_BETWEEN:-0}"
+check "a transaction commits between mg_ret's lock and ml's turn" "${COMMIT_BEFORE_ML:-false}" "true"
+printf '      observed: %s event(s) captured, %s commit(s) between mg_ret'"'"'s last ACCESS EXCLUSIVE and ml'"'"'s first lock\n' \
+       "${EVENT_COUNT:-0}" "${COMMITS_BETWEEN:-0}"
 
 exit "$fail"

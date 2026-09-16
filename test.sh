@@ -500,7 +500,7 @@ run_discriminate() {
 run_locktrace() {
   local prof="locktrace" svc="locktrace" c="pgpm_test-locktrace"
   echo; echo "========================================="
-  echo "Lock-trace track: eBPF lock boundaries (pg17 + pg-lock-tracer)"
+  echo "Lock-trace track: eBPF lock boundaries (pg17 + bench/lock_probe.py)"
   echo "========================================="
   $DC --profile "$prof" down -v 2>/dev/null || true
   $DC --profile "$prof" build $BUILD_PROGRESS "$svc"
@@ -596,8 +596,8 @@ if [ "$TRACK" = "ci" ]; then
       # Deliberately NOT folded into the PASS line's meaning: this run did not verify that track, and
       # saying so plainly is the whole point of reporting a skip at all.
       echo "ci: PASS, except SKIPPED --$ci_skipped"
-      echo "    That track was NOT verified: not here, and not by CI either, which has no job"
-      echo "    for it yet (#383 phase 3). Run it on Linux before trusting this PASS."
+      echo "    That track was NOT verified on this machine. CI does run it on Linux"
+      echo "    (.github/workflows/locktrace.yml), so a PR still covers it."
     else
       echo "ci: PASS (every track CI runs)"
     fi

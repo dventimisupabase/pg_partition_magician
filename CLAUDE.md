@@ -47,12 +47,12 @@ than stopping at the first failure.
 One track is the exception, and it says so rather than hiding it: `locktrace` needs eBPF
 (a privileged container and the host's own kernel headers), so `ci` runs it on Linux and
 prints `SKIPPED` for it anywhere else, never folding it into the `PASS`. The guard is on
-the kernel alone, so a Linux box that cannot actually trace FAILS rather than skipping. On
-macOS that track is then verified by **nobody**: there is no CI job for it either yet (that
-workflow is #383's phase 3, issue #389), so a skip means nothing has checked it anywhere.
-Until that job exists, a change touching the locktrace guard needs a run on a Linux box,
-and a Mac `ci` run should be read the way the archive round trip below teaches you to read
-a green `./test.sh all`.
+the kernel alone, so a Linux box that cannot actually trace FAILS rather than skipping. A
+skip is covered by CI rather than by nothing: `.github/workflows/locktrace.yml` runs that
+track on every PR touching the tracer, the guard, the mutations or the core install. But a
+Mac `ci` run still has not verified it itself, so read that skip the way the archive round
+trip below teaches you to read a green `./test.sh all`: the PR's own job is what covers
+you, not the run you just watched.
 
 This has already cost a round trip: making `pgpm.transmute` a procedure broke
 `tests/archive/fixtures.sql`, whose `mk_archive_table` was a function calling it (a

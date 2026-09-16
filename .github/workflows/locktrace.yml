@@ -1,0 +1,80 @@
+name: Lock trace guard
+
+# OBSERVES a maintenance tick's lock boundaries with eBPF, rather than inferring them from whether a
+# concurrent reader timed out (issue #383, phase 3 of #389).
+#
+# Separate from perf.yml because it needs things no other job here does: a PRIVILEGED container, and
+# the runner host's own kernel headers, since BCC compiles its BPF program at run time and attaches
+# uprobes to the running postgres binary. It gets its own workflow and its own container so the shared
+# docker-compose services the other tracks depend on are untouched.
+#
+# ONE step runs the track, unlike perf.yml's two. `./test.sh locktrace` already runs the guard AND
+# rebuilds install.sql with the commit-boundary defect back in, requiring the guard to FAIL against it
+# (bench/discriminate.sh --track=locktrace). Green here therefore means both "the property holds" and
+# "the guard would have noticed if it did not", which is the only combination this repo counts.
+#
+# Measured on a hosted runner before this workflow was written (the spike on #389): whole job 132 s,
+# of which the image build is 91 s. That is why there is no build cache here -- it would add cache
+# correctness to worry about to save ~90 s on a path-filtered job that runs only when the tracer, the
+# guard, the mutations or the core install actually change.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pgpm_core/install.sql'
+      - 'bench/lock_trace.sh'
+      - 'bench/lock_probe.py'
+      - 'bench/discriminate.sh'
+      - 'bench/mutations/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/locktrace.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pgpm_core/install.sql'
+      - 'bench/lock_trace.sh'
+      - 'bench/lock_probe.py'
+      - 'bench/discriminate.sh'
+      - 'bench/mutations/**'
+      - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - '.github/workflows/locktrace.yml'
+  workflow_dispatch:
+
+jobs:
+  locktrace:
+    name: eBPF lock boundaries / PG17
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # The one environmental assumption this job makes, asserted up front so that losing it is a
+      # legible failure instead of an opaque BCC compile error a hundred lines into a build log.
+      # Measured on the #389 spike: ubuntu-latest (kernel 6.17.0-1022-azure) already ships headers
+      # matching `uname -r`, so this normally does nothing. It is here for the day a runner image
+      # stops doing that. The install attempt is a remedy, not a skip: if headers still cannot be
+      # had, the job FAILS, because a guard that never ran is unverified.
+      - name: Require kernel headers matching the runner's kernel
+        run: |
+          if [ -d "/lib/modules/$(uname -r)/build" ] || [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
+            echo "kernel headers present for $(uname -r)"
+            exit 0
+          fi
+          echo "no headers for $(uname -r); attempting install..."
+          sudo apt-get update -qq
+          sudo apt-get install -y "linux-headers-$(uname -r)" || true
+          if [ -d "/lib/modules/$(uname -r)/build" ] || [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
+            echo "kernel headers installed for $(uname -r)"
+            exit 0
+          fi
+          echo "::error::No kernel headers for $(uname -r) and none installable. BCC cannot compile"
+          echo "::error::its BPF program, so the lock-trace guard cannot run. See issue #389."
+          exit 1
+
+      # Runs the guard and, against a mutant built from the same patterns, requires it to fail.
+      - name: Run the locktrace track
+        run: ./test.sh locktrace
