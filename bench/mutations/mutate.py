@@ -149,6 +149,19 @@ TRANSMUTE_CUTOVER_HOIST = """  -- #344: everything below that only touches the N
 
 """
 
+# The "no commits in the sweep" defect, shared BY REFERENCE by the two mutations that model it: one
+# for the reader-probe guard (bench/maintain_lock.sh) and one for the trace guard
+# (bench/lock_trace.sh). Not copied, on purpose. This pattern's expected count has already drifted
+# out of date three times as maintain() gained and lost boundaries; a second copy would have to be
+# found and corrected each of those times, and the failure mode if it were missed is the bad one --
+# one copy keeps matching while the other silently stops, leaving one guard verified and the other
+# only apparently so.
+MAINTAIN_NO_COMMITS_EDITS = [
+    (BOUNDARY_RE, "", 5),
+    ("    call pgpm.maintain(r.parent_table, v_status);\n    commit;\n",
+     "    call pgpm.maintain(r.parent_table, v_status);\n", 1),
+]
+
 MUTATIONS = {
     "transmute_no_commits": (
         "bench/transmute_lock.sh",
@@ -174,9 +187,18 @@ MUTATIONS = {
         # discriminate.sh lesson as before, restated: removing only one still releases the lock a few
         # statements later, at the NEXT boundary or (failing that) the outer loop's own per-parent
         # commit, which the guard rightly does not object to.
-        [(BOUNDARY_RE, "", 5),
-         ("    call pgpm.maintain(r.parent_table, v_status);\n    commit;\n",
-          "    call pgpm.maintain(r.parent_table, v_status);\n", 1)],
+        MAINTAIN_NO_COMMITS_EDITS,
+    ),
+    "maintain_no_commits_trace": (
+        "bench/lock_trace.sh",
+        "The SAME defect as maintain_no_commits, put back for the eBPF trace guard (#383). The two "
+        "guards make the same claim about the same sweep and differ only in how they observe it -- "
+        "one infers the lock's lifetime from whether a concurrent reader timed out, the other reads "
+        "the acquire/release events off uprobes -- so the defect that must break them is one defect, "
+        "and the edits are shared by reference rather than restated. It earns its own entry because "
+        "discriminate.sh maps one mutation to one guard, and because a guard without a mutation of "
+        "its own is unverified no matter how well its twin is covered.",
+        MAINTAIN_NO_COMMITS_EDITS,
     ),
     "restore_fk_inline_validate": (
         "bench/restore_fk_lock.sh",
@@ -585,10 +607,34 @@ MUTATION_SRC = {
     "archive_deflate_six_arrays": "pgpm_archive/install.sql",
 }
 
+# name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`
+# track, which is what `./test.sh discriminate` runs.
+#
+# This exists so one mutation framework can serve a track that not every machine can run.
+# bench/lock_trace.sh needs eBPF, which needs a privileged container and host kernel headers --
+# available on Linux and on GitHub's runners, and structurally impossible on Docker Desktop for Mac,
+# whose linuxkit VM publishes no headers for its own kernel. Issue #383 is explicit that local
+# development must not start requiring that on any platform. Listing the mutation here keeps it out
+# of the default listing, so `./test.sh discriminate` stays runnable on a laptop, while
+# `--track=locktrace` still runs it under the same mutate/assert-it-FAILS machinery as every other
+# guard. A track of its own, not an exemption: the mutation is still mandatory, still built from the
+# same patterns, and still has to break its guard.
+MUTATION_TRACK = {
+    "maintain_no_commits_trace": "locktrace",
+}
+
 
 def main() -> int:
-    if len(sys.argv) == 2 and sys.argv[1] == "--list":
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "--list":
+        track = "perf"
+        if len(sys.argv) == 3:
+            if not sys.argv[2].startswith("--track="):
+                print(__doc__, file=sys.stderr)
+                return 2
+            track = sys.argv[2].split("=", 1)[1]
         for name, (guard, why, _) in MUTATIONS.items():
+            if MUTATION_TRACK.get(name, "perf") != track:
+                continue
             src = MUTATION_SRC.get(name, "pgpm_core/install.sql")
             print(f"{name}\t{guard}\t{why}\t{src}")
         return 0

@@ -14,12 +14,20 @@
 # bench/mutations/, build a copy of install.sql with the defect back in, run the guard against it, and
 # require the guard to FAIL. A guard that stays green on its own mutant is not testing anything.
 #
-# Usage: discriminate.sh <container> [<archive container>]
+# Usage: discriminate.sh [--track=NAME] <container> [<archive container>]
 # The second container is only needed for mutations scoped to pgpm_archive/install.sql (which
 # requires the archive track's own image -- pgsql-http isn't in the plain core image); a mutation
 # whose src needs it, with no such container supplied, is a FAILURE of this check, not a skip --
 # same principle as a stale pattern: a guard this script never actually ran is unverified.
+#
+# --track selects which mutations to run, defaulting to `perf` -- the ones every machine can run.
+# `--track=locktrace` runs the eBPF trace guard's mutation instead, against the privileged container
+# passed as <container> (see bench/mutations/mutate.py's MUTATION_TRACK for why that track is
+# separate rather than simply skipped when eBPF is unavailable). The tracks are disjoint, so every
+# mutation is run by exactly one of them and none is silently left out.
 set -uo pipefail
+TRACK="perf"
+case "${1:-}" in --track=*) TRACK="${1#--track=}"; shift ;; esac
 C="${1:?container}"
 CA="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -59,7 +67,7 @@ while IFS=$'\t' read -r name guard why src; do
     grep '^FAIL' "$OUT/$name.log" | sed 's/^/      /'
   fi
   docker exec "$target_c" psql -U postgres -q -c "drop database if exists $db" >/dev/null 2>&1
-done < <(python3 "$ROOT/bench/mutations/mutate.py" --list)
+done < <(python3 "$ROOT/bench/mutations/mutate.py" --list "--track=$TRACK")
 
 echo
 if [ "$fail" = 0 ]; then echo "discriminate: PASS ($i guard(s) verified against their defects)"

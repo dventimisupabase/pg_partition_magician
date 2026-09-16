@@ -95,6 +95,41 @@ services:
     container_name: pgpm_test-archive
     ports: ["5520:5432"]
 
+  # The locktrace track (issue #383): PG17 plus eBPF lock tracing via pg-lock-tracer, which attaches
+  # uprobes to the running postgres binary and reports every lock acquire/release as it happens --
+  # continuous observation, where every other lock guard in bench/ infers a lock's lifetime from
+  # whether a concurrent reader timed out. Its own profile, excluded from "all": the image carries bcc,
+  # debug symbols and a Python toolchain that nothing else needs, and the service is PRIVILEGED, which
+  # no other service here is.
+  #
+  # Why privileged, and why the three host mounts. BCC compiles its BPF program at run time against the
+  # HOST kernel's headers and then loads it, so the container needs /lib/modules and /usr/src from the
+  # host (the kernel it traces is the host's, not the image's) and /sys/kernel/debug for the uprobe
+  # machinery. Loading a BPF program and attaching uprobes both need capabilities a default container
+  # does not have. This is also exactly why the track is CI-and-Linux-only and never a pre-push
+  # expectation: Docker Desktop for Mac's linuxkit VM publishes no headers for its own kernel, so BCC
+  # cannot compile there at all (confirmed structurally on #383, not a missing package).
+  #
+  # The tracer runs INSIDE this container, alongside the server it traces, so it shares the server's PID
+  # namespace and resolves the same /usr/lib/postgresql/17/bin/postgres it probes.
+  locktrace:
+    <<: *pg-base
+    profiles: ["locktrace"]
+    build: { context: ., args: { PG_VERSION: 17, WITH_LOCK_TRACER: "true" } }
+    image: pgpm_test:17-locktrace
+    container_name: pgpm_test-locktrace
+    privileged: true
+    # Overrides pg-base's single repo mount rather than adding to it: a nested `volumes:` key REPLACES
+    # the anchor's list outright, so /repo has to be repeated here or the harness cannot psql -f the
+    # source. /sys/kernel/debug is read-write on purpose (the tracer writes to the uprobe_events
+    # interface under it); the other two are read-only.
+    volumes:
+      - .:/repo:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      - /sys/kernel/debug:/sys/kernel/debug
+    ports: ["5521:5432"]
+
 networks:
   default:
     name: pgpm_test_net

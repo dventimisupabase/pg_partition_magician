@@ -11,6 +11,7 @@
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
 #   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
 #   ./test.sh discriminate               # prove each of those guards fails when its defect is present
+#   ./test.sh locktrace                  # eBPF lock-boundary observation (PG17, Linux only)
 #   ./test.sh ci                         # EVERY track CI runs, in one go
 #
 # `all` means all four PostgreSQL VERSIONS, not all tracks. The timescale, observe, archive, perf and
@@ -69,8 +70,9 @@ for arg in "$@"; do
     archive) TRACK="archive" ;;
     perf) TRACK="perf" ;;
     discriminate) TRACK="discriminate" ;;
+    locktrace) TRACK="locktrace" ;;
     ci) TRACK="ci" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | ci"; exit 1 ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | locktrace | ci"; exit 1 ;;
   esac
 done
 
@@ -482,8 +484,46 @@ run_discriminate() {
   return "$rc"
 }
 
+# The `locktrace` track: OBSERVE a maintenance tick's lock boundaries with eBPF rather than inferring
+# them from a reader probe's timeout (issue #383, phases 1 and 2).
+#
+# Self-contained on purpose: it runs the guard AND its mutation, rather than adding the mutation to
+# the shared `discriminate` track. The guard needs eBPF, which needs a privileged container and the
+# host's kernel headers -- fine on Linux and on GitHub's runners, structurally impossible on Docker
+# Desktop for Mac. Folding it into `discriminate` would make that track, and so `ci`, unrunnable on a
+# laptop, which #383 explicitly rules out: the deterministic pg_locks technique stays the local tool
+# and tracing is a CI-time confirmation layer. Keeping the mutation in bench/mutations/ and selecting
+# it with --track means it is still built, run and required to fail by the same machinery as every
+# other guard's -- separated, not exempted.
+#
+# Not part of `ci` for the same reason. Its own workflow is #383's phase 3.
+run_locktrace() {
+  local prof="locktrace" svc="locktrace" c="pgpm_test-locktrace"
+  echo; echo "========================================="
+  echo "Lock-trace track: eBPF lock boundaries (pg17 + pg-lock-tracer)"
+  echo "========================================="
+  $DC --profile "$prof" down -v 2>/dev/null || true
+  $DC --profile "$prof" build $BUILD_PROGRESS "$svc"
+  $DC --profile "$prof" up -d
+  wait_pg "$prof" "$svc" 60
+  local rc=0
+  bash "$(dirname "$0")/bench/lock_trace.sh" "$c" pgpm_lt || rc=1
+  # Green on correct code is not evidence -- the standing lesson of this repo. Build the same
+  # commit-boundary defect maintain_lock.sh's mutant models, and require THIS guard to fail on it.
+  bash "$(dirname "$0")/bench/discriminate.sh" --track=locktrace "$c" || rc=1
+  $DC --profile "$prof" down -v
+  if [ "$rc" -ne 0 ]; then echo "locktrace track: FAIL"; return 1; fi
+  echo "locktrace track: PASS"
+}
+
 if [ "$TRACK" = "perf" ]; then
   run_perf
+  echo; echo "All requested tests passed."
+  exit 0
+fi
+
+if [ "$TRACK" = "locktrace" ]; then
+  run_locktrace
   echo; echo "All requested tests passed."
   exit 0
 fi
