@@ -14,12 +14,20 @@
 # bench/mutations/, build a copy of install.sql with the defect back in, run the guard against it, and
 # require the guard to FAIL. A guard that stays green on its own mutant is not testing anything.
 #
-# Usage: discriminate.sh <container> [<archive container>]
+# Usage: discriminate.sh [--track=NAME] <container> [<archive container>]
 # The second container is only needed for mutations scoped to pgpm_archive/install.sql (which
 # requires the archive track's own image -- pgsql-http isn't in the plain core image); a mutation
 # whose src needs it, with no such container supplied, is a FAILURE of this check, not a skip --
 # same principle as a stale pattern: a guard this script never actually ran is unverified.
+#
+# --track selects which mutations to run, defaulting to `perf` -- the ones every machine can run.
+# `--track=locktrace` runs the eBPF trace guard's mutation instead, against the privileged container
+# passed as <container> (see bench/mutations/mutate.py's MUTATION_TRACK for why that track is
+# separate rather than simply skipped when eBPF is unavailable). The tracks are disjoint, so every
+# mutation is run by exactly one of them and none is silently left out.
 set -uo pipefail
+TRACK="perf"
+case "${1:-}" in --track=*) TRACK="${1#--track=}"; shift ;; esac
 C="${1:?container}"
 CA="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +35,17 @@ OUT="$ROOT/bench/results/mutants"       # gitignored
 mkdir -p "$OUT"
 fail=0
 i=0
+
+# Materialise the listing BEFORE the loop rather than piping it straight in. `done < <(cmd)` discards
+# cmd's exit status, so a mutate.py that refused to list anything -- an unknown track, a track whose
+# last mutation was removed -- would be indistinguishable from a track that simply had no work, and
+# the loop would fall straight through to "PASS (0 guard(s) verified)". A green check that ran
+# nothing is the one output this script must never produce.
+LIST="$OUT/mutations-$TRACK.tsv"
+if ! python3 "$ROOT/bench/mutations/mutate.py" --list "--track=$TRACK" > "$LIST"; then
+  printf 'FAIL  could not list mutations for track %s (see above); nothing was verified\n' "$TRACK"
+  exit 1
+fi
 
 while IFS=$'\t' read -r name guard why src; do
   i=$((i + 1))
@@ -59,9 +78,16 @@ while IFS=$'\t' read -r name guard why src; do
     grep '^FAIL' "$OUT/$name.log" | sed 's/^/      /'
   fi
   docker exec "$target_c" psql -U postgres -q -c "drop database if exists $db" >/dev/null 2>&1
-done < <(python3 "$ROOT/bench/mutations/mutate.py" --list)
+done < "$LIST"
 
 echo
+# Belt and braces with the listing check above: whatever the reason, finishing having run nothing is
+# a failure, not a pass. This script's whole claim is "these guards were run against their defects
+# and failed"; with i=0 it has no such evidence for anything.
+if [ "$i" = 0 ]; then
+  printf 'FAIL  track %s ran no mutations at all; every guard it covers is unverified\n' "$TRACK"
+  fail=1
+fi
 if [ "$fail" = 0 ]; then echo "discriminate: PASS ($i guard(s) verified against their defects)"
 else echo "discriminate: FAIL"; fi
 exit "$fail"

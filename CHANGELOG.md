@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+- **Lock boundaries are now OBSERVED, not inferred, by a new `./test.sh locktrace` track (issue #383,
+  phases 1 and 2).** Every lock guard in `bench/` proves "the lock was released before the next slow
+  step" indirectly: a concurrent reader under a short `lock_timeout` either times out or does not.
+  Cheap and portable, but it cannot see a lock it did not happen to collide with, and it cannot say
+  which boundary released one. `bench/lock_trace.sh` attaches
+  [pg-lock-tracer](https://github.com/jnidzwetzki/pg-lock-tracer) uprobes to the running server and
+  asserts the thing itself: between the last `AccessExclusiveLock` grant on `mg_ret`'s parent and the
+  first lock event on `ml`'s parent, there is an ungrant (the release) and a `TRANSACTION_COMMIT` (the
+  `#265`/`#279` boundary). Measured on correct code: 2 releases and 7 commits in that interval; against
+  the mutant, zero of each while every liveness witness still passes. The track runs the guard and its
+  mutation together in about 50 seconds. It is a supplement, not a replacement: the reader-probe guards
+  stay as the fast, portable first line, and `./test.sh discriminate` and `ci` are unchanged and still
+  run anywhere, since eBPF needs a privileged container and host kernel headers that Docker Desktop for
+  Mac cannot provide. Linux only. (`bench/lock_trace.sh`, `bench/skip_fastpath_probes.py`,
+  `bench/mutations/mutate.py`'s `maintain_no_commits_trace`, the `locktrace` compose service,
+  `Dockerfile`'s `WITH_LOCK_TRACER`)
+
+  Two findings worth keeping. The trace JSON is written in perf-buffer DELIVERY order, not time order:
+  4 inversions in 101,185 events, two of them the statement markers themselves, which moved
+  `maintain_all()`'s `QUERY_BEGIN` 53,000 events away from its real position and silently reduced the
+  window under test to almost nothing. Sort by `timestamp` first. And that failure was caught by the
+  guard's liveness witnesses rather than its ordering assertion, which held vacuously over the empty
+  window -- the exact shape `CLAUDE.md` exists to prevent, arriving from a direction nobody had
+  anticipated.
+
 - **`maintain_obtain()` no longer lets its back-off outlast the forward grid.** One lost `lock_timeout`
   race sets a 30-second `config.obtain_retry_after` back-off, and obtain was skipped for all of it, however
   little grid was left. That was harmless while a `DEFAULT` partition caught writes past the grid; since
