@@ -140,6 +140,15 @@ if [ "$ready" != true ]; then
   exit 1
 fi
 
+# The uprobes attach to the BINARY, so the probe sees matching locks from EVERY backend on the server
+# and the analysis below must not mix them: autovacuum touching ml would end the measured interval
+# early and fail a healthy run, and another session's strong lock plus commit could supply the commit
+# this guard looks for while the tick under test held its lock straight through.
+#
+# The backend is identified FROM THE TRACE rather than passed in, because pg_backend_pid() cannot be
+# used for this. It reports the pid inside the CONTAINER's namespace while eBPF reports the initial
+# namespace -- measured on this fixture: 145 versus 71504 for the same backend -- so scoping by it
+# matches nothing at all, which is exactly how the first attempt at this failed.
 docker exec "$C" psql -U postgres -d "$DB" -qtA -c "call pgpm.maintain_all()" >/dev/null 2>&1
 
 # SIGINT, then wait for the process to go: the probe drains the buffer and writes its drop count on
@@ -176,25 +185,33 @@ events = [r for r in records if "kind" in r]
 grants = [i for i, e in enumerate(events)
           if e["kind"] == "lock" and e["oid"] == mg and e["mode"] == ACCESS_EXCLUSIVE]
 if not grants:
-    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=0, ML_ANCHOR="false",
-         COMMIT_BEFORE_ML="false")
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=0, MG_BACKENDS=0,
+         ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-# From the LAST strong-lock grant on mg_ret (retain holds it across every drop in its step, releasing
-# once at that step's commit) to the FIRST time ml's parent is touched at all.
+# The backend under test, taken from the trace: whoever took mg_ret's strong lock. How many DISTINCT
+# backends did so is reported alongside, and asserted to be one -- if a second session had also taken
+# it, this anchor could be someone else's and the interval would splice two sessions together, which
+# is the direction that PASSES and so the one worth checking rather than assuming.
+backends = {events[i]["pid"] for i in grants}
 last_grant = grants[-1]
+tick_pid = events[last_grant]["pid"]
+
+# From that LAST strong-lock grant (retain holds it across every drop in its step, releasing once at
+# that step's commit) to the FIRST time the SAME backend touches ml's parent at all.
 ml_start = [i for i, e in enumerate(events)
-            if i > last_grant and e["kind"] == "lock" and e["oid"] == ml]
+            if i > last_grant and e["pid"] == tick_pid
+            and e["kind"] == "lock" and e["oid"] == ml]
 if not ml_start:
-    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants), ML_ANCHOR="false",
-         COMMIT_BEFORE_ML="false")
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+         MG_BACKENDS=len(backends), ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-pid = events[last_grant]["pid"]
 between = events[last_grant:ml_start[0]]
-commits = sum(1 for e in between if e["kind"] == "commit" and e["pid"] == pid)
+commits = sum(1 for e in between if e["kind"] == "commit" and e["pid"] == tick_pid)
 
-emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants), ML_ANCHOR="true",
+emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+     MG_BACKENDS=len(backends), ML_ANCHOR="true",
      COMMITS_BETWEEN=commits, COMMIT_BEFORE_ML=str(commits > 0).lower())
 PY
 )"
@@ -202,6 +219,10 @@ PY
 # --- the witnesses that the ordering assertion is about a non-empty interval --------------------
 check "the probe captured events"                 "$([ "${EVENT_COUNT:-0}" -gt 0 ] && echo true || echo false)" "true"
 check "mg_ret took ACCESS EXCLUSIVE in the tick"  "$([ "${MG_GRANTS:-0}" -gt 0 ] && echo true || echo false)" "true"
+# The anchor identifies the backend under test, so a second backend holding mg_ret's strong lock in
+# the same window would let the interval splice two sessions together -- and that is the direction
+# that PASSES, since the other session would supply the commit. Asserted, not assumed.
+check "exactly one backend took mg_ret's strong lock" "${MG_BACKENDS:-0}" "1"
 check "ml's turn is visible in the same tick"     "${ML_ANCHOR:-false}" "true"
 # Counted in the kernel, at the instant of the event, by the probe itself. Every assertion here is a
 # claim about which events are present, so a stream with holes is not evidence of anything -- and
