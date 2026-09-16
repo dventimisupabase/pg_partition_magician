@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **The lock-trace guard now runs in CI (`.github/workflows/locktrace.yml`, #383 phase 3 / #389).**
+  Until now nothing in CI ran that track, so off Linux it was verified by nobody. A spike on a hosted
+  runner settled the three questions that had kept the workflow unwritten, by measurement rather than
+  argument: BCC compiles and attaches on `ubuntu-latest` (kernel `6.17.0-1022-azure`) and the guard
+  passes there, including failing against its mutant; headers matching `uname -r` are already present,
+  so there is no drift to work around and no source build; and the whole job takes 132 s, of which the
+  image build is 91 s, which is why it carries no build cache. The job asserts the header requirement
+  up front so that losing it later is a legible failure rather than an opaque BCC compile error, and
+  runs a single `./test.sh locktrace`, since that track already runs the guard and requires it to fail
+  against the defect. `./test.sh ci`'s skip notice and `CLAUDE.md` now say CI covers the skip, which
+  before this they could not truthfully say.
+
 - **Lock boundaries are now OBSERVED, not inferred, by a new `./test.sh locktrace` track (issue #383,
   phases 1 and 2).** Every lock guard in `bench/` proves "the lock was released before the next slow
   step" indirectly: a concurrent reader under a short `lock_timeout` either times out or does not.
