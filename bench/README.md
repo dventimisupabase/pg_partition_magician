@@ -463,3 +463,96 @@ the stall exceeds a real client's patience. Keep all of them.
 | `PILOT_LOCK_TIMEOUT` | `2s` | the workload's own `lock_timeout` |
 | `PILOT_TX_LOCK_TIMEOUT` | `5s` | `p_lock_timeout` passed to transmute |
 | `PILOT_BOUND_HEADROOM` | 1 | `p_bound_headroom`. Defaults ON, unlike transmute's own 0: the monolith bound rejects writes at or past `hi` for the whole conversion, so a writer at the frontier can cross it if the conversion spans a grid boundary (a daily step converted at 23:59). This is the pattern a live production conversion should use too. |
+
+## Lock-sequence renderer (`bench/lock_view.sh`, issue #392)
+
+Draws a **picture** of a maintenance tick's lock sequence, for a human to look at. It is
+**not** a guard: it asserts nothing about pgpm's behaviour and blocks no merge, so it never
+runs in CI and passes no build/fail verdict of its own. `bench/lock_trace.sh` is the guard
+(it runs in `./test.sh locktrace` and answers a yes/no question with eBPF); this tool answers
+"what actually happened, in what order, on which relations" by turning the same kind of eBPF
+capture into a timeline you can read.
+
+### Invocation
+
+```bash
+bench/lock_view.sh <container> <db> <relations> <sql> [run-name]
+
+# example: watch mg_ret and ml through one maintenance tick
+bench/lock_view.sh pgpm_test-locktrace mydb 'public.mg_ret,public.ml' \
+  "call pgpm.maintain_all()" mytick
+```
+
+`<relations>` is a comma-separated list of `schema.table` names to enlist (their oids are
+looked up at the start of the run); `<sql>` is the statement to trace. The harness snapshots
+relation names before and after the traced statement, runs the probe, executes `<sql>`, waits
+for the probe to drain, then renders the two figures.
+
+### Prerequisites
+
+- The `locktrace` compose profile, up and healthy: `docker compose --profile locktrace up -d`.
+  This is the same privileged, eBPF-capable container `./test.sh locktrace` uses; nothing here
+  needs a second image.
+- A Python virtualenv with matplotlib, at `.venv-lockview/` (gitignored, created on demand):
+
+  ```bash
+  python3 -m venv .venv-lockview
+  .venv-lockview/bin/pip install matplotlib
+  ```
+
+  This has to be a venv rather than a plain `pip install matplotlib` against the system
+  interpreter: PEP 668 marks a Homebrew (or distro-managed) Python as externally managed and
+  refuses the install outright, precisely to stop a `pip install` from silently rewriting
+  packages the OS itself depends on. The renderer (`bench/plot_lock_view.py`) imports
+  matplotlib at module scope, so both it and `bench/lock_view_selftest.py` have to run under
+  this venv's interpreter, never the system `python3`:
+
+  ```bash
+  .venv-lockview/bin/python bench/lock_view_selftest.py
+  ```
+
+  Do not reuse `.venv-verify/`; that one belongs to the archive track's own toolchain
+  (pyarrow, duckdb) and conflating the two makes either one's rebuild a surprise for the other.
+
+### Output
+
+Each run writes a timestamped directory, `bench/results/lockview-<run-name>-<YYYYmmdd-HHMMSS>/`,
+containing:
+
+- `meta.json`: the traced sql, the enlisted relations and their oids, the clock window
+  (`t_begin`/`t_end`), and the git sha the capture was taken against.
+- `events.jsonl`: the raw capture (one JSON record per lock/commit event, plus a final
+  `{"dropped": ..., "unmatched": ...}` tally).
+- `names.before.csv` / `names.after.csv`: the relation-name snapshots taken immediately before
+  and after the traced statement, each already carrying the SQL fold (index to its table,
+  toast to its table, partition to its managed parent).
+- `lock-view.png` and `lock-view.svg`: the rendered figure.
+
+`bench/results/` is git-ignored (`bench/results/.gitignore`), so a run's output stays local by
+default. To share one, force-add it explicitly:
+
+```bash
+git add -f bench/results/lockview-mytick-20260916-191847/
+```
+
+### The four refusals
+
+`bench/plot_lock_view.py` refuses to draw a capture it cannot trust, rather than render a
+picture that looks fine and is wrong. Each refusal corresponds to a way that can happen:
+
+| refusal | trips when | why a drawing would mislead |
+| --- | --- | --- |
+| `dropped` | the kernel ring buffer overflowed and the probe lost events | a truncated trace drawn as a complete one is the exact failure that made an earlier tracer unsound |
+| `drain` | the probe was killed before it wrote its final tally | "dropped" is then unknown, and treating unknown as zero is the same mistake as above |
+| `empty` | the capture recorded no lock events at all | an empty timeline and "the probe attached to nothing" render identically |
+| `strong` | the capture never saw an `AccessExclusive` lock | a tick that did no real work renders as a calm, correct-looking figure of a no-op |
+
+A run that trips one of these prints `refusing to draw this capture -- <refusal>: <detail>` on
+stderr and exits nonzero instead of writing a figure. Passing `--modes strong` to
+`plot_lock_view.py` filters which marks get drawn (dropping `AccessShare`); it does not affect
+which captures are trusted enough to draw in the first place.
+
+### The spec
+
+Design rationale, the capture contract, the fold, and the drawing rules are written up in
+[`docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md`](../docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md).

@@ -83,27 +83,66 @@ check("a good capture loads", refuses(GOLDEN, CHECKS), "")
 # 2-column defaulting) is caught here instead of passing as an untested side effect of a load that
 # merely did not throw.
 cap = load_capture(GOLDEN, checks=CHECKS)
-enlisted = cap.names.get(16567)
+# Re-pointed 2026-09-16 (Task 5) to a real bench/lock_view.sh capture of the lock_trace.sh
+# retain-drop fixture (mg_ret/ml under call pgpm.maintain_all()); oid 21278 is that capture's
+# public.mg_ret, not the spike fixture's 16567.
+enlisted = cap.names.get(21278)
 check("a known oid resolves to its recorded name",
       enlisted.name if enlisted else None, "public.mg_ret")
-check("a relation from the 2-column CSV defaults parent to \"\"",
-      enlisted.parent if enlisted else None, "")
-check("a relation from the 2-column CSV defaults kind to \"other\"",
-      enlisted.kind if enlisted else None, "other")
+
+
+def _write_two_column_capture(tmp):
+    """Build a capture directory whose names CSV is deliberately 2-column (oid,name only).
+
+    The golden fixture used to BE this shape by accident: it predated the uretprobe and the
+    parent column, so every one of its relations defaulted through the fallback below whether
+    the test meant to exercise it or not. Task 5 re-points the golden fixture to a real
+    bench/lock_view.sh capture, whose names CSVs are always 4-column (see the fold block
+    below), so nothing else in this file exercises _read_names' 2-column contract any more.
+    This fixture exists solely to keep proving it: a bare "oid,name" row must still default
+    parent to "" and kind to "other" rather than raising or leaving them unset, exactly per
+    the docstring in plot_lock_view.py's _read_names.
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 1},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    with (d / "names.after.csv").open("w") as fh:
+        fh.write("1,public.two_col_table\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    two_col_dir = _write_two_column_capture(tmp)
+    two_col_cap = load_capture(two_col_dir, checks=())
+    two_col_rel = two_col_cap.names.get(1)
+    check("a relation from a 2-column CSV defaults parent to \"\"",
+          two_col_rel.parent if two_col_rel else None, "")
+    check("a relation from a 2-column CSV defaults kind to \"other\"",
+          two_col_rel.kind if two_col_rel else None, "other")
 
 from plot_lock_view import fold_rows  # noqa: E402
 
 # --- The fold (Task 2) ---
 #
-# The brief's own test asserts len(rows) == 10 against the golden fixture, but the golden
-# fixture's names.*.csv are deliberately 2-column (oid,name only, see the two checks above
-# this comment): every Relation.parent is "", so the fold has nothing to fold on and produces
-# one row per relation, not ten. Synthesizing parents into the fixture by pattern-matching
-# names was rejected: it would make this test verify a regex in the fixture builder instead
-# of the real SQL fold that a later task supplies. So the fold is proved two ways instead:
-# a small synthetic capture WITH explicit parents (proves folding happens when parent is
-# populated), and the golden fixture WITHOUT parents (proves the rel.parent or rel.name
-# fallback this ruling makes load-bearing).
+# The brief's own test asserts len(rows) == 10 against the golden fixture, but the ORIGINAL
+# golden fixture's names.*.csv were 2-column (oid,name only): every Relation.parent was "", so
+# the fold had nothing to fold on and produced one row per relation, not ten. Synthesizing
+# parents into the fixture by pattern-matching names was rejected: it would make this test
+# verify a regex in the fixture builder instead of the real SQL fold. So the fold was proved
+# two ways: a small synthetic capture WITH explicit parents (below, unchanged), and the golden
+# fixture WITHOUT parents (the degenerate case).
+#
+# Task 5 re-points the golden fixture to a real bench/lock_view.sh capture (Ruling 2), whose
+# names CSVs carry a real `parent` column from the harness's SQL fold, so the degenerate case
+# no longer applies to it: this is the first time the golden fixture exercises the REAL fold
+# rather than its fallback. See the block below the synthetic capture for the re-measured
+# assertions.
 
 
 def _write_synthetic_capture(tmp):
@@ -156,25 +195,42 @@ cap = load_capture(GOLDEN, checks=CHECKS)
 rows = fold_rows(cap)
 locked = {e["oid"] for e in cap.events if e["kind"] == "lock"}
 
-# Measured on the source capture 2026-09-16: 261 distinct locks. The golden names CSVs carry
-# no parent column (asserted above), so every Relation.parent is "" and the fallback in
-# fold_rows (rel.parent or rel.name) makes this degenerate to one row per relation: 261, not
-# the brief's invented 10. This is not a throwaway count: it is the only thing in this file
-# that exercises the "or rel.name" branch at all.
+# Re-measured 2026-09-16 against the re-pointed golden fixture (Task 5): a real
+# bench/lock_view.sh capture of the lock_trace.sh retain-drop fixture (mg_ret/ml, under call
+# pgpm.maintain_all()). 261 distinct locked relations is the SAME number the old spike
+# fixture had -- confirmed here by a fresh count against the new file, not assumed to still
+# hold -- but the fold itself is no longer degenerate: this fixture's names CSVs carry a real
+# `parent` column from the harness's own SQL fold (index to its table, toast to its table,
+# partition to its managed parent, walked through up to two hops so an index on a partition's
+# own toast table still lands on the partition's parent), so the 261 relations now collapse
+# onto 9 rows, matching the design spec's "roughly ten" prediction rather than the old
+# fallback's 261.
 check("the golden capture locks 261 distinct relations", len(locked), 261)
-check("without a parent column the fold degenerates to one row per relation",
-      len(rows), 261)
+check("the real parent column folds 261 relations down to 9 rows", len(rows), 9)
+# Identity, not cardinality (CLAUDE.md): the row count alone would also pass if the fold
+# merged the wrong relations together, so the exact label set is pinned too.
+check("the 9 rows are exactly the tables the tick actually touched",
+      sorted(rows), [
+          "pgpm.archive_result", "pgpm.config", "pgpm.dropped_fk", "pgpm.log",
+          "pgpm.log_id_seq", "pgpm.part", "public.mg_ret", "public.ml",
+          "public.ml_pgpm_regrain_delta",
+      ])
 check("no commit leaked into any row of the golden capture",
       any(e["kind"] == "commit" for evs in rows.values() for e in evs), False)
 
-# Not asserting ts-ordering here on purpose: without a parent column every one of these 261
-# rows holds exactly one event (see the degenerate-fold check above), and a singleton list
-# is trivially "sorted" whatever fold_rows does with it, including if the evs.sort() call
-# were deleted entirely. Shuffling the input first does not fix this either: the fold still
-# produces one event per row, because folding only ever appends a subsequence of the input.
-# The synthetic capture above is what actually proves the sort, because its three events
-# land in a single row with deliberately scrambled ts values. Do not re-add an ordering
-# check here; it would be a passing test that also passes against code missing the sort.
+# Ruling 2: rows here now hold hundreds of events apiece (public.mg_ret's alone carries
+# 2,251), not the one-event-per-row degenerate case the old fixture produced, so a
+# ts-ordering check on the golden fixture is worth attempting. Attempted, and DROPPED after
+# checking it does not discriminate: bench/lock_view.py's probe drains one ring buffer in one
+# polling loop and appends events as they are produced, so events.jsonl is already globally
+# non-decreasing in ts before fold_rows ever runs, and folding only ever filters a subsequence
+# of an already-sorted sequence, which stays sorted whether or not fold_rows sorts it again.
+# Verified directly rather than assumed: a scratch copy of plot_lock_view.py with the
+# `evs.sort(key=lambda e: e["ts"])` line deleted was run against this exact golden capture,
+# and all 9 folded rows were still in ts order. A check that cannot fail against the defect it
+# exists to catch is not evidence (this repo's CLAUDE.md), so it is not added here. The
+# synthetic capture above remains the only place that check can fail, because it deliberately
+# writes its three events out of ts order (3, 1, 2) before folding.
 
 from plot_lock_view import render, tier  # noqa: E402
 
@@ -197,6 +253,11 @@ check("tier classifies ShareRowExclusive (6) as strong", tier(6), "strong")
 check("tier classifies Exclusive (7) as strong", tier(7), "strong")
 check("tier classifies AccessExclusive (8) as strong", tier(8), "strong")
 
+# Re-measured against the re-pointed golden fixture: bench/lock_view.sh ran the whole traced
+# tick through a single psql invocation, so the capture is still single-backend (stamps one
+# backend, below). `--modes strong` still has AccessShare marks to drop -- 2,527 of the
+# capture's 3,347 events are AccessShare (light tier), leaving 820 drawn -- so this pair keeps
+# discriminating rather than becoming vacuous on a capture that happened to have none.
 with tempfile.TemporaryDirectory() as tmp:
     out = pathlib.Path(tmp)
     stamp = render(cap, out)

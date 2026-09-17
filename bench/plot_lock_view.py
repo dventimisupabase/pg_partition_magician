@@ -40,6 +40,7 @@ Do not reuse `.venv-verify`; that one belongs to the archive track (pyarrow, duc
 import csv
 import json
 import pathlib
+import sys
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -359,3 +360,24 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         )
     plt.close(fig)
     return stamp
+
+
+def main(argv) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(description="Draw a lock-sequence capture.")
+    p.add_argument("run_dir", type=pathlib.Path)
+    p.add_argument("--modes", choices=("all", "strong"), default="all")
+    args = p.parse_args(argv)
+    try:
+        cap = load_capture(args.run_dir)
+    except Refused as exc:
+        print(f"refusing to draw this capture -- {exc}", file=sys.stderr)
+        return 1
+    stamp = render(cap, args.run_dir, modes=args.modes)
+    print("  " + "  ".join(f"{k}={v}" for k, v in stamp.items()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

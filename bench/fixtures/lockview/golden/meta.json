@@ -1,16 +1,15 @@
 {
-  "run": "golden",
+  "run": "real",
   "sql": "call pgpm.maintain_all()",
   "enlist": [
     "public.mg_ret",
     "public.ml"
   ],
   "enlist_oids": [
-    16567,
-    16791
+    21278,
+    21502
   ],
-  "t_begin": 117219386669681,
-  "t_end": 117219610434545,
-  "git_sha": "spike",
-  "trimmed_from": 16591
+  "t_begin": 126691618785541,
+  "t_end": 126691921893817,
+  "git_sha": "a585ae8"
 }
