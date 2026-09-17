@@ -169,7 +169,19 @@ loudly, rather than drawing:
 | `dropped > 0` | a truncated trace rendered as a complete one is the exact failure that made pg-lock-tracer unsound |
 | no final `{"dropped": N}` record | the probe was killed before draining; completeness is unknown, which is not the same as fine |
 | zero events | an empty chart reads as "no locks were taken", indistinguishable from "the probe attached to nothing" |
-| no strong-mode mark on any enlisted relation | a tick that did nothing renders as a calm, correct-looking figure |
+| no strong-mode mark on any relation | a tick that did nothing renders as a calm, correct-looking figure |
+
+**Amended 2026-09-16 (whole-branch review, fix 6).** This row originally read "on any ENLISTED
+relation". That reading is wrong in general: `retain` takes `AccessExclusive` on PARTITION oids,
+never on the enlisted table's own oid, so restricting the check to the enlisted set would refuse
+the exact captures this refusal exists to accept. The implementation always checked any relation
+in the whole capture, which was right; the spec's stricter wording was the defect, and this row now
+says what the code does. Separately, "strong-mode" here means `tier() == "strong"` (ShareRowExclusive,
+Exclusive or AccessExclusive), not only `AccessExclusive`: the implementation originally hardcoded a
+comparison against `AccessExclusive` alone, which `tier()`'s own three-way split (light/saturated/
+strong) made an unreconciled second source of truth for the same classification. Reconciled onto
+`tier()`, so a tick whose only strong-tier work was `ShareRowExclusive` or `Exclusive` -- never
+`AccessExclusive` itself -- is still recognised as having done real, blocking work.
 
 Every figure is stamped with its event count, drop count, traced span and originating SQL, so one
 pasted into an issue carries its own provenance.
@@ -206,17 +218,34 @@ Legibility at 3,347 user marks:
 - Every other mode draws saturated above the baseline, with `AccessExclusive`, `ShareRowExclusive`
   and `Exclusive` tallest, so the eye lands on boundaries first.
 - `--modes strong` drops `AccessShare` entirely, taking the figure to 820 marks (3,347 less 2,527).
-- Overplotted clusters are annotated with their exact count, so the picture never implies more or
-  fewer events than were captured.
+- A row whose marks are ALL light-tier is annotated with its exact event count. **Amended
+  2026-09-16 (whole-branch review, fix 4b)**: this is the minimal form of the annotation, not a
+  general "annotate any overplotted cluster". It exists because a row with only a handful of
+  light-tier marks (`pgpm.archive_result` in the golden fixture holds exactly one) renders as
+  visually EMPTY at the light tier's alpha, even though the figure's own captured count says
+  otherwise; writing the count beside such a row closes that specific legibility gap. A saturated
+  or strong-tier row that happens to be visually dense from many overlapping marks is not
+  separately annotated -- implementing that general form was judged not worth the added
+  complexity against what this fixes, and the minimal form covers the only concrete legibility
+  defect found (`pgpm.archive_result`, and equally `pgpm.dropped_fk`'s 11 marks).
 
 Commits are full-height vertical rules across all rows, because a commit is a backend event rather
 than a relation event.
 
 Partitions present in the before snapshot and absent from the after snapshot were dropped during the
-window; the renderer rings their last mark.
+window; the renderer rings their last mark. **Implemented 2026-09-16** (whole-branch review, fix 4c):
+`load_capture` now reads `names.before.csv` and `names.after.csv` separately before folding them into
+the union `Relation` map, specifically so it can still answer "which side did this oid come from"
+after the union is built; `Capture.dropped_oids` carries the answer. Verified against the golden
+fixture: 29 partitions dropped, all 29 carrying at least one lock event, matching the design spike's
+own 29-against-29 cross-check under "Cross-checks printed on the figure" below.
 
 Rows stay plain relation rows when one backend is present and become `(relation, pid)` pairs when
 more than one is. The spike saw one backend, but that is a fixture accident rather than a property.
+**Implemented 2026-09-16** (whole-branch review, fix 4a): `fold_rows` keys each row on `(label, pid)`
+whenever the capture's lock events carry more than one distinct pid, verified with a synthetic
+two-backend fixture (the golden fixture itself remains single-backend, so it cannot exercise this
+path).
 
 Palette is `plot_results.py`'s, unchanged: `#d2553b` for `AccessExclusive`, `#3ecf8e` for commits,
 `#9aa0a6` for light modes, `#1c1c1c` ink. No new colours.
@@ -235,8 +264,25 @@ observed rather than inferred, and it is exactly what someone changing lock boun
 This introduces one new failure mode, and it must not be silent. A pending request that never gets a
 matching return, from a backend killed mid-wait, would otherwise render as an instant grant: a lost
 wait drawn as no wait, which is the silent-overflow defect wearing a different hat. Unmatched entries
-are capped and counted into the same reported counter as drops, and the figure names them. **A wait
-that was lost track of never renders as a zero-length wait.**
+are counted and the figure names them. **A wait that was lost track of never renders as a zero-length
+wait.**
+
+**Amended 2026-09-16 (whole-branch review, fix 2).** Two corrections to the paragraph above:
+
+1. "capped" never described a real mechanism and is removed. There is no cap, and none is needed:
+   `pending` is a `BPF_HASH` keyed by pid, so there is at most one live pending entry per watched pid
+   at any moment by construction, not because anything enforces a limit.
+2. `unmatched` is reported as its own number, **never folded into the same counter as `dropped`, and
+   never made a fifth refusal.** A whole-branch review proposed folding `unmatched` into the `dropped`
+   refusal to match this section's original wording more literally; that remedy is rejected. The two
+   mean different things: `dropped > 0` means the kernel ring buffer overflowed, so the trace is
+   incomplete in an UNKNOWN way, and refusing is right. `unmatched > 0` means a lock request never got
+   a matching grant; the trace is COMPLETE and is accurately reporting a wait whose end could not be
+   observed, which is the normal, expected shape of an aborted wait under `lock_timeout` -- exactly the
+   contention case the uretprobe was added to observe. Refusing on `unmatched` would make the tool
+   useless in precisely that case. The split field and the shared red footer tint (drawn from
+   `footer_color(dropped, unmatched)`, `plot_lock_view.py`) stay: both still deserve a reader's
+   attention on a figure that otherwise reads as calm, short of withholding the figure over either one.
 
 ## Verification
 

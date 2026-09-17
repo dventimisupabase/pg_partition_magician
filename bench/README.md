@@ -520,12 +520,19 @@ Each run writes a timestamped directory, `bench/results/lockview-<run-name>-<YYY
 containing:
 
 - `meta.json`: the traced sql, the enlisted relations and their oids, the clock window
-  (`t_begin`/`t_end`), and the git sha the capture was taken against.
+  (`t_begin`/`t_end`), the git sha the capture was taken against, and a `producer` key naming
+  which probe wrote the capture (`bench/lock_view.py` writes `ts` at the grant; the CI guard's
+  own `bench/lock_probe.py` writes it at the request and carries no `producer` key at all, so a
+  guard capture loaded here is never plotted as though its marks meant the same instant).
 - `events.jsonl`: the raw capture (one JSON record per lock/commit event, plus a final
   `{"dropped": ..., "unmatched": ...}` tally).
 - `names.before.csv` / `names.after.csv`: the relation-name snapshots taken immediately before
   and after the traced statement, each already carrying the SQL fold (index to its table,
-  toast to its table, partition to its managed parent).
+  toast to its table, partition to its managed parent). A failed snapshot aborts the run rather
+  than warning: `plot_lock_view.py`'s loader treats a missing or truncated CSV as "every
+  relation was created during the window", which renders a wrong figure that still passes every
+  refusal, so `bench/lock_view.sh` checks each snapshot's exit status and stops rather than
+  hand that silently-wrong input to the renderer.
 - `lock-view.png` and `lock-view.svg`: the rendered figure.
 
 `bench/results/` is git-ignored (`bench/results/.gitignore`), so a run's output stays local by
@@ -534,6 +541,10 @@ default. To share one, force-add it explicitly:
 ```bash
 git add -f bench/results/lockview-mytick-20260916-191847/
 ```
+
+The container-side capture paths (`/tmp/pgpm_lock_view.jsonl`, `/tmp/pgpm_lock_view.log`) are
+fixed, not per-run: two `lock_view.sh` invocations against the same container at the same time
+will collide and corrupt each other's capture. Run one at a time per container.
 
 ### The four refusals
 
@@ -545,14 +556,30 @@ picture that looks fine and is wrong. Each refusal corresponds to a way that can
 | `dropped` | the kernel ring buffer overflowed and the probe lost events | a truncated trace drawn as a complete one is the exact failure that made an earlier tracer unsound |
 | `drain` | the probe was killed before it wrote its final tally | "dropped" is then unknown, and treating unknown as zero is the same mistake as above |
 | `empty` | the capture recorded no lock events at all | an empty timeline and "the probe attached to nothing" render identically |
-| `strong` | the capture never saw an `AccessExclusive` lock | a tick that did no real work renders as a calm, correct-looking figure of a no-op |
+| `strong` | the capture never saw a strong-tier lock (`ShareRowExclusive`, `Exclusive` or `AccessExclusive`, per `tier()`) on any relation | a tick that did no real work renders as a calm, correct-looking figure of a no-op |
 
 A run that trips one of these prints `refusing to draw this capture -- <refusal>: <detail>` on
 stderr and exits nonzero instead of writing a figure. Passing `--modes strong` to
 `plot_lock_view.py` filters which marks get drawn (dropping `AccessShare`); it does not affect
 which captures are trusted enough to draw in the first place.
 
+`unmatched` (a lock request that never got a matching grant, most often an aborted wait under
+`lock_timeout`) is reported alongside `dropped` on the figure's footer but is deliberately **not**
+a fifth refusal: it means the trace is complete and accurately reporting a wait it could not see
+the end of, not that the trace is untrustworthy. See the design spec's "Requests, grants and
+waits" section for the reasoning.
+
 ### The spec
 
 Design rationale, the capture contract, the fold, and the drawing rules are written up in
 [`docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md`](../docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md).
+
+### The request/return pairing proof
+
+`bench/lock_timeout_pairing_demo.sh` is a runnable, two-session demonstration of a defect that
+was found and fixed in `bench/lock_view.py`'s eBPF probe: an aborted wait under `lock_timeout`
+must be paired with and counted against its own request, never left to be silently stolen and
+misreported by whatever `LockRelationOid` return comes next. Nothing runs it automatically (no
+`test.sh` wiring, no CI job); it exists so the discrimination proof for that fix stays a runnable,
+committed artifact instead of prose in a report that will eventually be deleted. See its own
+header for what it demonstrates and how to run it.
