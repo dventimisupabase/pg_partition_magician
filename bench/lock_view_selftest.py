@@ -176,7 +176,26 @@ check("no commit leaked into any row of the golden capture",
 # land in a single row with deliberately scrambled ts values. Do not re-add an ordering
 # check here; it would be a passing test that also passes against code missing the sort.
 
-from plot_lock_view import render  # noqa: E402
+from plot_lock_view import render, tier  # noqa: E402
+
+# --- The mode -> tier classification (fix round 1, Finding 1/2) ---
+#
+# An earlier cut of render() used two independently-maintained constant sets, LIGHT for the
+# --modes strong filter and STRONG for the styling, and they disagreed: RowShare (2),
+# RowExclusive (3), ShareUpdateExclusive (4) and Share (5) are not in STRONG (so they painted
+# as pale background) and are not LIGHT either (so --modes strong never dropped them). On a
+# real capture that was 279 marks surviving the "strong" filter while being drawn as noise.
+# Every one of PostgreSQL's eight lock modes is pinned here, rather than a couple of
+# representative samples, specifically because that defect lived in the gap between two
+# samples (mode 3 was never asserted anywhere in the original 27-check suite).
+check("tier classifies AccessShare (1) as light", tier(1), "light")
+check("tier classifies RowShare (2) as saturated", tier(2), "saturated")
+check("tier classifies RowExclusive (3) as saturated", tier(3), "saturated")
+check("tier classifies ShareUpdateExclusive (4) as saturated", tier(4), "saturated")
+check("tier classifies Share (5) as saturated", tier(5), "saturated")
+check("tier classifies ShareRowExclusive (6) as strong", tier(6), "strong")
+check("tier classifies Exclusive (7) as strong", tier(7), "strong")
+check("tier classifies AccessExclusive (8) as strong", tier(8), "strong")
 
 with tempfile.TemporaryDirectory() as tmp:
     out = pathlib.Path(tmp)

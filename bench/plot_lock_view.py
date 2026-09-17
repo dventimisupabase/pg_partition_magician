@@ -194,17 +194,44 @@ def fold_rows(cap: Capture) -> dict:
 
 GREEN, INK, GREY, RED = "#3ecf8e", "#1c1c1c", "#9aa0a6", "#d2553b"
 
-# Lock mode integers per storage/lockdefs.h. LIGHT is the mode "--modes strong" drops:
-# AccessShare (1) is the mode that swamps a real capture (198 of 261 locks in the golden
-# fixture) and is the only one dropped, matching the spec's "3,347 captured -> 820 drawn"
-# example. STRONG is the set drawn tall and saturated rather than as a thin baseline tick:
-# ShareRowExclusive (6), Exclusive (7) and AccessExclusive (8), the modes that actually block
-# other backends. RowShare (2), RowExclusive (3), ShareUpdateExclusive (4) and Share (5) are
-# neither: they draw with the same thin styling as AccessShare but are not dropped by
-# "--modes strong", since only AccessShare is common enough to need dropping.
-STRONG = (6, 7, 8)
-LIGHT = 1
-ACCESS_EXCLUSIVE_MODE = 8
+# Lock mode integers per storage/lockdefs.h, folded into three drawing/filtering tiers by one
+# function (`tier`) rather than two independently-maintained constant sets. An earlier cut of
+# this module used LIGHT (what --modes strong drops) for the filter and STRONG (what draws
+# tall) for the styling, and the two disagreed: RowShare/RowExclusive/ShareUpdateExclusive/
+# Share are not in STRONG, so they painted as pale background, yet they are not LIGHT either,
+# so --modes strong never dropped them -- on a real capture that is 279 marks surviving the
+# "strong" filter while being drawn as unimportant. `tier()` is the single place both the
+# filter and the styling read from, so they cannot diverge again.
+LIGHT_MODE = 1
+STRONG_MODES = (6, 7, 8)
+
+
+def tier(mode: int) -> str:
+    """Classify a lock mode integer into "light", "saturated" or "strong" (design spec's terms).
+
+    light      AccessShare (1) only: the mode common enough to swamp a real capture (198 of
+               261 locks in the golden fixture, 2,527 of 3,347 in the spec's real one) and the
+               only mode `--modes strong` drops. Drawn thin, low alpha, on the row baseline.
+    saturated  RowShare (2), RowExclusive (3), ShareUpdateExclusive (4), Share (5): ordinary
+               locking traffic. Drawn full alpha, above the baseline, but not the tallest.
+    strong     ShareRowExclusive (6), Exclusive (7), AccessExclusive (8): the modes that
+               actually block other backends. Drawn tallest; AccessExclusive additionally
+               keeps its own colour (RED, via the ACCESS_EXCLUSIVE constant) rather than
+               sharing "strong"'s INK.
+    """
+    if mode == LIGHT_MODE:
+        return "light"
+    if mode in STRONG_MODES:
+        return "strong"
+    return "saturated"
+
+
+# (half_height, alpha, linewidth) per tier, applied in render()'s drawing loop below.
+TIER_STYLE = {
+    "light": (0.10, 0.35, 0.6),
+    "saturated": (0.22, 1.0, 0.9),
+    "strong": (0.34, 1.0, 1.2),
+}
 
 
 def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
@@ -223,12 +250,12 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     fixture's probe never wrote that field, so `.get("wait_ns", 0)` reads 0 and no wait span is
     drawn for it, which is correct rather than a gap in this function.
 
-    `modes="strong"` drops AccessShare (LIGHT) marks only; it is not a synonym for "only
-    STRONG modes". `captured` in the returned stamp always counts every event `load_capture`
-    read from the file, regardless of `modes`, while `drawn` counts only what this specific
-    call put ink on. Keeping those two independent is the point: a filtering bug that silently
-    drops the wrong set (too many, too few, or the wrong mode) shows up as a `captured`/`drawn`
-    mismatch on the artifact itself instead of passing unnoticed.
+    `modes="strong"` drops `tier() == "light"` marks only, i.e. AccessShare; it is not a
+    synonym for "only strong-tier modes". `captured` in the returned stamp always counts every
+    event `load_capture` read from the file, regardless of `modes`, while `drawn` counts only
+    what this specific call put ink on. Keeping those two independent is the point: a filtering
+    bug that silently drops the wrong set (too many, too few, or the wrong mode) shows up as a
+    `captured`/`drawn` mismatch on the artifact itself instead of passing unnoticed.
     """
     out_dir = pathlib.Path(out_dir)
     rows = fold_rows(cap)
@@ -243,17 +270,24 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     fig, ax = plt.subplots(figsize=(12, 1.1 + 0.42 * len(order)))
     for y, label in enumerate(order):
         for e in rows[label]:
-            if modes == "strong" and e["mode"] == LIGHT:
+            mode_tier = tier(e["mode"])
+            if modes == "strong" and mode_tier == "light":
                 continue
             drawn += 1
-            strong = e["mode"] in STRONG
+            half_height, alpha, linewidth = TIER_STYLE[mode_tier]
+            if e["mode"] == ACCESS_EXCLUSIVE:
+                color = RED
+            elif mode_tier == "light":
+                color = GREY
+            else:
+                color = INK
             ax.vlines(
                 ms(e["ts"]),
-                y - (0.34 if strong else 0.10),
-                y + (0.34 if strong else 0.10),
-                color=RED if e["mode"] == ACCESS_EXCLUSIVE_MODE else (INK if strong else GREY),
-                alpha=1.0 if strong else 0.35,
-                linewidth=1.2 if strong else 0.6,
+                y - half_height,
+                y + half_height,
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
             )
             # The only lock span drawn, and only because it is observed rather than inferred:
             # the distance between the request (uprobe, entry) and the grant (uretprobe,
