@@ -44,6 +44,31 @@ Never join on pg_backend_pid(). eBPF's bpf_get_current_pid_tgid() reports the pi
 kernel's initial pid namespace; psql's pg_backend_pid() reports the pid as seen from inside the
 container's own pid namespace. Those numbers do not agree, so the enlistment here works purely off
 which oids a backend touches, never off an identifier fetched from SQL.
+
+KNOWN BLIND SPOT (issue #392 review, finding 1), stated here rather than left implicit. Enlistment
+happens on first touch: a backend joins `watched` only once it locks one of the target oids, so
+anything that SAME backend locked EARLIER in the same statement is invisible to this trace --
+`LOCK other_table; LOCK target;`, run as one statement against an unenlisted backend, loses
+`other_table` entirely, and nothing here or in bench/plot_lock_view.py refuses on it; a truncated
+prefix renders as though it were the complete sequence.
+
+bench/lock_view.sh works around this for the one relation it can reach ahead of time: it primes
+enlistment by touching the FIRST enlisted relation as its own statement, in the same backend,
+immediately before the traced SQL runs. That closes the gap for a backend whose only earlier
+activity is the traced statement itself. It does NOT close two other gaps, and nothing in this
+file or that script can:
+
+  1. A lock this backend already held before the primer ever ran (e.g. an already-open
+     transaction the harness didn't start). There is no such thing within one fresh psql
+     invocation, but this tool has no way to detect or refuse an already-open session if it were
+     ever invoked against one.
+  2. Locks taken by a DIFFERENT backend before THAT backend first touches a target relation.
+     Priming enlists only the one backend running the traced SQL; every other backend on the
+     server is still enlisted the same way this file always enlisted anyone -- on first touch --
+     so another session's own prefix is permanently invisible to this instrument.
+
+Read a rendered figure as a complete SUFFIX of the one backend under test, from the moment it was
+primed onward, never as a complete prefix of every backend's locking.
 """
 import ctypes
 import json

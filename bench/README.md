@@ -488,6 +488,43 @@ looked up at the start of the run); `<sql>` is the statement to trace. The harne
 relation names before and after the traced statement, runs the probe, executes `<sql>`, waits
 for the probe to drain, then renders the two figures.
 
+### A primer mark you will see on the figure
+
+`bench/lock_view.py` enlists a backend into its watched set only once that backend touches one of
+the enlisted oids, so any lock the SAME backend took EARLIER in `<sql>` would otherwise be lost
+outright and rendered as though the sequence were complete (issue #392 review, finding 1):
+`LOCK other; LOCK target;`, traced as one statement, would drop `other` with no refusal to catch
+it. `lock_view.sh` closes this for the one relation it can reach ahead of time: immediately before
+`<sql>` runs, it issues `select 1 from <first-enlisted-relation> limit 0` as its own statement, in
+the SAME `docker exec ... psql -c ... -c ...` invocation (one backend, one pid) that then runs
+`<sql>`. That backend is enlisted before `<sql>` executes anything at all.
+
+Two things follow, both worth knowing before reading a figure:
+
+- **The primer takes a real AccessShare lock, and it will appear in the capture.** It is the
+  FIRST AccessShare mark on the first enlisted relation, and it is an artifact of this harness, not
+  part of `<sql>`'s own work. Do not read it as something the traced statement did.
+- **It renders INSIDE the shaded `[t_begin, t_end]` band, not before it.** `t_begin` is recorded on
+  the host before the single `docker exec` that runs the primer and `<sql>` back to back; there is
+  no point at which this script can record a timestamp between them without splitting them into
+  separate psql invocations, which would give them separate backends and defeat the whole point of
+  priming. So the ordinary rule ("locks before `t_begin` are outside the band, ambient noise") does
+  not apply to this one mark -- it is inside the band by construction, and the first AccessShare on
+  the first enlisted relation is how you recognise it.
+- **Only when it is safe.** If the first enlisted relation cannot be selected from (dropped
+  mid-run, no privilege, whatever), the primer's own statement fails and `<sql>` still runs; a
+  primer failure never aborts the run or gets mistaken for `<sql>` itself failing.
+
+**What this does NOT close.** A lock the SAME backend held before the primer ever ran cannot exist
+within one fresh `psql` invocation, so there is nothing to miss there. But a lock taken by a
+DIFFERENT backend, before THAT backend first touches a target relation, is still invisible --
+priming enlists only the one backend running `<sql>`; every other session on the server is
+enlisted the same way this tool always enlisted anyone, on first touch. Read a figure as a complete
+suffix of the one backend under test from the moment it was primed, never as a complete prefix of
+every backend's own locking. See `bench/lock_view.py`'s module docstring for the same limit stated
+next to the code it applies to, and `bench/lock_view_names_scope_demo.sh`'s sibling script,
+`bench/lock_view_prefix_demo.sh`, for a runnable demonstration against a live capture.
+
 ### Prerequisites
 
 - The `locktrace` compose profile, up and healthy: `docker compose --profile locktrace up -d`.

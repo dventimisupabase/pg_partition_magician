@@ -27,70 +27,30 @@ OIDS=$(q "select string_agg(c.oid::text, ',') from unnest(string_to_array('$RELS
           r join pg_class c on c.oid = trim(r)::regclass")
 [ -n "$OIDS" ] || { echo "error: none of '$RELS' resolved" >&2; exit 1; }
 
+# Prime enlistment (issue #392 review, finding 1). bench/lock_view.py enlists a backend into
+# `watched` only once it touches one of the target oids, so any lock that SAME backend took
+# EARLIER in the traced statement is silently missing -- `LOCK other; LOCK target;` in one
+# statement loses `other` outright, with no refusal anywhere to catch it. The first enlisted
+# relation is the one this harness can reach ahead of the traced SQL: a trivial `limit 0` touch
+# of it, issued as its own psql `-c` immediately before `$SQL` and run via the same `docker exec
+# psql` invocation (one backend, one pid, still separate implicit transactions), enlists the
+# backend before the traced statement runs anything at all.
+FIRST_REL="$(printf '%s' "$RELS" | cut -d, -f1 | xargs)"
+PRIMER="select 1 from $FIRST_REL limit 0"
+
 # The name map, snapshotted DURING the window. The three folds are SQL joins because that is where
 # they belong: index to its table, toast to its table, partition to its managed parent. Resolving
 # any of this afterwards fails for the relations most worth seeing, since retain drops them.
 #
-# Folding this to a base table takes up to two hops, not one, and a real retain-drop capture
-# exercises every depth: a plain index or toast on a normal table is one hop (index -> its
-# table); a partition's OWN index or toast is two hops (index -> the partition -> the
-# partition's managed parent, via pgpm.part); and an index ON a partition's toast table is
-# three hops (index -> toast -> the partition -> the parent). base1/base2 below apply the
-# "index -> indrelid, else toast -> its owning table, else itself" step twice, which is enough
-# to walk index-on-toast-of-partition down to the real base table (a toast table cannot itself
-# be indexed-and-toasted further, so two applications always reach a fixed point); the
-# managed_parent join then folds that base table's own name if pgpm.part says it is a child.
-# A single-hop version of this was tried first and produced 131 rows on a real 31-partition
-# retain-drop capture instead of the roughly-ten the design predicts: every dropped partition's
-# own index and toast table (and the toast's own index) sat in one-off rows instead of joining
-# the partition's.
+# The query lives in bench/sql/lockview_names.sql, not inlined here, so
+# bench/lock_view_names_scope_demo.sh can run the EXACT SQL this harness runs against a synthetic
+# fixture instead of a hand-copied duplicate that could drift. See that file's own header for the
+# two-hop fold and the schema-scoped managed_parent join (issue #392 review, finding 2): two managed
+# parents sharing a bare relname in different schemas used to fold their children onto whichever
+# parent's row happened to read last, nondeterministically, because the join matched on bare child
+# name alone.
 names_snapshot() {
-  docker exec "$C" psql -U postgres -d "$DB" -qtA -F, -c "
-    with base1 as (
-      select c.oid,
-             coalesce(i.indrelid,
-                      (select t.oid from pg_class t where t.reltoastrelid = c.oid),
-                      c.oid) as b
-        from pg_class c
-        left join pg_index i on i.indexrelid = c.oid
-       where c.oid >= 16384
-    ),
-    base2 as (
-      select b1.oid,
-             coalesce(i2.indrelid,
-                      (select t2.oid from pg_class t2 where t2.reltoastrelid = b1.b),
-                      b1.b) as b
-        from base1 b1
-        left join pg_index i2 on i2.indexrelid = b1.b
-    ),
-    based as (
-      select b2.oid, pc.relname as bare_name,
-             pn.nspname || '.' || pc.relname as qname
-        from base2 b2
-        join pg_class pc on pc.oid = b2.b
-        join pg_namespace pn on pn.oid = pc.relnamespace
-    ),
-    managed_parent as (
-      select p.child_name,
-             pn.nspname || '.' || pc.relname as qname
-        from pgpm.part p
-        join pg_class pc on pc.oid = p.parent_table
-        join pg_namespace pn on pn.oid = pc.relnamespace
-    )
-    select c.oid,
-           n.nspname || '.' || c.relname,
-           coalesce(mp.qname, bd.qname, '') as parent,
-           case when c.relkind = 'i' then 'index'
-                when n.nspname = 'pg_toast' then 'toast'
-                when exists (select 1 from pgpm.part p where p.child_name = c.relname)
-                  then 'partition'
-                else 'other' end
-      from pg_class c
-      join pg_namespace n on n.oid = c.relnamespace
-      left join based bd on bd.oid = c.oid
-      left join managed_parent mp on mp.child_name = bd.bare_name
-     where c.oid >= 16384
-     order by c.oid"
+  docker exec "$C" psql -U postgres -d "$DB" -qtA -F, -f /repo/bench/sql/lockview_names.sql
 }
 
 # Checked, not fired-and-forgotten (issue #392 review, fix 1): a failing snapshot under
@@ -129,13 +89,33 @@ fi
 
 # The probe's bpf_ktime_get_ns() and the host's CLOCK_MONOTONIC are the SAME clock domain (same
 # kernel), verified on the design spike. Clocks cross the container boundary; pids do not.
+#
+# Honesty about where the primer lands (finding 1): T_BEGIN is recorded here, before the ONE
+# combined `docker exec` below that runs the primer and `$SQL` back to back over the same
+# connection. There is no point at which this script can record a timestamp BETWEEN the primer
+# and `$SQL` without splitting them into separate psql invocations, which would give them
+# separate backends and defeat the whole point of priming. So the primer's own AccessShare mark
+# lands INSIDE the shaded [T_BEGIN, T_END] band on the figure, not before it, even though it is
+# not part of the traced statement's own work. bench/README.md says this plainly: the first
+# AccessShare mark on the first enlisted relation is the primer, not the traced statement.
 T_BEGIN=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
 # Kept and checked, not discarded: a failed or partially-executed traced statement still lets
 # the capture and render proceed (a near-empty capture usually trips the "empty"/"strong"
 # refusal downstream), but that refusal reads as "the probe saw nothing" when the real cause
 # was the SQL itself. Warning here, with the real error alongside the capture, means a wrong
 # picture never has to be debugged as though it were a probe defect.
-if ! docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$SQL" >/dev/null 2>"$OUT/sql.stderr"; then
+#
+# $PRIMER runs as its OWN `-c`, ahead of `$SQL`, in this same invocation -- one backend, primed
+# before the traced statement touches anything. "Only when it is safe and possible" (finding 1):
+# if the first enlisted relation cannot be selected from (dropped mid-run, no SELECT privilege,
+# whatever), the primer's `-c` fails on its own and psql -- run without ON_ERROR_STOP, exactly as
+# every other multi-statement invocation in this script -- reports that error and moves on to the
+# NEXT `-c`; the exit status checked below reflects only the LAST command, so a primer failure
+# never surfaces as "the traced statement exited non-zero" (verified: a failing first `-c`
+# followed by a succeeding second one exits 0). `sql.stderr` may therefore carry a harmless
+# primer error alongside, or instead of, a real one from `$SQL` itself; only the exit status says
+# which happened.
+if ! docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$PRIMER" -c "$SQL" >/dev/null 2>"$OUT/sql.stderr"; then
   echo "warning: the traced statement exited non-zero; see $OUT/sql.stderr" >&2
   echo "         the capture below may be empty or partial for that reason, not because the probe failed" >&2
 fi
@@ -184,9 +164,11 @@ open(f"{out}/meta.json", "w").write(json.dumps({
     "t_begin": int(t0), "t_end": int(t1), "git_sha": sha,
     # Names which probe wrote this capture's events: bench/lock_view.py writes `ts` at the
     # GRANT (it pairs request and grant via a uretprobe); bench/lock_probe.py, the CI guard's
-    # probe, writes `ts` at the REQUEST and never wrote a producer key at all. Recorded so a
-    # guard capture loaded by plot_lock_view.py is never plotted as though its marks meant the
-    # same instant as one from this harness (issue #392 review, fix 7).
+    # probe, writes `ts` at the REQUEST and never wrote a producer key at all. Recorded so
+    # plot_lock_view.py's `render` can stamp the correct timestamp semantics on the figure
+    # instead of assuming grant time for every capture it loads (issue #392 review, fix 7 and
+    # finding 3 -- the original comment here claimed the loader already acted on this key; it
+    # did not, until finding 3's fix).
     "producer": "lock_view.py",
 }, indent=2) + "\n")
 PY
