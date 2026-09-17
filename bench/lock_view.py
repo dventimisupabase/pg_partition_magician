@@ -20,6 +20,20 @@ below is close to identical; the differences are all here, and all deliberate.
 An unmatched request is COUNTED, never dropped silently: a wait we lost track of must not render as a
 zero-length wait, which is the silent-overflow defect wearing a different hat.
 
+The catalog filter lives on the RETURN side, not the request side, and this is deliberate rather than
+incidental. `lock_timeout`, `statement_timeout` and `deadlock_timeout` all abort a wait with an ERROR,
+and PostgreSQL escapes that with siglongjmp -- the frame is unwound, not returned from, so a
+uretprobe's return trampoline never fires. If a catalog request were filtered out before it ever
+reached `pending`, an aborted NON-catalog wait's entry would be left stranded there, and since catalog
+locks are 76 to 80% of a watched backend's traffic (measured on this project's own fixtures), the very
+next `LockRelationOid` return on that pid -- almost certainly a catalog one -- would consume the stale
+entry and emit a FABRICATED grant carrying the old oid and mode with the new, meaningless timestamp.
+The real lost wait would vanish with no counter incremented at all: silent loss reintroduced by the
+interaction of two individually-correct pieces. So `on_lock` tracks EVERY call from a watched backend,
+catalog included, and `on_lock_ret` filters on the way out, after consuming whichever entry is there --
+a catalog return must pair with and discard its own catalog request, never leave it for something else
+to steal.
+
 Never join on pg_backend_pid(). eBPF's bpf_get_current_pid_tgid() reports the pid as seen from the
 kernel's initial pid namespace; psql's pg_backend_pid() reports the pid as seen from inside the
 container's own pid namespace. Those numbers do not agree, so the enlistment here works purely off
@@ -66,14 +80,22 @@ int on_lock(struct pt_regs *ctx) {
 
     if (targets.lookup(&oid)) { u8 one = 1; watched.update(&pid, &one); }
     if (!watched.lookup(&pid)) { return 0; }
-    if (oid < FIRST_NORMAL) { return 0; }
+    /* No catalog filter here, deliberately: every call by a watched backend is tracked so entry and
+       exit stay paired even when lock_timeout/statement_timeout/deadlock_timeout aborts a wait and
+       the uretprobe never fires for it. The filter lives on the return side, below. */
 
-    /* A pending entry still here means the previous request never returned. Count it rather than
-       overwrite it, so a lost wait is reported instead of vanishing. */
-    if (pending.lookup(&pid)) {
-        int k = 0;
-        u64 *u = unmatched.lookup(&k);
-        if (u) { (*u)++; }
+    /* A pending entry still here means the previous request never returned (its wait was aborted by
+       a timeout, which unwinds the frame instead of returning through it). Count it rather than
+       overwrite it, so a lost wait is reported instead of vanishing -- but only when it was a wait
+       this trace would actually have emitted; a stale CATALOG entry is traffic this trace deliberately
+       excludes; it is noise, not signal, and must not fill the counter that certifies completeness. */
+    struct req_t *prev = pending.lookup(&pid);
+    if (prev) {
+        if (prev->oid >= FIRST_NORMAL) {
+            int k = 0;
+            u64 *u = unmatched.lookup(&k);
+            if (u) { (*u)++; }
+        }
     }
     struct req_t r = {};
     r.ts = bpf_ktime_get_ns();
@@ -88,22 +110,30 @@ int on_lock_ret(struct pt_regs *ctx) {
     struct req_t *r = pending.lookup(&pid);
     if (!r) { return 0; }
 
+    /* Read the fields out and consume the entry before deciding whether to emit: a catalog return
+       must pair with and discard its OWN catalog request, never leave it in the map for a later,
+       unrelated return to steal and misreport as its own. */
+    u64 req_ts = r->ts;
+    u32 req_oid = r->oid;
+    u32 req_mode = r->mode;
+    pending.delete(&pid);
+
+    if (req_oid < FIRST_NORMAL) { return 0; }   /* paired and discarded, never emitted */
+
     struct ev_t *e = events.ringbuf_reserve(sizeof(struct ev_t));
     if (!e) {
         int k = 0;
         u64 *d = dropped.lookup(&k);
         if (d) { (*d)++; }
-        pending.delete(&pid);
         return 0;
     }
     e->ts = bpf_ktime_get_ns();
-    e->wait_ns = e->ts - r->ts;
+    e->wait_ns = e->ts - req_ts;
     e->pid = pid;
-    e->oid = r->oid;
-    e->mode = r->mode;
+    e->oid = req_oid;
+    e->mode = req_mode;
     e->kind = KIND_LOCK;
     events.ringbuf_submit(e, 0);
-    pending.delete(&pid);
     return 0;
 }
 
@@ -182,8 +212,13 @@ def main() -> int:
     b.ring_buffer_poll(200)
 
     # Requests still pending at teardown never got a grant either. Counting them here, rather than
-    # letting them evaporate, is what keeps "unmatched" honest.
-    unmatched = b["unmatched"][ctypes.c_int(0)].value + len(list(b["pending"].items()))
+    # letting them evaporate, is what keeps "unmatched" honest. Filtered the same way as on_lock's own
+    # stale-entry check (Ruling 13): a pending CATALOG request is traffic this trace deliberately
+    # excludes, so it must not inflate the counter that certifies the trace's completeness.
+    stale_pending = sum(
+        1 for _, v in b["pending"].items() if v.oid >= FIRST_NORMAL_OBJECT_ID
+    )
+    unmatched = b["unmatched"][ctypes.c_int(0)].value + stale_pending
     out.write(json.dumps({"dropped": b["dropped"][ctypes.c_int(0)].value,
                           "unmatched": unmatched}) + "\n")
     out.close()
