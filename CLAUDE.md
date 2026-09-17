@@ -76,12 +76,34 @@ the check green.
 - **Check, then optionally fix:**
 
   ```bash
-  npx -y markdownlint-cli2@0.13.0 "**/*.md" \
-    "!postgresql_online_partition_migration_summary.md" "!bench/results/**"
+  npx -y markdownlint-cli2@0.13.0 $(git ls-files '*.md' \
+    | grep -v '^postgresql_online_partition_migration_summary.md$' | tr '\n' ' ')
   # add --fix to auto-correct the structural rules (MD022/MD032/MD012/MD004/MD009)
   ```
 
-  (Pass globs, not bare filenames: positional filenames lint zero files. Add `!<path>`
-  for any local untracked scratch present in your working tree.)
+  Lint the TRACKED set by name. Bare filenames work fine, and a `**/*.md` glob does not,
+  because the glob walks gitignored scratch that CI never checks out. Measured 2026-09-17:
+  the glob linted 68 files and reported 76 errors, every one of them from vendored markdown
+  inside a venv, against 26 files and 0 errors for the tracked set. An `!<path>` exclusion
+  list cannot keep up, because it needs a new entry for every scratch directory anyone
+  creates, and a missing entry shows up as a confident failure in a file CI cannot see.
 - **`-` or `+` at the start of a wrapped line** reads as a stray list item (MD004/MD032).
   Reword instead of introducing an em dash (house style: no em dashes anywhere).
+
+## An unresolved review thread blocks a merge invisibly
+
+`gh pr view` reports `mergeable: MERGEABLE` and `mergeStateStatus: BLOCKED` at the same
+time, with every check green and nothing on the PR page to explain it. The usual cause is
+an unresolved `chatgpt-codex-connector` review thread. Those threads do not appear in
+`gh pr checks`, so query them directly:
+
+```bash
+gh api graphql -f query='{repository(owner:"dventimisupabase",name:"pg_partition_magician"){
+  pullRequest(number:NNN){reviewThreads(first:50){nodes{isResolved path
+  comments(first:1){nodes{databaseId body}}}}}}}'
+```
+
+Read what they raise and fix or rebut it, then reply on the thread and resolve it. Never
+`--admin` past them, and never resolve one unread to clear the path: on #394 all three were
+real, two of them were defects in our own spec rather than in the code, and one was a
+docstring claiming a safety property that nothing enforced.
