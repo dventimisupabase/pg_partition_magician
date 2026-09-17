@@ -34,6 +34,12 @@ catalog included, and `on_lock_ret` filters on the way out, after consuming whic
 a catalog return must pair with and discard its own catalog request, never leave it for something else
 to steal.
 
+The discrimination proof for this exact defect (a genuine two-session `lock_timeout` scenario, run
+against both the fixed and the pre-fix code) is committed as a runnable script,
+`bench/lock_timeout_pairing_demo.sh` -- nothing runs it automatically, per its own header, but it is
+not gitignored scratch either: it is the reason these twenty lines of catalog-filter placement exist,
+kept runnable rather than left as prose in a report that will eventually be deleted.
+
 Never join on pg_backend_pid(). eBPF's bpf_get_current_pid_tgid() reports the pid as seen from the
 kernel's initial pid namespace; psql's pg_backend_pid() reports the pid as seen from inside the
 container's own pid namespace. Those numbers do not agree, so the enlistment here works purely off
