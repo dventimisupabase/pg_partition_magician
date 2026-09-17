@@ -138,3 +138,47 @@ def load_capture(run_dir: pathlib.Path, checks: Sequence[str] = CHECKS) -> Captu
                                     "nothing renders as a calm, correct-looking figure")
 
     return Capture(events=events, dropped=dropped, unmatched=unmatched, meta=meta, names=names)
+
+
+def fold_rows(cap: Capture) -> dict:
+    """Fold every relation onto the row a reader cares about.
+
+    One tick locks hundreds of distinct relations (261 in the golden capture), and a figure
+    with hundreds of rows is a wall, not a picture. The fold collapses an index onto the
+    table it indexes, a toast relation onto its table and a partition onto its managed
+    parent, so a reader sees the handful of tables the maintenance actually touched. Those
+    mappings are resolved in SQL by a later task (index to pg_index.indrelid, toast to
+    pg_class.reltoastrelid, partition to pgpm.part.parent_table) and arrive here already
+    decided, in the `parent` column of the name CSVs load_capture reads. This function
+    consumes that answer; it never recomputes it, because the joins it would need
+    (pg_inherits, pg_index, pg_class) belong to a snapshot taken DURING the traced window.
+    44% of the relations in a real capture (116 of 261 here) stop resolving in pg_class the
+    moment the tick succeeds, because retain drops them, so reconstructing the fold from a
+    post-hoc query would fail for exactly the rows most worth seeing.
+
+    A commit is a backend event, not a relation event, so it is never grouped into a row
+    here: it belongs on the drawing as a rule across all rows (Task 3), not inside one of
+    them. An oid with no entry in cap.names is a relation the tick CREATED during the window
+    (a new partition, its index, its toast table) rather than one that existed going in, so
+    it gets its own literal label rather than silently vanishing from the figure.
+
+    When names.*.csv carries no parent column (the 2-column shape load_capture's docstring
+    calls out), every Relation.parent is "" and `rel.parent or rel.name` falls back to the
+    relation's own name, so the fold degenerates to one row per relation rather than
+    collapsing anything. That is not a bug in this function: it is the correct answer to a
+    fold with nothing to fold on, and it is what the golden fixture (whose CSVs predate the
+    parent column) exercises.
+    """
+    rows: dict = {}
+    for e in cap.events:
+        if e["kind"] != "lock":
+            continue                      # a commit belongs to the backend, not to a row
+        rel = cap.names.get(e["oid"])
+        if rel is None:
+            label = "created during the window"
+        else:
+            label = rel.parent or rel.name
+        rows.setdefault(label, []).append(e)
+    for evs in rows.values():
+        evs.sort(key=lambda e: e["ts"])
+    return rows

@@ -91,4 +91,82 @@ check("a relation from the 2-column CSV defaults parent to \"\"",
 check("a relation from the 2-column CSV defaults kind to \"other\"",
       enlisted.kind if enlisted else None, "other")
 
+from plot_lock_view import fold_rows  # noqa: E402
+
+# --- The fold (Task 2) ---
+#
+# The brief's own test asserts len(rows) == 10 against the golden fixture, but the golden
+# fixture's names.*.csv are deliberately 2-column (oid,name only, see the two checks above
+# this comment): every Relation.parent is "", so the fold has nothing to fold on and produces
+# one row per relation, not ten. Synthesizing parents into the fixture by pattern-matching
+# names was rejected: it would make this test verify a regex in the fixture builder instead
+# of the real SQL fold that a later task supplies. So the fold is proved two ways instead:
+# a small synthetic capture WITH explicit parents (proves folding happens when parent is
+# populated), and the golden fixture WITHOUT parents (proves the rel.parent or rel.name
+# fallback this ruling makes load-bearing).
+
+
+def _write_synthetic_capture(tmp):
+    """Build a capture directory with three relations sharing one parent.
+
+    Kept deliberately asymmetric per this repo's CLAUDE.md: three relation-lock events and
+    two commit events, never a matched 1-and-1 shape, so a transposition bug (e.g. counting
+    commits as rows, or off-by-one folding) cannot cancel out and pass by accident. The three
+    lock events are written with ts values out of order (3, 1, 2) so the "ordered by ts"
+    assertion cannot pass merely because the input already happened to be sorted.
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 3, "mode": 8},
+        {"kind": "lock", "oid": 2, "ts": 1, "mode": 8},
+        {"kind": "lock", "oid": 3, "ts": 2, "mode": 8},
+        {"kind": "commit", "ts": 4},
+        {"kind": "commit", "ts": 5},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    # 4-column CSV: oid,name,parent,kind. All three relations share one parent, so the fold
+    # must collapse them onto a single row labelled by that parent, not by their own names.
+    with (d / "names.after.csv").open("w") as fh:
+        fh.write("1,public.child_a,public.parent_x,other\n")
+        fh.write("2,public.child_b,public.parent_x,other\n")
+        fh.write("3,public.child_c,public.parent_x,other\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    syn_dir = _write_synthetic_capture(tmp)
+    syn_cap = load_capture(syn_dir, checks=())
+    syn_rows = fold_rows(syn_cap)
+
+    check("three relations sharing one parent fold to exactly one row", len(syn_rows), 1)
+    check("the one row is labelled by the shared parent, not a member's own name",
+          list(syn_rows.keys()), ["public.parent_x"])
+    check("the folded row carries all three relations' lock events",
+          sorted(e["oid"] for e in syn_rows.get("public.parent_x", [])), [1, 2, 3])
+    check("the folded row's events are ordered by ts despite arriving out of order",
+          [e["oid"] for e in syn_rows.get("public.parent_x", [])], [2, 3, 1])
+    check("no commit leaked into the synthetic row",
+          any(e["kind"] == "commit" for evs in syn_rows.values() for e in evs), False)
+
+cap = load_capture(GOLDEN, checks=CHECKS)
+rows = fold_rows(cap)
+locked = {e["oid"] for e in cap.events if e["kind"] == "lock"}
+
+# Measured on the source capture 2026-09-16: 261 distinct locks. The golden names CSVs carry
+# no parent column (asserted above), so every Relation.parent is "" and the fallback in
+# fold_rows (rel.parent or rel.name) makes this degenerate to one row per relation: 261, not
+# the brief's invented 10. This is not a throwaway count: it is the only thing in this file
+# that exercises the "or rel.name" branch at all.
+check("the golden capture locks 261 distinct relations", len(locked), 261)
+check("without a parent column the fold degenerates to one row per relation",
+      len(rows), 261)
+check("no commit leaked into any row of the golden capture",
+      any(e["kind"] == "commit" for evs in rows.values() for e in evs), False)
+check("every row's events are ordered by ts",
+      all(evs == sorted(evs, key=lambda e: e["ts"]) for evs in rows.values()), True)
+
 sys.exit(fail)
