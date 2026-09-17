@@ -93,7 +93,22 @@ names_snapshot() {
      order by c.oid"
 }
 
-names_snapshot > "$OUT/names.before.csv"
+# Checked, not fired-and-forgotten (issue #392 review, fix 1): a failing snapshot under
+# `set -uo pipefail` (no `-e`) would otherwise truncate the CSV and let the run continue.
+# _read_names then returns {} without complaint, every relation falls through to the "created
+# during the window" fallback, and the renderer produces a one-row figure that PASSES all four
+# refusals -- wrong, but not caught by any of them, unlike a failed traced statement (which at
+# least usually trips "empty" or "strong" downstream). This aborts rather than warns, because a
+# capture whose names are missing cannot produce a correct figure at all, not just a degraded
+# one; nothing has been started yet at this point, so there is nothing to unwind.
+if ! names_snapshot > "$OUT/names.before.csv" 2>"$OUT/names.before.stderr"; then
+  echo "error: the BEFORE names snapshot failed; see $OUT/names.before.stderr" >&2
+  echo "       aborting rather than warning: every relation would silently fall back to" >&2
+  echo "       'created during the window' and still render a one-row figure that passes" >&2
+  echo "       every refusal, which is worse than no figure at all" >&2
+  exit 1
+fi
+[ -s "$OUT/names.before.stderr" ] || rm -f "$OUT/names.before.stderr"
 
 docker exec "$C" sh -c "rm -f $EVENTS $PLOG"
 docker exec -d "$C" sh -c "python3 /repo/bench/lock_view.py $OIDS $EVENTS > $PLOG 2>&1"
@@ -124,6 +139,7 @@ if ! docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$SQL" >/dev/null 2>"$OU
   echo "warning: the traced statement exited non-zero; see $OUT/sql.stderr" >&2
   echo "         the capture below may be empty or partial for that reason, not because the probe failed" >&2
 fi
+[ -s "$OUT/sql.stderr" ] || rm -f "$OUT/sql.stderr"
 T_END=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
 
 # SIGINT then WAIT: the drop count is written on the way out, and reading early truncates the very
@@ -140,7 +156,21 @@ if [ "$probe_exited" != true ]; then
   echo "         downstream 'drain' refusal if so" >&2
 fi
 
-names_snapshot > "$OUT/names.after.csv"
+# Same discipline as the BEFORE snapshot above, checked rather than fired-and-forgotten. The
+# probe has already stopped and the raw capture still needs to come out of the container, so on
+# failure this still copies events.jsonl (the raw capture is not itself wrong, only its name
+# resolution) before aborting ahead of meta.json and the render, which would otherwise silently
+# produce a wrong figure from an empty or truncated names.after.csv.
+if ! names_snapshot > "$OUT/names.after.csv" 2>"$OUT/names.after.stderr"; then
+  docker cp "$C:$EVENTS" "$OUT/events.jsonl" >/dev/null
+  echo "error: the AFTER names snapshot failed; see $OUT/names.after.stderr" >&2
+  echo "       the raw capture (events.jsonl) was still copied into $OUT for a later, manual" >&2
+  echo "       re-render once the failure is understood; rendering now would silently produce" >&2
+  echo "       a wrong figure, since every relation would fall back to 'created during the" >&2
+  echo "       window' and still pass every refusal" >&2
+  exit 1
+fi
+[ -s "$OUT/names.after.stderr" ] || rm -f "$OUT/names.after.stderr"
 docker cp "$C:$EVENTS" "$OUT/events.jsonl" >/dev/null
 
 python3 - "$OUT" "$RUN" "$SQL" "$RELS" "$OIDS" "$T_BEGIN" "$T_END" <<'PY'
@@ -152,6 +182,12 @@ open(f"{out}/meta.json", "w").write(json.dumps({
     "run": run, "sql": sql, "enlist": rels.split(","),
     "enlist_oids": [int(o) for o in oids.split(",")],
     "t_begin": int(t0), "t_end": int(t1), "git_sha": sha,
+    # Names which probe wrote this capture's events: bench/lock_view.py writes `ts` at the
+    # GRANT (it pairs request and grant via a uretprobe); bench/lock_probe.py, the CI guard's
+    # probe, writes `ts` at the REQUEST and never wrote a producer key at all. Recorded so a
+    # guard capture loaded by plot_lock_view.py is never plotted as though its marks meant the
+    # same instant as one from this harness (issue #392 review, fix 7).
+    "producer": "lock_view.py",
 }, indent=2) + "\n")
 PY
 
