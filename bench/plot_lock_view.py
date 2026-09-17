@@ -39,8 +39,22 @@ from an instant grant. A later task's probe always does. Both are read with dict
 never a bare key lookup, so one loader serves both producers without caring which wrote the capture.
 `bench/lock_probe.py` also writes its `ts` at the REQUEST (it has no uretprobe), while
 `bench/lock_view.py` writes `ts` at the GRANT; a capture's `meta.json` names which one produced it in
-its `producer` key (added by `bench/lock_view.sh`), so a guard capture loaded here is never plotted as
-though its marks meant the same instant as a `lock_view.py` capture's.
+its `producer` key (added by `bench/lock_view.sh`).
+
+**Corrected 2026-09-17 (issue #392 review, finding 3).** The paragraph above used to end "so a guard
+capture loaded here is never plotted as though its marks meant the same instant as a `lock_view.py`
+capture's" -- that was false. `load_capture` never read `producer` at all, and `bench/lock_probe.py`
+never wrote the key in the first place, so every guard capture that reached this module was in fact
+plotted with grant semantics it does not have. A docstring claiming a safety property that does not
+exist is worse than no claim, so this is fixed rather than reworded quietly: `load_capture` now reads
+`producer` off `meta.json` onto `Capture.producer`, `is_grant_producer` is the one place "does this
+producer's `ts` mean grant-time" is decided, and `render` stamps the answer on the figure's footer
+via `producer_note`. A capture with no `producer` key (every `bench/lock_probe.py` capture, and any
+`bench/lock_view.py` capture taken before this key existed, such as this repo's own golden fixture)
+is treated exactly like an explicit `"producer": "lock_probe.py"` -- deliberately, per the design
+spec: absence IS the guard's signature, not a third case to special-case around. This does NOT
+refuse such a capture; the design spec values "one format, two producers", so the fix is honest
+labelling, never a fifth refusal.
 
 Drawing (matplotlib) is imported below (Task 3's `render`). Because of that import, from here on
 `bench/lock_view_selftest.py` only runs under an interpreter that has matplotlib installed, which the
@@ -99,6 +113,11 @@ class Capture:
     # CSVs separately before folding them into `names` below -- the union alone cannot answer
     # "which side did this oid come from".
     dropped_oids: frozenset = field(default_factory=frozenset)
+    # meta.json's "producer" key, carried onto the Capture itself rather than left buried in
+    # `meta` (issue #392 review, finding 3), so `render` and a self-test can read it directly.
+    # "" means the key was absent, which `is_grant_producer` treats exactly like an explicit
+    # "lock_probe.py" -- see this module's docstring for why that is deliberate, not a gap.
+    producer: str = ""
 
 
 def _read_names(path: pathlib.Path) -> dict:
@@ -175,7 +194,42 @@ def load_capture(run_dir: pathlib.Path, checks: Sequence[str] = CHECKS) -> Captu
                                     "renders as a calm, correct-looking figure")
 
     return Capture(events=events, dropped=dropped, unmatched=unmatched, meta=meta, names=names,
-                   dropped_oids=dropped_oids)
+                   dropped_oids=dropped_oids, producer=meta.get("producer", ""))
+
+
+def is_grant_producer(producer: str) -> bool:
+    """True only for the one producer whose `ts` is a GRANT and whose waits are observed.
+
+    `bench/lock_view.py` is the only probe with a uretprobe: it pairs each request with its return
+    and writes `ts` at the grant, with `wait_ns` alongside it. Every other value -- including the
+    empty string, which is what a capture with no `producer` key at all carries (`bench/lock_probe.py`
+    never writes the key, and neither did `bench/lock_view.py` before this key existed) -- means `ts`
+    is a REQUEST time and no wait was observed for it. Absent and `"lock_probe.py"` are deliberately
+    given identical treatment, per the design spec: a missing key IS the guard's signature, not a
+    third case to distinguish from it.
+    """
+    return producer == "lock_view.py"
+
+
+def producer_label(producer: str) -> str:
+    """Normalize `producer` for display: "" (absent) reads as "lock_probe.py", its treated-alike
+    twin (see `is_grant_producer`), rather than as a blank stamp field."""
+    return producer or "lock_probe.py"
+
+
+def producer_note(producer: str) -> str:
+    """One sentence describing what a capture's `ts` means, keyed off `producer`.
+
+    Extracted as its own function (issue #392 review, finding 3) so `render`'s footer and a
+    self-test read the exact same sentence, rather than the footer building its own text inline
+    while a test asserts on something else. Mirrors this module's existing precedent (`tier`,
+    `should_draw_wait`, `footer_color`, `all_light`): a wording decision that a figure's honesty
+    rests on gets its own testable function.
+    """
+    if is_grant_producer(producer):
+        return "producer: lock_view.py (ts is grant time; request-to-grant waits observed)"
+    label = producer or "lock_probe.py"
+    return f"producer: {label} (ts is REQUEST time; waits not observed for it)"
 
 
 def fold_rows(cap: Capture) -> dict:
@@ -328,6 +382,25 @@ def footer_color(dropped: int, unmatched: int) -> str:
     return RED if (dropped or unmatched) else GREY
 
 
+def build_footer(stamp: dict, modes: str) -> str:
+    """Build the figure's footer text from a rendered stamp dict.
+
+    Extracted (issue #392 review, finding 3) for the same reason `footer_color`, `tier` and
+    `should_draw_wait` are their own functions rather than inline code in `render`'s drawing loop:
+    a self-test can assert on the exact wording without inspecting matplotlib text objects after
+    `plt.close(fig)` has already discarded them. Requires `stamp["producer_note"]` (set by
+    `render` before calling this), which is why this is a formatting function over an already-built
+    stamp rather than something render's loop composes piecemeal.
+    """
+    filt = "" if modes == "all" else f", --modes {modes}"
+    return (
+        f"{stamp['captured']} captured, {stamp['drawn']} drawn{filt}   "
+        f"{stamp['dropped']} dropped, {stamp['unmatched']} unmatched   "
+        f"{stamp['span_ms']} ms first event to last, {stamp['backends']} backend(s)   "
+        f"{stamp['producer_note']}"
+    )
+
+
 def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     """Draw a loaded, trusted Capture to lock-view.png / lock-view.svg in out_dir.
 
@@ -456,14 +529,14 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         "wait_spans": wait_spans,
         "annotated_rows": annotated_rows,
         "rung": rung,
+        # Finding 3: carried on the stamp, not just on `cap`, so main()'s printed line and a
+        # self-test both see the same normalized producer label and the same sentence render()
+        # actually drew, rather than re-deriving either from cap.producer independently.
+        "producer": producer_label(cap.producer),
+        "producer_note": producer_note(cap.producer),
     }
 
-    filt = "" if modes == "all" else f", --modes {modes}"
-    foot = (
-        f"{stamp['captured']} captured, {stamp['drawn']} drawn{filt}   "
-        f"{stamp['dropped']} dropped, {stamp['unmatched']} unmatched   "
-        f"{stamp['span_ms']} ms first event to last, {stamp['backends']} backend(s)"
-    )
+    foot = build_footer(stamp, modes)
     ax.set_title(cap.meta.get("sql", "lock view"), fontsize=10, color=INK, loc="left")
     # An absolute point offset below the axes, not a figure-fraction coordinate: the figure's
     # height ranges from ~1.5in (one folded row) to over 100in (the golden fixture's 261

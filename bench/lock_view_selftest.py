@@ -516,4 +516,113 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a capture whose only strong-tier lock is Exclusive (7), never AccessExclusive, "
           "still passes the strong refusal", refuses(sre_d, CHECKS), "")
 
+# --- producer semantics: honest, not merely claimed (issue #392 review, finding 3) ---
+#
+# plot_lock_view.py's own docstring used to claim a guard capture "is never plotted as though its
+# marks meant the same instant as a lock_view.py capture's", on the strength of meta.json's
+# `producer` key. That claim was false: load_capture never read the key at all, so every capture,
+# guard or not, was drawn with grant semantics regardless of what actually produced it. These checks
+# cover both branches this fix introduces (is_grant_producer's one true case, and everything else,
+# including no key at all) and are what a mutation restoring the old always-grant behaviour must
+# fail against (see the report for the discrimination proof; it is not repeated as an in-file
+# bypass here because there is no CHECKS-style "damage the fixture, then bypass the check" shape
+# for a labelling decision that is not a refusal).
+from plot_lock_view import (  # noqa: E402
+    build_footer,
+    is_grant_producer,
+    producer_label,
+    producer_note,
+)
+
+check("is_grant_producer is True for lock_view.py, the only probe with a uretprobe",
+      is_grant_producer("lock_view.py"), True)
+check("is_grant_producer is False for lock_probe.py (the CI guard's probe, no uretprobe)",
+      is_grant_producer("lock_probe.py"), False)
+check("is_grant_producer is False for an absent producer (\"\"), treated like lock_probe.py",
+      is_grant_producer(""), False)
+check("is_grant_producer is False for any other, unrecognised producer string",
+      is_grant_producer("something_else.py"), False)
+
+check("producer_label normalizes an absent producer to lock_probe.py",
+      producer_label(""), "lock_probe.py")
+check("producer_label passes an explicit producer through unchanged",
+      producer_label("lock_view.py"), "lock_view.py")
+
+check("producer_note says grant time for lock_view.py",
+      "grant time" in producer_note("lock_view.py"), True)
+check("producer_note says REQUEST time for lock_probe.py",
+      "REQUEST time" in producer_note("lock_probe.py"), True)
+check("producer_note says REQUEST time for an absent producer too",
+      "REQUEST time" in producer_note(""), True)
+check("producer_note names lock_probe.py by name even when the key was absent",
+      "lock_probe.py" in producer_note(""), True)
+
+
+def _write_producer_capture(tmp, producer):
+    """A minimal capture whose meta.json carries the given `producer` (or omits the key if None)."""
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 8, "pid": 1},
+        {"kind": "commit", "ts": 2, "pid": 1},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    meta = {} if producer is None else {"producer": producer}
+    (d / "meta.json").write_text(json.dumps(meta))
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    grant_dir = _write_producer_capture(tmp, "lock_view.py")
+    grant_cap = load_capture(grant_dir, checks=())
+    check("load_capture carries an explicit lock_view.py producer onto Capture.producer",
+          grant_cap.producer, "lock_view.py")
+
+with tempfile.TemporaryDirectory() as tmp:
+    probe_dir = _write_producer_capture(tmp, "lock_probe.py")
+    probe_cap = load_capture(probe_dir, checks=())
+    check("load_capture carries an explicit lock_probe.py producer onto Capture.producer",
+          probe_cap.producer, "lock_probe.py")
+
+with tempfile.TemporaryDirectory() as tmp:
+    # meta.json exists but omits the key entirely: the real shape of a lock_view.py capture taken
+    # before this key existed. The golden fixture (checked below, no meta.json edit needed) is a
+    # real instance of exactly this case.
+    nokey_dir = _write_producer_capture(tmp, None)
+    nokey_cap = load_capture(nokey_dir, checks=())
+    check("load_capture carries \"\" when meta.json omits the producer key",
+          nokey_cap.producer, "")
+
+# The golden fixture predates the producer key (Task 5's real capture was taken before
+# bench/lock_view.sh started writing it), so its own meta.json has no such key -- a real,
+# committed instance of the "absent" branch, not a fixture built to order for it.
+golden_cap = load_capture(GOLDEN, checks=CHECKS)
+check("the golden fixture's meta.json carries no producer key",
+      golden_cap.producer, "")
+check("is_grant_producer is False for the golden fixture's own producer value",
+      is_grant_producer(golden_cap.producer), False)
+
+with tempfile.TemporaryDirectory() as tmp:
+    out = pathlib.Path(tmp)
+    grant_stamp = render(load_capture(_write_producer_capture(tmp, "lock_view.py"), checks=()), out)
+    check("render's stamp names lock_view.py when the capture declares it",
+          grant_stamp["producer"], "lock_view.py")
+    check("render's stamp notes grant time for a lock_view.py capture",
+          "grant time" in grant_stamp["producer_note"], True)
+    check("build_footer includes the grant-time note for a lock_view.py capture",
+          "grant time" in build_footer(grant_stamp, "all"), True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    out = pathlib.Path(tmp)
+    guard_stamp = render(golden_cap, out)
+    check("render's stamp normalizes the golden fixture's absent producer to lock_probe.py",
+          guard_stamp["producer"], "lock_probe.py")
+    check("render's stamp notes REQUEST time for a producer-less (guard-shaped) capture",
+          "REQUEST time" in guard_stamp["producer_note"], True)
+    check("build_footer includes the REQUEST-time note for a producer-less capture",
+          "REQUEST time" in build_footer(guard_stamp, "all"), True)
+
 sys.exit(fail)
