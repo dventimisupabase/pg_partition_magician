@@ -113,7 +113,9 @@ Steps:
 4. Start `/repo/bench/lock_view.py` detached. The repo is already bind-mounted read-only at `/repo`,
    so there is no `docker cp`.
 5. Gate on `READY`, never on anything printed earlier.
-6. Record `t_begin` from `CLOCK_MONOTONIC`, run the supplied SQL, record `t_end`.
+6. Record `t_begin` from `CLOCK_MONOTONIC`. Run the supplied SQL, primed (see "Priming enlistment"
+   below): the traced statement is one `docker exec ... psql -c <primer> -c <sql>` invocation, not
+   a bare run of `<sql>` alone. Record `t_end`.
 7. `SIGINT`, then wait for the process to exit. The drop count is written on the way out, and reading
    early truncates the record that says whether anything was lost.
 8. Snapshot names AFTER, into `names.after.csv`.
@@ -127,11 +129,53 @@ rather than assumed on 2026-09-16: a capture's last event read 117,219.6 s again
 
 This is why the x-axis origin is the investigator's statement rather than the first event the probe
 happened to catch. Locks taken before `t_begin` are drawn, outside the shaded band, so ambient noise
-is never mistaken for the statement's own work.
+is never mistaken for the statement's own work. **Amended 2026-09-17 (issue #392 review, finding 1):
+one mark is a deliberate exception to this rule -- see "Priming enlistment" immediately below.**
 
 Note the asymmetry with a known trap: **clocks survive the container boundary, pids do not.**
 `pg_backend_pid()` reports the container namespace while eBPF reports the initial one (measured on
 this fixture: 145 against 71,504). Nothing in this tool joins on `pg_backend_pid()`.
+
+### Priming enlistment (added 2026-09-17, issue #392 review, finding 1)
+
+`bench/lock_view.py` enlists a backend into `watched` only once that backend touches one of the
+target oids. That has a consequence the original design did not state: a lock the SAME backend took
+EARLIER in the traced statement, before it first touches an enlisted relation, is invisible --
+`LOCK other; LOCK target;`, traced as one statement, drops `other` entirely, and nothing in the probe
+or the renderer refuses on it. A truncated prefix renders as a complete sequence. The reviewer's
+suggested alternative, identifying the backend via `pg_backend_pid()` before running the statement, is
+exactly the trap the paragraph above already rules out -- that identifier does not agree between the
+container and the kernel, so there is nothing to join it against.
+
+The fix instead exploits `docker exec ... psql -c A -c B`: both run in ONE backend. Immediately before
+the traced SQL, the harness issues `select 1 from <first enlisted relation> limit 0` as its own `-c`,
+in the same invocation that then runs the traced SQL. That backend is enlisted before the traced
+statement executes anything at all. The primer is skipped harmlessly, never fatally, when the first
+enlisted relation cannot be selected from: its own `-c` fails, psql (run without `ON_ERROR_STOP`, as
+every multi-statement invocation in this script is) reports that and moves on to the next `-c`, and
+the exit status checked afterward reflects only the LAST command, so a primer failure never surfaces
+as the traced statement having failed.
+
+Two things follow, and both are disclosed rather than hidden:
+
+- **The primer takes a real AccessShare lock, and it appears in the capture** -- the first AccessShare
+  mark on the first enlisted relation. It is drawn INSIDE the shaded `[t_begin, t_end]` band, not
+  before it, because `t_begin` is recorded on the host before the single `docker exec` that runs the
+  primer and the traced SQL back to back; there is no point at which this script can record a
+  timestamp between them without giving them separate backends, which would defeat priming
+  altogether. `bench/README.md` states this plainly rather than leaving a reader to mistake it for the
+  traced statement's own first move.
+- **The residual blind spot.** A lock this backend held before the primer cannot exist within one
+  fresh `psql` invocation, so there is nothing to miss there. But a lock taken by a DIFFERENT backend,
+  before THAT backend first touches an enlisted relation, is still invisible: priming enlists only the
+  one backend running the traced statement, and every other session on the server is still enlisted
+  the same way this tool always enlisted anyone, on first touch. A rendered figure is a complete
+  SUFFIX of the one backend under test from the moment it was primed, never a complete prefix of every
+  backend's own locking.
+
+Verified against a live capture (bench/lock_view_prefix_demo.sh): tracing `LOCK other; LOCK target;`
+against a backend enlisted on `target`'s oid alone drops `other`'s lock without the primer and
+captures it with the primer, against the identical, unmodified probe.
 
 ### Formats
 
@@ -191,6 +235,17 @@ pasted into an issue carries its own provenance.
 Rows are managed parents. Three fold rules, all catalog joins taken during the window: index to
 `pg_index.indrelid`, toast to `pg_class.reltoastrelid`, partition to `pgpm.part.parent_table`.
 Measured on the spike's capture, 261 distinct relations fold to 10 rows:
+
+**Amended 2026-09-17 (issue #392 review, finding 2).** The partition fold is scoped by the parent's
+own schema, not by `child_name` alone. `pgpm.part`'s key is `(parent_table, child_name)`, not
+`(parent_table, nspname, child_name)`, so two managed parents that share a bare relname in different
+schemas (`public.orders` and `archive.orders`, say) can register children with the same bare
+`child_name`. A bare-name join matches one child oid against BOTH parents' rows and emits duplicate
+CSV rows for it with different `parent` labels; the loader's `out[oid] = Relation(...)` then lets
+whichever duplicate reads last win, so locks fold onto the wrong parent nondeterministically.
+Partitions live in their parent's own schema, so joining on that schema as well as the bare name is
+enough to disambiguate. `bench/lock_view_names_scope_demo.sh` proves this discriminates on a
+synthetic two-schema fixture, since the golden fixture (one schema) cannot exercise it.
 
 ```text
   2077  public.mg_ret        (32 partitions, their indexes, its toast)
@@ -284,6 +339,18 @@ wait.**
    `footer_color(dropped, unmatched)`, `plot_lock_view.py`) stay: both still deserve a reader's
    attention on a figure that otherwise reads as calm, short of withholding the figure over either one.
 
+**Amended 2026-09-17 (issue #392 review, finding 3).** `meta.json`'s `producer` key (added by fix 7,
+above) named which probe wrote a capture, but nothing read it: `load_capture` never looked at
+`producer`, so every capture -- including one from `bench/lock_probe.py`, which writes `ts` at the
+REQUEST and has no uretprobe -- was drawn as though its marks were grants with observed waits. A
+docstring claiming otherwise was worse than not claiming it at all. Fixed, not refused: the design
+still values "one format, two producers" (this section's own point above), so a non-`lock_view.py`
+capture is drawn, never rejected. `load_capture` now carries `producer` onto `Capture.producer`
+(`""` when the key is absent, treated identically to an explicit `"lock_probe.py"` -- absence IS the
+guard's signature), and `render`'s footer stamps a sentence naming the producer and saying plainly
+that its `ts` is request time and its waits were not observed, whenever the producer is not
+`bench/lock_view.py`.
+
 ## Verification
 
 The tool splits into an asserting part and a non-asserting part. The figure asserts nothing. The
@@ -353,6 +420,15 @@ side, and `lock_view.py` now carries one probe the guard does not have. The uret
 rests on the same reasoning as the entry probe, scalars read out of registers with no struct reads,
 plus the counted-unmatched rule. Stating that boundary is better than implying the self-test covers
 more than it does.
+
+Two properties fall on the same side of that boundary and, for the same reason, are proved by a
+runnable script rather than a `bench/lock_view_selftest.py` assertion (added 2026-09-17, issue #392
+review): priming enlistment (finding 1, `bench/lock_view_prefix_demo.sh`, which needs a live eBPF
+capture to show a lock actually disappearing and reappearing) and the schema-scoped name fold
+(finding 2, `bench/lock_view_names_scope_demo.sh`, which needs a live database to show the SQL join
+actually duplicating a row). Both follow the pattern `bench/lock_timeout_pairing_demo.sh` set: not
+wired to `./test.sh` or CI, committed rather than left as prose in a report, and run against the
+unmodified probe or query so the same script demonstrates the defect and the fix side by side.
 
 ## Non-goals
 
