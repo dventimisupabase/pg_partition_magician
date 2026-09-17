@@ -39,6 +39,30 @@ jobs:
           scandir: '.'
           severity: warning
 
+  lock-view-selftest:
+    name: Lock-view self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # bench/lock_view_selftest.py covers the lock-sequence renderer's asserting half: the four
+      # refusals, the relation fold, the mode tiers, the wait-span threshold and the producer
+      # semantics. It lives here rather than in test.yml's matrix because it needs no container, no
+      # database and no eBPF -- only matplotlib and the committed golden fixture -- so it runs in
+      # seconds beside the other cheap checks instead of behind a five-minute Postgres start-up.
+      #
+      # The eBPF capture itself (bench/lock_view.py) is deliberately NOT covered here: it needs a
+      # privileged container and the host's own kernel headers, which is what locktrace.yml exists
+      # for. Green here means the renderer's assertions hold, not that the probe attached.
+      #
+      # A venv rather than a bare `pip install`: the runner's python may be PEP 668
+      # externally-managed, in which case installing into it is refused. A venv is correct either
+      # way and costs a couple of seconds.
+      - name: Run the lock-view self-test
+        run: |
+          python3 -m venv .venv-lockview
+          .venv-lockview/bin/pip install --quiet matplotlib
+          .venv-lockview/bin/python bench/lock_view_selftest.py
+
   sql-syntax:
     name: SQL unterminated-block check
     runs-on: ubuntu-latest
