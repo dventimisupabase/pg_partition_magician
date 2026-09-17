@@ -5,10 +5,11 @@ Refuses to draw a capture it cannot trust. A picture is more persuasive than a n
 to a higher bar than the guard's numeric output: a truncated trace rendered as a complete one is the
 exact failure that made pg-lock-tracer unsound (#391).
 
-This module is the loading half only, and it asserts nothing about PostgreSQL or the probe directly:
-it reads whatever bench/lock_view.sh (a later task) or the existing CI probe wrote to a run directory
-and decides whether the result is trustworthy enough to draw. That decision is the point. Every
-refusal below corresponds to a way a capture can look fine and be wrong:
+The loading half below (`load_capture`) asserts nothing about PostgreSQL or the probe directly: it
+reads whatever bench/lock_view.sh (a later task) or the existing CI probe wrote to a run directory and
+decides whether the result is trustworthy enough to draw. That decision is the point. Every refusal
+below corresponds to a way a capture can look fine and be wrong. The drawing half (`render`, Task 3)
+asserts nothing at all; it draws whatever a trusted `Capture` hands it and stamps what it drew.
 
   - dropped:  the kernel ring buffer overflowed and the probe lost events. A ring-buffer drop is
               silent to everything downstream unless the probe itself counts it, so this is the one
@@ -29,16 +30,23 @@ task) never wrote a "wait_ns" or "unmatched" field, because it never needed to d
 from an instant grant. A later task's probe always does. Both are read with dict.get(..., default),
 never a bare key lookup, so one loader serves both producers without caring which wrote the capture.
 
-Drawing (matplotlib) is deliberately not imported here. It arrives in Task 3. Importing it in this
-module would make this self-test depend on a plotting stack for a check that has nothing to do with
-plotting, and would fail on any host that has Python but not matplotlib, including the one this task
-was written on.
+Drawing (matplotlib) is imported below (Task 3's `render`). Because of that import, from here on
+`bench/lock_view_selftest.py` only runs under an interpreter that has matplotlib installed, which the
+system `python3` on this host does not: `pip install matplotlib` refuses under PEP 668. Use the venv
+this repo keeps for exactly this (Ruling 8/8a): `python3 -m venv .venv-lockview && .venv-lockview/bin/pip
+install matplotlib`, then run the self-test as `.venv-lockview/bin/python bench/lock_view_selftest.py`.
+Do not reuse `.venv-verify`; that one belongs to the archive track (pyarrow, duckdb).
 """
 import csv
 import json
 import pathlib
 from dataclasses import dataclass, field
 from typing import Sequence
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 
 ACCESS_EXCLUSIVE = 8
 CHECKS = ("dropped", "drain", "empty", "strong")
@@ -182,3 +190,138 @@ def fold_rows(cap: Capture) -> dict:
     for evs in rows.values():
         evs.sort(key=lambda e: e["ts"])
     return rows
+
+
+GREEN, INK, GREY, RED = "#3ecf8e", "#1c1c1c", "#9aa0a6", "#d2553b"
+
+# Lock mode integers per storage/lockdefs.h. LIGHT is the mode "--modes strong" drops:
+# AccessShare (1) is the mode that swamps a real capture (198 of 261 locks in the golden
+# fixture) and is the only one dropped, matching the spec's "3,347 captured -> 820 drawn"
+# example. STRONG is the set drawn tall and saturated rather than as a thin baseline tick:
+# ShareRowExclusive (6), Exclusive (7) and AccessExclusive (8), the modes that actually block
+# other backends. RowShare (2), RowExclusive (3), ShareUpdateExclusive (4) and Share (5) are
+# neither: they draw with the same thin styling as AccessShare but are not dropped by
+# "--modes strong", since only AccessShare is common enough to need dropping.
+STRONG = (6, 7, 8)
+LIGHT = 1
+ACCESS_EXCLUSIVE_MODE = 8
+
+
+def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
+    """Draw a loaded, trusted Capture to lock-view.png / lock-view.svg in out_dir.
+
+    Asserts nothing about PostgreSQL or the probe: `load_capture` already decided this capture
+    is trustworthy enough to draw (its four refusals), and `fold_rows` already decided which
+    relations share a row. This function only decides what ink goes where, and returns the
+    stamp dict Task 5's caller writes to the run directory alongside the two image files.
+
+    Every mark is an instant, drawn as a vertical tick at its own timestamp, never a bar from
+    lock to release: the release path is deliberately unprobed (see the module docstring and
+    the design spec), so a bar from request to commit would be an inference rather than an
+    observation. The one span drawn is the request-to-grant wait, which genuinely is observed
+    (a paired uprobe/uretprobe), via the `wait_ns` field a later probe writes; the golden
+    fixture's probe never wrote that field, so `.get("wait_ns", 0)` reads 0 and no wait span is
+    drawn for it, which is correct rather than a gap in this function.
+
+    `modes="strong"` drops AccessShare (LIGHT) marks only; it is not a synonym for "only
+    STRONG modes". `captured` in the returned stamp always counts every event `load_capture`
+    read from the file, regardless of `modes`, while `drawn` counts only what this specific
+    call put ink on. Keeping those two independent is the point: a filtering bug that silently
+    drops the wrong set (too many, too few, or the wrong mode) shows up as a `captured`/`drawn`
+    mismatch on the artifact itself instead of passing unnoticed.
+    """
+    out_dir = pathlib.Path(out_dir)
+    rows = fold_rows(cap)
+    commits = [e for e in cap.events if e["kind"] == "commit"]
+    order = sorted(rows, key=lambda label: min(e["ts"] for e in rows[label]))
+    t0 = cap.meta.get("t_begin") or min(e["ts"] for e in cap.events)
+
+    def ms(ts):
+        return (ts - t0) / 1e6
+
+    drawn = 0
+    fig, ax = plt.subplots(figsize=(12, 1.1 + 0.42 * len(order)))
+    for y, label in enumerate(order):
+        for e in rows[label]:
+            if modes == "strong" and e["mode"] == LIGHT:
+                continue
+            drawn += 1
+            strong = e["mode"] in STRONG
+            ax.vlines(
+                ms(e["ts"]),
+                y - (0.34 if strong else 0.10),
+                y + (0.34 if strong else 0.10),
+                color=RED if e["mode"] == ACCESS_EXCLUSIVE_MODE else (INK if strong else GREY),
+                alpha=1.0 if strong else 0.35,
+                linewidth=1.2 if strong else 0.6,
+            )
+            # The only lock span drawn, and only because it is observed rather than inferred:
+            # the distance between the request (uprobe, entry) and the grant (uretprobe,
+            # return). Sub-millisecond waits are not drawn; at this scale they would be
+            # invisible ink and not worth the mark.
+            wait = e.get("wait_ns", 0)
+            if wait > 1_000_000:
+                ax.hlines(y, ms(e["ts"] - wait), ms(e["ts"]), color=RED, alpha=0.5, linewidth=3)
+
+    for e in commits:
+        drawn += 1
+        ax.axvline(ms(e["ts"]), color=GREEN, linewidth=1.0, alpha=0.9, zorder=0)
+
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(order, fontsize=8)
+    ax.set_ylim(-0.7, len(order) - 0.3)
+    ax.set_xlabel("ms since the traced statement began")
+    ax.invert_yaxis()
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+
+    if cap.meta.get("t_begin") and cap.meta.get("t_end"):
+        ax.axvspan(ms(cap.meta["t_begin"]), ms(cap.meta["t_end"]), color=GREY, alpha=0.12, zorder=0)
+
+    span_ms = (max(e["ts"] for e in cap.events) - min(e["ts"] for e in cap.events)) / 1e6
+    stamp = {
+        "captured": len(cap.events),
+        "drawn": drawn,
+        "dropped": cap.dropped,
+        "unmatched": cap.unmatched,
+        "rows": len(order),
+        "backends": len({e["pid"] for e in cap.events}),
+        "span_ms": round(span_ms, 1),
+    }
+
+    filt = "" if modes == "all" else f", --modes {modes}"
+    foot = (
+        f"{stamp['captured']} captured, {stamp['drawn']} drawn{filt}   "
+        f"{stamp['dropped']} dropped, {stamp['unmatched']} unmatched   "
+        f"{stamp['span_ms']} ms traced, {stamp['backends']} backend(s)"
+    )
+    ax.set_title(cap.meta.get("sql", "lock view"), fontsize=10, color=INK, loc="left")
+    # An absolute point offset below the axes, not a figure-fraction coordinate: the figure's
+    # height ranges from ~1.5in (one folded row) to over 100in (the golden fixture's 261
+    # unfolded rows, see the module docstring), and a fixed fraction such as fig.text(0.01,
+    # 0.01, ...) sits at a wildly different physical distance from the x-axis tick labels
+    # depending on that height, close enough on a short figure to overlap them. An offset in
+    # points is independent of figure height and clears the tick labels and the x-axis title
+    # on every size this function produces.
+    ax.annotate(
+        foot,
+        xy=(0, 0),
+        xycoords="axes fraction",
+        xytext=(0, -38),
+        textcoords="offset points",
+        fontsize=7,
+        ha="left",
+        va="top",
+        annotation_clip=False,
+        color=RED if (cap.dropped or cap.unmatched) else GREY,
+    )
+
+    for ext in ("png", "svg"):
+        fig.savefig(
+            out_dir / f"lock-view.{ext}",
+            dpi=140,
+            bbox_inches="tight",
+            facecolor="white" if ext == "png" else "none",
+        )
+    plt.close(fig)
+    return stamp

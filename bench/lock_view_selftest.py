@@ -176,4 +176,19 @@ check("no commit leaked into any row of the golden capture",
 # land in a single row with deliberately scrambled ts values. Do not re-add an ordering
 # check here; it would be a passing test that also passes against code missing the sort.
 
+from plot_lock_view import render  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    out = pathlib.Path(tmp)
+    stamp = render(cap, out)
+    check("renders a PNG", (out / "lock-view.png").exists(), True)
+    check("renders an SVG", (out / "lock-view.svg").exists(), True)
+    check("stamps the captured count", stamp["captured"], len(cap.events))
+    check("captured equals drawn with no filter", stamp["drawn"], stamp["captured"])
+    check("stamps one backend", stamp["backends"], 1)
+
+    strong = render(cap, out, modes="strong")
+    check("strong mode draws fewer marks", strong["drawn"] < strong["captured"], True)
+    check("strong mode still stamps the full captured count", strong["captured"], stamp["captured"])
+
 sys.exit(fail)
