@@ -99,9 +99,14 @@ an unresolved `chatgpt-codex-connector` review thread. Those threads do not appe
 
 ```bash
 gh api graphql -f query='{repository(owner:"dventimisupabase",name:"pg_partition_magician"){
-  pullRequest(number:NNN){reviewThreads(first:50){nodes{isResolved path
-  comments(first:1){nodes{databaseId body}}}}}}}'
+  pullRequest(number:NNN){reviewThreads(first:50){pageInfo{hasNextPage}
+  nodes{isResolved path comments(first:1){nodes{databaseId body}}}}}}}'
 ```
+
+`pageInfo{hasNextPage}` is not decoration. `first:50` truncates silently, so on a PR with more
+threads the query reports nothing unresolved while one sits past the boundary, and you are left
+with a confidently unexplained `BLOCKED`. If `hasNextPage` is true, page through with an
+`$endCursor` variable and `--paginate` before believing a clean result.
 
 Read what they raise and fix or rebut it, then reply on the thread and resolve it. Never
 `--admin` past them, and never resolve one unread to clear the path: on #394 all three were
