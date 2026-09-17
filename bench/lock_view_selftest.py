@@ -166,7 +166,14 @@ check("without a parent column the fold degenerates to one row per relation",
       len(rows), 261)
 check("no commit leaked into any row of the golden capture",
       any(e["kind"] == "commit" for evs in rows.values() for e in evs), False)
-check("every row's events are ordered by ts",
-      all(evs == sorted(evs, key=lambda e: e["ts"]) for evs in rows.values()), True)
+
+# Not asserting ts-ordering here on purpose: without a parent column every one of these 261
+# rows holds exactly one event (see the degenerate-fold check above), and a singleton list
+# is trivially "sorted" whatever fold_rows does with it, including if the evs.sort() call
+# were deleted entirely. Shuffling the input first does not fix this either: the fold still
+# produces one event per row, because folding only ever appends a subsequence of the input.
+# The synthetic capture above is what actually proves the sort, because its three events
+# land in a single row with deliberately scrambled ts values. Do not re-add an ordering
+# check here; it would be a passing test that also passes against code missing the sort.
 
 sys.exit(fail)
