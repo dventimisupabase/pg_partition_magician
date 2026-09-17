@@ -317,9 +317,13 @@ more than it does.
   question this repo asks.
 - Not reviving pg-lock-tracer, for the reasons recorded in #391 and in `bench/lock_probe.py`'s header.
 
-## Follow-up worth its own issue
+## Follow-up
+
+Filed as [#393](https://github.com/dventimisupabase/pg_partition_magician/issues/393).
 
 The guard's vocabulary calls a lock request a grant (`MG_GRANTS`, "took ACCESS EXCLUSIVE") because
-`attach_uprobe` fires at function entry. Its conclusions are unaffected, since its fixture is
-single-backend and request and grant are microseconds apart there. The wording is still imprecise and
-worth correcting, but touching `lock_trace.sh` is explicitly outside this design.
+`attach_uprobe` fires at function entry. Its conclusions are unaffected, and the argument is worth
+recording rather than re-deriving: a backend cannot commit while blocked on a lock it has itself
+requested, so the request-based and grant-based intervals contain exactly the same commits. Neither a
+false pass nor a false fail is reachable through it. The wording is still imprecise, and touching
+`lock_trace.sh` is explicitly outside this design.
