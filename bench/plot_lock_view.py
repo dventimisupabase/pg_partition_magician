@@ -104,8 +104,10 @@ def load_capture(run_dir: pathlib.Path, checks: Sequence[str] = CHECKS) -> Captu
     events = [r for r in records if "kind" in r]
     tail = [r for r in records if "dropped" in r]
 
-    # before UNION after: before carries what the tick DROPS (44% of relations stop resolving once
-    # it succeeds), after carries what the tick CREATES. A tick does both.
+    # before UNION after: before carries what the tick DROPS (44% of the relations this capture
+    # traced, 116 of 261, do not resolve in names.after.csv once the tick succeeds -- not 44% of
+    # every relation in the database, which is a much larger and unrelated denominator), after
+    # carries what the tick CREATES. A tick does both.
     names = _read_names(run_dir / "names.after.csv")
     names.update(_read_names(run_dir / "names.before.csv"))
 

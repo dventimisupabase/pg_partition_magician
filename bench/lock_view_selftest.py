@@ -59,8 +59,9 @@ def refuses(run_dir, checks):
         return exc.check
 
 
-# Asymmetric on purpose: three relations and two commits, never one and one, so a transposition
-# cannot cancel the way a symmetric fixture lets it.
+# Asymmetric on purpose: the golden fixture carries 261 relations and 13 commits, nowhere near a
+# symmetric one-and-one shape, so a transposition bug in the damage functions below cannot cancel
+# the way it could against a fixture with matched counts.
 DAMAGE = {
     "dropped": lambda rs: [{"dropped": 5, "unmatched": 0} if "dropped" in r else r for r in rs],
     "drain":   lambda rs: [r for r in rs if "dropped" not in r],
@@ -75,5 +76,19 @@ for name, damage in DAMAGE.items():
         check(f"{name}: renders with checks bypassed entirely", refuses(d, ()), "")
 
 check("a good capture loads", refuses(GOLDEN, CHECKS), "")
+
+# The refusal checks above only prove the loader does not raise; refuses() discards the Capture it
+# gets back, so none of them says anything about what got resolved. Load once more and inspect the
+# result directly, so a names resolution that silently returns nothing (or drops Ruling 2's
+# 2-column defaulting) is caught here instead of passing as an untested side effect of a load that
+# merely did not throw.
+cap = load_capture(GOLDEN, checks=CHECKS)
+enlisted = cap.names.get(16567)
+check("a known oid resolves to its recorded name",
+      enlisted.name if enlisted else None, "public.mg_ret")
+check("a relation from the 2-column CSV defaults parent to \"\"",
+      enlisted.parent if enlisted else None, "")
+check("a relation from the 2-column CSV defaults kind to \"other\"",
+      enlisted.kind if enlisted else None, "other")
 
 sys.exit(fail)
