@@ -9,4 +9,10 @@ supabase/.temp/
 
 # venv for scripts/verify_parquet*.py, created on demand by test.sh's archive track
 /.venv-verify/
+
+# venv for bench/plot_lock_view.py's matplotlib dependency, created on demand (Ruling 8/8a,
+# 2026-09-16 lock-sequence renderer task 3). Kept separate from .venv-verify: that one holds
+# pyarrow/duckdb for the archive track, and conflating the two toolchains makes either one's
+# rebuild a surprise for the other.
+/.venv-lockview/
 __pycache__/

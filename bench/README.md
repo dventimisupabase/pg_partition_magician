@@ -463,3 +463,160 @@ the stall exceeds a real client's patience. Keep all of them.
 | `PILOT_LOCK_TIMEOUT` | `2s` | the workload's own `lock_timeout` |
 | `PILOT_TX_LOCK_TIMEOUT` | `5s` | `p_lock_timeout` passed to transmute |
 | `PILOT_BOUND_HEADROOM` | 1 | `p_bound_headroom`. Defaults ON, unlike transmute's own 0: the monolith bound rejects writes at or past `hi` for the whole conversion, so a writer at the frontier can cross it if the conversion spans a grid boundary (a daily step converted at 23:59). This is the pattern a live production conversion should use too. |
+
+## Lock-sequence renderer (`bench/lock_view.sh`, issue #392)
+
+Draws a **picture** of a maintenance tick's lock sequence, for a human to look at. It is
+**not** a guard: it asserts nothing about pgpm's behaviour and blocks no merge, so it never
+runs in CI and passes no build/fail verdict of its own. `bench/lock_trace.sh` is the guard
+(it runs in `./test.sh locktrace` and answers a yes/no question with eBPF); this tool answers
+"what actually happened, in what order, on which relations" by turning the same kind of eBPF
+capture into a timeline you can read.
+
+### Invocation
+
+```bash
+bench/lock_view.sh <container> <db> <relations> <sql> [run-name]
+
+# example: watch mg_ret and ml through one maintenance tick
+bench/lock_view.sh pgpm_test-locktrace mydb 'public.mg_ret,public.ml' \
+  "call pgpm.maintain_all()" mytick
+```
+
+`<relations>` is a comma-separated list of `schema.table` names to enlist (their oids are
+looked up at the start of the run); `<sql>` is the statement to trace. The harness snapshots
+relation names before and after the traced statement, runs the probe, executes `<sql>`, waits
+for the probe to drain, then renders the two figures.
+
+### A primer mark you will see on the figure
+
+`bench/lock_view.py` enlists a backend into its watched set only once that backend touches one of
+the enlisted oids, so any lock the SAME backend took EARLIER in `<sql>` would otherwise be lost
+outright and rendered as though the sequence were complete (issue #392 review, finding 1):
+`LOCK other; LOCK target;`, traced as one statement, would drop `other` with no refusal to catch
+it. `lock_view.sh` closes this for the one relation it can reach ahead of time: immediately before
+`<sql>` runs, it issues `select 1 from <first-enlisted-relation> limit 0` as its own statement, in
+the SAME `docker exec ... psql -c ... -c ...` invocation (one backend, one pid) that then runs
+`<sql>`. That backend is enlisted before `<sql>` executes anything at all.
+
+Two things follow, both worth knowing before reading a figure:
+
+- **The primer takes a real AccessShare lock, and it will appear in the capture.** It is the
+  FIRST AccessShare mark on the first enlisted relation, and it is an artifact of this harness, not
+  part of `<sql>`'s own work. Do not read it as something the traced statement did.
+- **It renders INSIDE the shaded `[t_begin, t_end]` band, not before it.** `t_begin` is recorded on
+  the host before the single `docker exec` that runs the primer and `<sql>` back to back; there is
+  no point at which this script can record a timestamp between them without splitting them into
+  separate psql invocations, which would give them separate backends and defeat the whole point of
+  priming. So the ordinary rule ("locks before `t_begin` are outside the band, ambient noise") does
+  not apply to this one mark -- it is inside the band by construction, and the first AccessShare on
+  the first enlisted relation is how you recognise it.
+- **Only when it is safe.** If the first enlisted relation cannot be selected from (dropped
+  mid-run, no privilege, whatever), the primer's own statement fails and `<sql>` still runs; a
+  primer failure never aborts the run or gets mistaken for `<sql>` itself failing.
+
+**What this does NOT close.** A lock the SAME backend held before the primer ever ran cannot exist
+within one fresh `psql` invocation, so there is nothing to miss there. But a lock taken by a
+DIFFERENT backend, before THAT backend first touches a target relation, is still invisible --
+priming enlists only the one backend running `<sql>`; every other session on the server is
+enlisted the same way this tool always enlisted anyone, on first touch. Read a figure as a complete
+suffix of the one backend under test from the moment it was primed, never as a complete prefix of
+every backend's own locking. See `bench/lock_view.py`'s module docstring for the same limit stated
+next to the code it applies to, and `bench/lock_view_names_scope_demo.sh`'s sibling script,
+`bench/lock_view_prefix_demo.sh`, for a runnable demonstration against a live capture.
+
+### Prerequisites
+
+- The `locktrace` compose profile, up and healthy: `docker compose --profile locktrace up -d`.
+  This is the same privileged, eBPF-capable container `./test.sh locktrace` uses; nothing here
+  needs a second image.
+- A Python virtualenv with matplotlib, at `.venv-lockview/` (gitignored, created on demand):
+
+  ```bash
+  python3 -m venv .venv-lockview
+  .venv-lockview/bin/pip install matplotlib
+  ```
+
+  This has to be a venv rather than a plain `pip install matplotlib` against the system
+  interpreter: PEP 668 marks a Homebrew (or distro-managed) Python as externally managed and
+  refuses the install outright, precisely to stop a `pip install` from silently rewriting
+  packages the OS itself depends on. The renderer (`bench/plot_lock_view.py`) imports
+  matplotlib at module scope, so both it and `bench/lock_view_selftest.py` have to run under
+  this venv's interpreter, never the system `python3`:
+
+  ```bash
+  .venv-lockview/bin/python bench/lock_view_selftest.py
+  ```
+
+  Do not reuse `.venv-verify/`; that one belongs to the archive track's own toolchain
+  (pyarrow, duckdb) and conflating the two makes either one's rebuild a surprise for the other.
+
+### Output
+
+Each run writes a timestamped directory, `bench/results/lockview-<run-name>-<YYYYmmdd-HHMMSS>/`,
+containing:
+
+- `meta.json`: the traced sql, the enlisted relations and their oids, the clock window
+  (`t_begin`/`t_end`), the git sha the capture was taken against, and a `producer` key naming
+  which probe wrote the capture (`bench/lock_view.py` writes `ts` at the grant; the CI guard's
+  own `bench/lock_probe.py` writes it at the request and carries no `producer` key at all, so a
+  guard capture loaded here is never plotted as though its marks meant the same instant).
+- `events.jsonl`: the raw capture (one JSON record per lock/commit event, plus a final
+  `{"dropped": ..., "unmatched": ...}` tally).
+- `names.before.csv` / `names.after.csv`: the relation-name snapshots taken immediately before
+  and after the traced statement, each already carrying the SQL fold (index to its table,
+  toast to its table, partition to its managed parent). A failed snapshot aborts the run rather
+  than warning: `plot_lock_view.py`'s loader treats a missing or truncated CSV as "every
+  relation was created during the window", which renders a wrong figure that still passes every
+  refusal, so `bench/lock_view.sh` checks each snapshot's exit status and stops rather than
+  hand that silently-wrong input to the renderer.
+- `lock-view.png` and `lock-view.svg`: the rendered figure.
+
+`bench/results/` is git-ignored (`bench/results/.gitignore`), so a run's output stays local by
+default. To share one, force-add it explicitly:
+
+```bash
+git add -f bench/results/lockview-mytick-20260916-191847/
+```
+
+The container-side capture paths (`/tmp/pgpm_lock_view.jsonl`, `/tmp/pgpm_lock_view.log`) are
+fixed, not per-run: two `lock_view.sh` invocations against the same container at the same time
+will collide and corrupt each other's capture. Run one at a time per container.
+
+### The four refusals
+
+`bench/plot_lock_view.py` refuses to draw a capture it cannot trust, rather than render a
+picture that looks fine and is wrong. Each refusal corresponds to a way that can happen:
+
+| refusal | trips when | why a drawing would mislead |
+| --- | --- | --- |
+| `dropped` | the kernel ring buffer overflowed and the probe lost events | a truncated trace drawn as a complete one is the exact failure that made an earlier tracer unsound |
+| `drain` | the probe was killed before it wrote its final tally | "dropped" is then unknown, and treating unknown as zero is the same mistake as above |
+| `empty` | the capture recorded no lock events at all | an empty timeline and "the probe attached to nothing" render identically |
+| `strong` | the capture never saw a strong-tier lock (`ShareRowExclusive`, `Exclusive` or `AccessExclusive`, per `tier()`) on any relation | a tick that did no real work renders as a calm, correct-looking figure of a no-op |
+
+A run that trips one of these prints `refusing to draw this capture -- <refusal>: <detail>` on
+stderr and exits nonzero instead of writing a figure. Passing `--modes strong` to
+`plot_lock_view.py` filters which marks get drawn (dropping `AccessShare`); it does not affect
+which captures are trusted enough to draw in the first place.
+
+`unmatched` (a lock request that never got a matching grant, most often an aborted wait under
+`lock_timeout`) is reported alongside `dropped` on the figure's footer but is deliberately **not**
+a fifth refusal: it means the trace is complete and accurately reporting a wait it could not see
+the end of, not that the trace is untrustworthy. See the design spec's "Requests, grants and
+waits" section for the reasoning.
+
+### The spec
+
+Design rationale, the capture contract, the fold, and the drawing rules are written up in
+[`docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md`](../docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md).
+
+### The request/return pairing proof
+
+`bench/lock_timeout_pairing_demo.sh` is a runnable, two-session demonstration of a defect that
+was found and fixed in `bench/lock_view.py`'s eBPF probe: an aborted wait under `lock_timeout`
+must be paired with and counted against its own request, never left to be silently stolen and
+misreported by whatever `LockRelationOid` return comes next. Nothing runs it automatically (no
+`test.sh` wiring, no CI job); it exists so the discrimination proof for that fix stays a runnable,
+committed artifact instead of prose in a report that will eventually be deleted. See its own
+header for what it demonstrates and how to run it.
