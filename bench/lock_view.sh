@@ -115,16 +115,30 @@ fi
 # The probe's bpf_ktime_get_ns() and the host's CLOCK_MONOTONIC are the SAME clock domain (same
 # kernel), verified on the design spike. Clocks cross the container boundary; pids do not.
 T_BEGIN=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
-docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$SQL" >/dev/null 2>&1
+# Kept and checked, not discarded: a failed or partially-executed traced statement still lets
+# the capture and render proceed (a near-empty capture usually trips the "empty"/"strong"
+# refusal downstream), but that refusal reads as "the probe saw nothing" when the real cause
+# was the SQL itself. Warning here, with the real error alongside the capture, means a wrong
+# picture never has to be debugged as though it were a probe defect.
+if ! docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$SQL" >/dev/null 2>"$OUT/sql.stderr"; then
+  echo "warning: the traced statement exited non-zero; see $OUT/sql.stderr" >&2
+  echo "         the capture below may be empty or partial for that reason, not because the probe failed" >&2
+fi
 T_END=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
 
 # SIGINT then WAIT: the drop count is written on the way out, and reading early truncates the very
 # record that says whether anything was lost.
 docker exec "$C" pkill -INT -f lock_view.py >/dev/null 2>&1
+probe_exited=false
 for _ in $(seq 1 30); do
-  docker exec "$C" pgrep -f lock_view.py >/dev/null 2>&1 || break
+  docker exec "$C" pgrep -f lock_view.py >/dev/null 2>&1 || { probe_exited=true; break; }
   sleep 1
 done
+if [ "$probe_exited" != true ]; then
+  echo "warning: the probe did not exit within 30s of SIGINT" >&2
+  echo "         the capture may be truncated and the drop count may be missing; expect the" >&2
+  echo "         downstream 'drain' refusal if so" >&2
+fi
 
 names_snapshot > "$OUT/names.after.csv"
 docker cp "$C:$EVENTS" "$OUT/events.jsonl" >/dev/null
