@@ -20,15 +20,27 @@ asserts nothing at all; it draws whatever a trusted `Capture` hands it and stamp
   - empty:    the capture has no lock events at all. An empty timeline and "the probe attached to
               nothing and recorded nothing" render identically, so this is caught before drawing
               rather than left to look like a suspiciously quiet result.
-  - strong:   the capture never saw an AccessExclusive lock. A partition-maintenance tick that did
-              real work always takes at least one; a capture without one recorded a no-op, and a
-              calm, correct-looking figure of a no-op is worse than an error because it is
-              persuasive.
+  - strong:   the capture never saw a strong-tier lock (`tier() == "strong"`: ShareRowExclusive,
+              Exclusive or AccessExclusive) on ANY relation, not only the enlisted ones. A
+              partition-maintenance tick that did real work always takes at least one; a capture
+              without one recorded a no-op, and a calm, correct-looking figure of a no-op is worse
+              than an error because it is persuasive. The design spec originally read this as "no
+              strong-mode mark on any ENLISTED relation", which is the wrong reading in general:
+              `retain` takes AccessExclusive on PARTITION oids, which are not the enlisted table's
+              own oid, so restricting the check to the enlisted set would refuse the exact captures
+              this refusal exists to accept. Checking `tier()`, not a hardcoded AccessExclusive-only
+              comparison, is likewise deliberate: `tier()` is this module's one place strong-mode
+              classification lives (see its own docstring), and a maintenance tick that only ever
+              took ShareRowExclusive or Exclusive locks still did real, blocking work.
 
 Two formats feed this loader. The existing CI guard's probe (bench/lock_probe.py, untouched by this
 task) never wrote a "wait_ns" or "unmatched" field, because it never needed to distinguish a lock wait
 from an instant grant. A later task's probe always does. Both are read with dict.get(..., default),
 never a bare key lookup, so one loader serves both producers without caring which wrote the capture.
+`bench/lock_probe.py` also writes its `ts` at the REQUEST (it has no uretprobe), while
+`bench/lock_view.py` writes `ts` at the GRANT; a capture's `meta.json` names which one produced it in
+its `producer` key (added by `bench/lock_view.sh`), so a guard capture loaded here is never plotted as
+though its marks meant the same instant as a `lock_view.py` capture's.
 
 Drawing (matplotlib) is imported below (Task 3's `render`). Because of that import, from here on
 `bench/lock_view_selftest.py` only runs under an interpreter that has matplotlib installed, which the
@@ -82,6 +94,11 @@ class Capture:
     unmatched: int = 0
     meta: dict = field(default_factory=dict)
     names: dict = field(default_factory=dict)
+    # Oids present (as kind == "partition") in names.before.csv and absent from names.after.csv:
+    # dropped by the traced statement, per spec:215-216. This is why load_capture reads the two
+    # CSVs separately before folding them into `names` below -- the union alone cannot answer
+    # "which side did this oid come from".
+    dropped_oids: frozenset = field(default_factory=frozenset)
 
 
 def _read_names(path: pathlib.Path) -> dict:
@@ -117,8 +134,18 @@ def load_capture(run_dir: pathlib.Path, checks: Sequence[str] = CHECKS) -> Captu
     # traced, 116 of 261, do not resolve in names.after.csv once the tick succeeds -- not 44% of
     # every relation in the database, which is a much larger and unrelated denominator), after
     # carries what the tick CREATES. A tick does both.
-    names = _read_names(run_dir / "names.after.csv")
-    names.update(_read_names(run_dir / "names.before.csv"))
+    #
+    # Read separately, not straight into the union, because the union alone cannot answer "which
+    # side did this oid come from" -- and spec:215-216 needs exactly that to ring a dropped
+    # partition's last mark: present (as kind == "partition") in before, absent from after.
+    names_before = _read_names(run_dir / "names.before.csv")
+    names_after = _read_names(run_dir / "names.after.csv")
+    names = dict(names_after)
+    names.update(names_before)
+    dropped_oids = frozenset(
+        oid for oid, rel in names_before.items()
+        if rel.kind == "partition" and oid not in names_after
+    )
 
     meta = {}
     if (run_dir / "meta.json").exists():
@@ -141,12 +168,14 @@ def load_capture(run_dir: pathlib.Path, checks: Sequence[str] = CHECKS) -> Captu
 
     if "strong" in checks:
         strong = [e for e in events
-                  if e["kind"] == "lock" and e.get("mode") == ACCESS_EXCLUSIVE]
+                  if e["kind"] == "lock" and tier(e.get("mode", 0)) == "strong"]
         if not strong:
-            raise Refused("strong", "no AccessExclusive mark on any relation: a tick that did "
-                                    "nothing renders as a calm, correct-looking figure")
+            raise Refused("strong", "no strong-tier mark (ShareRowExclusive, Exclusive or "
+                                    "AccessExclusive) on any relation: a tick that did nothing "
+                                    "renders as a calm, correct-looking figure")
 
-    return Capture(events=events, dropped=dropped, unmatched=unmatched, meta=meta, names=names)
+    return Capture(events=events, dropped=dropped, unmatched=unmatched, meta=meta, names=names,
+                   dropped_oids=dropped_oids)
 
 
 def fold_rows(cap: Capture) -> dict:
@@ -177,7 +206,17 @@ def fold_rows(cap: Capture) -> dict:
     collapsing anything. That is not a bug in this function: it is the correct answer to a
     fold with nothing to fold on, and it is what the golden fixture (whose CSVs predate the
     parent column) exercises.
+
+    Per spec:218-219, a row stays a plain relation row when the capture holds one backend, and
+    becomes a `(relation, pid)` pair when it holds more than one: with two backends, the marks
+    of both would otherwise interleave onto one row whose label implies a single actor, while
+    the figure's own `backends` stamp reports 2 beside a row that cannot show which backend did
+    which mark. This is reachable exactly when the tool is most valuable -- a wait needs
+    contention, and contention needs more than one backend -- so it is decided here, once, off
+    the real pid distribution in the capture, rather than left for a reader to infer.
     """
+    pids = {e["pid"] for e in cap.events if e["kind"] == "lock"}
+    multi_backend = len(pids) > 1
     rows: dict = {}
     for e in cap.events:
         if e["kind"] != "lock":
@@ -187,6 +226,8 @@ def fold_rows(cap: Capture) -> dict:
             label = "created during the window"
         else:
             label = rel.parent or rel.name
+        if multi_backend:
+            label = f"{label} (pid {e['pid']})"
         rows.setdefault(label, []).append(e)
     for evs in rows.values():
         evs.sort(key=lambda e: e["ts"])
@@ -234,6 +275,58 @@ TIER_STYLE = {
     "strong": (0.34, 1.0, 1.2),
 }
 
+# Nanoseconds. Extracted to its own predicate (fix round 2, Finding 3) rather than left as an
+# inline `if wait > 1_000_000` inside render()'s drawing loop, per this branch's own precedent
+# with `tier()`: a threshold buried in a drawing loop that no fixture's real wait_ns values ever
+# cross (the golden fixture's range 1,403-9,027 ns, three orders of magnitude below this) is code
+# no test run ever executes, proven by deleting the whole `ax.hlines` block and watching 36/36
+# still pass. Testing the predicate directly, and adding a synthetic capture whose wait_ns
+# straddles it, closes both gaps at once.
+WAIT_DRAW_THRESHOLD_NS = 1_000_000
+
+
+def should_draw_wait(wait_ns: int) -> bool:
+    """True when a request-to-grant wait is long enough to draw as its own span.
+
+    Sub-millisecond waits are not drawn; at this figure's scale they would be invisible ink and
+    not worth the mark. Strictly greater than the threshold, not greater-or-equal: a wait of
+    exactly WAIT_DRAW_THRESHOLD_NS is still sub-millisecond-adjacent noise, not a genuine wait
+    worth a reader's attention.
+    """
+    return wait_ns > WAIT_DRAW_THRESHOLD_NS
+
+
+def all_light(evs: list) -> bool:
+    """True when every event in a folded row is light-tier (AccessShare only), and the row is
+    non-empty.
+
+    Such a row draws as thin, low-alpha ticks at whatever alpha TIER_STYLE gives "light" -- for a
+    row with only one or a few such marks (`pgpm.archive_result` in the golden fixture holds
+    exactly one) that is visually indistinguishable from an empty row, even though the figure's
+    own `captured` stamp says otherwise. Per spec:209-210, such a row is annotated with its exact
+    event count so the picture never implies fewer events than were captured. An empty row is
+    excluded (returns False, not vacuously True) because there is nothing to annotate a count
+    onto.
+    """
+    return bool(evs) and all(tier(e["mode"]) == "light" for e in evs)
+
+
+def footer_color(dropped: int, unmatched: int) -> str:
+    """RED when the footer must flag a lossy or incomplete-in-a-known-way condition, else GREY.
+
+    Extracted (fix round 2, Finding 2) because before this, "unmatched" reached the footer's
+    color decision but nothing in the self-test asserted on it: forcing `unmatched = 0` in
+    load_capture still passed 36/36. `dropped` and `unmatched` are reported as separate numbers
+    (never folded into one), because they mean different things: `dropped > 0` means the ring
+    buffer overflowed and the trace is incomplete in an UNKNOWN way (refused before rendering,
+    see CHECKS); `unmatched > 0` means a lock request never got a matching grant, which the trace
+    reports COMPLETELY and accurately -- an aborted wait under `lock_timeout` is normal in
+    exactly the contention case the uretprobe exists to observe, so it must not refuse. Both
+    still deserve the reader's attention on a figure that otherwise reads as calm, hence the
+    shared red tint here, short of refusing to draw over either one.
+    """
+    return RED if (dropped or unmatched) else GREY
+
 
 def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     """Draw a loaded, trusted Capture to lock-view.png / lock-view.svg in out_dir.
@@ -241,7 +334,9 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     Asserts nothing about PostgreSQL or the probe: `load_capture` already decided this capture
     is trustworthy enough to draw (its four refusals), and `fold_rows` already decided which
     relations share a row. This function only decides what ink goes where, and returns the
-    stamp dict Task 5's caller writes to the run directory alongside the two image files.
+    stamp dict. Nothing writes that dict to the run directory: `main()` below only prints it to
+    stdout, and `bench/lock_view.sh` does not capture that output into a file either, so the
+    stamp lives only in the two image files' own footer text and in whatever terminal ran it.
 
     Every mark is an instant, drawn as a vertical tick at its own timestamp, never a bar from
     lock to release: the release path is deliberately unprobed (see the module docstring and
@@ -268,10 +363,17 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         return (ts - t0) / 1e6
 
     drawn = 0
+    wait_spans = 0
+    annotated_rows = 0
+    rung = 0
     fig, ax = plt.subplots(figsize=(12, 1.1 + 0.42 * len(order)))
     for y, label in enumerate(order):
-        for e in rows[label]:
+        evs = rows[label]
+        last_rung_by_oid = {}
+        for e in evs:
             mode_tier = tier(e["mode"])
+            if e["oid"] in cap.dropped_oids:
+                last_rung_by_oid[e["oid"]] = e  # evs is ts-ordered, so the last write wins
             if modes == "strong" and mode_tier == "light":
                 continue
             drawn += 1
@@ -294,9 +396,38 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
             # the distance between the request (uprobe, entry) and the grant (uretprobe,
             # return). Sub-millisecond waits are not drawn; at this scale they would be
             # invisible ink and not worth the mark.
-            wait = e.get("wait_ns", 0)
-            if wait > 1_000_000:
+            if should_draw_wait(e.get("wait_ns", 0)):
+                wait_spans += 1
+                wait = e["wait_ns"]
                 ax.hlines(y, ms(e["ts"] - wait), ms(e["ts"]), color=RED, alpha=0.5, linewidth=3)
+
+        # spec:209-210: a row whose marks are ALL light-tier renders as visually empty (one mark
+        # at low alpha reads the same as zero), so its exact event count is written beside it
+        # rather than left implicit. Skipped under --modes strong: that filter already removes
+        # every light mark from such a row on purpose, so an empty row there is the expected
+        # result of the filter, not the legibility gap this annotation exists to close.
+        if modes != "strong" and all_light(evs):
+            annotated_rows += 1
+            ax.annotate(
+                str(len(evs)),
+                xy=(ms(evs[0]["ts"]), y),
+                xytext=(6, 0),
+                textcoords="offset points",
+                fontsize=7,
+                color=GREY,
+                va="center",
+                ha="left",
+            )
+
+        # spec:215-216: a partition present in names.before.csv and absent from names.after.csv
+        # was dropped during the traced window; its last mark on this row is ringed so a reader
+        # sees where the drop happened without cross-referencing the CSVs by hand.
+        for e in last_rung_by_oid.values():
+            rung += 1
+            ax.scatter(
+                [ms(e["ts"])], [y],
+                s=90, facecolors="none", edgecolors=RED, linewidths=1.3, zorder=3,
+            )
 
     for e in commits:
         drawn += 1
@@ -322,13 +453,16 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         "rows": len(order),
         "backends": len({e["pid"] for e in cap.events}),
         "span_ms": round(span_ms, 1),
+        "wait_spans": wait_spans,
+        "annotated_rows": annotated_rows,
+        "rung": rung,
     }
 
     filt = "" if modes == "all" else f", --modes {modes}"
     foot = (
         f"{stamp['captured']} captured, {stamp['drawn']} drawn{filt}   "
         f"{stamp['dropped']} dropped, {stamp['unmatched']} unmatched   "
-        f"{stamp['span_ms']} ms traced, {stamp['backends']} backend(s)"
+        f"{stamp['span_ms']} ms first event to last, {stamp['backends']} backend(s)"
     )
     ax.set_title(cap.meta.get("sql", "lock view"), fontsize=10, color=INK, loc="left")
     # An absolute point offset below the axes, not a figure-fraction coordinate: the figure's
@@ -348,7 +482,7 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         ha="left",
         va="top",
         annotation_clip=False,
-        color=RED if (cap.dropped or cap.unmatched) else GREY,
+        color=footer_color(cap.dropped, cap.unmatched),
     )
 
     for ext in ("png", "svg"):

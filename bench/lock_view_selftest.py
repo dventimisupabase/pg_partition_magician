@@ -62,11 +62,21 @@ def refuses(run_dir, checks):
 # Asymmetric on purpose: the golden fixture carries 261 relations and 13 commits, nowhere near a
 # symmetric one-and-one shape, so a transposition bug in the damage functions below cannot cancel
 # the way it could against a fixture with matched counts.
+# "strong" strips every STRONG_MODES member (6, 7, 8), not only AccessExclusive (8): the check
+# this damages was broadened (issue #392 review, fix 6) to tier()=="strong" rather than a
+# hardcoded mode == 8 comparison, because retain's AccessExclusive locks land on PARTITION oids,
+# not the enlisted table's own, so restricting the refusal to "no AccessExclusive anywhere" was
+# already the right shape -- but a maintenance tick that only ever took ShareRowExclusive (6) or
+# Exclusive (7) still did real, blocking work and must not be misread as a no-op either. The
+# golden fixture carries 29 mode-6 (ShareRowExclusive) events alongside its 499 mode-8 ones, so
+# stripping mode 8 alone would leave mode 6 behind and the refusal would no longer trip -- which
+# is exactly what happened when this was first written against the old hardcoded check.
 DAMAGE = {
     "dropped": lambda rs: [{"dropped": 5, "unmatched": 0} if "dropped" in r else r for r in rs],
     "drain":   lambda rs: [r for r in rs if "dropped" not in r],
     "empty":   lambda rs: [r for r in rs if "dropped" in r],
-    "strong":  lambda rs: [r for r in rs if not (r.get("kind") == "lock" and r.get("mode") == 8)],
+    "strong":  lambda rs: [r for r in rs
+                            if not (r.get("kind") == "lock" and r.get("mode") in (6, 7, 8))],
 }
 
 for name, damage in DAMAGE.items():
@@ -106,7 +116,7 @@ def _write_two_column_capture(tmp):
     d = pathlib.Path(tmp) / "run"
     d.mkdir()
     events = [
-        {"kind": "lock", "oid": 1, "ts": 1, "mode": 1},
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 1, "pid": 1},
         {"dropped": 0, "unmatched": 0},
     ]
     with (d / "events.jsonl").open("w") as fh:
@@ -157,11 +167,11 @@ def _write_synthetic_capture(tmp):
     d = pathlib.Path(tmp) / "run"
     d.mkdir()
     events = [
-        {"kind": "lock", "oid": 1, "ts": 3, "mode": 8},
-        {"kind": "lock", "oid": 2, "ts": 1, "mode": 8},
-        {"kind": "lock", "oid": 3, "ts": 2, "mode": 8},
-        {"kind": "commit", "ts": 4},
-        {"kind": "commit", "ts": 5},
+        {"kind": "lock", "oid": 1, "ts": 3, "mode": 8, "pid": 1},
+        {"kind": "lock", "oid": 2, "ts": 1, "mode": 8, "pid": 1},
+        {"kind": "lock", "oid": 3, "ts": 2, "mode": 8, "pid": 1},
+        {"kind": "commit", "ts": 4, "pid": 1},
+        {"kind": "commit", "ts": 5, "pid": 1},
         {"dropped": 0, "unmatched": 0},
     ]
     with (d / "events.jsonl").open("w") as fh:
@@ -270,5 +280,240 @@ with tempfile.TemporaryDirectory() as tmp:
     strong = render(cap, out, modes="strong")
     check("strong mode draws fewer marks", strong["drawn"] < strong["captured"], True)
     check("strong mode still stamps the full captured count", strong["captured"], stamp["captured"])
+
+    # The golden fixture's real wait_ns values (1,403-9,027 ns, per the module docstring) never
+    # cross WAIT_DRAW_THRESHOLD_NS, so this is the liveness witness that the real data legitimately
+    # draws none -- distinct from the synthetic straddle fixture below, which proves the drawing
+    # path CAN execute.
+    check("the golden capture's real sub-microsecond waits draw no wait span", stamp["wait_spans"], 0)
+
+    # spec:209-210 (fix round 2, Finding 4b), against real data: pgpm.archive_result (1 mark) and
+    # pgpm.dropped_fk (11 marks) are the golden capture's only all-light-tier rows (verified
+    # directly above via fold_rows/tier), and both should be annotated with their exact count.
+    check("annotates exactly the golden capture's two all-light-tier rows", stamp["annotated_rows"], 2)
+    check("--modes strong skips the all-light annotation (that filter already empties those rows)",
+          strong["annotated_rows"], 0)
+
+    # spec:215-216 (fix round 2, Finding 4c), against real data: the design spec's own cross-check
+    # (Verification section, "Drops against pgpm.log, by identity") measured 29 partitions dropped
+    # by this exact tick, matched to pgpm.log by range bound. Every one of those 29 carries at
+    # least one lock event in the golden capture (verified directly against the CSVs), so the ring
+    # count below should be exactly 29, not a subset.
+    check("rings exactly the 29 partitions dropped during the golden capture's window", stamp["rung"], 29)
+
+# --- unmatched: coverage and discrimination (fix round 2, Finding 2) ---
+#
+# Forcing `unmatched = 0` in load_capture previously passed 36/36, because nothing asserted on
+# Capture.unmatched, the stamp's "unmatched" key, or the footer color it feeds. These three
+# checks close that gap. `footer_color` is deliberately pulled out and tested directly (like
+# `tier()` and `should_draw_wait()`) rather than only indirectly through a rendered image, whose
+# color a self-test cannot easily inspect after `plt.close(fig)`.
+from plot_lock_view import GREY, RED, footer_color  # noqa: E402
+
+
+def _write_unmatched_capture(tmp):
+    """A single-backend capture whose tail record carries a distinctive, nonzero unmatched count.
+
+    4, not 1: this repo's CLAUDE.md warns against fixtures where a miscount could still land on a
+    value a bug might produce by accident (e.g. a bool coerced to 0/1). One lock event and one
+    commit event, asymmetric on purpose.
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 8, "pid": 1},
+        {"kind": "commit", "ts": 2, "pid": 1},
+        {"dropped": 0, "unmatched": 4},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    u_dir = _write_unmatched_capture(tmp)
+    u_cap = load_capture(u_dir, checks=())
+    check("a capture whose tail record reports unmatched=4 carries that on the Capture",
+          u_cap.unmatched, 4)
+    with tempfile.TemporaryDirectory() as tmp2:
+        u_stamp = render(u_cap, pathlib.Path(tmp2))
+        check("the rendered stamp reports the same unmatched count the capture carries",
+              u_stamp["unmatched"], 4)
+
+check("footer_color is grey when neither dropped nor unmatched is nonzero", footer_color(0, 0), GREY)
+check("footer_color is red when unmatched alone is nonzero (a complete trace, still flagged)",
+      footer_color(0, 4), RED)
+check("footer_color is red when dropped alone is nonzero", footer_color(2, 0), RED)
+
+# --- should_draw_wait: threshold coverage and a synthetic capture that crosses it (Finding 3) ---
+from plot_lock_view import should_draw_wait  # noqa: E402
+
+check("should_draw_wait is False for a wait just below the threshold (999,999 ns)",
+      should_draw_wait(999_999), False)
+check("should_draw_wait is False for a wait exactly at the threshold (1,000,000 ns)",
+      should_draw_wait(1_000_000), False)
+check("should_draw_wait is True for a wait just above the threshold (1,000,001 ns)",
+      should_draw_wait(1_000_001), True)
+
+
+def _write_wait_straddle_capture(tmp):
+    """Two relations, three lock events, wait_ns straddling WAIT_DRAW_THRESHOLD_NS.
+
+    oid 10's one event sits just below threshold (no span drawn); oid 20 carries two events
+    above it (both drawn), so drawing more than once on the same row is exercised too. This is
+    the fixture that actually walks the `ax.hlines` line: deleting that whole block, as the
+    review's mutation proved, passes 36/36 against every OTHER fixture in this file, because none
+    of their wait_ns values (0, absent, or the golden fixture's 1,403-9,027 ns) ever cross
+    1,000,000.
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 10, "ts": 10_000_000, "mode": 8, "pid": 1, "wait_ns": 999_999},
+        {"kind": "lock", "oid": 20, "ts": 20_000_000, "mode": 8, "pid": 1, "wait_ns": 1_500_000},
+        {"kind": "lock", "oid": 20, "ts": 30_000_000, "mode": 8, "pid": 1, "wait_ns": 4_000_000},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    w_dir = _write_wait_straddle_capture(tmp)
+    w_cap = load_capture(w_dir, checks=())
+    with tempfile.TemporaryDirectory() as tmp2:
+        w_stamp = render(w_cap, pathlib.Path(tmp2))
+        check("a synthetic capture straddling the wait threshold draws exactly its two "
+              "above-threshold waits as spans", w_stamp["wait_spans"], 2)
+
+# --- all_light: coverage of the predicate itself (Finding 4b) ---
+from plot_lock_view import all_light  # noqa: E402
+
+check("all_light is True for a row whose one mark is light-tier", all_light([{"mode": 1}]), True)
+check("all_light is False for a row mixing light and strong marks",
+      all_light([{"mode": 1}, {"mode": 8}]), False)
+check("all_light is False for an empty row (nothing to annotate a count onto)", all_light([]), False)
+
+all_light_labels = sorted(label for label, evs in rows.items() if all_light(evs))
+check("the golden capture's all-light-tier rows are exactly archive_result and dropped_fk",
+      all_light_labels, ["pgpm.archive_result", "pgpm.dropped_fk"])
+
+# --- per-pid rows: two backends (Finding 4a, spec:218-219) ---
+#
+# Also gives "stamps one backend" (above) something real to discriminate against: before this
+# fixture, no capture in this file ever had more than one pid, so a `backends` counter hardcoded
+# to 1 would have passed every check in this file.
+
+
+def _write_two_backend_capture(tmp):
+    """Three lock events across two pids (2-and-1, not 1-and-1) plus one commit.
+
+    pid 100 takes both marks on oid 2 and one of the two marks on oid 1; pid 200 takes the other
+    mark on oid 1. Both relations share no parent (2-column-shape names), so without per-pid
+    keying oid 1's two marks (one per pid) would land on the SAME row and interleave, which is
+    exactly the defect spec:218-219 exists to prevent.
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 8, "pid": 100},
+        {"kind": "lock", "oid": 1, "ts": 2, "mode": 1, "pid": 200},
+        {"kind": "lock", "oid": 2, "ts": 3, "mode": 8, "pid": 100},
+        {"kind": "commit", "ts": 4, "pid": 100},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    with (d / "names.after.csv").open("w") as fh:
+        fh.write("1,public.t1,,other\n")
+        fh.write("2,public.t2,,other\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    two_d = _write_two_backend_capture(tmp)
+    two_cap = load_capture(two_d, checks=())
+    two_rows = fold_rows(two_cap)
+    check("two backends fold rows keyed on (label, pid), not label alone",
+          sorted(two_rows), ["public.t1 (pid 100)", "public.t1 (pid 200)", "public.t2 (pid 100)"])
+    with tempfile.TemporaryDirectory() as tmp2:
+        two_stamp = render(two_cap, pathlib.Path(tmp2))
+        check("stamps two backends", two_stamp["backends"], 2)
+
+# --- the drop ring: partitions present before, absent after (Finding 4c, spec:215-216) ---
+
+
+def _write_drop_ring_capture(tmp):
+    """One partition dropped during the window (oid 5), one that survives it (oid 6).
+
+    oid 5 gets two lock events (its last mark is the one that should be rung); oid 6 gets one,
+    asymmetric on purpose so a transposition between "rung" and "not rung" cannot cancel. Both
+    fold onto the same parent row (public.mg_ret), so this also proves the ring is drawn at the
+    RIGHT event within a row that mixes rung and non-rung oids, not merely "somewhere in the
+    figure".
+    """
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 5, "ts": 1, "mode": 8, "pid": 1},
+        {"kind": "lock", "oid": 5, "ts": 2, "mode": 8, "pid": 1},
+        {"kind": "lock", "oid": 6, "ts": 3, "mode": 8, "pid": 1},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    with (d / "names.before.csv").open("w") as fh:
+        fh.write("5,public.mg_ret_p1,public.mg_ret,partition\n")
+        fh.write("6,public.mg_ret_p2,public.mg_ret,partition\n")
+    with (d / "names.after.csv").open("w") as fh:
+        fh.write("6,public.mg_ret_p2,public.mg_ret,partition\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    ring_d = _write_drop_ring_capture(tmp)
+    ring_cap = load_capture(ring_d, checks=())
+    check("a partition present before and absent after is recorded as dropped",
+          ring_cap.dropped_oids, frozenset({5}))
+    check("a partition present in both before and after is not recorded as dropped",
+          6 in ring_cap.dropped_oids, False)
+    with tempfile.TemporaryDirectory() as tmp2:
+        ring_stamp = render(ring_cap, pathlib.Path(tmp2))
+        check("rings exactly the one dropped partition's last mark, not the surviving one",
+              ring_stamp["rung"], 1)
+
+# --- the strong refusal on a real, non-AccessExclusive tier (fix round 2, Finding 6) ---
+#
+# retain's AccessExclusive locks land on PARTITION oids, never the enlisted table's own, so the
+# spec's stricter original reading ("no strong-mode mark on any ENLISTED relation") was wrong in
+# general; the code's "any relation" was already right. Separately, the code hardcoded
+# `mode == ACCESS_EXCLUSIVE` while `tier()` defines "strong" as modes 6, 7 and 8: reconciled here
+# by checking `tier() == "strong"`, so a tick whose only strong-tier work was ShareRowExclusive or
+# Exclusive (never AccessExclusive itself) is still recognised as having done real work.
+
+
+def _write_share_row_exclusive_only_capture(tmp):
+    d = pathlib.Path(tmp) / "run"
+    d.mkdir()
+    events = [
+        {"kind": "lock", "oid": 1, "ts": 1, "mode": 7, "pid": 1},   # Exclusive: strong, never 8
+        {"kind": "lock", "oid": 2, "ts": 2, "mode": 1, "pid": 1},
+        {"dropped": 0, "unmatched": 0},
+    ]
+    with (d / "events.jsonl").open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    return d
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    sre_d = _write_share_row_exclusive_only_capture(tmp)
+    check("a capture whose only strong-tier lock is Exclusive (7), never AccessExclusive, "
+          "still passes the strong refusal", refuses(sre_d, CHECKS), "")
 
 sys.exit(fail)
