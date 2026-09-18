@@ -283,6 +283,17 @@ Legibility at 3,347 user marks:
   separately annotated -- implementing that general form was judged not worth the added
   complexity against what this fixes, and the minimal form covers the only concrete legibility
   defect found (`pgpm.archive_result`, and equally `pgpm.dropped_fk`'s 11 marks).
+- A sparse all-light row additionally draws with a **visibility floor**. **Added 2026-09-18 (issue
+  #396)**: the count annotation above says how many events such a row holds, but a count written
+  beside a row that still shows nothing leaves the reader with a figure whose stamp claims more
+  than it displays, which is the smaller version of the problem the refusals exist to prevent. The
+  floor raises alpha and linewidth so the marks are visible at all. It deliberately leaves
+  `half_height` at the light tier's value: height is the SEVERITY channel (0.10 light, 0.22
+  saturated, 0.34 strong), so a floored light mark must never read as a higher tier than the lock
+  actually was. It is density-gated at `VISIBILITY_FLOOR_MAX_MARKS = 25`, because a row of 313
+  `AccessShare` events is also all-light and already reads as an unmistakable grey band; flooring
+  that row would undo the recession the light tier exists for. Both mitigations stay: the count
+  answers "how many", the floor answers "where".
 
 Commits are full-height vertical rules across all rows, because a commit is a backend event rather
 than a relation event.

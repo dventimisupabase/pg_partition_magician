@@ -294,6 +294,27 @@ with tempfile.TemporaryDirectory() as tmp:
     check("--modes strong skips the all-light annotation (that filter already empties those rows)",
           strong["annotated_rows"], 0)
 
+    # issue #396, against real data: those same two rows are ALSO sparse enough to be floored (1
+    # and 11 marks, both at or below VISIBILITY_FLOOR_MAX_MARKS), so on this fixture the floor and
+    # the annotation happen to cover the same rows. That coincidence is exactly why the predicate
+    # is exercised directly below against a row ABOVE the threshold: without that, nothing here
+    # would distinguish needs_visibility_floor from all_light, and the density gate would be
+    # untested code.
+    check("floors exactly the golden capture's two sparse all-light rows", stamp["floored_rows"], 2)
+    check("--modes strong floors nothing (that filter already removes every light mark)",
+          strong["floored_rows"], 0)
+
+    # floored_rows alone would NOT catch deletion of the floor's APPLICATION. It is incremented
+    # where the predicate is evaluated, not where LIGHT_FLOOR_STYLE is selected, so the drawing
+    # branch could be deleted outright with every other check in this file still passing -- the
+    # exact gap this module already records for WAIT_DRAW_THRESHOLD_NS ("proven by deleting the
+    # whole ax.hlines block and watching 36/36 still pass"). floored_marks is incremented AT the
+    # point the floored style is chosen, mirroring how wait_spans is incremented inside the branch
+    # that draws, so it cannot be satisfied unless the style is really applied. The golden
+    # capture's two floored rows hold 1 mark (pgpm.archive_result) and 11 (pgpm.dropped_fk).
+    check("applies the floored style to every mark on those rows", stamp["floored_marks"], 12)
+    check("--modes strong applies the floored style to nothing", strong["floored_marks"], 0)
+
     # spec:215-216 (fix round 2, Finding 4c), against real data: the design spec's own cross-check
     # (Verification section, "Drops against pgpm.log, by identity") measured 29 partitions dropped
     # by this exact tick, matched to pgpm.log by range bound. Every one of those 29 carries at
@@ -400,6 +421,22 @@ check("all_light is False for an empty row (nothing to annotate a count onto)", 
 all_light_labels = sorted(label for label, evs in rows.items() if all_light(evs))
 check("the golden capture's all-light-tier rows are exactly archive_result and dropped_fk",
       all_light_labels, ["pgpm.archive_result", "pgpm.dropped_fk"])
+
+# --- needs_visibility_floor: the density gate all_light alone does not provide (issue #396) ---
+from plot_lock_view import needs_visibility_floor, VISIBILITY_FLOOR_MAX_MARKS  # noqa: E402
+
+check("needs_visibility_floor is True for a row whose one mark is light-tier",
+      needs_visibility_floor([{"mode": 1}]), True)
+check("needs_visibility_floor is True at exactly the threshold",
+      needs_visibility_floor([{"mode": 1}] * VISIBILITY_FLOOR_MAX_MARKS), True)
+# THE case that separates this predicate from all_light: a dense all-light row is the grey band
+# the recession exists to produce, and must not be floored. Without this assertion the density
+# gate could be deleted outright and every other check here would still pass.
+check("needs_visibility_floor is False one mark above the threshold",
+      needs_visibility_floor([{"mode": 1}] * (VISIBILITY_FLOOR_MAX_MARKS + 1)), False)
+check("needs_visibility_floor is False for a row mixing light and strong marks",
+      needs_visibility_floor([{"mode": 1}, {"mode": 8}]), False)
+check("needs_visibility_floor is False for an empty row", needs_visibility_floor([]), False)
 
 # --- per-pid rows: two backends (Finding 4a, spec:218-219) ---
 #
