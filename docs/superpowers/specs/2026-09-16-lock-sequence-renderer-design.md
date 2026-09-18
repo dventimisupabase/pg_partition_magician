@@ -433,11 +433,38 @@ unmodified probe or query so the same script demonstrates the defect and the fix
 ## Non-goals
 
 - No CI job, no `actions/upload-artifact`, and nothing added to `./test.sh ci`.
+  **Amended 2026-09-18 (issue #398): the capture half now has a CI job and a `ci` track.** The
+  reasoning is below; `actions/upload-artifact` is still a non-goal.
 - No change to `lock_probe.py`, `lock_trace.sh`, `discriminate.sh` or `bench/mutations/`.
-- Not a guard. It asserts nothing about pgpm's behaviour and blocks no merge.
+- Not a guard. It asserts nothing about pgpm's behaviour and blocks no merge. **Still true, and it
+  is what the amendment turns on:** the `lockview` track asserts nothing about pgpm either.
 - Not a lock graph. Wait-for edges were `animate_lock_graph`'s deadlock use case, which is not the
   question this repo asks.
 - Not reviving pg-lock-tracer, for the reasons recorded in #391 and in `bench/lock_probe.py`'s header.
+
+### Why the first non-goal was amended (2026-09-18, issue #398)
+
+Recorded rather than silently reversed, because a non-goal that quietly stops being one is the kind
+of documentation rot `scripts/check_living_docs.sh` exists to catch.
+
+The original reasoning holds for the FIGURE and not for the PROBE, and that distinction is the whole
+argument. Nothing ships on a figure. A wrong one is read by the human who asked for it, and that
+human is the one who finds out. The renderer's asserting half is covered cheaply anyway, by
+`bench/lock_view_selftest.py` in `lint.yml`, in about 25 seconds with no container.
+
+The capture is different. `bench/lock_view.py`'s worst defect during development was invisible to
+everything cheap: `on_lock_ret` paired with whatever sat in `pending[pid]`, so an aborted lock wait
+left a stale entry that the next catalog return consumed, emitting a fabricated grant and erasing
+the evidence that a wait had been lost. It reported `{"dropped": 0, "unmatched": 0}`, loaded cleanly
+through the consumer, and was refused by nothing. An instrument in that state has not failed to
+inform its reader; it is telling them the confident opposite of the truth. Prose was all that stood
+between a simplification of those twenty lines of BPF C and the defect returning.
+
+So the amendment is deliberately narrow. `.github/workflows/lockview.yml` is path-filtered to the
+lock-view files alone and fires on no other change. `./test.sh lockview` runs the same two steps
+locally and is wired into `./test.sh ci` on Linux beside `locktrace`, so that "green locally" keeps
+meaning what this repo has always made it mean. Neither gates anything about pgpm's behaviour. The
+remaining non-goals stand unchanged.
 
 ## Follow-up
 

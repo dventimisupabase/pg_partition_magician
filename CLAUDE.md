@@ -36,23 +36,25 @@ and absence-of-setup look identical unless you separate them deliberately.
 ## `./test.sh all` is not what CI runs
 
 `all` means all four PostgreSQL **versions**, not all tracks. The `timescale`, `observe`,
-`archive`, `perf`, `discriminate` and `locktrace` tracks each need their own image or
-service and are skipped, so a green `./test.sh all` does **not** predict a green CI.
+`archive`, `perf`, `discriminate`, `locktrace` and `lockview` tracks each need their own
+image or service and are skipped, so a green `./test.sh all` does **not** predict a green CI.
 
 Use **`./test.sh ci`** before pushing anything that touches `pgpm_core/install.sql`, which
 every one of those tracks installs. It runs each track as a child invocation, so each gets
 its own `set -e` and behaves exactly as CI's separate jobs do, and it runs them all rather
 than stopping at the first failure.
 
-One track is the exception, and it says so rather than hiding it: `locktrace` needs eBPF
-(a privileged container and the host's own kernel headers), so `ci` runs it on Linux and
-prints `SKIPPED` for it anywhere else, never folding it into the `PASS`. The guard is on
-the kernel alone, so a Linux box that cannot actually trace FAILS rather than skipping. A
-skip is covered by CI rather than by nothing: `.github/workflows/locktrace.yml` runs that
-track on every PR touching the tracer, the guard, the mutations or the core install. But a
-Mac `ci` run still has not verified it itself, so read that skip the way the archive round
-trip below teaches you to read a green `./test.sh all`: the PR's own job is what covers
-you, not the run you just watched.
+Two tracks are the exception, and they say so rather than hiding it: `locktrace` and
+`lockview` both need eBPF (a privileged container and the host's own kernel headers), so
+`ci` runs them on Linux and prints `SKIPPED` for them anywhere else, never folding either
+into the `PASS`. The guard is on the kernel alone, so a Linux box that cannot actually
+trace FAILS rather than skipping. A skip is covered by CI rather than by nothing:
+`.github/workflows/locktrace.yml` runs the tracer's track on every PR touching the tracer,
+the guard, the mutations or the core install, and `.github/workflows/lockview.yml` runs the
+renderer's capture track on every PR touching a lock-view file. But a Mac `ci` run still has
+not verified them itself, so read that skip the way the archive round trip below teaches you
+to read a green `./test.sh all`: the PR's own job is what covers you, not the run you just
+watched.
 
 This has already cost a round trip: making `pgpm.transmute` a procedure broke
 `tests/archive/fixtures.sql`, whose `mk_archive_table` was a function calling it (a

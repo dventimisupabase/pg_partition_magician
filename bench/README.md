@@ -467,11 +467,16 @@ the stall exceeds a real client's patience. Keep all of them.
 ## Lock-sequence renderer (`bench/lock_view.sh`, issue #392)
 
 Draws a **picture** of a maintenance tick's lock sequence, for a human to look at. It is
-**not** a guard: it asserts nothing about pgpm's behaviour and blocks no merge, so it never
-runs in CI and passes no build/fail verdict of its own. `bench/lock_trace.sh` is the guard
-(it runs in `./test.sh locktrace` and answers a yes/no question with eBPF); this tool answers
-"what actually happened, in what order, on which relations" by turning the same kind of eBPF
-capture into a timeline you can read.
+**not** a guard over pgpm: it asserts nothing about the extension's behaviour and blocks no
+merge on it. `bench/lock_trace.sh` is that guard (it runs in `./test.sh locktrace` and answers
+a yes/no question with eBPF); this tool answers "what actually happened, in what order, on
+which relations" by turning the same kind of eBPF capture into a timeline you can read.
+
+CI does run it, on itself. `./test.sh lockview` drives this harness end to end and then runs the
+pairing proof, and `.github/workflows/lockview.yml` runs that track on every PR touching a
+lock-view file, so the **instrument** is guarded even though the thing it measures is not
+(issue #398). The distinction is the whole point: nothing ships on a figure, but an instrument
+that fabricates a grant tells its reader the confident opposite of the truth.
 
 ### Invocation
 
@@ -616,7 +621,18 @@ Design rationale, the capture contract, the fold, and the drawing rules are writ
 `bench/lock_timeout_pairing_demo.sh` is a runnable, two-session demonstration of a defect that
 was found and fixed in `bench/lock_view.py`'s eBPF probe: an aborted wait under `lock_timeout`
 must be paired with and counted against its own request, never left to be silently stolen and
-misreported by whatever `LockRelationOid` return comes next. Nothing runs it automatically (no
-`test.sh` wiring, no CI job); it exists so the discrimination proof for that fix stays a runnable,
-committed artifact instead of prose in a report that will eventually be deleted. See its own
-header for what it demonstrates and how to run it.
+misreported by whatever `LockRelationOid` return comes next. See its own header for what it
+demonstrates and how to run it.
+
+It is also a guard, and the only one that covers that defect. `./test.sh lockview` runs it as its
+second step, and `.github/workflows/lockview.yml` runs that track on every PR touching a lock-view
+file (issue #398). It had to grow assertions to do that, because a demo that only prints what a
+reader should look for cannot fail, and a check that cannot fail gates nothing. Its six checks are
+four observations plus two liveness witnesses, and the witnesses are not decoration: every other
+assertion it makes is a negative, so a run in which session A never acquired the lock would satisfy
+all of them while proving nothing at all.
+
+Measured against a probe with the fix hand-reverted, exactly as its header describes: two lock
+events instead of one, a fabricated `wait_ns` of 100541273 against a 100 ms `lock_timeout`, and
+`unmatched` 0 instead of 1. Three of the six checks flip, and both liveness witnesses stay green, so
+the failure is attributable to the defect rather than to a fixture that quietly did nothing.

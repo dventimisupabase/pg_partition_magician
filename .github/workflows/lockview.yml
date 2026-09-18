@@ -1,0 +1,111 @@
+name: Lock-view capture guard
+
+# Gates bench/lock_view.py, the lock-sequence renderer's eBPF CAPTURE half (issue #398).
+#
+# WHY ITS OWN FILE, when #398 proposed "a new job in locktrace.yml". GitHub Actions path filters are
+# WORKFLOW-level: `on.pull_request.paths` applies to every job in the file and there is no per-job
+# equivalent. A second job in locktrace.yml would therefore inherit THAT workflow's filter, so it
+# would fire on every pgpm_core/install.sql change (expensive, and unrelated to what changed) while
+# still not firing on a change to bench/lock_view.py itself -- which is the exact gap #398 exists to
+# close. Its own file is the only way to path-filter this to the lock-view files alone without
+# taking on a third-party changed-files action.
+#
+# WHAT IT COVERS, and why the cheap job is not enough. lint.yml's `Lock-view self-test` already
+# covers the renderer's ASSERTING half -- the four refusals, the fold, the tiers, the wait threshold,
+# the producer semantics -- in about 25 seconds with no container. The CAPTURE is the half it cannot
+# reach, and the capture is where the expensive defect lived: `on_lock_ret` paired with whatever sat
+# in `pending[pid]`, so an aborted lock wait (lock_timeout raises ERROR, PostgreSQL siglongjmps out,
+# and the uretprobe's return trampoline never fires) left a stale entry that the next catalog return
+# consumed, emitting a FABRICATED grant and erasing the evidence that a wait had been lost. It passed
+# every cheap check: {"dropped": 0, "unmatched": 0}, loaded cleanly through the consumer, refused by
+# nothing. That is this repo's recurring defect exactly -- a green result that would also be green
+# against broken code.
+#
+# THE NON-GOAL THIS REVERSES, stated here rather than left for a reader to trip over. The renderer's
+# design spec listed "No CI job" among its non-goals, because the renderer is a human instrument that
+# gates no merge. That reasoning holds for the FIGURE and not for the PROBE: nothing ships on the
+# figure, but an instrument that fabricates a grant tells its reader the confident opposite of the
+# truth, and prose is all that currently stands between a simplification of those twenty lines of BPF
+# C and the defect coming back. The spec has been AMENDED with this reasoning rather than silently
+# contradicted; see its Non-goals section.
+#
+# test.sh IS in the filter, although it is not itself a lock-view file, because the `lockview`
+# track's body lives there. Leaving it out meant a PR that only weakened `run_lockview` -- dropping
+# the pairing proof, loosening its assertions -- triggered no job at all and merged unguarded, which
+# is the same shape of gap #398 exists to close.
+#
+# An earlier revision of this file left it out and justified that by noting locktrace.yml's filter
+# includes test.sh. That justification was WRONG: locktrace.yml's only step runs `./test.sh
+# locktrace`, which never touches this track, so the sentence claimed coverage nothing performed --
+# the same defect #395 fixed one file over. Recorded rather than quietly corrected, because this
+# repo's recurring failure is precisely a claim that reads as protection and is not one.
+#
+# The marginal cost is small: locktrace.yml ALREADY starts a privileged eBPF container on every
+# test.sh change, so this adds one parallel ~2m job to PRs that were paying for one already.
+#
+# Duplicating locktrace.yml's kernel-header step rather than factoring it out is deliberate: each
+# eBPF workflow states its own environmental assumption, so losing it is legible in the job that
+# needs it instead of in a shared file neither job names.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'bench/lock_view.py'
+      - 'bench/lock_view.sh'
+      - 'bench/plot_lock_view.py'
+      - 'bench/lock_view_selftest.py'
+      - 'bench/lock_timeout_pairing_demo.sh'
+      - 'bench/lock_view_prefix_demo.sh'
+      - 'bench/lock_view_names_scope_demo.sh'
+      - 'bench/sql/lockview_names.sql'
+      - 'bench/fixtures/lockview/**'
+      - 'test.sh'
+      - '.github/workflows/lockview.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'bench/lock_view.py'
+      - 'bench/lock_view.sh'
+      - 'bench/plot_lock_view.py'
+      - 'bench/lock_view_selftest.py'
+      - 'bench/lock_timeout_pairing_demo.sh'
+      - 'bench/lock_view_prefix_demo.sh'
+      - 'bench/lock_view_names_scope_demo.sh'
+      - 'bench/sql/lockview_names.sql'
+      - 'bench/fixtures/lockview/**'
+      - 'test.sh'
+      - '.github/workflows/lockview.yml'
+  workflow_dispatch:
+
+jobs:
+  lockview:
+    name: eBPF lock-view capture / PG17
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # The one environmental assumption this job makes, asserted up front so that losing it is a
+      # legible failure instead of an opaque BCC compile error a hundred lines into a build log. The
+      # install attempt is a remedy, not a skip: if headers still cannot be had, the job FAILS,
+      # because a guard that never ran is unverified.
+      - name: Require kernel headers matching the runner's kernel
+        run: |
+          if [ -d "/lib/modules/$(uname -r)/build" ] || [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
+            echo "kernel headers present for $(uname -r)"
+            exit 0
+          fi
+          echo "no headers for $(uname -r); attempting install..."
+          sudo apt-get update -qq
+          sudo apt-get install -y "linux-headers-$(uname -r)" || true
+          if [ -d "/lib/modules/$(uname -r)/build" ] || [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
+            echo "kernel headers installed for $(uname -r)"
+            exit 0
+          fi
+          echo "::error::No kernel headers for $(uname -r) and none installable. BCC cannot compile"
+          echo "::error::its BPF program, so the lock-view capture guard cannot run. See issue #389."
+          exit 1
+
+      # Runs the capture end to end and then the pairing proof, which is the half that discriminates.
+      - name: Run the lockview track
+        run: ./test.sh lockview
