@@ -29,11 +29,19 @@ name: Lock-view capture guard
 # C and the defect coming back. The spec has been AMENDED with this reasoning rather than silently
 # contradicted; see its Non-goals section.
 #
-# WHAT IS DELIBERATELY NOT IN THE FILTER: test.sh. The job runs `./test.sh lockview`, so a change to
-# that track is not covered by this workflow's own trigger. That is the stated scope ("the lock-view
-# files only") and the cheaper choice -- test.sh changes often, and this job is privileged and slow.
-# locktrace.yml's filter does include test.sh, so a change there is still exercised by an eBPF job,
-# just not by this one.
+# test.sh IS in the filter, although it is not itself a lock-view file, because the `lockview`
+# track's body lives there. Leaving it out meant a PR that only weakened `run_lockview` -- dropping
+# the pairing proof, loosening its assertions -- triggered no job at all and merged unguarded, which
+# is the same shape of gap #398 exists to close.
+#
+# An earlier revision of this file left it out and justified that by noting locktrace.yml's filter
+# includes test.sh. That justification was WRONG: locktrace.yml's only step runs `./test.sh
+# locktrace`, which never touches this track, so the sentence claimed coverage nothing performed --
+# the same defect #395 fixed one file over. Recorded rather than quietly corrected, because this
+# repo's recurring failure is precisely a claim that reads as protection and is not one.
+#
+# The marginal cost is small: locktrace.yml ALREADY starts a privileged eBPF container on every
+# test.sh change, so this adds one parallel ~2m job to PRs that were paying for one already.
 #
 # Duplicating locktrace.yml's kernel-header step rather than factoring it out is deliberate: each
 # eBPF workflow states its own environmental assumption, so losing it is legible in the job that
@@ -51,6 +59,7 @@ on:
       - 'bench/lock_view_names_scope_demo.sh'
       - 'bench/sql/lockview_names.sql'
       - 'bench/fixtures/lockview/**'
+      - 'test.sh'
       - '.github/workflows/lockview.yml'
   pull_request:
     branches: [ main ]
@@ -64,6 +73,7 @@ on:
       - 'bench/lock_view_names_scope_demo.sh'
       - 'bench/sql/lockview_names.sql'
       - 'bench/fixtures/lockview/**'
+      - 'test.sh'
       - '.github/workflows/lockview.yml'
   workflow_dispatch:
 
