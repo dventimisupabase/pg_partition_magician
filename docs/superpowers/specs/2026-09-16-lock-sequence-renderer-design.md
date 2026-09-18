@@ -472,11 +472,16 @@ remaining non-goals stand unchanged.
 
 ## Follow-up
 
-Filed as [#393](https://github.com/dventimisupabase/pg_partition_magician/issues/393).
+Filed as [#393](https://github.com/dventimisupabase/pg_partition_magician/issues/393), and fixed on
+2026-09-18.
 
-The guard's vocabulary calls a lock request a grant (`MG_GRANTS`, "took ACCESS EXCLUSIVE") because
-`attach_uprobe` fires at function entry. Its conclusions are unaffected, and the argument is worth
-recording rather than re-deriving: a backend cannot commit while blocked on a lock it has itself
-requested, so the request-based and grant-based intervals contain exactly the same commits. Neither a
-false pass nor a false fail is reachable through it. The wording is still imprecise, and touching
-`lock_trace.sh` is explicitly outside this design.
+The guard's vocabulary called a lock request a grant (`MG_GRANTS`, "took ACCESS EXCLUSIVE") because
+`attach_uprobe` fires at function entry. Its conclusions were never affected, and the argument is
+worth recording rather than re-deriving: a backend cannot commit while blocked on a lock it has
+itself requested, so the request-based and grant-based intervals contain exactly the same commits.
+Neither a false pass nor a false fail was reachable through it.
+
+`bench/lock_trace.sh` now reads `MG_REQUESTS` / `requests` / `last_request`, and its check labels say
+"requested" rather than "took". That argument is recorded in the guard's own header, next to the code
+it applies to, so the next reader meets it there rather than deriving it again. Touching that file
+was outside THIS design, which is why it was filed separately rather than folded in.

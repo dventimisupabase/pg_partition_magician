@@ -40,6 +40,23 @@
 # boundary vocabulary #265 and #279 are written in, and what #383 specified. A commit releases the
 # lock, so this is the property.
 #
+# REQUESTS, NOT GRANTS (issue #393). bench/lock_probe.py attaches with attach_uprobe, which fires at
+# function ENTRY, so every `kind: "lock"` record is a lock REQUEST, and the variables and labels below
+# say so. The guard's conclusions are unaffected, and the argument is recorded here so the next reader
+# does not have to re-derive it: under the request reading BOTH endpoints of the interval move
+# earlier, but the interval contains exactly the SAME commits, because a backend cannot commit while
+# it is blocked on a lock it has itself requested. A commit between mg_ret's request and its grant is
+# impossible (the backend is waiting), and a commit between ml's request and its grant is likewise
+# impossible -- and the request-based endpoint excludes that window anyway, so it cannot admit a
+# spurious commit either. Neither a false pass nor a false fail is reachable through the distinction.
+# On this fixture the two readings are microseconds apart regardless, it being single-backend and
+# uncontended.
+#
+# Under CONTENTION the distinction is the whole signal: the distance between request and grant IS the
+# wait. bench/lock_view.py adds an attach_uretprobe precisely so that span is observed rather than
+# inferred, and shipping that beside a guard whose variables called a request a grant invited the
+# misreading this repo keeps paying for.
+#
 # The RELEASE is deliberately not asserted, and not even probed. UnGrantLock and RemoveLocalLock take
 # pointers to structs, so recovering a relation oid from them means reading fields at offsets that
 # shift between PostgreSQL versions -- the fragility this instrument exists to avoid.
@@ -176,41 +193,41 @@ def emit(**kw):
 try:
     records = [json.loads(line) for line in open(path) if line.strip()]
 except FileNotFoundError:
-    emit(EVENT_COUNT=0, DROPPED=-1, MG_GRANTS=0, ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
+    emit(EVENT_COUNT=0, DROPPED=-1, MG_REQUESTS=0, ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
 dropped = next((r["dropped"] for r in records if "dropped" in r), -1)
 events = [r for r in records if "kind" in r]
 
-grants = [i for i, e in enumerate(events)
+requests = [i for i, e in enumerate(events)
           if e["kind"] == "lock" and e["oid"] == mg and e["mode"] == ACCESS_EXCLUSIVE]
-if not grants:
-    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=0, MG_BACKENDS=0,
+if not requests:
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_REQUESTS=0, MG_BACKENDS=0,
          ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-# The backend under test, taken from the trace: whoever took mg_ret's strong lock. How many DISTINCT
-# backends did so is reported alongside, and asserted to be one -- if a second session had also taken
-# it, this anchor could be someone else's and the interval would splice two sessions together, which
-# is the direction that PASSES and so the one worth checking rather than assuming.
-backends = {events[i]["pid"] for i in grants}
-last_grant = grants[-1]
-tick_pid = events[last_grant]["pid"]
+# The backend under test, taken from the trace: whoever REQUESTED mg_ret's strong lock. How many
+# DISTINCT backends did so is reported alongside, and asserted to be one -- if a second session had
+# also requested it, this anchor could be someone else's and the interval would splice two sessions
+# together, which is the direction that PASSES and so the one worth checking rather than assuming.
+backends = {events[i]["pid"] for i in requests}
+last_request = requests[-1]
+tick_pid = events[last_request]["pid"]
 
-# From that LAST strong-lock grant (retain holds it across every drop in its step, releasing once at
-# that step's commit) to the FIRST time the SAME backend touches ml's parent at all.
+# From that LAST strong-lock REQUEST (retain holds the lock across every drop in its step, releasing
+# once at that step's commit) to the FIRST time the SAME backend touches ml's parent at all.
 ml_start = [i for i, e in enumerate(events)
-            if i > last_grant and e["pid"] == tick_pid
+            if i > last_request and e["pid"] == tick_pid
             and e["kind"] == "lock" and e["oid"] == ml]
 if not ml_start:
-    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+    emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_REQUESTS=len(requests),
          MG_BACKENDS=len(backends), ML_ANCHOR="false", COMMIT_BEFORE_ML="false")
     sys.exit(0)
 
-between = events[last_grant:ml_start[0]]
+between = events[last_request:ml_start[0]]
 commits = sum(1 for e in between if e["kind"] == "commit" and e["pid"] == tick_pid)
 
-emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_GRANTS=len(grants),
+emit(EVENT_COUNT=len(events), DROPPED=dropped, MG_REQUESTS=len(requests),
      MG_BACKENDS=len(backends), ML_ANCHOR="true",
      COMMITS_BETWEEN=commits, COMMIT_BEFORE_ML=str(commits > 0).lower())
 PY
@@ -218,11 +235,11 @@ PY
 
 # --- the witnesses that the ordering assertion is about a non-empty interval --------------------
 check "the probe captured events"                 "$([ "${EVENT_COUNT:-0}" -gt 0 ] && echo true || echo false)" "true"
-check "mg_ret took ACCESS EXCLUSIVE in the tick"  "$([ "${MG_GRANTS:-0}" -gt 0 ] && echo true || echo false)" "true"
-# The anchor identifies the backend under test, so a second backend holding mg_ret's strong lock in
+check "mg_ret requested ACCESS EXCLUSIVE in the tick" "$([ "${MG_REQUESTS:-0}" -gt 0 ] && echo true || echo false)" "true"
+# The anchor identifies the backend under test, so a second backend requesting mg_ret's strong lock in
 # the same window would let the interval splice two sessions together -- and that is the direction
 # that PASSES, since the other session would supply the commit. Asserted, not assumed.
-check "exactly one backend took mg_ret's strong lock" "${MG_BACKENDS:-0}" "1"
+check "exactly one backend requested mg_ret's strong lock" "${MG_BACKENDS:-0}" "1"
 check "ml's turn is visible in the same tick"     "${ML_ANCHOR:-false}" "true"
 # Counted in the kernel, at the instant of the event, by the probe itself. Every assertion here is a
 # claim about which events are present, so a stream with holes is not evidence of anything -- and
@@ -240,7 +257,7 @@ check "and regrained ml in the same tick" \
 
 # --- the property itself -----------------------------------------------------------------------
 check "a transaction commits between mg_ret's lock and ml's turn" "${COMMIT_BEFORE_ML:-false}" "true"
-printf '      observed: %s event(s) captured, %s commit(s) between mg_ret'"'"'s last ACCESS EXCLUSIVE and ml'"'"'s first lock\n' \
+printf '      observed: %s event(s) captured, %s commit(s) between mg_ret'"'"'s last ACCESS EXCLUSIVE request and ml'"'"'s first lock\n' \
        "${EVENT_COUNT:-0}" "${COMMITS_BETWEEN:-0}"
 
 exit "$fail"
