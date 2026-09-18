@@ -26,7 +26,8 @@ LIVING=(README.md ONBOARDING.md docs/guide.md docs/reference.md docs/runbook.md
 
 FROZEN=(frozen/REDESIGN.md frozen/NIGHT-LOG.md frozen/from_hypertable_design.md
         frozen/from_hypertable_test_plan.md frozen/postgresql_online_partition_migration_summary.md
-        frozen/blog-partition-a-live-table.md frozen/STORAGE-IO-ON-GREEN.md)
+        frozen/blog-partition-a-live-table.md frozen/STORAGE-IO-ON-GREEN.md
+        frozen/2026-09-16-lock-sequence-renderer-design.md frozen/2026-09-16-lock-sequence-renderer.md)
 
 # Identifiers that install.sql once defined and no longer does. Deliberately a literal list rather than a
 # derived one: deriving "every pgpm identifier" from SQL text produces false positives on prose, and a

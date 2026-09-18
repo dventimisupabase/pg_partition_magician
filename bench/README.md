@@ -614,8 +614,8 @@ waits" section for the reasoning.
 
 ### The spec
 
-Design rationale, the capture contract, the fold, and the drawing rules are written up in
-[`docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md`](../docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md).
+Design rationale, the capture contract, the fold, and the drawing rules are written up in the
+design spec archived under [`frozen/`](../frozen/README.md).
 
 ### The request/return pairing proof
 
