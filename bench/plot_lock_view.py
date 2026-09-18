@@ -329,6 +329,25 @@ TIER_STYLE = {
     "strong": (0.34, 1.0, 1.2),
 }
 
+# The floored style for a sparse all-light row (issue #396). Same half_height as "light", and that
+# is the whole point rather than an oversight: HEIGHT is the severity channel (0.10 light, 0.22
+# saturated, 0.34 strong), so a floored mark must never grow tall enough to read as a higher tier
+# than the lock actually was. Only alpha and linewidth -- the legibility channel -- are raised.
+LIGHT_FLOOR_STYLE = (0.10, 0.9, 1.0)
+
+# Marks per row at or below which an all-light row draws with LIGHT_FLOOR_STYLE instead of
+# TIER_STYLE["light"] (issue #396). A named constant behind a predicate rather than an inline
+# comparison in the drawing loop, for exactly the reason WAIT_DRAW_THRESHOLD_NS records above: a
+# threshold buried in that loop is code no test run ever executes.
+#
+# The number is a JUDGEMENT; the anchors it sits between are measured. The golden fixture's two
+# all-light rows hold 1 mark (pgpm.archive_result) and 11 (pgpm.dropped_fk), and both are the
+# legibility defect #396 was filed about. A real capture's pgpm.config holds 313 AccessShare events
+# and reads as an unmistakable grey band -- that row is the recession working as designed, and
+# flooring it would undo the very thing the light tier exists to do. 25 sits an order of magnitude
+# below 313 and comfortably above 11.
+VISIBILITY_FLOOR_MAX_MARKS = 25
+
 # Nanoseconds. Extracted to its own predicate (fix round 2, Finding 3) rather than left as an
 # inline `if wait > 1_000_000` inside render()'s drawing loop, per this branch's own precedent
 # with `tier()`: a threshold buried in a drawing loop that no fixture's real wait_ns values ever
@@ -363,6 +382,25 @@ def all_light(evs: list) -> bool:
     onto.
     """
     return bool(evs) and all(tier(e["mode"]) == "light" for e in evs)
+
+
+def needs_visibility_floor(evs: list) -> bool:
+    """True when a folded row is all light-tier AND sparse enough to render as visually empty.
+
+    Two mitigations for one defect, answering different questions. The spec:209-210 annotation
+    tells a reader HOW MANY events such a row holds; this decides whether the MARKS THEMSELVES are
+    raised out of invisibility, which is WHERE they happened. Issue #396 is the gap between those:
+    `pgpm.archive_result`'s single mark draws at alpha 0.35 on a 0.2-row-tall tick, which reads
+    exactly like an empty row even though the figure's own `captured` stamp says otherwise, and a
+    count written beside an empty-looking row still shows the reader nothing.
+
+    Density-gated, not merely `all_light`. A row of 313 AccessShare events is also all-light, and
+    it already reads as an unmistakable grey band; flooring that one would undo the recession the
+    light tier exists for. That distinction is the only thing separating this predicate from
+    `all_light`, and on the golden fixture the two coincide -- which is why the self-test exercises
+    the threshold directly rather than only through a rendered figure.
+    """
+    return all_light(evs) and len(evs) <= VISIBILITY_FLOOR_MAX_MARKS
 
 
 def footer_color(dropped: int, unmatched: int) -> str:
@@ -438,11 +476,19 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
     drawn = 0
     wait_spans = 0
     annotated_rows = 0
+    floored_rows = 0
+    floored_marks = 0
     rung = 0
     fig, ax = plt.subplots(figsize=(12, 1.1 + 0.42 * len(order)))
     for y, label in enumerate(order):
         evs = rows[label]
         last_rung_by_oid = {}
+        # Decided ONCE per row, before any mark is drawn (issue #396). Gated on
+        # `modes != "strong"` for the same reason the annotation below is: that filter removes
+        # every light mark from such a row on purpose, so there is nothing left to make visible.
+        floor_row = modes != "strong" and needs_visibility_floor(evs)
+        if floor_row:
+            floored_rows += 1
         for e in evs:
             mode_tier = tier(e["mode"])
             if e["oid"] in cap.dropped_oids:
@@ -450,7 +496,16 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
             if modes == "strong" and mode_tier == "light":
                 continue
             drawn += 1
-            half_height, alpha, linewidth = TIER_STYLE[mode_tier]
+            if floor_row and mode_tier == "light":
+                # Counted HERE, where the floored style is actually selected, and deliberately not
+                # beside `floored_rows` where the row predicate was evaluated: a counter
+                # incremented next to a decision cannot prove the decision was acted upon. This
+                # mirrors `wait_spans`, which increments inside the branch that draws, and closes
+                # the gap this module already recorded once for WAIT_DRAW_THRESHOLD_NS.
+                floored_marks += 1
+                half_height, alpha, linewidth = LIGHT_FLOOR_STYLE
+            else:
+                half_height, alpha, linewidth = TIER_STYLE[mode_tier]
             if e["mode"] == ACCESS_EXCLUSIVE:
                 color = RED
             elif mode_tier == "light":
@@ -528,6 +583,8 @@ def render(cap: Capture, out_dir: pathlib.Path, modes: str = "all") -> dict:
         "span_ms": round(span_ms, 1),
         "wait_spans": wait_spans,
         "annotated_rows": annotated_rows,
+        "floored_rows": floored_rows,
+        "floored_marks": floored_marks,
         "rung": rung,
         # Finding 3: carried on the stamp, not just on `cap`, so main()'s printed line and a
         # self-test both see the same normalized producer label and the same sentence render()
