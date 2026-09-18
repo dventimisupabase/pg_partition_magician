@@ -34,12 +34,12 @@ parameters (`p_region`, `p_endpoint` for S3-compatible stores like MinIO or Supa
 
 ## Automatic vs. manual
 
-| | Automatic | Manual |
-|---|---|---|
-| Turn on | `pgpm.set_archive_fn(parent, fn)`, once | nothing to set up |
-| Runs | every `pgpm.maintain()` tick, in bounded chunks | whenever you call it |
-| Drop safety | `pgpm.retire()` waits until fully archived | your own script's responsibility |
-| Call | -- | `archive.to_s3(parent, child, lo, hi)` / `archive.to_s3_parquet(...)` |
+|             | Automatic                                       | Manual                                                                |
+|-------------|-------------------------------------------------|-----------------------------------------------------------------------|
+| Turn on     | `pgpm.set_archive_fn(parent, fn)`, once         | nothing to set up                                                     |
+| Runs        | every `pgpm.maintain()` tick, in bounded chunks | whenever you call it                                                  |
+| Drop safety | `pgpm.retire()` waits until fully archived      | your own script's responsibility                                      |
+| Call        | --                                              | `archive.to_s3(parent, child, lo, hi)` / `archive.to_s3_parquet(...)` |
 
 Automatic is the normal way to use this module. Manual exists for a one-off archive or a workflow
 that doesn't want pgpm's own drop-gating; call it, then drop the partition however you like:
