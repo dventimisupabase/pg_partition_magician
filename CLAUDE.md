@@ -81,7 +81,7 @@ the check green.
 
   ```bash
   npx -y markdownlint-cli2@0.13.0 $(git ls-files '*.md' \
-    | grep -v '^postgresql_online_partition_migration_summary.md$' | tr '\n' ' ')
+    | grep -v '^frozen/postgresql_online_partition_migration_summary.md$' | tr '\n' ' ')
   # add --fix to auto-correct the structural rules (MD022/MD032/MD012/MD004/MD009)
   ```
 

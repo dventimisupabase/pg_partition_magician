@@ -65,6 +65,7 @@ docker compose --profile pg15 down -v
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
 | `docs/runbook.md` | Operational runbook: symptom -> step-by-step procedures (e.g. RI violations after a preserve conversion) |
+| `frozen/` | Point-in-time design notes and journals, kept for history and not maintained against the code -- see `frozen/README.md`. Nothing in the living docs above links to it; `scripts/check_living_docs.sh` enforces that |
 
 ## The mental model (in one breath)
 

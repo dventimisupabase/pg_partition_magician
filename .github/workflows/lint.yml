@@ -19,7 +19,7 @@ jobs:
           # artifact, not our authored prose, so we don't reformat it.
           globs: |
             **/*.md
-            !postgresql_online_partition_migration_summary.md
+            !frozen/postgresql_online_partition_migration_summary.md
 
   living-docs:
     name: Living docs
