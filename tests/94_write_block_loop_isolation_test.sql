@@ -7,13 +7,14 @@
 -- turned one recurring point of lock contention on one old partition into a stalled retention
 -- backlog spanning many unrelated partitions.
 --
--- This test proves isolation directly rather than via real lock contention (pgTAP wraps each file
--- in one transaction, so a genuine multi-session lock-timeout probe belongs in bench/, not here,
--- per this project's own established convention): a middle-ordered eligible child's underlying
--- table is dropped directly (bypassing pgpm entirely), leaving its pgpm.part row attached but
--- pointing at nothing. _install_write_block's `create trigger ... on <that child>` then fails
--- deterministically with a real "relation does not exist" error -- the same shape of failure a
--- lock timeout would produce (an exception raised mid-loop), without needing real contention.
+-- This test proves isolation directly rather than via real lock contention (a genuine lock-timeout
+-- probe needs a second session observing a first one mid-operation, which a single pgTAP file cannot
+-- provide, so it belongs in bench/, not here, per this project's own established convention): a
+-- middle-ordered eligible child's underlying table is dropped directly (bypassing pgpm entirely),
+-- leaving its pgpm.part row attached but pointing at nothing. _install_write_block's
+-- `create trigger ... on <that child>` then fails deterministically with a real "relation does not
+-- exist" error -- the same shape of failure a lock timeout would produce (an exception raised
+-- mid-loop), without needing real contention.
 create extension if not exists pgtap;
 
 select plan(9);

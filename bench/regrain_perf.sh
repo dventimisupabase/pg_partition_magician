@@ -8,9 +8,10 @@
 # WHY THIS IS NOT A pgTAP TEST. The assertions read pg_stat_all_tables scan counters, and those are
 # accumulated per backend and only flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports
 # seq_tup_read growth of 0 when read inside the same transaction and 20000 when read across transactions.
-# pgTAP wraps each file in BEGIN/ROLLBACK, so the same assertions there would read 0 unconditionally and
-# pass no matter how badly the code regressed. Every tick below therefore runs in its own transaction,
-# which is also how maintain drives it in production.
+# The sample therefore has to be taken in a later transaction than the work it measures, which this
+# harness makes explicit by running every tick below in its own transaction, which is also how maintain
+# drives it in production. It lives in bench/ alongside the sibling lock guards, which need a second
+# concurrent session observing a first one mid-operation that a single pgTAP file cannot provide.
 #
 # WHY COUNTERS AND NOT WALL CLOCK. Timing thresholds are flaky on shared CI runners. Scan counters are
 # exact and their expected value is zero, so the assertion needs no margin.

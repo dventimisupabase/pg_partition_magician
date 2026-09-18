@@ -30,8 +30,10 @@ and absence-of-setup look identical unless you separate them deliberately.
   test), and check your instrument's cost against the window's width before trusting it
   (~100 ms per `docker exec` sample cannot land inside a ~400 ms scan; poll server-side).
 - **Counters flush at transaction end.** `pg_stat_all_tables` scan counters read 0 when
-  sampled inside the transaction that produced them, so those assertions cannot live in
-  pgTAP, which wraps each file in a transaction. They belong in a `bench/` shell harness.
+  sampled inside the transaction that produced them, so the sample has to come from a
+  later transaction than the work it measures. Those assertions belong in a `bench/` shell
+  harness, which runs every tick in its own transaction, alongside the lock guards, which
+  need a second concurrent session that one pgTAP file cannot give them.
 
 ## `./test.sh all` is not what CI runs
 

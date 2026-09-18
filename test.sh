@@ -41,13 +41,13 @@
 #
 # The `archive` track is also separate: it installs the OPTIONAL pgpm_archive module on top of the
 # core and exercises it against a real MinIO container standing in for S3 (tests/archive/). Its own
-# image (pgpm_test:17-archive) adds pgsql-http on top of the stock pg17 image. Unlike `timescale`,
-# it installs once and runs every tests/archive/db/*.sql via pg_prove against one shared database,
-# each file wrapped in its own BEGIN/ROLLBACK -- the same pattern the default matrix uses. This used
-# to need a disposable database per file, because the old paced worker's
-# archive.tick()/archive._encode_upload_ndjson_commits committed internally as part of normal
-# operation, which a rolled-back transaction would not undo. That apparatus is gone (issue #240);
-# nothing left in this track commits internally, so a shared database is safe. After the pgTAP
+# image (pgpm_test:17-archive) adds pgsql-http on top of the stock pg17 image. Like the default matrix,
+# it runs every tests/archive/db/*.sql via pg_prove in ONE DATABASE PER FILE, each one cloned from a
+# template (pgpm_arch_tmpl) that carries the fixtures and both modules. These files used to isolate
+# themselves with BEGIN/ROLLBACK against one shared database, which stopped being possible once the
+# fixture's pgpm.transmute became a committing PROCEDURE (#275): transaction control is illegal inside
+# an explicit transaction block. Cloning gives back the isolation the rollback provided, and gives it
+# for real, since a rollback never undid anything these tests pushed to MinIO. After the pgTAP
 # suite, it also runs scripts/verify_parquet.py/verify_parquet_range.py (a venv-installed Python
 # step, not psql) against the same running instance: independent-reader (pyarrow + DuckDB)
 # verification of archive._pq_to_parquet/_range, ported into this repo proper from a standalone
@@ -343,12 +343,12 @@ run_observe() {  # pg_flight_recorder observability track: impact_report correla
 }
 
 # The pgpm_archive track: PG17 + pgsql-http against a real MinIO container standing in for S3.
-# Installs once into the `postgres` database and runs every tests/archive/db/*.sql via pg_prove,
-# each file wrapped in its own BEGIN/ROLLBACK -- the same shared-database pattern the default
-# matrix uses, not a disposable database per file (that was only ever needed for the old paced
-# worker's internal commits, gone since #240). MinIO has no docker-compose service of its own for
-# the `mc` client, so bucket setup runs as a one-off `docker run` against the network name pinned
-# in docker-compose.yml (pgpm_test_net) rather than a compose-managed service.
+# Builds one template database (pgpm_arch_tmpl) carrying the fixtures and both modules, then runs
+# every tests/archive/db/*.sql via pg_prove against its OWN clone of it -- the same one-database-per-file
+# pattern the default matrix uses, for the same reason (the clone loop below states it in full). MinIO
+# has no docker-compose service of its own for the `mc` client, so bucket setup runs as a one-off
+# `docker run` against the network name pinned in docker-compose.yml (pgpm_test_net) rather than a
+# compose-managed service.
 run_archive() {
   local prof="archive" svc="archive" fail=0
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
@@ -436,11 +436,14 @@ run_archive() {
 # ------------------------------------------------------------------------------------------------------
 # The `perf` track: guard against data-coupled locks and data-coupled work (issues #267, #275).
 #
-# NOT part of the pgTAP suite, and deliberately so. Its assertions read pg_stat_all_tables scan counters,
-# which are flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports growth of 0 when read
-# inside the same transaction and 20000 across transactions. pgTAP wraps each file in BEGIN/ROLLBACK, so
-# the same assertions there would read 0 unconditionally and pass however badly the code regressed. Every
-# tick in the harness runs in its own transaction, which is also how maintain drives it in production.
+# NOT part of the pgTAP suite, and deliberately so, for two reasons that outlive any one isolation scheme.
+# The lock guards need a SECOND SESSION observing a first one mid-operation (a reader under a short
+# lock_timeout while the O(rows) scan runs), and a pgTAP file is one session, so the regression they exist
+# to catch would be invisible written as one. The work guards read pg_stat_all_tables scan counters, which
+# are flushed at TRANSACTION END: measured, a seq scan of 20000 rows reports growth of 0 when read inside
+# the same transaction and 20000 across transactions, so the sample has to be taken in a later transaction
+# than the work it measures. Every tick in the harness runs in its own transaction, which is also how
+# maintain drives it in production.
 run_perf() {
   local prof="pg17" svc="postgres17" c="pgpm_test-17"
   $DC --profile "$prof" up -d --wait "$svc"
