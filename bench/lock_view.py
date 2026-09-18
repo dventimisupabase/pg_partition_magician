@@ -36,9 +36,10 @@ to steal.
 
 The discrimination proof for this exact defect (a genuine two-session `lock_timeout` scenario, run
 against both the fixed and the pre-fix code) is committed as a runnable script,
-`bench/lock_timeout_pairing_demo.sh` -- nothing runs it automatically, per its own header, but it is
-not gitignored scratch either: it is the reason these twenty lines of catalog-filter placement exist,
-kept runnable rather than left as prose in a report that will eventually be deleted.
+`bench/lock_timeout_pairing_demo.sh`, and CI runs it: it is the asserting half of the `lockview`
+track (issue #398), and the only check anywhere that fails when this filter placement is undone.
+Every cheap check passed the defect -- the capture reported {"dropped": 0, "unmatched": 0} and the
+consumer refused nothing -- so that script is not a record of the fix, it is the fix's guard.
 
 Never join on pg_backend_pid(). eBPF's bpf_get_current_pid_tgid() reports the pid as seen from the
 kernel's initial pid namespace; psql's pg_backend_pid() reports the pid as seen from inside the

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Demonstrates the fix committed as a585ae8 ("pair aborted lock waits instead of letting a return
 # steal them", issue #392): bench/lock_view.py's on_lock/on_lock_ret must consume the PENDING entry
-# for a pid BEFORE filtering on the oid's catalog status, not after. NOT run by CI or ./test.sh, and
-# nothing here calls it automatically -- it is a committed, runnable record of the discrimination
-# proof that justified those twenty lines of BPF C (bench/lock_view.py:108-121), which otherwise read
-# as redundant complexity to anyone who has not seen the defect it prevents.
+# for a pid BEFORE filtering on the oid's catalog status, not after. RUN BY CI as the asserting half
+# of the `lockview` track (./test.sh lockview, .github/workflows/lockview.yml, issue #398): it is the
+# only check anywhere that fails when that filter placement is undone, since every cheap check passed
+# the defect. It is still readable as what it was first written to be -- the committed record of the
+# discrimination proof that justified those twenty lines of BPF C (bench/lock_view.py:108-121), which
+# otherwise read as redundant complexity to anyone who has not seen the defect it prevents.
 #
 # THE DEFECT THIS GUARDS AGAINST
 #
@@ -67,8 +69,15 @@ PLOG=/tmp/pgpm_pairing_demo.log
 # HOST-side, unlike the two above: session A runs as an attached `docker exec` backgrounded by this
 # shell, so its output arrives here rather than in the container (see where it is launched).
 ALOG=/tmp/pgpm_pairing_demo.session_a.log
+BLOG=/tmp/pgpm_pairing_demo.session_b.log
+CAP=/tmp/pgpm_pairing_demo.capture.jsonl
+fail=0
 
 q() { docker exec "$C" psql -U postgres -d "$DB" -qtA -c "$1"; }
+check() { # <label> <actual> <expected>
+  if [ "$2" = "$3" ]; then printf 'PASS  %-64s %s\n' "$1" "$2"
+  else printf 'FAIL  %-64s got %s, want %s\n' "$1" "$2" "$3"; fail=1; fi
+}
 
 if ! docker exec "$C" python3 -c 'import bcc' 2>/dev/null; then
   echo "error: $C has no bcc. Start the locktrace service:" >&2
@@ -143,7 +152,8 @@ echo "session B: requesting the same lock under a 100ms lock_timeout (expect an 
 docker exec "$C" psql -U postgres -d "$DB" \
   -c "SET lock_timeout='100ms';" -c "BEGIN;" \
   -c "LOCK TABLE $TABLE IN ACCESS EXCLUSIVE MODE;" \
-  -c "ROLLBACK;" -c "SELECT relname FROM pg_class LIMIT 1;"
+  -c "ROLLBACK;" -c "SELECT relname FROM pg_class LIMIT 1;" > "$BLOG" 2>&1
+cat "$BLOG"
 
 # Let session A's sleep finish and its COMMIT land before the probe is stopped, so both sessions'
 # full activity is captured. A real wait on a real job now: before #395 this was a bare `wait` with
@@ -169,6 +179,62 @@ echo "--- tail record ---"
 docker exec "$C" tail -1 "$EVENTS"
 
 q "drop table if exists $TABLE" >/dev/null
+
+# --- assertions -----------------------------------------------------------------------------
+#
+# This script used to end by PRINTING what a reader should look for and exiting 0 regardless. That
+# was honest while nothing ran it; it is not good enough now that CI does, because a demo that
+# cannot fail gates nothing. The checks below are the same two observations the old prose named,
+# plus the liveness witnesses without which every one of them is vacuous.
+#
+# WHY NOT "no lock event carries session B's pid". That is how the prose put it, and it is not
+# available to this script: eBPF reports pids from the kernel's initial namespace and psql's
+# pg_backend_pid() reports them from inside the container's, so the two never join (see
+# bench/lock_view.py's header). The capture is discriminated on its SHAPE instead, which needs no
+# pid correlation at all -- and every one of these values flips when the fix is reverted:
+#
+#                                 fixed      pre-fix (filter moved back onto on_lock)
+#   lock events                   1          2   (A's real grant, plus B's fabricated one)
+#   largest wait_ns               ~2e4       ~1.0e8  (the 100ms lock_timeout window, measured
+#                                                    at 100488505 in the original proof run)
+#   unmatched                     1          0   (the lost wait counted, versus stolen silently)
+docker exec "$C" cat "$EVENTS" > "$CAP"
+read -r n_lock max_wait a_commit unmatched dropped <<EOF
+$(python3 - "$CAP" <<'PY'
+import json, sys
+recs = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+tail = recs[-1] if recs and "dropped" in recs[-1] else {}
+locks = [r for r in recs if r.get("kind") == "lock"]
+commits = {r["pid"] for r in recs if r.get("kind") == "commit"}
+# Session A is the only backend that can appear as a granted lock on the watched oid: B's request
+# was aborted and must never be emitted at all. So locks[0]'s pid IS A's, whenever there is one.
+a_pid = locks[0]["pid"] if locks else 0
+print(len(locks),
+      max((r["wait_ns"] for r in locks), default=0),
+      "true" if a_pid and a_pid in commits else "false",
+      tail.get("unmatched", -1),
+      tail.get("dropped", -1))
+PY
+)
+EOF
+
+# A wait anywhere near the 100ms timeout is the fabricated grant's signature. A's real grant was
+# uncontended and measured ~2e4 ns; the fabricated one carries the whole timeout window. 1ms sits
+# three orders of magnitude clear of the first and two clear of the second.
+if [ "$max_wait" -ge 1000000 ]; then near_timeout=true; else near_timeout=false; fi
+if grep -q 'canceling statement due to lock timeout' "$BLOG"; then b_aborted=true; else b_aborted=false; fi
+
 echo
-echo "expected: exactly one 'lock' event's pid never repeats with a fabricated instant grant, and"
-echo "the tail record reads unmatched: 1 (not 0)."
+echo "--- assertions ---"
+# Liveness first: without these two, every assertion below is satisfied by a run in which nothing
+# happened, which is the failure shape this whole repo is organised against.
+check "session B's wait was actually aborted by lock_timeout" "$b_aborted" true
+check "session A's commit is in the capture, so the probe outlived it" "$a_commit" true
+check "exactly one lock event: A's real grant, and no fabricated second" "$n_lock" 1
+check "no lock event carries a wait near the 100ms lock_timeout" "$near_timeout" false
+check "the aborted wait was COUNTED against its own request" "$unmatched" 1
+check "no events were dropped" "$dropped" 0
+
+echo
+if [ "$fail" = 0 ]; then echo "pairing demo: PASS"; else echo "pairing demo: FAIL"; fi
+exit "$fail"

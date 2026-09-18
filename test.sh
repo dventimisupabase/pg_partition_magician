@@ -12,10 +12,11 @@
 #   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
 #   ./test.sh discriminate               # prove each of those guards fails when its defect is present
 #   ./test.sh locktrace                  # eBPF lock-boundary observation (PG17, Linux only)
+#   ./test.sh lockview                   # the lock-sequence renderer's eBPF capture (PG17, Linux only)
 #   ./test.sh ci                         # EVERY track CI runs, in one go
 #
 # `all` means all four PostgreSQL VERSIONS, not all tracks. The timescale, observe, archive, perf,
-# discriminate and locktrace tracks each need their own image or service, so `./test.sh all` deliberately skips them
+# discriminate, locktrace and lockview tracks each need their own image or service, so `./test.sh all` deliberately skips them
 # and a green run of it does NOT mean CI will be green. That gap is real: a change to
 # pgpm_core/install.sql broke the archive track's fixture while `./test.sh all` stayed green from end
 # to end, and only the PR's archive job caught it. Use `./test.sh ci` before pushing anything that
@@ -71,8 +72,9 @@ for arg in "$@"; do
     perf) TRACK="perf" ;;
     discriminate) TRACK="discriminate" ;;
     locktrace) TRACK="locktrace" ;;
+    lockview) TRACK="lockview" ;;
     ci) TRACK="ci" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | locktrace | ci"; exit 1 ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | locktrace | lockview | ci"; exit 1 ;;
   esac
 done
 
@@ -516,6 +518,117 @@ run_locktrace() {
   echo "locktrace track: PASS"
 }
 
+# The `lockview` track: gate the lock-sequence renderer's eBPF CAPTURE half (issue #398).
+#
+# DIFFERENT IN KIND from `locktrace`, which sits next to it and shares its container. That track
+# gates pgpm's own commit boundaries, using bench/lock_probe.py as its instrument. This one asserts
+# nothing about pgpm at all -- it gates the INSTRUMENT: that bench/lock_view.py still attaches, still
+# filters catalogs in the kernel, still produces a capture the consumer will agree to draw, and --
+# the half that matters -- still pairs an aborted lock wait with its OWN request instead of leaving
+# it for the next catalog return to steal.
+#
+# WHY IT EXISTS AT ALL, given the renderer gates no merge and its design spec listed "No CI job"
+# among its non-goals. That reasoning holds for the figure and not for the probe. Nothing ships on
+# the figure, but an instrument that fabricates a grant tells its reader the confident opposite of
+# the truth, and until this track there was nothing between a simplification of those twenty lines
+# of BPF C and the defect coming back. The spec's Non-goals section has been amended with this
+# reasoning rather than silently contradicted.
+#
+# TWO STEPS, and they cover different failures:
+#
+#   1. bench/lock_view.sh end to end over a real maintain_all() tick. Covers attach, in-kernel
+#      filtering, the name snapshots and the format contract. These failures are already loud on
+#      their own (an attach error is fatal and named, a missing catalog filter shows up as tens of
+#      thousands of events, a malformed capture is refused outright by plot_lock_view.py), so this
+#      step's value is running the whole pipeline the way a human actually would, not novel coverage.
+#   2. bench/lock_timeout_pairing_demo.sh. THIS is the step that gates the silent defect, and the
+#      only one of the two that would have caught it: the fabricated grant reported
+#      {"dropped": 0, "unmatched": 0}, loaded cleanly through the consumer, and was refused by
+#      nothing. Measured against a hand-reverted probe (the mutation the demo's own header
+#      describes): 2 lock events instead of 1, a fabricated wait_ns of 100541273 against a 100 ms
+#      lock_timeout, and unmatched 0 instead of 1 -- three of its six checks flip, while BOTH its
+#      liveness witnesses stay green, so the failure is attributable to the defect rather than to a
+#      fixture that quietly did nothing.
+#
+# THE FIXTURE has to survive plot_lock_view.py's `strong` refusal, which rejects any capture carrying
+# no ShareRowExclusive/Exclusive/AccessExclusive mark, on the grounds that "a tick that did nothing
+# renders as a calm, correct-looking figure". So it is built to make the MEASURED tick actually drop
+# a partition: retain's DROP takes ACCESS EXCLUSIVE on the parent, and that is the strong mark. This
+# is deliberate, not incidental -- a fixture with nothing to do would make this track fail on its own
+# setup, which is the failure shape hardest to tell apart from a real defect.
+run_lockview() {
+  local prof="locktrace" svc="locktrace" c="pgpm_test-locktrace" db="lv_ci"
+  echo; echo "========================================="
+  echo "Lock-view track: eBPF capture for the lock-sequence renderer (pg17 + bench/lock_view.py)"
+  echo "========================================="
+  $DC --profile "$prof" down -v 2>/dev/null || true
+  $DC --profile "$prof" build $BUILD_PROGRESS "$svc"
+  $DC --profile "$prof" up -d
+  wait_pg "$prof" "$svc" 60
+  local rc=0
+
+  # matplotlib for bench/plot_lock_view.py, in its own venv (Ruling 8a). A venv rather than a bare
+  # pip install because the runner's python may be PEP 668 externally-managed, where installing into
+  # it is refused outright. Reused across runs; delete .venv-lockview to force a clean reinstall.
+  if [ ! -d .venv-lockview ]; then
+    python3 -m venv .venv-lockview
+    .venv-lockview/bin/pip install -q matplotlib
+  fi
+
+  docker exec "$c" psql -U postgres -q -c "drop database if exists $db" >/dev/null
+  docker exec "$c" psql -U postgres -q -c "create database $db" >/dev/null
+  docker exec "$c" psql -U postgres -d "$db" -q -v ON_ERROR_STOP=1 -f /repo/pgpm_core/install.sql >/dev/null
+
+  local lvq=(docker exec "$c" psql -U postgres -d "$db" -qtA -c)
+
+  # A managed table whose retention will have something to drop in the measured tick. Small on
+  # purpose: unlike bench/lock_trace.sh's fixture, nothing here needs a WIDE window for a probe to
+  # land inside -- a trace either contains the strong mark or it does not.
+  "${lvq[@]}" "create table public.lv (id bigint primary key, v text)" >/dev/null
+  "${lvq[@]}" "insert into public.lv select g, 'x' from generate_series(1,100) g" >/dev/null
+  "${lvq[@]}" "call pgpm.transmute('public.lv','id',100000::bigint, p_retain => 100000::bigint, p_paused => false)" >/dev/null
+
+  # One warm-up tick, with nothing yet eligible for retention, so the MEASURED tick below is the
+  # first one that drops anything.
+  "${lvq[@]}" "call pgpm.maintain_all()" >/dev/null
+
+  # Now advance the frontier past the oldest partition, so retention has a drop to make. The ceiling
+  # is read back rather than assumed, since transmute builds the grid during the cutover.
+  local hi
+  hi=$("${lvq[@]}" "select max(hi::bigint) from pgpm.part where parent_table='public.lv'::regclass")
+  "${lvq[@]}" "insert into public.lv values ($((hi-1)), 'advances past the oldest partition')" >/dev/null
+
+  # --- step 1: the whole pipeline, end to end -----------------------------------------------------
+  local out
+  if out=$(bash "$(dirname "$0")/bench/lock_view.sh" "$c" "$db" 'public.lv' "call pgpm.maintain_all()" ci 2>&1); then
+    echo "$out"
+    case "$out" in
+      *"dropped=0"*) echo "PASS  the capture reports dropped=0" ;;
+      *) echo "FAIL  the capture did not report dropped=0"; rc=1 ;;
+    esac
+    case "$out" in
+      *"unmatched=0"*) echo "PASS  the capture reports unmatched=0" ;;
+      *) echo "FAIL  the capture did not report unmatched=0"; rc=1 ;;
+    esac
+  else
+    echo "$out"
+    echo "FAIL  bench/lock_view.sh did not complete; see the refusal or error above"
+    rc=1
+  fi
+
+  # --- step 2: the pairing proof, which is the half that discriminates ----------------------------
+  if bash "$(dirname "$0")/bench/lock_timeout_pairing_demo.sh" "$c" "$db"; then
+    echo "PASS  the request/return pairing proof holds"
+  else
+    echo "FAIL  the request/return pairing proof did not hold"
+    rc=1
+  fi
+
+  $DC --profile "$prof" down -v
+  if [ "$rc" -ne 0 ]; then echo "lockview track: FAIL"; return 1; fi
+  echo "lockview track: PASS"
+}
+
 if [ "$TRACK" = "perf" ]; then
   run_perf
   echo; echo "All requested tests passed."
@@ -524,6 +637,12 @@ fi
 
 if [ "$TRACK" = "locktrace" ]; then
   run_locktrace
+  echo; echo "All requested tests passed."
+  exit 0
+fi
+
+if [ "$TRACK" = "lockview" ]; then
+  run_lockview
   echo; echo "All requested tests passed."
   exit 0
 fi
@@ -586,8 +705,9 @@ if [ "$TRACK" = "ci" ]; then
   # broken, so it is the one case that skips.
   if [ "$(uname -s)" = "Linux" ]; then
     "$0" locktrace || ci_failed="$ci_failed locktrace"
+    "$0" lockview  || ci_failed="$ci_failed lockview"
   else
-    ci_skipped=" locktrace (needs Linux; eBPF cannot run on $(uname -s))"
+    ci_skipped=" locktrace and lockview (need Linux; eBPF cannot run on $(uname -s))"
   fi
 
   echo; echo "========================================="
@@ -596,8 +716,8 @@ if [ "$TRACK" = "ci" ]; then
       # Deliberately NOT folded into the PASS line's meaning: this run did not verify that track, and
       # saying so plainly is the whole point of reporting a skip at all.
       echo "ci: PASS, except SKIPPED --$ci_skipped"
-      echo "    That track was NOT verified on this machine. CI does run it on Linux"
-      echo "    (.github/workflows/locktrace.yml), so a PR still covers it."
+      echo "    Those tracks were NOT verified on this machine. CI does run them on Linux"
+      echo "    (.github/workflows/locktrace.yml and lockview.yml), so a PR still covers them."
     else
       echo "ci: PASS (every track CI runs)"
     fi
