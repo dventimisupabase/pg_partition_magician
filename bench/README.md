@@ -612,11 +612,6 @@ a fifth refusal: it means the trace is complete and accurately reporting a wait 
 the end of, not that the trace is untrustworthy. See the design spec's "Requests, grants and
 waits" section for the reasoning.
 
-### The spec
-
-Design rationale, the capture contract, the fold, and the drawing rules are written up in the
-design spec archived under [`frozen/`](../frozen/README.md).
-
 ### The request/return pairing proof
 
 `bench/lock_timeout_pairing_demo.sh` is a runnable, two-session demonstration of a defect that

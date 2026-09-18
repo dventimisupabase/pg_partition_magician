@@ -170,8 +170,6 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
 - **[Pilot template](docs/pilot.md)**: how an early production install is run, and what it does not promise.
 - **[Releasing](RELEASING.md)**: what a version number covers, and how a release is cut.
 - **[Security policy](SECURITY.md)**: how to report a vulnerability, and what is in scope.
-- **[Frozen artifacts](frozen/README.md)**: superseded design notes, journals, and one-off writeups,
-  kept for history rather than deleted. Not required reading, and not current.
 
 ## Tests
 
