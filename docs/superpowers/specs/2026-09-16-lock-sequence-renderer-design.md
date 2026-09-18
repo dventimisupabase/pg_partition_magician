@@ -426,9 +426,13 @@ runnable script rather than a `bench/lock_view_selftest.py` assertion (added 202
 review): priming enlistment (finding 1, `bench/lock_view_prefix_demo.sh`, which needs a live eBPF
 capture to show a lock actually disappearing and reappearing) and the schema-scoped name fold
 (finding 2, `bench/lock_view_names_scope_demo.sh`, which needs a live database to show the SQL join
-actually duplicating a row). Both follow the pattern `bench/lock_timeout_pairing_demo.sh` set: not
-wired to `./test.sh` or CI, committed rather than left as prose in a report, and run against the
-unmodified probe or query so the same script demonstrates the defect and the fix side by side.
+actually duplicating a row). Both follow the pattern `bench/lock_timeout_pairing_demo.sh` set:
+committed rather than left as prose in a report, and run against the unmodified probe or query so
+the same script demonstrates the defect and the fix side by side.
+
+As of 2026-09-18 all three are wired into the `lockview` track as steps 2 to 4 and run in CI. They
+were already named in `.github/workflows/lockview.yml`'s path filter before that, which was the
+worst of both worlds: editing one fired the job, and the job went green without ever executing it.
 
 ## Non-goals
 

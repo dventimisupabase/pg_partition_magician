@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Prove bench/sql/lockview_names.sql's managed_parent join is scoped by the parent's own schema,
-# not just its bare relname (issue #392 review, finding 2). NOT wired to ./test.sh or any CI job --
-# like bench/lock_timeout_pairing_demo.sh, this is a committed, runnable discrimination proof for a
-# fix that would otherwise read as an unmotivated extra join condition to anyone who has not seen
-# the duplicate-row defect it prevents. No eBPF needed: this is a plain SQL correctness check
-# against a live database, not a lock-observation one.
+# not just its bare relname (issue #392 review, finding 2). RUN BY CI as step 4 of the `lockview`
+# track (./test.sh lockview, .github/workflows/lockview.yml). It is a committed, runnable
+# discrimination proof for a fix that would otherwise read as an unmotivated extra join condition to
+# anyone who has not seen the duplicate-row defect it prevents. No eBPF needed: this is a plain SQL
+# correctness check against a live database, not a lock-observation one, and it runs in that eBPF
+# track anyway because that is the track whose path filter fires when this query changes.
+#
+# NOTE FOR CALLERS: this script CREATES AND DROPS the database it is given. Never hand it a database
+# another step depends on.
 #
 # THE DEFECT
 #
