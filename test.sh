@@ -534,7 +534,13 @@ run_locktrace() {
 # of BPF C and the defect coming back. The spec's Non-goals section has been amended with this
 # reasoning rather than silently contradicted.
 #
-# TWO STEPS, and they cover different failures:
+# Steps 3 and 4 were added after the track first shipped, and the gap they close is worth naming:
+# both demos were ALREADY in this workflow's path filter, so editing either one FIRED this job,
+# which then went green having never executed the file that changed. That is worse than no gate at
+# all -- an absent check is visibly absent, while a green one that ran nothing reads as assurance.
+# Every demo named in the filter is now actually run by the track.
+#
+# FOUR STEPS, and they cover different failures:
 #
 #   1. bench/lock_view.sh end to end over a real maintain_all() tick. Covers attach, in-kernel
 #      filtering, the name snapshots and the format contract. These failures are already loud on
@@ -542,13 +548,27 @@ run_locktrace() {
 #      thousands of events, a malformed capture is refused outright by plot_lock_view.py), so this
 #      step's value is running the whole pipeline the way a human actually would, not novel coverage.
 #   2. bench/lock_timeout_pairing_demo.sh. THIS is the step that gates the silent defect, and the
-#      only one of the two that would have caught it: the fabricated grant reported
+#      only step here that would have caught it: the fabricated grant reported
 #      {"dropped": 0, "unmatched": 0}, loaded cleanly through the consumer, and was refused by
 #      nothing. Measured against a hand-reverted probe (the mutation the demo's own header
 #      describes): 2 lock events instead of 1, a fabricated wait_ns of 100541273 against a 100 ms
 #      lock_timeout, and unmatched 0 instead of 1 -- three of its six checks flip, while BOTH its
 #      liveness witnesses stay green, so the failure is attributable to the defect rather than to a
 #      fixture that quietly did nothing.
+#   3. bench/lock_view_prefix_demo.sh. Gates the enlistment primer. lock_view.py enlists a backend
+#      only on its FIRST touch of a target oid, so a lock that same backend took earlier in the
+#      traced statement is invisible, and a truncated prefix renders as a complete sequence with no
+#      refusal anywhere to catch it. It needs no mutation because it is self-discriminating by
+#      construction: its case 1 runs UNPRIMED and REQUIRES the defect to reproduce against the
+#      unmodified probe, so the two cases cannot both pass unless the primer is what made the
+#      difference.
+#   4. bench/lock_view_names_scope_demo.sh. Gates the schema-scoped managed_parent join in
+#      bench/sql/lockview_names.sql: two managed parents sharing a bare relname in different schemas
+#      used to fold their children onto whichever parent's row happened to read last,
+#      nondeterministically. The one step here needing no eBPF -- it is a plain SQL correctness
+#      check -- but it belongs in THIS track regardless, because this is the track whose path filter
+#      fires when that query changes. Measured against the join reverted to bare-name-only: both
+#      row-count checks go to "got 2, want 1".
 #
 # THE FIXTURE has to survive plot_lock_view.py's `strong` refusal, which rejects any capture carrying
 # no ShareRowExclusive/Exclusive/AccessExclusive mark, on the grounds that "a tick that did nothing
@@ -621,6 +641,24 @@ run_lockview() {
     echo "PASS  the request/return pairing proof holds"
   else
     echo "FAIL  the request/return pairing proof did not hold"
+    rc=1
+  fi
+
+  # --- step 3: the enlistment primer, against a live capture --------------------------------------
+  if bash "$(dirname "$0")/bench/lock_view_prefix_demo.sh" "$c" "$db"; then
+    echo "PASS  the enlistment primer closes the prefix-loss gap"
+  else
+    echo "FAIL  the enlistment primer proof did not hold"
+    rc=1
+  fi
+
+  # --- step 4: the schema-scoped name fold (plain SQL; the one step needing no eBPF) ---------------
+  # Given its OWN database, never $db: this demo creates and DROPS the database it is handed, so
+  # passing it the track's fixture database would destroy what steps 1 to 3 depend on.
+  if bash "$(dirname "$0")/bench/lock_view_names_scope_demo.sh" "$c" lv_scope_ci; then
+    echo "PASS  the managed_parent join stays scoped by the parent's own schema"
+  else
+    echo "FAIL  the schema-scoped name fold proof did not hold"
     rc=1
   fi
 

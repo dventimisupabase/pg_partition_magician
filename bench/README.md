@@ -472,9 +472,10 @@ merge on it. `bench/lock_trace.sh` is that guard (it runs in `./test.sh locktrac
 a yes/no question with eBPF); this tool answers "what actually happened, in what order, on
 which relations" by turning the same kind of eBPF capture into a timeline you can read.
 
-CI does run it, on itself. `./test.sh lockview` drives this harness end to end and then runs the
-pairing proof, and `.github/workflows/lockview.yml` runs that track on every PR touching a
-lock-view file, so the **instrument** is guarded even though the thing it measures is not
+CI does run it, on itself. `./test.sh lockview` drives this harness end to end and then runs all
+three discrimination proofs (the request/return pairing, the enlistment primer, and the
+schema-scoped name fold), and `.github/workflows/lockview.yml` runs that track on every PR touching
+a lock-view file, so the **instrument** is guarded even though the thing it measures is not
 (issue #398). The distinction is the whole point: nothing ships on a figure, but an instrument
 that fabricates a grant tells its reader the confident opposite of the truth.
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Prove bench/lock_view.sh's enlistment primer closes the prefix-loss gap in bench/lock_view.py
-# (issue #392 review, finding 1). NOT wired to ./test.sh or any CI job -- like
-# bench/lock_timeout_pairing_demo.sh, this is a committed, runnable discrimination proof: the
-# assertion needs a live eBPF capture, so it cannot live in bench/lock_view_selftest.py, which runs
-# with no eBPF, no container and no Linux, by design.
+# (issue #392 review, finding 1). RUN BY CI as step 3 of the `lockview` track (./test.sh lockview,
+# .github/workflows/lockview.yml). The assertion needs a live eBPF capture, so it cannot live in
+# bench/lock_view_selftest.py, which runs with no eBPF, no container and no Linux, by design.
+#
+# Until that wiring existed, this file sat in the workflow's path filter WITHOUT being executed by
+# it: editing this demo fired the job, which then went green having never run the file that changed.
+# An absent check is visibly absent; a green one that ran nothing reads as assurance.
 #
 # THE DEFECT
 #
