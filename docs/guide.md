@@ -249,7 +249,7 @@ window, lower it under heavy traffic. A timeout is safe to retry: re-running `tr
 **If a conversion dies partway, the bound outlives it** and the table goes on refusing those writes.
 `pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was. You rarely
 need to: every `maintain_all` tick sweeps for abandoned conversions and undoes them, deciding "abandoned"
-from a session-level advisory lock `transmute` holds from start to finish rather than from a timeout, so a
+from whether the session that claimed the conversion is still connected rather than from a timeout, so a
 long scan is never mistaken for a dead one. Re-running `transmute` resumes from the recorded bound rather
 than recomputing one.
 

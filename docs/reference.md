@@ -216,8 +216,8 @@ recorded row and reuses the bound already on the table rather than recomputing o
 has since moved.
 
 You mostly will not need to call this. Every `maintain_all` tick sweeps for abandoned conversions and
-undoes them, and it decides "abandoned" from the session-level advisory lock `transmute` holds for its
-whole run rather than from a timeout, so a long validation scan is never mistaken for a dead one and an
+undoes them, and it decides "abandoned" from whether the session that claimed the conversion is still
+connected rather than from a timeout, so a long validation scan is never mistaken for a dead one and an
 operator whose session is still open keeps the right to retry.
 
 ### `untransmute`
@@ -1409,7 +1409,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `transmute` / `untransmute` | conversion and its reversal |
 | `transmute_resume` | a conversion resumed mid-flight from its recorded bound (crash/restart between phases), rather than starting over |
 | `transmute_abort` | a half-finished conversion undone by an explicit `transmute_abort()` call; `method` records that the bound was dropped |
-| `transmute_reap` | the same cleanup as `transmute_abort`, but automatic: `maintain_all`'s sweep found an abandoned in-flight conversion (its session's advisory lock was free) and undid it itself |
+| `transmute_reap` | the same cleanup as `transmute_abort`, but automatic: `maintain_all`'s sweep found an abandoned in-flight conversion (the session that claimed it is gone) and undid it itself |
 | `obtain` | a forward partition created (`method` = `plain`) |
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
