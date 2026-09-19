@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- **`docs/reference.md` described an `obtain` that has not existed since #288.** Its closing paragraph
+  called `obtain` "a procedure, not a function", said it took "an advisory lock per parent" so a second
+  concurrent call "defers instead of interfering", and said it reported failures through `p_deferred`.
+  All three were false: `obtain` is `function pgpm.obtain(p_parent regclass) returns int` (as the
+  section's own signature block, three paragraphs above, said correctly), there is no advisory lock
+  anywhere in `pgpm_core/install.sql`, and no `p_deferred` parameter exists. Removed rather than
+  rewritten -- the paragraphs above it already describe the real early-stop and lookahead behavior, so
+  it left no gap.
+
 - **`transmute` no longer claims a conversion with a session advisory lock (#405).** The claim was keyed
   on `hashtextextended('pgpm_transmute:' || oid)` -- a formula published in `install.sql`, over an oid
   anyone can read out of `pg_class` -- and advisory locks carry no ACL of any kind. Any role that could

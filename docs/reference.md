@@ -525,11 +525,6 @@ This is the only thing standing between the workload and a write with nowhere to
 the grid is refused rather than parked. `config.obtain x partition_step` is therefore both the slack if
 maintenance stalls and a ceiling on how far ahead an application may write.
 
-A procedure, not a function, because of those commits. It takes an advisory lock per parent, so a second
-concurrent `obtain` defers instead of interfering, and it reports failures through `p_deferred` rather
-than raising: `maintain` cannot wrap it in an exception handler, since transaction control is illegal
-below one.
-
 ### `extend_to`
 
 ```sql
