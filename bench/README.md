@@ -246,6 +246,30 @@ query latency). The correlation has its own test track (`./test.sh observe`); se
 - Enough disk for the target table size **plus** regrain headroom (regrain copies the
   monolith into fine partitions before the swap drops it, so history briefly exists twice).
 
+## Timing instruments (not guards, issue #345)
+
+Two scripts measure a named phase's duration, attributed to buckets rather than one wall-clock
+number, so a slowdown can be pinned to *which* step grew. Neither is wired into `./test.sh
+perf`/`discriminate`: there is no known-good threshold to assert against, so each is evidence for
+a decision, not a guard against a regression.
+
+- **`transmute_cutover_timing.sh <container> <db_prefix> [install.sql]`** -- transmute's phase 3
+  (the cutover). Each fixture case gets its own throwaway database (`<prefix>_<case>`), since
+  transmute only runs once per table.
+- **`regrain_swap_timing.sh <container> <db_prefix> [install.sql]`** -- the sibling for
+  `regrain_step`'s swap. A different fixture (an already-transmuted table with a resumable
+  regrain), not an extension of the cutover script.
+
+`io_burst_probe.sh` is unrelated to either: a standalone disk-IO burst discriminator, measuring by
+direct wall-clock timing of bounded units against a lake that exceeds RAM, so reads hit disk. Tells
+a steady-state volume (flat throughput/IOPS) from one that bursts and then steps down once its
+credits deplete.
+
+```bash
+MODE=iops bench/io_burst_probe.sh
+MODE=throughput LAKE_GB=100 bench/io_burst_probe.sh
+```
+
 ## Migrating a TimescaleDB hypertable (`run_fh.sh`)
 
 `bench/run.sh` converts a plain id-keyed table with `transmute` + `regrain`.
@@ -372,16 +396,16 @@ The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pcti
 and pending delta keys over time), `regrain.progress.csv` (coarse children counting down
 to 0), and `lockprobe.log` (the cutover lock-window probe's `LOCKPROBE …` line).
 
-## Pilot instruments: rung 0b (`pilot_workload.sql`, `transmute_online.sh`)
+## Instruments for a customer's own table (`pilot_workload.sql`, `transmute_online.sh`)
 
 Everything above drives pgpm's own fixtures at scale. These two drive a **customer's** table over a
 DSN, and they exist for one specific question that the rest of the suite cannot ask.
 
-An idle clone, which is the usual first pilot arena, establishes that a conversion is correct: that the
-schema survives it, that rows survive by identity, that regrain and (for a time-like key) obtain and
-retention do real work. It cannot establish that the conversion is **online**, because "no reader or
-writer was blocked" is trivially true where there are none. `docs/pilot.md` splits that into rung 0a
-and rung 0b; this is rung 0b's apparatus.
+An idle clone establishes that a conversion is correct: that the schema survives it, that rows survive
+by identity, that regrain and (for a time-like key) obtain and retention do real work. It cannot
+establish that the conversion is **online**, because "no reader or writer was blocked" is trivially
+true where there are none -- that needs a live workload against the clone, which is what these two
+drive.
 
 ```bash
 # 1. Generate a workload for the target table. Introspects the catalog and builds
@@ -611,11 +635,6 @@ which captures are trusted enough to draw in the first place.
 a fifth refusal: it means the trace is complete and accurately reporting a wait it could not see
 the end of, not that the trace is untrustworthy. See the design spec's "Requests, grants and
 waits" section for the reasoning.
-
-### The spec
-
-Design rationale, the capture contract, the fold, and the drawing rules are written up in
-[`docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md`](../docs/superpowers/specs/2026-09-16-lock-sequence-renderer-design.md).
 
 ### The request/return pairing proof
 

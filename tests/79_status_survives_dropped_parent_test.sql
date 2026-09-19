@@ -25,7 +25,8 @@
 -- forget_missing() takes NO argument on purpose -- it can only ever match config rows whose relation is
 -- already gone, so by construction it cannot harm a live managed table.
 --
--- NOTE: no begin/rollback isolation. transmute is a committing procedure.
+-- NOTE: transmute is a committing procedure, so -- like every file in this suite -- this one runs
+-- in its own database rather than begin/rollback.
 create extension if not exists pgtap;
 
 select plan(26);

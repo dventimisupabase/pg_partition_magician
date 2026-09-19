@@ -60,11 +60,12 @@ docker compose --profile pg15 down -v
 | `tests/*.sql` | pgTAP tests (one concern per file), run by `pg_prove` in the matrix |
 | `tests/timescale/` | The `from_hypertable` track: its own `Dockerfile` (TimescaleDB + pgTAP), `fixtures.sql`, and `db/*.sql` tests, run by `./test.sh timescale` (disposable-db per file) |
 | `tests/observe/` | The `pg_flight_recorder` correlation track: `db/with_pgfr_test.sql` against a real vendored PGFR install, run by `./test.sh observe`. The PGFR-absent gate is a plain test in the main suite instead (`tests/65_observe_no_pgfr_test.sql`) |
-| `tests/archive/` | The `pgpm_archive` track: `fixtures.sql` (a `vault.decrypted_secrets` stub + small managed-table/config builders) and `db/*.sql` tests against a real MinIO service, run by `./test.sh archive` (one shared database, each file wrapped in its own BEGIN/ROLLBACK, like the default matrix) |
+| `tests/archive/` | The `pgpm_archive` track: `fixtures.sql` (a `vault.decrypted_secrets` stub + small managed-table/config builders) and `db/*.sql` tests against a real MinIO service, run by `./test.sh archive` (one database per file, cloned from a template, like the default matrix) |
 | `README.md` | Overview, quickstart, and links into the docs |
 | `docs/guide.md` | User guide: concepts, install, transmute, schedule, monitor, retain, FKs, ops |
 | `docs/reference.md` | Reference for every public function and catalog object |
 | `docs/runbook.md` | Operational runbook: symptom -> step-by-step procedures (e.g. RI violations after a preserve conversion) |
+| `frozen/` | Point-in-time design notes and journals, kept for history and not maintained against the code -- see `frozen/README.md`. Nothing in the living docs above links to it; `scripts/check_living_docs.sh` enforces that |
 
 ## The mental model (in one breath)
 
@@ -101,20 +102,21 @@ needs to be kept in sync.
 ```
 
 Each run starts from a fresh container and tears it down, so tests never depend on
-leftover state. Within a run the pgTAP files use `begin/rollback`, so they don't
-persist either.
+leftover state. Within a run each pgTAP file gets its own database, cloned from a
+template, so no file leaks state into the next one either.
 
 ### Adding a test
 
-Drop `tests/NN_my_thing_test.sql` following the existing pattern:
+Drop `tests/NN_my_thing_test.sql` following the existing pattern. The harness gives each
+file its own database, so the file does **not** wrap itself in a transaction: `transmute`
+and `maintain` are committing procedures, and calling one inside an explicit transaction
+block fails with `invalid transaction termination`.
 
 ```sql
 create extension if not exists pgtap;
-begin;
 select plan(N);
 -- assertions: is(), ok(), cmp_ok(), throws_ok(), lives_ok() ...
 select * from finish();
-rollback;
 ```
 
 ## Conventions

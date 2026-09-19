@@ -1,5 +1,10 @@
 # Lock-sequence renderer: design
 
+> **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
+> maintained against the code, so it describes the system as it stood when written. For how
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
+
 Issue [#392](https://github.com/dventimisupabase/pg_partition_magician/issues/392), which is phase 5
 of [#383](https://github.com/dventimisupabase/pg_partition_magician/issues/383). Supersedes the
 `animate_lock_graph` capability that shipped with pg-lock-tracer and left with it in

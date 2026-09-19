@@ -2,8 +2,8 @@
 
 > **Frozen artifact: not current documentation.** A point-in-time record, kept for history and not
 > maintained against the code, so it describes the system as it stood when written. For how
-> pg_partition_magician works today see the [user guide](docs/guide.md) and the
-> [reference](docs/reference.md).
+> pg_partition_magician works today see the [user guide](../docs/guide.md) and the
+> [reference](../docs/reference.md).
 
 Status: Implemented (online copy, online pre-drain of the live-write backlog, brief cutover, transmute handoff). See `docs/reference.md` for the function reference and `CHANGELOG.md` for the changes.
 Scope: single time-or-monotonic RANGE dimension, TimescaleDB Apache 2 Edition
@@ -132,8 +132,7 @@ residual. Then, in one transaction holding a brief exclusive lock on the source:
 After commit, the original name resolves to a working plain table and the application is unaffected. Because
 the backlog is pre-drained online and the indexes are pre-built off the lock, the locked window is just the
 tiny residual plus a drop and a rename. Measured at 40M rows under continuous load, the online pre-drain
-shortened the `ACCESS EXCLUSIVE` window ~3.2x on the tracking path; the append-only window was already brief
-(see `bench/result-fh-cutover-lockwindow.md`).
+shortened the `ACCESS EXCLUSIVE` window ~3.2x on the tracking path; the append-only window was already brief.
 
 ### 7. Transmute handoff
 
@@ -174,7 +173,7 @@ Up to the cutover transaction, the source hypertable is untouched and serving tr
 
 ## Honest tradeoffs
 
-This is a one-time full copy. It costs about 2x disk transiently, a real read-and-rewrite of all data, and a brief cutover lock rather than the pure metadata flip transmute gives a normal table. The lock is kept brief on purpose: the indexes are pre-built off the lock and the live-write backlog is pre-drained online before it (step 5), so only a tiny residual is applied under the lock, and the window does not grow with the copy duration (measured ~3.2x shorter at 40M; see `bench/result-fh-cutover-lockwindow.md`). What it buys is total independence from Timescale's version and catalog internals, which is exactly right for a population stuck on old Apache builds being force-migrated off the extension. Where transmute's appeal is "no movement," `from_hypertable`'s appeal is "no dependence on Timescale," and it pays for that with movement.
+This is a one-time full copy. It costs about 2x disk transiently, a real read-and-rewrite of all data, and a brief cutover lock rather than the pure metadata flip transmute gives a normal table. The lock is kept brief on purpose: the indexes are pre-built off the lock and the live-write backlog is pre-drained online before it (step 5), so only a tiny residual is applied under the lock, and the window does not grow with the copy duration (measured ~3.2x shorter at 40M). What it buys is total independence from Timescale's version and catalog internals, which is exactly right for a population stuck on old Apache builds being force-migrated off the extension. Where transmute's appeal is "no movement," `from_hypertable`'s appeal is "no dependence on Timescale," and it pays for that with movement.
 
 ## Positioning versus pg_partman
 
@@ -188,13 +187,13 @@ Resolved (implemented + tested; the from_hypertable track runs in the default CI
 - **`DROP TABLE <hypertable>` cleanly removes chunks + catalog** — verified on the pinned fleet image
   (the cutover drops the hypertable and no `_timescaledb` catalog row survives; tests/timescale/db/02,10).
 - **Time-predicate chunk exclusion drives single-chunk reads** — the copy iterates chunk ranges as
-  designed; confirmed end to end at 10M/40M (`bench/result-fh-cutover-lockwindow.md`).
+  designed; confirmed end to end at 10M/40M.
 - **Identity/serial capture-and-reset** — a composite `(id, control)` PK with a sequence migrates and keeps
   the next value collision/gap-free, including when the source sequence sits ahead of `max(id)`
   (tests/timescale/db/04, 11).
 - **No-incoming-FK assumption** — Timescale disallows FKs referencing a hypertable; relied on, not refuted.
-- **Copy benchmark / real numbers** — the at-scale lock-window bench (`bench/run_fh.sh`,
-  `bench/result-fh-cutover-lockwindow.md`) gives wall-clock copy/cutover/lock-window figures at R2/R3.
+- **Copy benchmark / real numbers** — the at-scale lock-window bench (`bench/run_fh.sh`) gives
+  wall-clock copy/cutover/lock-window figures at R2/R3.
 
 Still open:
 
