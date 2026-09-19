@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pilot rung 0b (docs/pilot.md): prove a transmute is ONLINE against a customer's table, over a DSN,
-# while a synthetic workload writes at the frontier and reads the hot end.
+# Prove a transmute is ONLINE against a customer's table, over a DSN, while a synthetic workload
+# writes at the frontier and reads the hot end.
 #
 # NOT a CI guard. bench/transmute_lock.sh is the CI guard for the same property: it builds its own
 # fixture in a local container and is verified against a mutation by ./test.sh discriminate. This is the

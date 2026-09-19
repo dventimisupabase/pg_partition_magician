@@ -396,16 +396,16 @@ The same `bench/results/` layout (`report.md`, per-phase `*.pgbench.txt`/`*.pcti
 and pending delta keys over time), `regrain.progress.csv` (coarse children counting down
 to 0), and `lockprobe.log` (the cutover lock-window probe's `LOCKPROBE …` line).
 
-## Pilot instruments: rung 0b (`pilot_workload.sql`, `transmute_online.sh`)
+## Instruments for a customer's own table (`pilot_workload.sql`, `transmute_online.sh`)
 
 Everything above drives pgpm's own fixtures at scale. These two drive a **customer's** table over a
 DSN, and they exist for one specific question that the rest of the suite cannot ask.
 
-An idle clone, which is the usual first pilot arena, establishes that a conversion is correct: that the
-schema survives it, that rows survive by identity, that regrain and (for a time-like key) obtain and
-retention do real work. It cannot establish that the conversion is **online**, because "no reader or
-writer was blocked" is trivially true where there are none. `docs/pilot.md` splits that into rung 0a
-and rung 0b; this is rung 0b's apparatus.
+An idle clone establishes that a conversion is correct: that the schema survives it, that rows survive
+by identity, that regrain and (for a time-like key) obtain and retention do real work. It cannot
+establish that the conversion is **online**, because "no reader or writer was blocked" is trivially
+true where there are none -- that needs a live workload against the clone, which is what these two
+drive.
 
 ```bash
 # 1. Generate a workload for the target table. Introspects the catalog and builds

@@ -1407,14 +1407,19 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | Action | When |
 |---|---|
 | `transmute` / `untransmute` | conversion and its reversal |
-| `transmute_abort` | a half-finished conversion undone, by `transmute_abort()` or by `maintain_all`'s sweep; `method` records that the bound was dropped |
-| `obtain` | a forward partition created (`method` = `plain` or `check_skip`) |
+| `transmute_resume` | a conversion resumed mid-flight from its recorded bound (crash/restart between phases), rather than starting over |
+| `transmute_abort` | a half-finished conversion undone by an explicit `transmute_abort()` call; `method` records that the bound was dropped |
+| `transmute_reap` | the same cleanup as `transmute_abort`, but automatic: `maintain_all`'s sweep found an abandoned in-flight conversion (its session's advisory lock was free) and undid it itself |
+| `obtain` | a forward partition created (`method` = `plain`) |
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
-| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child / completed (`method` = `copy_swap_drop`) |
+| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child (`method` = `check_skip`) / completed (`method` = `copy_swap_drop`) |
 | `regrain_prepare` / `regrain_capture_orphan` / `regrain_reconcile` / `regrain_reconcile_aged` / `regrain_rename` / `regrain_restart` / `regrain_cancel` | the cross-tick regrain's own steps: change capture installed / a leftover capture table cleared / the source-is-authority reconcile before the swap (and its below-horizon counterpart) / the source renamed onto the target grid / a stale run restarted / a run cancelled by `regrain_cancel()` |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
-| `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
+| `from_hypertable_carry_fk` | (`pgpm_hypertable` only) an outgoing FK re-added onto the migrated destination during `from_hypertable_copy` |
+| `forget_missing` | `forget_missing()` cleared a parent's registration because its relation no longer exists; `rows` carries how many partition rows were cleared with it |
+| `warn_obtain_unscheduled` | logged at most once per `maintain_all` sweep, with a null `parent_table`, when the `pgpm` cron job exists but `pgpm_obtain` doesn't -- obtain is silently not running |
+| `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_regrain_capture` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 | `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
 

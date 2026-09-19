@@ -167,7 +167,6 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
-- **[Pilot template](docs/pilot.md)**: how an early production install is run, and what it does not promise.
 - **[Releasing](RELEASING.md)**: what a version number covers, and how a release is cut.
 - **[Security policy](SECURITY.md)**: how to report a vulnerability, and what is in scope.
 

@@ -1,4 +1,4 @@
--- Synthetic frontier workload for pilot rung 0b (docs/pilot.md): a writer inserting at the write
+-- Synthetic frontier workload for a customer's own table: a writer inserting at the write
 -- frontier and a reader on the hot end, both against a CUSTOMER's table rather than a bench fixture.
 --
 -- WHY THIS EXISTS. An idle clone establishes that a conversion is correct. It cannot establish that the
