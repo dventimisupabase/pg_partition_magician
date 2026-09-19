@@ -29,9 +29,9 @@
 -- rows, SET NULL/SET DEFAULT sever them in place, NO ACTION/RESTRICT refuse the delete and block
 -- retention with the operator's OWN error. That is asserted below for both ends of that range.
 --
--- NOTE: this file does NOT use begin/rollback isolation. `ALTER TABLE ... DETACH PARTITION ...
--- CONCURRENTLY` cannot run inside a transaction block at all, and the reaper section needs a second
--- session (dblink) to see committed state.
+-- NOTE: `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY` cannot run inside a transaction block
+-- at all (a PostgreSQL restriction, not just this suite's own convention), and the reaper section
+-- needs a second session (dblink) to see committed state.
 create extension if not exists pgtap;
 create extension if not exists dblink;
 

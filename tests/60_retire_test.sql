@@ -17,9 +17,10 @@
 --   * pgpm.hook, the old pre_drop registry this superseded, is gone entirely (issue #240);
 --   * retain() is now a loop over retire() and behaves as before (tests/07/34/40/59).
 --
--- NOTE: this file does NOT use the usual begin/rollback isolation. The concurrency assertions need
--- a second session (dblink) to see and lock the fixture's pgpm.part rows, which requires the
--- fixture to be COMMITTED. The file cleans up everything it created at the end instead.
+-- NOTE: needs a second session (dblink) to see and lock the fixture's pgpm.part rows, which
+-- requires the fixture to be COMMITTED -- not just outside an explicit transaction block, as every
+-- file in this suite already is, but genuinely visible cross-session. The file cleans up
+-- everything it created at the end instead of relying on rollback.
 create extension if not exists pgtap;
 create extension if not exists dblink;
 
