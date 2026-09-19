@@ -246,6 +246,30 @@ query latency). The correlation has its own test track (`./test.sh observe`); se
 - Enough disk for the target table size **plus** regrain headroom (regrain copies the
   monolith into fine partitions before the swap drops it, so history briefly exists twice).
 
+## Timing instruments (not guards, issue #345)
+
+Two scripts measure a named phase's duration, attributed to buckets rather than one wall-clock
+number, so a slowdown can be pinned to *which* step grew. Neither is wired into `./test.sh
+perf`/`discriminate`: there is no known-good threshold to assert against, so each is evidence for
+a decision, not a guard against a regression.
+
+- **`transmute_cutover_timing.sh <container> <db_prefix> [install.sql]`** -- transmute's phase 3
+  (the cutover). Each fixture case gets its own throwaway database (`<prefix>_<case>`), since
+  transmute only runs once per table.
+- **`regrain_swap_timing.sh <container> <db_prefix> [install.sql]`** -- the sibling for
+  `regrain_step`'s swap. A different fixture (an already-transmuted table with a resumable
+  regrain), not an extension of the cutover script.
+
+`io_burst_probe.sh` is unrelated to either: a standalone disk-IO burst discriminator, measuring by
+direct wall-clock timing of bounded units against a lake that exceeds RAM, so reads hit disk. Tells
+a steady-state volume (flat throughput/IOPS) from one that bursts and then steps down once its
+credits deplete.
+
+```bash
+MODE=iops bench/io_burst_probe.sh
+MODE=throughput LAKE_GB=100 bench/io_burst_probe.sh
+```
+
 ## Migrating a TimescaleDB hypertable (`run_fh.sh`)
 
 `bench/run.sh` converts a plain id-keyed table with `transmute` + `regrain`.

@@ -3,8 +3,7 @@
 Climb rung by rung: a larger run is only worth doing once the one below it has passed
 cleanly. A "pilot" is the **smallest** run that exercises the whole pipeline, not a
 scaled-down replica of the target; bugs are scale-independent but their cost is not.
-Run a rung by editing the `BENCH_*` exports in `bench/run_pilot_green.sh`, or by setting
-the env vars directly for `bench/run.sh`.
+Run a rung by setting the `BENCH_*` env vars directly for `bench/run.sh`.
 
 ## The ladder (`BENCH_MONTHS=2`; R3 measured, the rest extrapolated from it)
 

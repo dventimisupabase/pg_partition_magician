@@ -439,8 +439,7 @@ tiny residual. Non-convergence means the workload is dirtying keys / appending f
 drain clears them, so the residual never falls to the threshold within the iteration budget (`p_max_iter`).
 The drain is best-effort and the under-lock pass is the correctness backstop, so the migration stays
 **correct** either way -- the symptom is a *long lock* (the under-lock pass applies a big residual), not data
-loss. (At-scale figures and the structural note that the append-only backlog stays small are in
-`bench/result-fh-cutover-lockwindow.md`.)
+loss.
 
 **Steps.**
 
