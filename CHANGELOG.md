@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+- **`docs/reference.md` described an `obtain` that has not existed since #288.** Its closing paragraph
+  called `obtain` "a procedure, not a function", said it took "an advisory lock per parent" so a second
+  concurrent call "defers instead of interfering", and said it reported failures through `p_deferred`.
+  All three were false: `obtain` is `function pgpm.obtain(p_parent regclass) returns int` (as the
+  section's own signature block, three paragraphs above, said correctly), there is no advisory lock
+  anywhere in `pgpm_core/install.sql`, and no `p_deferred` parameter exists. Removed rather than
+  rewritten -- the paragraphs above it already describe the real early-stop and lookahead behavior, so
+  it left no gap.
+
+- **`transmute` no longer claims a conversion with a session advisory lock (#405).** The claim was keyed
+  on `hashtextextended('pgpm_transmute:' || oid)` -- a formula published in `install.sql`, over an oid
+  anyone can read out of `pg_class` -- and advisory locks carry no ACL of any kind. Any role that could
+  merely CONNECT could therefore take it, with no grant on any pgpm function and no privilege on the
+  table. Two consequences, the second much worse than the first: holding it pre-emptively blocked every
+  `transmute()` of that table outright, and grabbing it the instant a crashed conversion released it
+  starved `_transmute_reap` forever, because the reaper decided "still running" by trying to take that
+  same lock. That second one had no way out at all -- `transmute_abort`, the documented manual escape
+  hatch, consulted the same lock and refused too -- so a crash could be turned into a permanent outage,
+  with the table's `pgpm_monolith_bound` CHECK rejecting every write outside `[lo, hi)` indefinitely.
+
+  `pgpm.transmute_inflight`'s existing primary key on `parent_table` is now the exclusion itself: one row
+  per table, taken by a single atomic `insert ... on conflict do update`, in a pgpm-owned table carrying
+  no GRANTs, so an unprivileged role cannot take or hold it at all. Liveness -- still the thing that has
+  to tell "running" from "its session died", with no heartbeat and no timeout guess -- comes from the
+  claiming session's identity, recorded in two new columns (`owner_pid`, `owner_backend_start`).
+
+  The subtlety that decided the implementation, found by measuring rather than reasoning: `backend_start`
+  is **masked for a backend owned by another role**, reading NULL rather than its real value (measured on
+  stock PostgreSQL 17.10: an unprivileged role sees the row and its `pid`, but `backend_start`,
+  `backend_type` and `query` all read NULL). The reaper runs from pg_cron under whatever role scheduled
+  it, which need not be the role that ran `transmute`, so the obvious predicate
+  `backend_start = owner_backend_start` evaluates to NULL for a perfectly live cross-role conversion --
+  and the reaper would then have undone it out from under itself, dropping the bound and deleting the
+  claim mid-validation-scan. `pgpm._session_alive` therefore DEGRADES instead: pid and `backend_start`
+  where that column is visible, pid alone where it is not. The residual failure is under-reaping (a
+  recycled pid looks live, leaving an abandoned bound for an operator's `transmute_abort`) and never
+  over-reaping a live conversion. Same discipline #98 established for the ambient sensors: read what
+  every role can see, never a column `pg_monitor` masks.
+
+  Guarded by `bench/transmute_claim_squat.sh`, which drives a real second-session squatter against the
+  old key and asserts -- with a liveness witness that the squat is genuinely in place, on the right key,
+  from a session that is not the claim's owner -- that the reaper and `transmute_abort` both work anyway.
+  Its mutation (`transmute_claim_advisory_reap`) restores the advisory-lock recovery paths and the guard
+  fails against it. `tests/101_transmute_claim_test.sql` pins the claim's state machine and the liveness
+  predicate. Upgrades in place: the two columns are added with `add column if not exists`, and a claim
+  recorded before they existed reads as having no live owner, so it stays reapable rather than becoming
+  stuck behind a check it has no data for.
+
 - **The lock-trace guard now runs in CI (`.github/workflows/locktrace.yml`, #383 phase 3 / #389).**
   Until now nothing in CI ran that track, so off Linux it was verified by nobody. A spike on a hosted
   runner settled the three questions that had kept the workflow unwritten, by measurement rather than

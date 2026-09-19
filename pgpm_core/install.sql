@@ -193,6 +193,10 @@ alter table pgpm.part add column if not exists retiring_at timestamptz;
 --
 -- lo/hi are recorded so a resumed transmute reuses the SAME bound rather than recomputing one against a
 -- frontier that has since moved.
+--
+-- owner_pid/owner_backend_start identify the session that claimed the conversion (#405). The row itself is
+-- the exclusion -- one per parent_table, by the primary key -- and these two columns are what make the claim
+-- releasable without a heartbeat. See pgpm._session_alive.
 create table if not exists pgpm.transmute_inflight (
   parent_table  regclass    not null primary key,
   nsp           name        not null,
@@ -200,8 +204,45 @@ create table if not exists pgpm.transmute_inflight (
   control_kind  text        not null,
   lo            text        not null,
   hi            text        not null,
-  started_at    timestamptz not null default now()
+  started_at    timestamptz not null default now(),
+  owner_pid           int,
+  owner_backend_start timestamptz
 );
+-- upgrade path for installs that predate these columns. A claim recorded before they existed has both null,
+-- which pgpm._session_alive reads as "no live owner" -- so an old abandoned claim stays reapable rather than
+-- becoming permanently stuck behind a liveness check it has no data for.
+alter table pgpm.transmute_inflight add column if not exists owner_pid int;
+alter table pgpm.transmute_inflight add column if not exists owner_backend_start timestamptz;
+
+-- Is the session that claimed a conversion still alive? (#405)
+--
+-- This is the liveness signal transmute's claim protocol rests on. It has to tell "the conversion is still
+-- running" from "its session died mid-way" with no heartbeat and no timeout guess -- exactly what the session
+-- advisory lock it replaces gave for free, since PostgreSQL released that automatically when the session
+-- ended, however it ended.
+--
+-- The trap, measured on stock PostgreSQL 17.10: backend_start is MASKED for a backend owned by ANOTHER role.
+-- It reads NULL rather than the real value (pid and usename stay visible; backend_start, backend_type and
+-- query do not). The reaper runs from pg_cron under whatever role scheduled it, which need not be the role
+-- that ran transmute, so a plain `backend_start = p_backend_start` evaluates to NULL for a perfectly live
+-- cross-role conversion -- and the reaper would then undo it out from under itself, dropping the bound and
+-- deleting the claim while phase 2's validation scan is still running.
+--
+-- So the match DEGRADES instead of failing: pid AND backend_start where backend_start is visible to us, pid
+-- alone where it is not. The residual failure is UNDER-reaping -- a recycled pid can look like a live
+-- conversion, leaving an abandoned bound for an operator's transmute_abort -- and never OVER-reaping a live
+-- one. That is the same discipline #98 established for the ambient sensors: read what every role can see,
+-- never a column pg_monitor masks (tests/41_no_pg_monitor_dep_test.sql pins it).
+--
+-- A null p_pid is never alive: there is no session to be alive. That covers both a pre-#405 claim and a row
+-- constructed by a test to stand in for a died-mid-run conversion.
+create or replace function pgpm._session_alive(p_pid int, p_backend_start timestamptz)
+returns boolean language sql stable as $$
+  select p_pid is not null
+     and exists (select 1 from pg_stat_activity
+                  where pid = p_pid
+                    and (backend_start = p_backend_start or backend_start is null));
+$$;
 
 -- The audit trail. NAMING RULE for `action`: non-success events are PREFIXED, never suffixed --
 -- `skip_<mechanism>` for a deferral, `fail_<mechanism>` for a failure. So no non-success action is ever
@@ -2395,7 +2436,7 @@ create or replace procedure pgpm._transmute(
 language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_default name; v_staging name; v_parent regclass;
-  v_lo_prev text; v_hi_prev text; v_resumed boolean := false;
+  v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
   v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
@@ -2882,32 +2923,50 @@ begin
   -- EXCLUSIVE lock the ADD takes. Measured before the split: the table was fully locked (ACCESS EXCLUSIVE
   -- conflicts with everything, reads included) for 30 ms at 1M rows, 173 ms at 5M, 492 ms at 10M, cached.
   --
-  -- A SESSION-level advisory lock is taken first and held across both commits. It is what lets the reaper
-  -- below tell "this conversion is still running" from "its session died mid-way", with no heartbeat and no
-  -- timeout guess: the lock is released automatically when the session ends, however it ends.
-  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+  -- THE CLAIM (#405). pgpm.transmute_inflight's primary key on parent_table IS the exclusion: one row per
+  -- table, taken here and deleted by the cutover, so a second conversion cannot register while a first holds
+  -- it. Liveness -- "still running" against "its session died mid-way", with no heartbeat and no timeout
+  -- guess -- comes from the claiming session's identity recorded alongside it (see pgpm._session_alive).
+  --
+  -- This REPLACES a session advisory lock keyed on hashtextextended('pgpm_transmute:' || oid). That key was
+  -- computable by anyone -- the formula is in this file and the oid is in pg_class -- and advisory locks
+  -- carry no ACL of any kind, so any role that could merely CONNECT could take it: either pre-emptively, to
+  -- block every transmute of that table outright, or the instant a crashed conversion released it, which
+  -- starved the reaper below and pinned a write-rejecting bound on the operator's table with no way back,
+  -- since transmute_abort consulted the same lock. The claim row lives in a pgpm-owned table carrying no
+  -- GRANTs, so an unprivileged role cannot take or hold it at all.
+  --
+  -- Optional headroom is applied to the candidate hi FIRST, because the claim itself decides fresh-vs-resume
+  -- and a resume must reuse the recorded bound. It pushes hi further out so a fast writer cannot cross it
+  -- while the scan runs: the bound rejects writes at or past hi for as long as it is in place, which with
+  -- the phase split is the whole conversion rather than a single locked statement.
+  for v_i in 1 .. greatest(coalesce(p_bound_headroom, 0), 0) loop
+    v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native);
+  end loop;
+
+  -- One atomic take-or-take-over. `do update` fires only when the recorded owner is gone, so the statement
+  -- returns a row exactly when the claim is ours and nothing at all when a live conversion already holds it.
+  -- It deliberately leaves lo/hi untouched, which is what makes RETURNING hand back the ORIGINAL bound on a
+  -- take-over rather than the candidates passed in above.
+  insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi,
+                                       owner_pid, owner_backend_start)
+  values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native,
+          pg_backend_pid(), (select backend_start from pg_stat_activity where pid = pg_backend_pid()))
+      on conflict (parent_table) do update
+         set owner_pid           = excluded.owner_pid,
+             owner_backend_start = excluded.owner_backend_start
+       where not pgpm._session_alive(transmute_inflight.owner_pid, transmute_inflight.owner_backend_start)
+  returning lo, hi, (xmax <> 0) into v_lo_native, v_hi_native, v_resumed;
+
+  if not found then
     raise exception 'pg_partition_magician: a transmute of % is already in progress in another session', p_parent;
   end if;
 
-  -- Resume: a recorded conversion whose lock we just took means the previous attempt's session is gone.
-  -- Reuse its bound rather than recomputing one, because the frontier has moved on since but no row can
-  -- have landed outside the recorded range -- the CHECK was rejecting those the whole time.
-  select lo, hi into v_lo_prev, v_hi_prev from pgpm.transmute_inflight where parent_table = p_parent;
-  if found then
-    v_lo_native := v_lo_prev; v_hi_native := v_hi_prev;
-    v_monolith  := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
-    v_resumed := true;
-  else
-    -- Optional headroom: push hi further out so a fast writer cannot cross it while the scan runs. The
-    -- bound rejects writes at or past hi for as long as it is in place, which with the split is the whole
-    -- conversion rather than a single locked statement.
-    for v_i in 1 .. greatest(coalesce(p_bound_headroom, 0), 0) loop
-      v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native);
-    end loop;
-    v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
-    insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi)
-      values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native);
-  end if;
+  -- Resume: the row was already there and its session is gone, so we took it over. Reuse its bound rather
+  -- than recomputing one -- the frontier has moved on since, but no row can have landed outside the recorded
+  -- range, because the CHECK was rejecting exactly those the whole time. xmax is 0 on an insert and the
+  -- updating xid on an update, which is what distinguishes the two here.
+  v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native);
 
   -- #309: bound the wait for the ADD's ACCESS EXCLUSIVE. Re-applied per phase rather than set once,
   -- because `set local` does not survive a COMMIT -- the same caution maintain() records at its own
@@ -2921,7 +2980,7 @@ begin
                    p_parent::text, p_control, pgpm._encode(p_control_kind, v_lo_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),
                    p_control, pgpm._encode(p_control_kind, v_hi_native, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
   end if;
-  commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; the advisory lock survives
+  commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; the claim row survives (it is committed)
 
   -- ============================ PHASE 2: validate it (#275) ============================
   -- VALIDATE takes only SHARE UPDATE EXCLUSIVE, which blocks nobody. Skipped when a previous attempt
@@ -3203,9 +3262,9 @@ begin
   -- and k=1 onward lays down [B, B + obtain x step) flush against the monolith's upper bound.
   perform pgpm.obtain(v_parent);
 
-  -- the conversion is complete: nothing is left for the reaper to undo, and the advisory lock can go.
+  -- the conversion is complete: deleting the claim row IS releasing the claim, and nothing is left for the
+  -- reaper to undo.
   delete from pgpm.transmute_inflight where parent_table = p_parent;
-  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
 end;
 $$;
 
@@ -3308,14 +3367,16 @@ declare r pgpm.transmute_inflight%rowtype;
 begin
   select * into r from pgpm.transmute_inflight where parent_table = p_parent;
   if not found then return false; end if;
-  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0)) then
+  -- #405: the claim's recorded session decides this, not an advisory lock anyone could have taken. When that
+  -- lock gated the abort, a squatter holding it left the operator with no way to clear a bound at all --
+  -- this path and the reaper both refused, for the same wrong reason.
+  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then
     raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is still running in another session', p_parent;
   end if;
   execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
   delete from pgpm.transmute_inflight where parent_table = p_parent;
   insert into pgpm.log (parent_table, action, lo, hi, method)
     values (p_parent, 'transmute_abort', r.lo, r.hi, 'bound dropped, table restored');
-  perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || p_parent::oid::text, 0));
   return true;
 end;
 $$;
@@ -3324,10 +3385,12 @@ $$;
 -- rejecting out-of-range writes until someone notices. Rather than leave that to the operator, every
 -- maintain_all tick sweeps for abandoned conversions and undoes them.
 --
--- "Abandoned" is decided by the session advisory lock transmute holds for its whole run, not by a timeout:
--- if the lock can be taken, the owning session is gone, whatever the reason. A long validation scan is
--- therefore never mistaken for a dead one, and an operator whose session is still open keeps the right to
--- retry -- the sweep waits until they disconnect.
+-- "Abandoned" is decided by the claiming session's recorded identity, not by a timeout: if that session is
+-- gone, the conversion is gone, whatever the reason. A long validation scan is therefore never mistaken for
+-- a dead one, and an operator whose session is still open keeps the right to retry -- the sweep waits until
+-- they disconnect. Before #405 this asked whether a session advisory lock could be taken, which any role
+-- that could connect was free to hold: squatting the key the moment a crashed conversion released it made
+-- this sweep read "still running" forever, so the bound it exists to undo never got undone.
 --
 -- Deliberately independent of pgpm.config: a half-converted table is not registered yet, because
 -- registration happens in the cutover. That is exactly why this lives in maintain_all rather than maintain.
@@ -3343,7 +3406,7 @@ begin
       v_n := v_n + 1;
       continue;
     end if;
-    if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0)) then
+    if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then
       continue;   -- still running; leave it alone
     end if;
     execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);
@@ -3351,7 +3414,6 @@ begin
     insert into pgpm.log (parent_table, action, lo, hi, method)
       values (r.parent_table, 'transmute_reap', r.lo, r.hi,
               'abandoned conversion undone: the bound was rejecting out-of-range writes');
-    perform pg_advisory_unlock(hashtextextended('pgpm_transmute:' || r.parent_table::oid::text, 0));
     v_n := v_n + 1;
   end loop;
   return v_n;
