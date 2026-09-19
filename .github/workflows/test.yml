@@ -28,10 +28,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build bundle + dbdev package and verify
         run: |
+          # Derived the same way test.sh derives it, so this can't drift from extension.control again.
+          VER=$(awk -F"'" '/default_version/ {print $2}' pgpm_core/extension.control)
+          DBDEV_PKG="dist/pg_partition_magician--${VER}.sql"
           scripts/build_install_bundle.sh pgpm_core/install.sql dist/pg_partition_magician-bundle.sql
-          scripts/build_dbdev_package.sh  pgpm_core/install.sql dist/pg_partition_magician--0.1.0.sql
+          scripts/build_dbdev_package.sh  pgpm_core/install.sql "$DBDEV_PKG"
           # bundle must be free of psql metacommands (dashboard SQL editor target)
-          if grep -nE '^\\' dist/pg_partition_magician-bundle.sql dist/pg_partition_magician--0.1.0.sql; then
+          if grep -nE '^\\' dist/pg_partition_magician-bundle.sql "$DBDEV_PKG"; then
             echo "ERROR: a package still contains psql metacommands"; exit 1
           fi
 
