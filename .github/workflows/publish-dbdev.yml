@@ -50,10 +50,18 @@ jobs:
           [ "$SIZE" -le 250000 ] || { echo "exceeds dbdev 250,000-char cap"; exit 1; }
 
       - name: Install the dbdev CLI
+        env:
+          # Pinned deliberately (issue #406) -- resolving releases/latest at run time let an upstream
+          # compromise hand this job's live DBDEV_TOKEN to an unverified binary. Bump the version and
+          # checksum together, as their own reviewed change, when supabase/dbdev needs to move forward.
+          # The checksum is the sha256 GitHub itself reports for the asset (via the Releases API's
+          # `digest` field), not anything supabase/dbdev's own release process asserts.
+          DBDEV_CLI_VERSION: v0.1.7
+          DBDEV_CLI_SHA256: d3aca68584f402c2192d2946acdd081a189851505be38ceaee6418340a335b11
         run: |
-          DEB_URL=$(curl -fsSL https://api.github.com/repos/supabase/dbdev/releases/latest \
-            | jq -r '.assets[] | select(.name | endswith("linux-amd64.deb")) | .browser_download_url')
+          DEB_URL="https://github.com/supabase/dbdev/releases/download/${DBDEV_CLI_VERSION}/dbdev-${DBDEV_CLI_VERSION}-linux-amd64.deb"
           curl -fsSL -o dbdev.deb "$DEB_URL"
+          echo "${DBDEV_CLI_SHA256}  dbdev.deb" | sha256sum -c -
           sudo dpkg -i dbdev.deb
 
       - name: Authenticate to dbdev
