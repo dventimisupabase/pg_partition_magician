@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **`bench/restore_fk_lock.sh` stops racing a 4 ms window, and its liveness witness can now fail
+  (#416).** The guard polled `pg_stat_activity` until it saw `restore_incoming_fks` active and only
+  then began writing. Measured on PG 17.11 against its own fixture, the fixed restore takes
+  **4.4 ms** -- it is one `ADD CONSTRAINT ... NOT VALID`, and `NOT VALID` does not scan -- so the
+  probe was trying to catch a 4 ms window by polling. It missed intermittently, wrote nothing, and
+  reported `at least one write landed inside it got false` against perfectly good code. Exactly the
+  instrument-versus-window mistake CLAUDE.md records.
+
+  Worse, the witness that was supposed to stop "no timeouts" from passing vacuously was itself
+  vacuous: `saw := true` sat *after* the spin loop, so it was set whether the loop found the restore
+  or exhausted two million iterations having seen nothing, and `"the probe overlapped a running
+  restore"` could not fail.
+
+  The race is now gone rather than tuned. A gate makes the ordering structural -- the probe starts
+  writing and announces itself, the restore does not begin until that lands, and the probe does not
+  stop until it finishes -- so the probe's write span *contains* the restore by construction and
+  nothing has to be caught. Each attempt and the restore both record the interval they occupied, and
+  the guard requires a genuine interval overlap, which also catches an attempt that began before the
+  window and blocked into it. That the new witness CAN fail was checked rather than assumed: against
+  a deliberately sabotaged copy whose probe never overlaps, it reports `0 of 300 attempts overlapped`
+  and fails -- while "writes are not blocked" passes, which is the vacuous green the old guard
+  reported as success. Fixed code 5/5 with 22-32 overlapping attempts; the
+  `restore_fk_inline_validate` mutation still fails it (221.8 ms restore, 4 timeouts).
+
 - **A retirement now knows WHICH relation it is retiring, not just its name (#407).** Retiring a
   partition an incoming foreign key references needs `ALTER TABLE ... DETACH PARTITION ...
   CONCURRENTLY`, which PostgreSQL refuses to run from a function, a procedure, a `DO` block or a
