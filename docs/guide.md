@@ -671,6 +671,11 @@ things follow, and none of them are optional:
   duration set by that table's size. Reads of it, and your managed table entirely, are unaffected. This is
   irreducible: it is PostgreSQL proving the foreign key still holds. An index on the referencing column is
   ordinary good practice but does not reduce it.
+- **Do not rename or replace a partition while its retirement is in flight.** What reaches cron is text
+  naming the partition, re-resolved in that session a tick later, so pgpm records the partition's oid at
+  dispatch and refuses to detach or drop anything else that turns up under the name. You get
+  `fail_retain_identity` in the log and a retirement that stays wedged until you sort the name out, rather
+  than a dropped table. `status().retain_detaching` tells you when a retirement is in flight.
 
 **When a live row genuinely references an aged one**, pgpm executes the policy you already declared in the
 foreign key's `ON DELETE` clause, rather than inventing one:

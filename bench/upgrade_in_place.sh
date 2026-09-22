@@ -72,6 +72,7 @@ pgpm.config:archive_byte_budget
 pgpm.config:archive_probe_sample
 pgpm.part:attached
 pgpm.part:retiring_at
+pgpm.part:retiring_oid
 pgpm.dropped_fk:restored_at
 pgpm.dropped_fk:validated_at
 pgpm.dropped_fk:validate_retry_after

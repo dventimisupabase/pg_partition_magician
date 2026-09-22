@@ -616,14 +616,39 @@ The sequence, per partition:
    applies the referential action the operator declared. `CASCADE`, `SET NULL` and `SET DEFAULT` proceed;
    `NO ACTION` and `RESTRICT` refuse, and the refusal is logged `fail_retain_crossing` with the
    constraint's own error, leaving the partition intact. A successful crossing is logged `retain_crossing`.
-2. Set `pgpm.part.retiring_at` and point `pgpm_detach` at this partition's concurrent detach, in one
-   transaction, logged `retain_detach`. With no such job, `fail_retain_detach` is logged instead.
-3. On a later call, with the partition detached, `DROP` it, delete the catalog row, log `retain_drop`, and
-   return the cron job to idle.
+2. Set `pgpm.part.retiring_at` and `pgpm.part.retiring_oid`, and point `pgpm_detach` at this partition's
+   concurrent detach, in one transaction, logged `retain_detach`. With no such job, `fail_retain_detach`
+   is logged instead.
+3. On a later call, with the partition detached, return the cron job to idle, `DROP` the partition, delete
+   the catalog row and log `retain_drop`.
 
-`fail_retain_crossing` and `fail_retain_detach` both count in `status().retain_drop_failures`; in-flight
-detaches show in `status().retain_detaching`. A partition that is detached but carries no `retiring_at` was
-detached by something other than pgpm, and `retire` refuses to drop it.
+`fail_retain_crossing`, `fail_retain_detach` and `fail_retain_identity` all count in
+`status().retain_drop_failures`; in-flight detaches show in `status().retain_detaching`. A partition that
+is detached but carries no `retiring_at` was detached by something other than pgpm, and `retire` refuses to
+drop it.
+
+##### The dispatch gap, and what `retiring_oid` is for
+
+What leaves `retire` is command **text**, and a command text can only name a relation -- there is no way to
+write an OID into `ALTER TABLE ... DETACH PARTITION`. pg_cron picks that text up on a later tick, in a
+session of its own, and re-resolves the name there; no lock is held on the partition across the gap. So if
+something else takes the name `schema.child` in between, and attaches the new relation to the same parent,
+the dispatched detach lands on it and the cron session cannot tell.
+
+pgpm cannot close that window -- the reason the statement is dispatched at all is that PostgreSQL refuses
+to run `DETACH ... CONCURRENTLY` from anywhere pgpm could hold a lock. What it does instead is record the
+partition's OID in `pgpm.part.retiring_oid` at dispatch, and check it at the top of every later `retire`
+call, before any side effect: the name must still resolve, and resolve to that OID. When it does not,
+`retire` logs `fail_retain_identity`, returns the standing job to idle, and does nothing else -- no
+re-dispatch, and in particular no `DROP`. The detach can still land on a substitute; the destructive half
+cannot.
+
+That refusal is permanent, not retryable: no later tick makes the name mean the right object again. It
+shows up as `retain_detaching` stuck non-zero with `retain_drop_failures` climbing, and the `method` column
+carries both OIDs. Recovery is an operator decision -- put the intended relation back under that name, or
+delete the `pgpm.part` row if it is gone for good. `retiring_oid` is null for every partition on the
+ordinary one-step drop path, and for a retirement that was already in flight when the column was added;
+both are treated as unanchored and behave as they did before.
 
 ### `_detach_reap`
 
@@ -1185,8 +1210,9 @@ One row per managed table. Beyond the static config it surfaces:
 - `retain_drop_failures` -- unexpected `DROP` failures since the last successful drop (not a
   child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
   is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
-  one and the FK's own `ON DELETE` refused the delete) and `fail_retain_detach` (nowhere to dispatch a
-  concurrent detach to), since all three wedge retention the same way.
+  one and the FK's own `ON DELETE` refused the delete), `fail_retain_detach` (nowhere to dispatch a
+  concurrent detach to) and `fail_retain_identity` (the partition's name no longer resolves to the
+  relation whose detach was dispatched), since all four wedge retention the same way.
 - `parent_missing` -- the managed relation itself is **gone**: dropped without
   [`untransmute`](#untransmute), leaving the `pgpm.config` row pointing at an oid with no `pg_class`
   entry. Everything else in the row still reports (it comes from pgpm's own catalog), but
@@ -1382,6 +1408,7 @@ The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 | `created_at` | `timestamptz` | when created |
 | `attached` | `boolean` | false while a regrain is still filling it standalone; true once attached |
 | `retiring_at` | `timestamptz` | set when `retire` dispatches a concurrent detach for this partition, so recovery can tell whose detach a pending one was; null for every partition on the ordinary one-step drop path |
+| `retiring_oid` | `oid` | which relation that dispatch meant. The detach travels to pg_cron as text naming the partition, and is re-resolved there; this is what lets `retire` refuse to act when the name has stopped resolving to it (see [the dispatch gap](#the-dispatch-gap-and-what-retiring_oid-is-for)). Null alongside a null `retiring_at`, and for a retirement already in flight when the column was added |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.

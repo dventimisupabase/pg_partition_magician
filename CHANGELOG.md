@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+- **A retirement now knows WHICH relation it is retiring, not just its name (#407).** Retiring a
+  partition an incoming foreign key references needs `ALTER TABLE ... DETACH PARTITION ...
+  CONCURRENTLY`, which PostgreSQL refuses to run from a function, a procedure, a `DO` block or a
+  dynamic `EXECUTE` -- so pgpm dispatches it to pg_cron as command text and completes the `DROP` on a
+  later tick. A command text can only name a relation; there is no way to write an oid into it. The
+  cron session therefore re-resolves `schema.child` a tick or more later, with no lock held on the
+  partition across the interval, and had no way to notice that the name had come to mean something
+  else. That is the same time-of-check/time-of-use shape as the `SPLIT`/`MERGE PARTITION` finding
+  that motivated the whole #346 audit -- a name decided now, re-resolved and trusted by something
+  else later -- and it ended in a `DROP`.
+
+  pgpm cannot close the window, because the reason the statement is dispatched at all is that
+  PostgreSQL will not let pgpm hold anything while it runs. So `pgpm.part` gains `retiring_oid`,
+  recorded in the same transaction as the dispatch, and `retire` checks it at the top of every later
+  call -- before the write block, the crossing `DELETE`, the re-dispatch or the `DROP`, so no step
+  can touch a substitute. Two facts have to agree, since either alone is forgeable: the name
+  resolves, and it resolves to that oid. When they do not, `retire` logs the new
+  `fail_retain_identity`, returns the standing `pgpm_detach` job to idle and does nothing else. The
+  detach can still land on a substitute; the destructive half cannot, which is the half worth
+  anchoring. `status().retain_drop_failures` counts the refusal alongside `fail_retain_drop`,
+  `fail_retain_crossing` and `fail_retain_detach`, because it wedges retention the same way -- and
+  unlike those it never clears itself, so it is a wedge an operator has to look at.
+
+  Three smaller changes fall out of the same reading. `_dispatch_detach` now takes the child as a
+  `regclass` and renders both relation names from oids, so the text that lands on `cron.job` can only
+  name relations the caller resolved in its own transaction. The standing job is returned to idle
+  BEFORE the `DROP` rather than after it: the armed window was never one cron interval, it lasted
+  until the drop SUCCEEDED, and a drop that kept failing left a stale name armed and re-firing
+  indefinitely. And `_idle_detach_job` takes the command it expects to find, so the wedge above --
+  which revisits it on every tick for as long as it lasts -- disarms only its own dispatch instead of
+  clobbering another parent's on every tick; both it and `_dispatch_detach` build that text through
+  the new `pgpm._detach_cmd`, so arming and disarming cannot drift. Both changed signatures are
+  dropped explicitly, since `create or replace` can change neither a parameter's type nor its
+  arity, and the old copies would otherwise stay installed and resolvable beside the new ones.
+
+  `tests/77_retain_incoming_fk_test.sql` builds the substitution in the only shape that matters --
+  the impostor is a genuine partition of the same parent under the same name, so the dispatched
+  detach succeeds on it -- and drives both refusals, with liveness witnesses for the recorded oid,
+  the impostor's different oid, and the impostor actually being attached. Every assertion there is a
+  negative, so `bench/retire_detach_substitution.sh` runs the same file against an arbitrary copy of
+  the module and the `retire_drop_unanchored_name` mutation deletes the identity check, which
+  `./test.sh discriminate` requires the file to FAIL against. Measured: the mutant loses seven
+  assertions, including the one that finds the substitute dropped. `retiring_oid` is added with `add
+  column if not exists` and reads null for a retirement already in flight across the upgrade, which
+  is treated as unanchored and behaves exactly as it did before rather than wedging mid-flight.
+
 - **A `_q` suffix now marks every already-quoted SQL fragment, and CI keeps the mark honest
   (#409).** Several functions build a comma-joined fragment out of `quote_ident`'d pieces and then
   splice the whole fragment with a bare `%s` -- correct, since `%I` over an already-quoted string
