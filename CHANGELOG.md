@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+- **The dbdev minifier decided what a line was without knowing where it sat (#410).**
+  `scripts/build_dbdev_package.sh` trims `pgpm_core/install.sql` from 329,376 chars to fit dbdev's
+  250,000-char cap by dropping blank lines, full-line `--` comments and `COMMENT ON` statements. The
+  `awk` that did it judged every one of those from the line's own leading characters, with no idea
+  whether the line sat inside a string literal. A line beginning `--` inside a multi-line `'...'`
+  literal is *data*: a statement assembled across several source lines, an example inside a `raise`
+  message. Dropping it changes the SQL an operator installs from dbdev while the reviewed, committed
+  `install.sql` still reads correctly, and nothing catches that, because the script's only check is
+  the size ceiling and a dropped line can only help pass it.
+
+  **#410 recorded this as dormant. Line-*dropping* was; whitespace *collapsing* was not.** The same
+  blindness was already rewriting literal content in the published package, at **17 lines across
+  five multi-line literals** -- among them the body of the delta trigger `regrain` generates, whose
+  indentation and internal spacing were being rewritten inside the `format()` string that carries
+  it. Harmless in every one of the five (the altered text lands in generated whitespace or inside a
+  generated comment), which is exactly why it had never been noticed.
+
+  The minifier is now `scripts/minify_sql.py`: one character-level scanner over the whole file
+  carrying real lexical state -- single-quoted literals with `''` escapes, double-quoted
+  identifiers, nestable `/* */` comments, and a stack of dollar-quote tags -- with every line's
+  decision made from the state the line *starts* in. A line starting inside a literal is emitted
+  byte for byte. A file that does not lex end to end (an unbalanced quote or dollar tag) is a loud
+  error rather than a silent minify, and so is a run that drops no lines at all.
+
+  Two things deliberately did not change. Comments inside `$$` bodies are still stripped: they are
+  most of what the minifier removes, and #410's sketch of leaving dollar-quoted bodies alone does
+  not fit under the cap. And `COMMENT ON` stripping stays, now state-aware, so a `;` inside the
+  comment's own text no longer ends the statement early (the old `;$` line match did, and emitted
+  the remainder of the literal as stray SQL). `\ir`/`\i` expansion is gone rather than fixed: it had
+  never run against any file in this repo, so it was unverified code standing between the reviewed
+  file and the published one, and a build that meets one now fails loudly.
+  `scripts/build_install_bundle.sh` keeps its includes, which is a real asymmetry rather than an
+  oversight -- it copies lines verbatim, where an include boundary costs nothing.
+
+  The self-test carries a port of the old awk and requires each of its five defect fixtures to come
+  out *differently* under it, so a rewrite that quietly reintroduced the blindness fails; three more
+  fixtures assert the opposite, that the preserved behaviour still matches the old minifier exactly.
+  Checked by pointing `minify()` at the legacy logic: the five fail, the three pass. New package is
+  148,737 chars against the 250,000 cap, and `./test.sh 17 --channel=dbdev` installs it and runs the
+  full pgTAP suite against it, green.
+
 - **`bench/upgrade_in_place.sh` degraded 15 of the 25 columns it claimed to, and nothing said so
   (#417).** The guard proves that re-running `install.sql` over an existing database upgrades it
   rather than half-breaking it: it drops "every column `install.sql` backfills with `add column if
