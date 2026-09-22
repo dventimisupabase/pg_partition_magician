@@ -40,6 +40,24 @@ name: Lock-view capture guard
 # the same defect #395 fixed one file over. Recorded rather than quietly corrected, because this
 # repo's recurring failure is precisely a claim that reads as protection and is not one.
 #
+# docker-compose.yml AND Dockerfile are in the filter for exactly that reason, and were missing for
+# exactly the reason above. `run_lockview` builds and runs the `locktrace` compose service
+# (docker-compose.yml:115, `pgpm_test:17-locktrace`, built from Dockerfile with
+# WITH_LOCK_TRACER=true), so a change to the service definition or to the image that carries BCC and
+# the debug symbols this capture needs could break this track while triggering no job. locktrace.yml
+# does list both -- and that is the same false comfort the paragraph above dismantles, since its one
+# step never runs this track.
+#
+# WHY THIS FILTER STAYS AN ENUMERATION where perf.yml's became a shape (`bench/*.sh`, #417's lesson
+# one level up). There is no shape here that is both complete and honest. `bench/lock_view*` misses
+# plot_lock_view.py and lock_timeout_pairing_demo.sh, two of the seven; a glob that silently covers
+# five of seven is WORSE than a list, because it reads as a rule and is not one. The list was
+# verified complete rather than assumed: every file the four scripts `run_lockview` invokes actually
+# reads is named above. bench/lock_probe.py, bench/lock_trace.sh and bench/README.md appear in those
+# scripts only inside comments (lock_view.py's docstring is explicit that it is deliberately NOT
+# shared with lock_probe.py), so their absence is correct and not an oversight to be "fixed" later.
+# pgpm_core/install.sql is absent on purpose too -- see the first paragraph.
+#
 # The marginal cost is small: locktrace.yml ALREADY starts a privileged eBPF container on every
 # test.sh change, so this adds one parallel ~2m job to PRs that were paying for one already.
 #
@@ -60,6 +78,8 @@ on:
       - 'bench/sql/lockview_names.sql'
       - 'bench/fixtures/lockview/**'
       - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
       - '.github/workflows/lockview.yml'
   pull_request:
     branches: [ main ]
@@ -74,6 +94,8 @@ on:
       - 'bench/sql/lockview_names.sql'
       - 'bench/fixtures/lockview/**'
       - 'test.sh'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
       - '.github/workflows/lockview.yml'
   workflow_dispatch:
 
