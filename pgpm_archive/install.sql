@@ -133,7 +133,7 @@ $$;
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
 -- heap (where ctid is no longer comparable): archive._pq_to_parquet_range, the Parquet range
--- reader, calls this. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
+-- reader, calls this. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin_q discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
 -- contract regrain() already enforces, an inherited limitation, not a new gap. (On a partitioned
@@ -1633,6 +1633,34 @@ $$;
 -- every column's array lines up on the same row order)
 -- ---------------------------------------------------------------------------
 
+-- archive._pq_from_item builds the FROM item every read in this section runs against, and is the
+-- ONLY place in the module that builds one. Both shapes come out of %I/%L over typed inputs: a
+-- whole relation from p_schema/p_table, and a half-open [p_lo, p_hi) range on p_control when a
+-- control column is given. Callers pass catalog values (n.nspname, c.relname) and the encoder's own
+-- parameters straight in -- nobody assembles the string themselves, which is the point.
+--
+-- WHY IT EXISTS. This used to be assembled by each caller and handed to
+-- archive._pq_encode_column_data as a `p_from_sql text` that the encoder then spliced with a bare
+-- %s, no quoting, in all seven type branches -- the one place among the module's audited
+-- `execute format(...)` sites where a text parameter reached the statement unquoted (issue #408,
+-- from the #346 audit). Nothing untrusted ever reached it: both callers built it out of %I-quoted
+-- catalog names. But the guarantee lived in the callers, so the encoder promised nothing on its
+-- own and a third caller written later would have inherited nothing. Building it here, from typed
+-- inputs, puts the guarantee where a future caller cannot route around it.
+--
+-- `x` aliases the range subquery because a subquery in a FROM item needs a name. Immutable and SQL,
+-- not plpgsql: it is pure text assembly with no catalog lookup of its own.
+create or replace function archive._pq_from_item(
+  p_schema name, p_table name, p_control name default null, p_lo text default null, p_hi text default null
+) returns text
+language sql immutable as $$
+  select case
+    when p_control is null then format('%I.%I', p_schema, p_table)
+    else format('(select * from %I.%I where %I >= %L and %I < %L) x',
+                p_schema, p_table, p_control, p_lo, p_control, p_hi)
+  end;
+$$;
+
 -- p_nullable columns interleave nulls with real values; is_present[i] tracks which rows had a
 -- value so the OPTIONAL path can prepend a definition-levels bitmap, while the values-only
 -- payload always contains just the non-null values, in row order. For a NOT NULL column every
@@ -1640,10 +1668,22 @@ $$;
 -- the old unconditional-encode behavior byte-for-byte; only p_nullable decides whether the
 -- definition-levels block gets prepended at all.
 --
--- p_order_by defaults to 'ctid' (this function's original, whole-relation ordering,
+-- NO PARAMETER OF THIS FUNCTION CARRIES SQL (issue #408). The relation arrives as p_schema/p_table
+-- and the range as p_control/p_lo/p_hi, both of which go to archive._pq_from_item above to be
+-- %I/%L-quoted; the ordering arrives as p_order_by `name[]` and is quote_ident'd element by element
+-- here, into v_order_q, before anything is spliced. Before that, p_from_sql and p_order_by were
+-- `text` spliced with a bare %s, twice each, in every branch below -- safe only because both
+-- callers happened to build them out of catalog-derived, already-quoted pieces. Keep it this way:
+-- if a future variant needs a shape neither p_control nor p_order_by can express, widen
+-- _pq_from_item's typed parameters rather than reintroducing a parameter that is pasted in whole.
+-- tests/archive/db/10_encode_boundary_test.sql drives a statement terminator through every one of
+-- these parameters and pins the signature against exactly that regression.
+--
+-- p_order_by defaults to {ctid} (this function's original, whole-relation ordering,
 -- unchanged byte-for-byte); archive._pq_to_parquet_range (below) passes an explicit
 -- '(control column, key columns)' order-by instead, since ctid is not comparable once a
--- read spans more than one child's heap. Both call sites guarantee p_order_by is a strict total
+-- read spans more than one child's heap. quote_ident('ctid') is `ctid` -- a system column needs no
+-- special case here. Both call sites guarantee p_order_by is a strict total
 -- order with no ties: ctid is unique per live row, and the range variant requires a primary
 -- key/predicate-free unique constraint specifically so the control column can be tiebroken (see
 -- the exception archive._pq_to_parquet_range raises when one is missing). That matters below,
@@ -1660,7 +1700,7 @@ $$;
 -- _pq_decimal_byte_width already sized to the column's own declared precision.
 -- Builds one column's data page: a per-row null bitmap (is_present) plus the concatenated
 -- PLAIN-encoded bytes of every non-null value, in p_order_by order. Each branch runs ONE dynamic
--- query directly against p_from_sql with two real aggregates -- array_agg for is_present, and
+-- query directly against the FROM item with two real aggregates -- array_agg for is_present, and
 -- string_agg (or array_agg again for bool) for values_payload -- never a PL/pgSQL loop that grows
 -- values_payload with `||`. That distinction matters: `:=`-with-`||` reassigns an immutable
 -- bytea/array value, so N appends copy the entire accumulated buffer each time (O(n^2) total);
@@ -1670,47 +1710,58 @@ $$;
 -- fetched the whole column into an array_agg first, then re-aggregated a SECOND time over
 -- unnest(...) with ordinality to derive is_present/values_payload -- that held two full-size
 -- copies of the column at once (plus the transient doubling each aggregate's own growth costs),
--- ~6x peak RSS on a large text column (issue #368); querying p_from_sql directly, once, removes
+-- ~6x peak RSS on a large text column (issue #368); querying the FROM item directly, once, removes
 -- the intermediate array entirely. string_agg/array_agg skip NULL inputs on their own; `filter
 -- (where ... is not null)` makes that explicit and is what replaces each old loop's `if ... is not
 -- null then` guard.
 create or replace function archive._pq_encode_column_data(
-  p_from_sql text, p_col text, p_pgtype text, p_nullable boolean, p_order_by text default 'ctid',
-  p_decimal_scale int4 default null, p_decimal_bytes int4 default null
+  p_schema name, p_table name, p_col text, p_pgtype text, p_nullable boolean,
+  p_order_by name[] default array['ctid']::name[],
+  p_decimal_scale int4 default null, p_decimal_bytes int4 default null,
+  p_control name default null, p_lo text default null, p_hi text default null
 ) returns bytea
 language plpgsql as $$
 declare
   values_payload bytea := ''::bytea;
   is_present boolean[] := '{}';
   present_bools boolean[] := '{}';
+  v_from_q text;
+  v_order_q text;
 begin
+  v_from_q := archive._pq_from_item(p_schema, p_table, p_control, p_lo, p_hi);
+  select string_agg(quote_ident(c), ', ' order by ord) into v_order_q
+    from unnest(p_order_by) with ordinality as t(c, ord);
+  if v_order_q is null then
+    raise exception 'archive._pq_encode_column_data: p_order_by is empty; the two aggregates below are separately sorted and need a total order to agree on';
+  end if;
+
   if p_pgtype = 'int4' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_int32(%I::int4), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'int8' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_int64(%I::int8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'float8' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_double(%I::float8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'bool' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(array_agg(%I::boolean order by %s) filter (where %I is not null), ''{}''::boolean[])
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, present_bools;
     values_payload := archive._pq_plain_boolean_array(present_bools);
   elsif p_pgtype in ('text', 'array_json') then
@@ -1723,28 +1774,28 @@ begin
                      coalesce(string_agg(archive._pq_plain_text(%I::text), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
                 from %s'
       end,
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype in ('timestamptz','timestamp') then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from %I::timestamptz) * 1000000)::int8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'uuid' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_uuid(%I::uuid), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'numeric' then
     execute format(
       'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
               coalesce(string_agg(archive._pq_plain_decimal(%I::numeric, %L, %L), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
          from %s',
-      p_col, p_order_by, p_col, p_decimal_scale, p_decimal_bytes, p_order_by, p_col, p_from_sql)
+      p_col, v_order_q, p_col, p_decimal_scale, p_decimal_bytes, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   else
     raise exception 'archive._pq_encode_column_data: unsupported column type % for column %', p_pgtype, p_col;
@@ -1765,7 +1816,7 @@ $$;
 create or replace function archive._pq_to_parquet(p_relation regclass, p_compress boolean default true) returns bytea
 language plpgsql as $$
 declare
-  v_schema name; v_table name; v_from_sql text;
+  v_schema name; v_table name; v_from_q text;
   v_col record;
   v_col_names text[] := '{}';
   v_col_pgtypes text[] := '{}';
@@ -1792,7 +1843,7 @@ begin
   select n.nspname, c.relname into v_schema, v_table
     from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where c.oid = p_relation;
-  v_from_sql := format('%I.%I', v_schema, v_table);
+  v_from_q := archive._pq_from_item(v_schema, v_table);
 
   for v_col in
     select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
@@ -1849,12 +1900,16 @@ begin
     raise exception 'archive._pq_to_parquet: relation % has no supported columns', p_relation;
   end if;
 
-  execute format('select count(*) from %s', v_from_sql) into v_num_rows;
+  execute format('select count(*) from %s', v_from_q) into v_num_rows;
 
   v_body := v_magic;
   for i in 1..v_ncols loop
-    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i],
-      'ctid', v_col_scale[i], v_col_typelen[i]);
+    -- named notation, and not just for length: it is what makes the absence of a SQL-carrying
+    -- argument legible at the call site, which is the whole point of #408's signature.
+    v_data := archive._pq_encode_column_data(
+      p_schema => v_schema, p_table => v_table,
+      p_col => v_col_names[i], p_pgtype => v_col_pgtypes[i], p_nullable => v_col_nullable[i],
+      p_decimal_scale => v_col_scale[i], p_decimal_bytes => v_col_typelen[i]);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
@@ -1898,7 +1953,7 @@ $$;
 create or replace function archive._pq_to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default true) returns bytea
 language plpgsql as $$
 declare
-  v_schema name; v_table name; v_from_sql text; v_order_by text; v_key_cols name[];
+  v_schema name; v_table name; v_from_q text; v_order_cols name[]; v_key_cols name[];
   v_col record;
   v_col_names text[] := '{}';
   v_col_pgtypes text[] := '{}';
@@ -1931,12 +1986,11 @@ begin
     raise exception 'archive._pq_to_parquet_range: % has no primary key or predicate/expression-free unique constraint; a resumable cross-partition range read cannot tiebreak ties on % without one (the same refusal pgpm.regrain_step already makes for keyless tables)',
       p_parent, p_control;
   end if;
-  select string_agg(quote_ident(c), ', ' order by ord) into v_order_by
-    from unnest(v_key_cols) with ordinality as t(c, ord);
-  v_order_by := quote_ident(p_control) || ', ' || v_order_by;
+  -- the ordering travels as column NAMES, not as a joined SQL fragment: the encoder quote_ident's
+  -- each one itself (#408). The control column leads, the key columns tiebreak it.
+  v_order_cols := array[p_control] || v_key_cols;
 
-  v_from_sql := format('(select * from %I.%I where %I >= %L and %I < %L) x',
-                        v_schema, v_table, p_control, p_lo, p_control, p_hi);
+  v_from_q := archive._pq_from_item(v_schema, v_table, p_control, p_lo, p_hi);
 
   for v_col in
     select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
@@ -1993,12 +2047,16 @@ begin
     raise exception 'archive._pq_to_parquet_range: relation % has no supported columns', p_parent;
   end if;
 
-  execute format('select count(*) from %s', v_from_sql) into v_num_rows;
+  execute format('select count(*) from %s', v_from_q) into v_num_rows;
 
   v_body := v_magic;
   for i in 1..v_ncols loop
-    v_data := archive._pq_encode_column_data(v_from_sql, v_col_names[i], v_col_pgtypes[i], v_col_nullable[i], v_order_by,
-      v_col_scale[i], v_col_typelen[i]);
+    v_data := archive._pq_encode_column_data(
+      p_schema => v_schema, p_table => v_table,
+      p_col => v_col_names[i], p_pgtype => v_col_pgtypes[i], p_nullable => v_col_nullable[i],
+      p_order_by => v_order_cols,
+      p_decimal_scale => v_col_scale[i], p_decimal_bytes => v_col_typelen[i],
+      p_control => p_control, p_lo => p_lo, p_hi => p_hi);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
@@ -2401,3 +2459,8 @@ drop function if exists archive.unschedule();
 -- gotcha, again).
 drop function if exists archive._pq_build_schema_leaf(text, int4, int4, boolean);
 drop function if exists archive._pq_encode_column_data(text, text, text, boolean, text);
+-- ...and then #408 retyped the whole parameter list (no parameter carries SQL any more), which is a
+-- different arity again, so the 7-arg version needs the same treatment. Leaving it installed would
+-- be worse than a stale overload: it is the one that still splices a caller's text verbatim, and it
+-- would stay resolvable by anything calling positionally.
+drop function if exists archive._pq_encode_column_data(text, text, text, boolean, text, int4, int4);

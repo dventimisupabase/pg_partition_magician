@@ -428,6 +428,13 @@ run_archive() {
   echo "--- DEFLATE encoder memory guard (issue #370) ---"
   bash "$(dirname "$0")/bench/archive_deflate_memory.sh" pgpm_test-archive pgpm_deflatemem || fail=1
 
+  # The encode boundary guard (#408) re-runs a pgTAP file the suite above ALREADY ran, which looks
+  # redundant and is not: what runs here is the harness bench/discriminate.sh drives that file
+  # through, and a harness only ever pointed at mutants would be green in `discriminate` even if it
+  # were broken enough to fail against everything. This is the clean-code half of that pair.
+  echo "--- encode parameter boundary guard (issue #408) ---"
+  bash "$(dirname "$0")/bench/archive_encode_boundary.sh" pgpm_test-archive pgpm_encbound || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"
