@@ -61,6 +61,23 @@ jobs:
           python3 scripts/minify_sql.py --selftest
           scripts/build_dbdev_package.sh pgpm_core/install.sql dist/minifier-check.sql
 
+  track-filters:
+    name: Track path filters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A workflow's `paths:` filter is a hand-maintained list of what it watches, and it drifts
+      # behind what the track it runs actually invokes. The drift is invisible in the worst way:
+      # the job does not fail, it does not RUN, and a PR that changed only the guard it gates
+      # merges green with nothing having looked at it. Three instances were found by hand in one
+      # afternoon (#419, #423, #424); this checks the class instead. --selftest runs FIRST, on
+      # embedded fixtures, so a parser that has stopped reading test.sh fails here rather than
+      # reporting a clean sweep of nothing. No dependencies, no database, no container.
+      - name: Every file a track runs must be in its workflow's path filter
+        run: |
+          python3 scripts/check_track_filters.py --selftest
+          python3 scripts/check_track_filters.py
+
   shellcheck:
     name: Shell scripts
     runs-on: ubuntu-latest
