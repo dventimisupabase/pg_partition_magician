@@ -57,7 +57,7 @@ docker exec "$C" psql -U postgres -d "$DB" -qtA \
   -c "set client_min_messages = warning" \
   -c "select pg_backend_pid()" \
   -c "select pg_sleep(0.3)" \
-  -c "select length(archive._pq_encode_column_data('public.encode_bench','payload','text',false))" \
+  -c "select length(archive._pq_encode_column_data(p_schema => 'public', p_table => 'encode_bench', p_col => 'payload', p_pgtype => 'text', p_nullable => false))" \
   -c "select 'marker_encode_done'" \
   > "$LOG" 2>&1 &
 BG=$!

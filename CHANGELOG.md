@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+- **No parameter of `archive._pq_encode_column_data` carries SQL any more (#408).** It was the one
+  place among the 166 `execute format(...)` sites the #346 audit covered where a `text` parameter
+  reached the executed statement through a bare `%s` with no quoting at all: the whole FROM item
+  (`p_from_sql`) and the whole ORDER BY list (`p_order_by`), twice each, in every one of the seven
+  type branches. Nothing untrusted ever reached it -- `_pq_to_parquet` passed a `%I`-quoted
+  `schema.table` and the literal `'ctid'`, and `_pq_to_parquet_range` passed a `quote_ident`-joined
+  key list and a `%I`/`%L`-built subquery -- so this closes no live hole. What it closes is where the
+  guarantee lived: entirely in the two callers, so the function promised nothing on its own and a
+  third caller written later would have inherited nothing.
+
+  The relation now arrives as `p_schema`/`p_table` and the range as `p_control`/`p_lo`/`p_hi`, both
+  of which go to the new `archive._pq_from_item` to be `%I`/`%L`-quoted; the ordering arrives as
+  `p_order_by name[]` and is `quote_ident`'d element by element inside the function. There is no
+  longer a parameter a caller can paste SQL into, so a future caller cannot route around it. Both
+  entry points also build their `count(*)` FROM item through `_pq_from_item`, which is now the only
+  place in the module that builds one.
+
+  `tests/archive/db/10_encode_boundary_test.sql` drives a statement-terminator payload through every
+  one of those parameters. Its `p_table` payload is deliberately self-completing -- it closes the
+  SELECT, drops a victim table, and supplies a third statement returning the `(boolean[], bytea)`
+  pair the `EXECUTE ... INTO` needs -- because the obvious payload leaves an unterminated identifier,
+  and a statement that fails rolls back the very drop it was meant to prove, which would have made
+  "the victim table survived" pass against vulnerable code too.
+
+  That those assertions discriminate is now a standing check rather than something checked once by
+  hand: `bench/archive_encode_boundary.sh` runs the same pgTAP file against an arbitrary copy of
+  the module, and two mutations put each half of the defect back (`archive_from_item_raw_splice`
+  weakens `%I` to `%s` in `_pq_from_item`; `archive_order_by_raw_splice` drops `quote_ident` from
+  the ORDER BY build), so `./test.sh discriminate` requires the file to FAIL against both. The
+  first takes the victim table with it; the second turns the payload into a syntax error instead of
+  a quoted column name. The signature is pinned by the test and the old 7-arg arity is dropped
+  explicitly, #209's gotcha being that `CREATE OR REPLACE` would otherwise leave the SQL-taking
+  version installed beside the new one.
+
 - **`docs/reference.md` described an `obtain` that has not existed since #288.** Its closing paragraph
   called `obtain` "a procedure, not a function", said it took "an advisory lock per parent" so a second
   concurrent call "defers instead of interfering", and said it reported failures through `p_deferred`.
