@@ -16,18 +16,18 @@ on:
     branches: [ main ]
     paths:
       - 'pgpm_core/install.sql'
-      - 'bench/regrain_perf.sh'
-      - 'bench/transmute_lock.sh'
-      - 'bench/transmute_lock_timeout.sh'
-      - 'bench/maintain_lock.sh'
-      - 'bench/retire_detach_lock.sh'
-      - 'bench/retire_detach_substitution.sh'
-      - 'tests/77_retain_incoming_fk_test.sql'   # the file that guard drives
-      - 'bench/restore_fk_lock.sh'
-      - 'bench/obtain_backoff_headroom.sh'
-      - 'bench/transmute_claim_squat.sh'
-      - 'bench/discriminate.sh'
+      # Matched by SHAPE, not enumerated. Every guard this job runs -- through `./test.sh perf` and
+      # through the `discriminate` step that drives the archive guards too -- is a bench/*.sh, and an
+      # enumerated list silently stops covering the next one added. It already had: four guards the
+      # perf track runs (transmute_cutover_order, upgrade_in_place, frontier_drought,
+      # regrain_outgoing_fk_lock) sat outside the list, so changing one of them on its own ran no
+      # perf job at all. Found while fixing #417, which is the same defect one level down -- a
+      # hand-maintained list of what to check, drifting behind what exists, with nothing reporting it.
+      # This sweeps in a few bench scripts the job does not run; a job that runs when it need not is
+      # cheap, and one that quietly does not run is what this repo keeps paying for.
+      - 'bench/*.sh'
       - 'bench/mutations/**'
+      - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -36,18 +36,18 @@ on:
     branches: [ main ]
     paths:
       - 'pgpm_core/install.sql'
-      - 'bench/regrain_perf.sh'
-      - 'bench/transmute_lock.sh'
-      - 'bench/transmute_lock_timeout.sh'
-      - 'bench/maintain_lock.sh'
-      - 'bench/retire_detach_lock.sh'
-      - 'bench/retire_detach_substitution.sh'
-      - 'tests/77_retain_incoming_fk_test.sql'   # the file that guard drives
-      - 'bench/restore_fk_lock.sh'
-      - 'bench/obtain_backoff_headroom.sh'
-      - 'bench/transmute_claim_squat.sh'
-      - 'bench/discriminate.sh'
+      # Matched by SHAPE, not enumerated. Every guard this job runs -- through `./test.sh perf` and
+      # through the `discriminate` step that drives the archive guards too -- is a bench/*.sh, and an
+      # enumerated list silently stops covering the next one added. It already had: four guards the
+      # perf track runs (transmute_cutover_order, upgrade_in_place, frontier_drought,
+      # regrain_outgoing_fk_lock) sat outside the list, so changing one of them on its own ran no
+      # perf job at all. Found while fixing #417, which is the same defect one level down -- a
+      # hand-maintained list of what to check, drifting behind what exists, with nothing reporting it.
+      # This sweeps in a few bench scripts the job does not run; a job that runs when it need not is
+      # cheap, and one that quietly does not run is what this repo keeps paying for.
+      - 'bench/*.sh'
       - 'bench/mutations/**'
+      - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
