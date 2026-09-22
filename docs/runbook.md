@@ -329,7 +329,8 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
    with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
-   (`fail_retain_drop`, `fail_retain_crossing` or `fail_retain_detach` rows, `method`).
+   (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach` or `fail_retain_identity` rows,
+   `method`).
 
 2. If anything has a foreign key **pointing at** this table, check the two failures specific to that. A
    referenced partition cannot be dropped outright; it is detached first, by a cron job.
@@ -337,7 +338,8 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    ```sql
    select at, action, lo, hi, method from pgpm.log
     where parent_table = 'public.events'::regclass
-      and action in ('fail_retain_detach', 'fail_retain_crossing', 'retain_detach', 'retain_crossing')
+      and action in ('fail_retain_detach', 'fail_retain_crossing', 'fail_retain_identity',
+                     'retain_detach', 'retain_crossing')
     order by id desc limit 20;
    ```
 
@@ -347,8 +349,15 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
      `ON DELETE` (`NO ACTION` or `RESTRICT`) refuses to let it go. `method` carries PostgreSQL's own
      error naming the constraint. This is the constraint doing its job, not a pgpm fault: remove the
      referencing rows, or change the referential action, if you meant retention to win.
-   - `retain_detaching` non-zero for many ticks with neither logged means the detach is dispatched but
-     the `pgpm` job is not running: check `cron.job_run_details`.
+   - `fail_retain_identity` -- the partition's name no longer resolves to the relation whose detach was
+     dispatched (`method` carries both oids). The detach travels to pg_cron as text naming the
+     partition and is re-resolved in that session a tick or more later, so pgpm records the oid at
+     dispatch and refuses to detach or drop anything else under that name. This one does **not** clear
+     itself on a later tick, and nothing was destroyed: find out what took the name. Either put the
+     intended relation back under it, or, if it is genuinely gone, `delete from pgpm.part where
+     parent_table = ... and child_name = ...` to retire the bookkeeping.
+   - `retain_detaching` non-zero for many ticks with none of these logged means the detach is
+     dispatched but the `pgpm` job is not running: check `cron.job_run_details`.
 
 3. Run a maintenance pass, or force the reclaim by hand:
 

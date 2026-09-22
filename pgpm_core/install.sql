@@ -186,11 +186,32 @@ create table if not exists pgpm.part (
   -- behind it was pgpm's to complete or an operator's to keep. null for every unreferenced partition,
   -- which never leaves the one-step bare-DROP path at all.
   retiring_at  timestamptz,
+  -- WHICH object that retirement meant, by OID, recorded in the same transaction that dispatches the
+  -- detach (issue #407). The dispatched command is a fully-formed `ALTER TABLE ... DETACH PARTITION
+  -- schema.child CONCURRENTLY` sitting on cron.job until pg_cron's scheduler picks it up a tick or
+  -- more later, in a session of its own, and a NAME is all a command text can carry: nothing bridges
+  -- that gap, no lock is held on the child across it. If the object answering to schema.child at
+  -- execution time is not the one pgpm resolved at dispatch, the detach acts on whatever now holds
+  -- the name and the executing session cannot tell the difference -- the same shape as the
+  -- SPLIT/MERGE time-of-check/time-of-use bug the #346 audit was about.
+  --
+  -- Preventing the substitution inside that window is not available to pgpm (see _dispatch_detach for
+  -- why the statement has to leave the process at all), so this makes it DETECTABLE at the two points
+  -- that still belong to pgpm: retire() refuses to re-dispatch, and refuses the DROP that follows a
+  -- successful detach, unless the name still resolves to exactly this OID. The DROP is the
+  -- destructive half, and it is the half this anchors.
+  --
+  -- Null means "no OID was recorded", which is true of every partition on the ordinary one-step drop
+  -- path and of a retirement that was already in flight when this column was added. Both read as
+  -- unanchored and are left to behave exactly as they did before, rather than wedging an upgrade
+  -- mid-retirement on a check that has nothing to compare against.
+  retiring_oid oid,
   primary key (parent_table, child_name)
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.part add column if not exists attached boolean not null default true;
 alter table pgpm.part add column if not exists retiring_at timestamptz;
+alter table pgpm.part add column if not exists retiring_oid oid;
 
 -- In-flight conversions (issue #275). transmute runs in three transactions -- add the bound, validate it,
 -- cut over -- so that the O(rows) validation scan is not held under the ACCESS EXCLUSIVE lock the ADD
@@ -946,6 +967,16 @@ $$;
 -- managed parent entirely, are unaffected. That part is irreducible: it is PostgreSQL proving the FK
 -- still holds. An index on the referencing FK column does NOT reduce it (measured: 1368 ms without,
 -- 1634 ms with).
+--
+-- And what it costs in IDENTITY, which is the other half of the bill (issue #407). Dispatching means
+-- the statement leaves this process as TEXT and is re-resolved BY NAME, later, somewhere else, with
+-- no lock held on the child in between -- the time-of-check/time-of-use shape the #346 audit went
+-- looking for. pgpm cannot close that window: the reason the statement is dispatched at all is that
+-- PostgreSQL will not let pgpm hold anything while it runs. So the retirement is anchored to the
+-- child's OID instead (pgpm.part.retiring_oid), and the two steps that remain pgpm's -- re-dispatching
+-- on a later tick, and the DROP that follows a successful detach -- refuse to act unless the name
+-- still resolves to it. The detach itself can still land on a substitute; the DROP, which is the
+-- irreversible half, cannot.
 
 -- _crossing_keys: the control-column values inside [p_lo, p_hi) that some incoming foreign key still
 -- references -- the rows where the operator's two promises, the FK and the retention horizon,
@@ -1005,6 +1036,28 @@ begin
 end;
 $$;
 
+-- #407 changed p_child from `name` to `regclass`, and gave _idle_detach_job a parameter.
+-- `create or replace` cannot change either, so the old signatures would otherwise stay installed
+-- beside the new ones on an upgrade -- and a zero-argument call would then be AMBIGUOUS against a
+-- one-argument version with a default, which is why _idle_detach_job's parameter has none.
+drop function if exists pgpm._dispatch_detach(regclass, name);
+drop function if exists pgpm._idle_detach_job();
+
+-- The one place the dispatched command's text is built. Both _dispatch_detach (which arms the job)
+-- and retire() (which disarms it, and has to recognise its own command to do that safely) go through
+-- here, so the two cannot drift into disagreeing about what was armed.
+--
+-- Returns null for a p_parent with no pg_class row, which _idle_detach_job reads as "disarm
+-- unconditionally" -- degrading to exactly the pre-#407 behaviour, not to something worse. retire()
+-- cannot reach it that way regardless: it resolves the parent's schema, and reads the frontier off
+-- the relation, well before either call site.
+create or replace function pgpm._detach_cmd(p_parent regclass, p_child_nsp name, p_child_rel name)
+returns text language sql stable as $$
+  select format('alter table %I.%I detach partition %I.%I concurrently',
+                n.nspname, c.relname, p_child_nsp, p_child_rel)
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+$$;
+
 -- _dispatch_detach: point the standing `pgpm_detach` job at this partition's concurrent detach.
 -- Returns null on success, or the REASON it could not dispatch -- pg_cron not installed, pgpm.schedule()
 -- never run, no privilege on cron.job. All three are configuration problems the operator has to see and
@@ -1013,13 +1066,21 @@ $$;
 -- Dynamic EXECUTE because the `cron` schema is only resolved at call time, so this file still installs
 -- cleanly where pg_cron is not enabled. Both relations are schema-qualified in the command: the cron
 -- job runs in its own session, with its own search_path.
-create or replace function pgpm._dispatch_detach(p_parent regclass, p_child name)
+--
+-- BOTH RELATIONS ARE PASSED AS OIDS AND RENDERED FROM THEM (issue #407), so the text that lands on
+-- cron.job can only ever name relations the caller actually resolved in its own transaction. That is
+-- the most this function can do about the gap it opens: the command it writes is picked up by pg_cron
+-- a tick or more later, in another session, and re-resolved BY NAME there, with no lock held on
+-- either relation across the interval and no way for a command text to carry an OID. The rest of the
+-- defence is pgpm.part.retiring_oid, which lets retire() DETECT at its next two decision points that
+-- the name no longer means what it meant here. See the column's comment.
+create or replace function pgpm._dispatch_detach(p_parent regclass, p_child regclass)
 returns text language plpgsql as $$
-declare v_nsp name; v_rel name; v_cmd_q text; v_n int;
+declare v_cnsp name; v_crel name; v_cmd_q text; v_n int;
 begin
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_cmd_q := format('alter table %I.%I detach partition %I.%I concurrently', v_nsp, v_rel, v_nsp, p_child);
+  select n.nspname, c.relname into v_cnsp, v_crel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_child;
+  v_cmd_q := pgpm._detach_cmd(p_parent, v_cnsp, v_crel);
   begin
     execute format(
       'select count(*)::int from (select cron.alter_job(jobid, command => %L) from cron.job'
@@ -1035,11 +1096,25 @@ $$;
 
 -- the reverse: put the standing job back to idle once a retirement completes, so it is not left
 -- re-running a detach that has already happened (which logs `is not a partition` every tick).
-create or replace function pgpm._idle_detach_job()
+--
+-- p_cmd null disarms whatever is there. Pass a command instead to disarm ONLY IF THAT IS STILL WHAT
+-- IS ARMED (issue #407). At most one detach is in flight, so the caller completing a retirement is
+-- normally the owner of the armed command and null is right; but a retirement WEDGED on an identity
+-- mismatch revisits this on every tick forever, and an unconditional disarm there would clobber some
+-- other parent's freshly-dispatched detach every tick for as long as the wedge lasts. Build p_cmd
+-- through pgpm._detach_cmd, the same function that armed it. A mismatch skips the disarm, which is
+-- the safe direction: the next successful dispatch overwrites the command anyway.
+create or replace function pgpm._idle_detach_job(p_cmd text)
 returns void language plpgsql as $$
 begin
-  execute 'select cron.alter_job(jobid, command => ''select 1'') from cron.job'
-       || ' where jobname = ''pgpm_detach'' and database = current_database()';
+  if p_cmd is null then
+    execute 'select cron.alter_job(jobid, command => ''select 1'') from cron.job'
+         || ' where jobname = ''pgpm_detach'' and database = current_database()';
+  else
+    execute 'select cron.alter_job(jobid, command => ''select 1'') from cron.job'
+         || ' where jobname = ''pgpm_detach'' and database = current_database() and command = $1'
+      using p_cmd;
+  end if;
 exception when others then
   null;   -- no pg_cron, or no such job: there is nothing to quiesce
 end;
@@ -1072,11 +1147,19 @@ $$;
 -- partition exactly one owner at a time. The claim is taken OUTSIDE the DROP's own subtransaction,
 -- so an unexpected drop failure (retain_drop_fail, logged, retried on a later call) keeps the row
 -- claimed until the caller's transaction ends.
+--
+-- IDENTITY ACROSS THE DISPATCH GAP (issue #407). A referenced partition's retirement spans sessions:
+-- this function dispatches a detach as command TEXT, pg_cron runs it a tick or more later, and a
+-- later call of this function completes the DROP. p_child is a name for the whole of that, so every
+-- step after the first re-resolves it, and the object it lands on is only the object pgpm meant if
+-- nothing took the name in between. pgpm.part.retiring_oid records which object that was, and the
+-- check below -- once, before the first side effect of a call, so it covers re-dispatch and DROP
+-- alike -- refuses to go on when the name has stopped resolving to it.
 create or replace function pgpm.retire(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_boundary text; r record;
-  v_referenced boolean; v_still_attached boolean;
+  v_referenced boolean; v_child regclass; v_now regclass;
   v_cross text[]; v_coltype text; v_lo_lit text; v_hi_lit text; v_deleted int; v_reason text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -1086,7 +1169,7 @@ begin
   end if;
 
   -- the claim: one owner per partition at a time
-  select p.lo, p.hi, p.attached, p.retiring_at into r
+  select p.lo, p.hi, p.attached, p.retiring_at, p.retiring_oid into r
     from pgpm.part p
    where p.parent_table = p_parent and p.child_name = p_child
      for update skip locked;
@@ -1100,13 +1183,43 @@ begin
     raise exception 'pg_partition_magician: % is not entirely past the retention horizon (hi %, horizon %)', p_child, r.hi, v_boundary;
   end if;
 
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  -- IDENTITY, BEFORE ANY SIDE EFFECT (issue #407). retiring_oid is set only on a retirement that has
+  -- already dispatched a detach, and it says WHICH object that dispatch meant. Everything from here
+  -- down acts on p_child by NAME -- installing the write block, deleting crossing keys, re-pointing
+  -- the cron job, and finally the DROP -- so the name has to be proved to still mean that object
+  -- before the first of them, not just before the last.
+  --
+  -- Two independent facts have to agree: the name resolves, and it resolves to the recorded OID.
+  -- Either alone is forgeable -- a name can be taken by a new relation, and a pg_class OID can in
+  -- principle be reused once its original is gone -- and neither is checkable by the cron session
+  -- that runs the detach, which is handed nothing but the name. `is distinct from` so a name that
+  -- resolves to nothing at all trips this too.
+  --
+  -- Fails closed and STAYS closed: logged, false, partition untouched, every tick. There is no later
+  -- tick on which the name goes back to meaning the right object, so this is a wedge an operator has
+  -- to look at, not a deferral -- and status() counts it as one. On the way out the standing job is
+  -- disarmed IF it is still holding this retirement's own command, which by now names the
+  -- substitute; conditionally, because this branch runs on every tick for as long as the wedge
+  -- lasts, and an unconditional disarm would clobber another parent's dispatch just as often.
+  if r.retiring_oid is not null then
+    v_now := to_regclass(format('%I.%I', v_nsp, p_child));
+    if v_now::oid is distinct from r.retiring_oid then
+      perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_retain_identity', r.lo, r.hi,
+                format('%I.%I is oid %s now, not the oid %s this retirement dispatched a detach for; refusing to detach or drop it',
+                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), r.retiring_oid));
+      return false;
+    end if;
+  end if;
+
   perform pgpm._install_write_block(p_parent, p_child);
 
   if not pgpm._archive_fully_covered(p_parent, p_child) then
     return false;
   end if;
-
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
   -- Is anything pointing at this parent at all (issue #268)? Without an incoming FK the bare DROP
   -- below works and costs nothing, so the overwhelmingly common path stays byte-identical: no marker,
@@ -1116,11 +1229,15 @@ begin
                            where confrelid = p_parent and contype = 'f' and conparentid = 0);
 
   if v_referenced then
-    v_still_attached := exists (
-      select 1 from pg_inherits i join pg_class c on c.oid = i.inhrelid
-       where i.inhparent = p_parent and c.relname = p_child);
+    -- Resolved to an OID, not merely counted (#407). This is both the "is it still attached?" test it
+    -- has always been AND the value recorded in retiring_oid below, which is what the check at the top
+    -- of every later call compares against -- so the identity being retired is pinned once, here,
+    -- read out of pg_inherits and therefore a partition OF THIS PARENT by construction.
+    select i.inhrelid into v_child
+      from pg_inherits i join pg_class c on c.oid = i.inhrelid
+     where i.inhparent = p_parent and c.relname = p_child;
 
-    if v_still_attached then
+    if v_child is not null then
       -- ONE DETACH IN FLIGHT AT A TIME, database-wide. There is a single standing cron job, so a
       -- second dispatch would overwrite the first and silently abandon it -- leaving a partition
       -- marked retiring_at that nothing is detaching. retain()'s batch loop walks every eligible
@@ -1194,10 +1311,14 @@ begin
       -- must not refresh it. Re-stamping makes the winner perpetually the newest marker, so it stops
       -- being the winner, and the total order above degenerates into no order at all -- two partitions
       -- then dispatch in the same tick and one clobbers the other's job.
-      update pgpm.part set retiring_at = coalesce(retiring_at, clock_timestamp())
+      -- retiring_oid is coalesced for the same reason and records the same instant: it is the object
+      -- the FIRST dispatch chose, and a retry that refreshed it would simply adopt whatever holds the
+      -- name now -- which is precisely the substitution the check above exists to catch.
+      update pgpm.part set retiring_at = coalesce(retiring_at, clock_timestamp()),
+                           retiring_oid = coalesce(retiring_oid, v_child::oid)
        where parent_table = p_parent and child_name = p_child;
 
-      v_reason := pgpm._dispatch_detach(p_parent, p_child);
+      v_reason := pgpm._dispatch_detach(p_parent, v_child);
       if v_reason is null then
         insert into pgpm.log (parent_table, action, lo, hi, method)
           values (p_parent, 'retain_detach', r.lo, r.hi,
@@ -1219,13 +1340,22 @@ begin
                 'detached from the parent by something other than retirement; not dropping it');
       return false;
     end if;
+
+    -- DISARM BEFORE THE DROP, not after it (#407). The standing job still carries this partition's
+    -- detach command and fires it every tick until something resets it, so the window in which a
+    -- stale name sits armed is not one cron interval: it lasts until the drop SUCCEEDS, and a drop
+    -- that keeps failing extends it indefinitely. Out here rather than inside the DROP's own
+    -- subtransaction for the same reason -- a rolled-back drop must not roll back the disarming.
+    -- Unconditional here, unlike the wedge above: this runs once per retirement rather than on every
+    -- tick forever, and the identity check has just proved the name means what it meant, so the
+    -- detach that landed was this retirement's and the armed command is its own.
+    perform pgpm._idle_detach_job(null);
   end if;
 
   begin
     execute format('drop table %I.%I', v_nsp, p_child);
     delete from pgpm.part where parent_table = p_parent and child_name = p_child;
     insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
-    if v_referenced then perform pgpm._idle_detach_job(); end if;
     return true;
   exception when others then
     insert into pgpm.log (parent_table, action, lo, hi, method)
@@ -4467,12 +4597,14 @@ begin
     select max(id) into v_last_retain_id from pgpm.log
       where parent_table = r.parent_table and action = 'retain_drop';
     -- Exact action values, never a prefix match: `fail_retain_crossing` (issue #268, a live row
-    -- references a doomed one and the FK's own ON DELETE refused the delete) and `fail_retain_detach`
-    -- (no pgpm_detach cron job to dispatch to) wedge retention exactly as a failed drop does, so they
-    -- belong in the same since-last-progress count.
+    -- references a doomed one and the FK's own ON DELETE refused the delete), `fail_retain_detach`
+    -- (no pgpm_detach cron job to dispatch to) and `fail_retain_identity` (issue #407, the child's
+    -- name no longer resolves to the object whose detach was dispatched) wedge retention exactly as a
+    -- failed drop does, so they belong in the same since-last-progress count.
     select count(*) into v_drop_fails from pgpm.log
       where parent_table = r.parent_table
-        and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach')
+        and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach',
+                       'fail_retain_identity')
         and id > coalesce(v_last_retain_id, 0);
     -- Partitions whose concurrent detach has been dispatched and not yet completed (issue #268).
     -- Non-zero is normal for a tick or two while cron performs the detach; persistently non-zero with

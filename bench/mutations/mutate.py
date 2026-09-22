@@ -241,10 +241,36 @@ MUTATIONS = {
         "MANAGED PARENT for the whole O(referencing table) scan, so reads of the parent die with "
         "55P03. This is the defect the dispatch-to-cron machinery exists to avoid, and nothing but a "
         "lock probe can tell the two apart.",
-        [("      v_reason := pgpm._dispatch_detach(p_parent, p_child);\n",
+        [("      v_reason := pgpm._dispatch_detach(p_parent, v_child);\n",
           "      execute format('alter table %s detach partition %I.%I',\n"
           "                     p_parent::text, v_nsp, p_child);\n"
           "      v_reason := null;\n", 1)],
+    ),
+    "retire_drop_unanchored_name": (
+        "bench/retire_detach_substitution.sh",
+        "Pre-#407 retire(): nothing checks that the partition's NAME still resolves to the relation "
+        "whose detach was dispatched. Deleting the identity check is the whole defect, because the "
+        "rest of the function already acts on p_child by name -- the retirement is carried on, and "
+        "completed with a DROP, against whatever answers to that name when the tick comes round. "
+        "The detach travels to pg_cron as text and is re-resolved in another session a tick or more "
+        "later, with no lock held across the gap, so a relation substituted under the name in "
+        "between is detached and then destroyed with no error anywhere. retiring_oid is left in "
+        "place deliberately: the defect being modelled is 'the anchor is not consulted', not 'the "
+        "anchor does not exist', and a mutant that dropped the column too would fail the test file "
+        "on its liveness witnesses and look like a catch for the wrong reason.",
+        [("  if r.retiring_oid is not null then\n"
+          "    v_now := to_regclass(format('%I.%I', v_nsp, p_child));\n"
+          "    if v_now::oid is distinct from r.retiring_oid then\n"
+          "      perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));\n"
+          "      insert into pgpm.log (parent_table, action, lo, hi, method)\n"
+          "        values (p_parent, 'fail_retain_identity', r.lo, r.hi,\n"
+          "                format('%I.%I is oid %s now, not the oid %s this retirement dispatched a "
+          "detach for; refusing to detach or drop it',\n"
+          "                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), "
+          "r.retiring_oid));\n"
+          "      return false;\n"
+          "    end if;\n"
+          "  end if;\n", "", 1)],
     ),
     "transmute_no_lock_timeout": (
         "bench/transmute_lock_timeout.sh",
@@ -287,7 +313,8 @@ MUTATIONS = {
     "upgrade_no_column_backfill": (
         "bench/upgrade_in_place.sh",
         "A column present in pgpm.config's `create table` body with no matching `add column if not "
-        "exists` line: precisely the mistake install.sql's 14 backfill lines exist to prevent. A FRESH "
+        "exists` line: precisely the mistake install.sql's `add column if not exists` backfill lines "
+        "exist to prevent. A FRESH "
         "install is unaffected, because it gets the column from the create table -- so the whole pgTAP "
         "suite stays green, installing fresh one database per file and never upgrading anything. Only a "
         "database that already had pgpm installed comes out of the upgrade missing the column, which is "

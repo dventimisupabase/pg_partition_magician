@@ -21,8 +21,11 @@ on:
       - 'bench/transmute_lock_timeout.sh'
       - 'bench/maintain_lock.sh'
       - 'bench/retire_detach_lock.sh'
+      - 'bench/retire_detach_substitution.sh'
+      - 'tests/77_retain_incoming_fk_test.sql'   # the file that guard drives
       - 'bench/restore_fk_lock.sh'
       - 'bench/obtain_backoff_headroom.sh'
+      - 'bench/transmute_claim_squat.sh'
       - 'bench/discriminate.sh'
       - 'bench/mutations/**'
       - 'test.sh'
@@ -38,8 +41,11 @@ on:
       - 'bench/transmute_lock_timeout.sh'
       - 'bench/maintain_lock.sh'
       - 'bench/retire_detach_lock.sh'
+      - 'bench/retire_detach_substitution.sh'
+      - 'tests/77_retain_incoming_fk_test.sql'   # the file that guard drives
       - 'bench/restore_fk_lock.sh'
       - 'bench/obtain_backoff_headroom.sh'
+      - 'bench/transmute_claim_squat.sh'
       - 'bench/discriminate.sh'
       - 'bench/mutations/**'
       - 'test.sh'
