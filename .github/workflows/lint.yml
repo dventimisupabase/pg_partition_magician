@@ -44,6 +44,23 @@ jobs:
           python3 scripts/check_quoted_splices.py --selftest
           python3 scripts/check_quoted_splices.py
 
+  minifier:
+    name: dbdev minifier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The dbdev package is the one artifact an operator installs that is NOT byte-for-byte the
+      # reviewed install.sql, and the minifier that makes it used to decide "is this line a
+      # comment" from the line's own leading characters, with no idea whether it sat inside a
+      # string literal (#410). Its --selftest carries a port of that old logic and requires each
+      # fixture to come out differently under it, so a rewrite that quietly reintroduced the
+      # blindness fails here. Then build the real package, which also re-checks that the file
+      # lexes end to end (unbalanced quote or dollar tag = a loud error, not a silent minify).
+      - name: The minifier must know where a line sits before deciding what it is
+        run: |
+          python3 scripts/minify_sql.py --selftest
+          scripts/build_dbdev_package.sh pgpm_core/install.sql dist/minifier-check.sql
+
   shellcheck:
     name: Shell scripts
     runs-on: ubuntu-latest
