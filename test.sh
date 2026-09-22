@@ -460,6 +460,7 @@ run_perf() {
   bash "$(dirname "$0")/bench/frontier_drought.sh" "$c" pgpm_perf9                            || rc=1
   bash "$(dirname "$0")/bench/regrain_outgoing_fk_lock.sh" "$c" pgpm_perf10                    || rc=1
   bash "$(dirname "$0")/bench/obtain_backoff_headroom.sh" "$c" pgpm_perf12                     || rc=1
+  bash "$(dirname "$0")/bench/transmute_claim_squat.sh" "$c" pgpm_perf13                       || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"

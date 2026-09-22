@@ -168,7 +168,34 @@ MUTATIONS = {
         "Pre-#275 transmute: one transaction, so the ADD's ACCESS EXCLUSIVE is still held during the "
         "O(rows) validation scan.",
         [("  commit;   -- releases the ADD's ACCESS EXCLUSIVE before the scan; "
-          "the advisory lock survives\n", "", 1)],
+          "the claim row survives (it is committed)\n", "", 1)],
+    ),
+    "transmute_claim_advisory_reap": (
+        "bench/transmute_claim_squat.sh",
+        "Pre-#405 recovery paths: _transmute_reap and transmute_abort decide 'is this conversion still "
+        "running?' by trying to TAKE the session advisory lock keyed on the table's oid, instead of "
+        "asking whether the claim's recorded owner session is alive. That key carries no ACL and is "
+        "computable by anyone, so a role that can merely CONNECT can hold it and make both paths read "
+        "'still running' forever -- pinning a write-rejecting pgpm_monolith_bound on the operator's "
+        "table with no automated or manual way back.",
+        [
+            ("    if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then\n"
+             "      continue;   -- still running; leave it alone\n"
+             "    end if;\n",
+             "    if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || "
+             "r.parent_table::oid::text, 0)) then\n"
+             "      continue;   -- still running; leave it alone\n"
+             "    end if;\n", 1),
+            ("  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then\n"
+             "    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is "
+             "still running in another session', p_parent;\n"
+             "  end if;\n",
+             "  if not pg_try_advisory_lock(hashtextextended('pgpm_transmute:' || "
+             "p_parent::oid::text, 0)) then\n"
+             "    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is "
+             "still running in another session', p_parent;\n"
+             "  end if;\n", 1),
+        ],
     ),
     "maintain_no_commits": (
         "bench/maintain_lock.sh",
