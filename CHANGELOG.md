@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- **A `_q` suffix now marks every already-quoted SQL fragment, and CI keeps the mark honest
+  (#409).** Several functions build a comma-joined fragment out of `quote_ident`'d pieces and then
+  splice the whole fragment with a bare `%s` -- correct, since `%I` over an already-quoted string
+  double-quotes it into garbage, but indistinguishable at the call site from a raw identifier
+  someone forgot to `%I`. A later edit could swap one for the other in any of these functions and
+  nothing would read as wrong.
+
+  Applied to all 31 sites rather than the three #409 cited: `_regrain_reconcile` and
+  `from_hypertable_drain_delta_step` were only the most visible copies, and a suffix on 3 of 31
+  would have made the other 28 read as "not pre-quoted". (#409's third site,
+  `_pq_to_parquet_range`'s `v_order_by`, is not among the 31 because it no longer exists: #408
+  turned it into a `name[]` the encoder quotes itself, which is the stronger answer wherever it is
+  available. A marker is for the fragments that have to stay fragments.) The sweep also turned up
+  sites nobody had listed, including `regrain_step`'s `v_pkjoin_q` (a `format('d.%I = s.%I', ...)`
+  join predicate), `transmute`'s `v_pdef_q` (a whole CREATE INDEX statement), and
+  `from_hypertable_cutover`'s
+  `v_pseq_q` (a `pg_get_serial_sequence` result, quoted by Postgres and spliced with `%s`).
+
+  `scripts/check_quoted_splices.py` (CI's `Quoted splices` lint job) enforces it in both
+  directions: a quote-derived `text` local must carry the suffix, and a suffixed one must be
+  assigned from something that actually quotes, so the name cannot outlive its value. It carries a
+  `--selftest` over embedded fixtures that requires each check to FAIL against its own defect, and
+  a floor on how many quoting assignments it must find, so a parser that has stopped reading the
+  module fails instead of reporting a clean sweep of nothing. Only `text` locals are considered,
+  which is why it parses the DECLARE block: `format('%I.%I', ...)::regclass` quotes identifiers on
+  its way to an OID, and an OID is not a fragment anyone can splice wrong.
+
 - **No parameter of `archive._pq_encode_column_data` carries SQL any more (#408).** It was the one
   place among the 166 `execute format(...)` sites the #346 audit covered where a `text` parameter
   reached the executed statement through a bare `%s` with no quoting at all: the whole FROM item

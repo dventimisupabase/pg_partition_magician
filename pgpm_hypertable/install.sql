@@ -32,6 +32,10 @@
 -- the key transmute reuses (a PRIMARY KEY or UNIQUE constraint), so tracking needs a
 -- key: it is refused on a keyless table. The cutover auto-detects the apparatus (the
 -- delta table) rather than taking a matching flag, so the two phases cannot disagree.
+--
+-- NAMING: a local ending in `_q` holds text whose identifiers are already quoted, so it is
+-- spliced with `%s` and `%I` would be a bug. See the note at the top of pgpm_core/install.sql;
+-- scripts/check_quoted_splices.py enforces it here too.
 -- =============================================================================
 
 -- from_hypertable_disk_estimate: the approximate extra disk the online migration needs. The copy writes a
@@ -217,15 +221,15 @@ create or replace procedure pgpm.from_hypertable_copy(
 )
 language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_dest name; v_cols text; r record;
-  v_delta name; v_trgfn name; v_trg name; v_keyidx oid; v_keycols text; v_newvals text; v_oldvals text;
+  v_nsp name; v_rel name; v_dest name; v_cols_q text; r record;
+  v_delta name; v_trgfn name; v_trg name; v_keyidx oid; v_keycols_q text; v_newvals_q text; v_oldvals_q text;
   v_keyconname name; v_keytmp text;
 begin
   perform pgpm.from_hypertable_preflight(p_hypertable, p_control);
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
 
@@ -249,7 +253,7 @@ begin
     select string_agg(quote_ident(a.attname), ', ' order by k.ord),
            string_agg('new.' || quote_ident(a.attname), ', ' order by k.ord),
            string_agg('old.' || quote_ident(a.attname), ', ' order by k.ord)
-      into v_keycols, v_newvals, v_oldvals
+      into v_keycols_q, v_newvals_q, v_oldvals_q
       from pg_index i
       cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
       join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
@@ -273,7 +277,7 @@ begin
     execute format('drop table if exists %I.%I', v_nsp, v_delta);
     -- delta holds just the key columns (their types come from the source via WITH NO DATA)
     execute format('create table %I.%I as select %s from %I.%I with no data',
-                   v_nsp, v_delta, v_keycols, v_nsp, v_rel);
+                   v_nsp, v_delta, v_keycols_q, v_nsp, v_rel);
     -- Append a monotonic ordering column (highest attnum) so the online delta-drain (from_hypertable_drain_delta,
     -- issue #170) can batch by a pgpm_seq watermark: a batch processes+deletes rows with pgpm_seq <= watermark,
     -- and any change that arrives mid-batch lands at a higher seq for the next pass. The cutover's key
@@ -295,9 +299,9 @@ begin
         end if;
       end $pgpm$',
       v_nsp, v_trgfn,
-      v_nsp, v_delta, v_keycols, v_oldvals,
-      v_nsp, v_delta, v_keycols, v_oldvals, v_newvals,
-      v_nsp, v_delta, v_keycols, v_newvals);
+      v_nsp, v_delta, v_keycols_q, v_oldvals_q,
+      v_nsp, v_delta, v_keycols_q, v_oldvals_q, v_newvals_q,
+      v_nsp, v_delta, v_keycols_q, v_newvals_q);
     execute format('drop trigger if exists %I on %I.%I', v_trg, v_nsp, v_rel);
     execute format('create trigger %I after insert or update or delete on %I.%I for each row execute function %I.%I()',
                    v_trg, v_nsp, v_rel, v_nsp, v_trgfn);
@@ -316,7 +320,7 @@ begin
   for r in select range_start, range_end from timescaledb_information.chunks
             where hypertable_schema = v_nsp and hypertable_name = v_rel order by range_start loop
     execute format('insert into %I.%I (%s) select %s from %I.%I where %I >= %L and %I < %L order by %I',
-                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel,
+                   v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel,
                    p_control, r.range_start, p_control, r.range_end, p_control);
     commit;
   end loop;
@@ -397,7 +401,7 @@ create or replace function pgpm.from_hypertable_drain_delta_step(
 ) returns bigint language plpgsql as $$
 declare
   v_nsp name; v_rel name; v_dest name; v_delta name;
-  v_keycols text; v_dkey text; v_skey text; v_cols text;
+  v_keycols_q text; v_dkey_q text; v_skey_q text; v_cols_q text;
   v_ctl_type text; v_min_ctl text; v_max_ctl text; v_watermark bigint; v_keys bigint;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
@@ -413,11 +417,11 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum),
          '(' || string_agg('d.' || quote_ident(attname), ', ' order by attnum) || ')',
          '(' || string_agg('s.' || quote_ident(attname), ', ' order by attnum) || ')'
-    into v_keycols, v_dkey, v_skey
+    into v_keycols_q, v_dkey_q, v_skey_q
     from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
       and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
   -- the source/dest column list for the reinsert (generated columns omitted: they recompute on insert)
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped and attgenerated = '';
 
   -- the dest's per-batch delete uses the reused-key index that from_hypertable_copy built on the dest (#175,
@@ -436,7 +440,7 @@ begin
   execute format('create temp table pgpm_dbatch on commit drop as
                   with d as (delete from %I.%I where pgpm_seq <= %s returning %s)
                   select distinct %s from d',
-                 v_nsp, v_delta, v_watermark, v_keycols, v_keycols);
+                 v_nsp, v_delta, v_watermark, v_keycols_q, v_keycols_q);
   get diagnostics v_keys = row_count;
 
   -- bound the source read to the batch's touched control range, as literal constants, for chunk exclusion
@@ -446,14 +450,14 @@ begin
     into v_min_ctl, v_max_ctl;
 
   -- reconcile: drop the batch's keys from the dest, then reinsert their current source rows
-  execute format('delete from %I.%I d where %s in (select %s from pgpm_dbatch)', v_nsp, v_dest, v_dkey, v_keycols);
+  execute format('delete from %I.%I d where %s in (select %s from pgpm_dbatch)', v_nsp, v_dest, v_dkey_q, v_keycols_q);
   if v_min_ctl is not null then
     execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from pgpm_dbatch) and %I >= %L::%s and %I <= %L::%s',
-                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_keycols,
+                   v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_keycols_q,
                    p_control, v_min_ctl, v_ctl_type, p_control, v_max_ctl, v_ctl_type);
   else
     execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from pgpm_dbatch)',
-                   v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_keycols);
+                   v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_keycols_q);
   end if;
   return v_keys;
 end $$;
@@ -517,14 +521,14 @@ create or replace function pgpm.from_hypertable_drain_appends_step(
   p_hypertable regclass, p_control name, p_batch int, p_watermark text
 ) returns text language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_dest name; v_cols text; v_ctl_type text; v_hi text;
+  v_nsp name; v_rel name; v_dest name; v_cols_q text; v_ctl_type text; v_hi text;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
   select format_type(atttypid, atttypmod) into v_ctl_type
     from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped and attgenerated = '';
 
   -- the batch's upper control bound: the control value p_batch rows past the watermark (or the source's max
@@ -537,7 +541,7 @@ begin
   if v_hi is null then return p_watermark; end if;   -- nothing past the watermark
 
   execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L::%s and %I <= %L::%s order by %I',
-                 v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel,
+                 v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel,
                  p_control, p_watermark, v_ctl_type, p_control, v_hi, v_ctl_type, p_control);
   return v_hi;
 end $$;
@@ -597,12 +601,12 @@ create or replace procedure pgpm.from_hypertable_cutover(
   p_paused boolean default true, p_predrain boolean default true
 ) language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_dest name; v_cols text; v_retain interval;
+  v_nsp name; v_rel name; v_dest name; v_cols_q text; v_retain interval;
   v_watermark timestamptz; v_orig regclass; k record;
-  v_delta name; v_trgfn name; v_track boolean; v_keycols text; v_dkey text; v_skey text; v_subsel text;
+  v_delta name; v_trgfn name; v_track boolean; v_keycols_q text; v_dkey_q text; v_skey_q text; v_subsel_q text;
   v_ctl_type text; v_min_ctl text; v_max_ctl text;
   v_ident_cols name[]; v_ident_next bigint[]; v_srcseq text; v_srcnext bigint; v_col name;
-  v_pseq text; v_curnext bigint; v_i int;
+  v_pseq_q text; v_curnext bigint; v_i int;
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
   v_in_refs text[]; v_in_names text[]; v_in_defs text[];   -- incoming FKs captured across the swap (#264)
 begin
@@ -625,7 +629,7 @@ begin
     select (config->>'drop_after')::interval into v_retain from timescaledb_information.jobs
      where proc_name = 'policy_retention' and hypertable_schema = v_nsp and hypertable_name = v_rel limit 1;
   end if;
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
 
@@ -697,10 +701,10 @@ begin
     select '(' || string_agg('d.' || quote_ident(attname), ', ' order by attnum) || ')',
            '(' || string_agg('s.' || quote_ident(attname), ', ' order by attnum) || ')',
            string_agg(quote_ident(attname), ', ' order by attnum)
-      into v_dkey, v_skey, v_keycols
+      into v_dkey_q, v_skey_q, v_keycols_q
       from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
         and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';   -- exclude the ordering column (#170)
-    v_subsel := format('select distinct %s from %I.%I', v_keycols, v_nsp, v_delta);
+    v_subsel_q := format('select distinct %s from %I.%I', v_keycols_q, v_nsp, v_delta);
     -- The delta was just populated by the trigger, so it has no stats; ANALYZE it so the planner sizes
     -- the semi-joins correctly (the dest was already ANALYZEd at the end of the copy). Shared helper (#164).
     perform pgpm._analyze(format('%I.%I', v_nsp, v_delta)::regclass);
@@ -715,21 +719,21 @@ begin
       from pg_attribute where attrelid = p_hypertable and attname = p_control and not attisdropped;
     execute format('select min(%I)::text, max(%I)::text from %I.%I', p_control, p_control, v_nsp, v_delta)
       into v_min_ctl, v_max_ctl;
-    execute format('delete from %I.%I d where %s in (%s)', v_nsp, v_dest, v_dkey, v_subsel);
+    execute format('delete from %I.%I d where %s in (%s)', v_nsp, v_dest, v_dkey_q, v_subsel_q);
     if v_min_ctl is not null then
       execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s) and %I >= %L::%s and %I <= %L::%s',
-                     v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel,
+                     v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_subsel_q,
                      p_control, v_min_ctl, v_ctl_type, p_control, v_max_ctl, v_ctl_type);
     else
       execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s)',
-                     v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, v_skey, v_subsel);
+                     v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_subsel_q);
     end if;
   else
     -- append-only catch-up: insert the tail past the watermark (read pre-lock above, off the locked window;
     -- the pre-drain, if it ran, already advanced the dest to within one batch of the head, so this is small).
     if v_watermark is not null then
       execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L',
-                     v_nsp, v_dest, v_cols, v_cols, v_nsp, v_rel, p_control, v_watermark);
+                     v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, p_control, v_watermark);
     end if;
   end if;
   -- (the key constraints + secondary indexes were captured and pre-built on the destination above, before
@@ -856,12 +860,12 @@ begin
   if v_ident_cols is not null then
     for v_i in 1 .. array_length(v_ident_cols, 1) loop
       if v_ident_next[v_i] is not null then
-        v_pseq := pg_get_serial_sequence(format('%I.%I', v_nsp, v_rel), v_ident_cols[v_i]::text);
-        if v_pseq is not null then
-          execute format('select case when is_called then last_value + 1 else last_value end from %s', v_pseq)
+        v_pseq_q := pg_get_serial_sequence(format('%I.%I', v_nsp, v_rel), v_ident_cols[v_i]::text);
+        if v_pseq_q is not null then
+          execute format('select case when is_called then last_value + 1 else last_value end from %s', v_pseq_q)
             into v_curnext;
           if v_ident_next[v_i] > coalesce(v_curnext, 0) then
-            execute format('select setval(%L, %s, false)', v_pseq, v_ident_next[v_i]);
+            execute format('select setval(%L, %s, false)', v_pseq_q, v_ident_next[v_i]);
           end if;
         end if;
       end if;

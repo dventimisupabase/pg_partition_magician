@@ -29,6 +29,21 @@ jobs:
       - name: Living documentation must be true, and must not cite frozen artifacts
         run: bash scripts/check_living_docs.sh
 
+  quoted-splices:
+    name: Quoted splices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # scripts/check_quoted_splices.py keeps the `_q` marker honest in both directions: an
+      # already-quoted fragment must carry it, and a name that carries it must have earned it
+      # (#409). Its --selftest runs FIRST and on its own embedded fixtures, so a parser that has
+      # stopped matching this module fails here rather than reporting a clean sweep of nothing.
+      # No dependencies, no database, no container: it reads the three install.sql files.
+      - name: The _q marker must be true in both directions
+        run: |
+          python3 scripts/check_quoted_splices.py --selftest
+          python3 scripts/check_quoted_splices.py
+
   shellcheck:
     name: Shell scripts
     runs-on: ubuntu-latest

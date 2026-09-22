@@ -28,6 +28,14 @@
 -- The engine is kind-agnostic: all type-specific logic lives in a small adapter
 -- (_grid_floor/_grid_next/_encode/_decode/_frontier_native/_part_name). Bounds are
 -- carried as text so one code path serves every kind.
+--
+-- NAMING: a local ending in `_q` holds text whose identifiers are ALREADY QUOTED --
+-- typically `string_agg(quote_ident(attname), ', ')` over a column list. Splice those
+-- with `%s`; `%I` would quote them a second time, into garbage. A local WITHOUT the
+-- suffix is raw and needs `%I`. The suffix exists because the two look identical at
+-- the call site, so an edit could swap one for the other and nothing would read as
+-- wrong (issue #409). scripts/check_quoted_splices.py enforces it in both directions
+-- across this file, pgpm_hypertable and pgpm_archive, and CI runs it.
 -- =============================================================================
 
 create schema if not exists pgpm;
@@ -1007,15 +1015,15 @@ $$;
 -- job runs in its own session, with its own search_path.
 create or replace function pgpm._dispatch_detach(p_parent regclass, p_child name)
 returns text language plpgsql as $$
-declare v_nsp name; v_rel name; v_cmd text; v_n int;
+declare v_nsp name; v_rel name; v_cmd_q text; v_n int;
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_cmd := format('alter table %I.%I detach partition %I.%I concurrently', v_nsp, v_rel, v_nsp, p_child);
+  v_cmd_q := format('alter table %I.%I detach partition %I.%I concurrently', v_nsp, v_rel, v_nsp, p_child);
   begin
     execute format(
       'select count(*)::int from (select cron.alter_job(jobid, command => %L) from cron.job'
-      || ' where jobname = ''pgpm_detach'' and database = current_database()) s', v_cmd)
+      || ' where jobname = ''pgpm_detach'' and database = current_database()) s', v_cmd_q)
       into v_n;
   exception when others then
     return left(sqlerrm, 160);
@@ -1680,8 +1688,8 @@ $$;
 create or replace function pgpm._regrain_capture_install(p_parent regclass, p_child name)
 returns void language plpgsql as $$
 declare
-  v_nsp name; v_delta name; v_fn name; v_keyidx oid; v_keycols text; v_newvals text; v_oldvals text;
-  v_bad text;
+  v_nsp name; v_delta name; v_fn name; v_keyidx oid; v_keycols_q text; v_newvals_q text; v_oldvals_q text;
+  v_bad_q text;
 begin
   select nsp, delta, fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_names(p_parent);
 
@@ -1698,27 +1706,27 @@ begin
   -- A NULL key component can never be matched by the row-constructor reconcile below, so its change would
   -- be silently lost -- the exact failure this apparatus exists to prevent. PK columns are NOT NULL, but a
   -- reused UNIQUE key may legitimately permit nulls, so refuse rather than lose the change.
-  select string_agg(quote_ident(a.attname), ', ') into v_bad
+  select string_agg(quote_ident(a.attname), ', ') into v_bad_q
     from pg_index i
     cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
     join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
    where i.indexrelid = v_keyidx and not a.attnotnull;
-  if v_bad is not null then
+  if v_bad_q is not null then
     raise exception 'pg_partition_magician: cannot regrain % -- its reused key has nullable column(s) (%), and a NULL key component cannot be reconciled, so a concurrent change to such a row would be lost. Add NOT NULL to those columns, then re-run.',
-      p_parent, v_bad;
+      p_parent, v_bad_q;
   end if;
 
   select string_agg(quote_ident(a.attname), ', ' order by k.ord),
          string_agg('new.' || quote_ident(a.attname), ', ' order by k.ord),
          string_agg('old.' || quote_ident(a.attname), ', ' order by k.ord)
-    into v_keycols, v_newvals, v_oldvals
+    into v_keycols_q, v_newvals_q, v_oldvals_q
     from pg_index i
     cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
     join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
    where i.indexrelid = v_keyidx;
 
   if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
-    execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols, p_parent::text);
+    execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);
     -- monotonic ordering column so a reconcile pass can batch by a pgpm_seq watermark: a batch processes
     -- and deletes rows at or below the watermark, and anything arriving mid-batch lands higher for the next
     -- pass. Excluded by name wherever key columns are introspected.
@@ -1738,9 +1746,9 @@ begin
       end if;
     end $pgpm$',
     v_nsp, v_fn,
-    v_nsp, v_delta, v_keycols, v_oldvals,
-    v_nsp, v_delta, v_keycols, v_oldvals, v_newvals,
-    v_nsp, v_delta, v_keycols, v_newvals);
+    v_nsp, v_delta, v_keycols_q, v_oldvals_q,
+    v_nsp, v_delta, v_keycols_q, v_oldvals_q, v_newvals_q,
+    v_nsp, v_delta, v_keycols_q, v_newvals_q);
 
   execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, p_child);
   execute format('create trigger pgpm_regrain_capture after insert or update or delete on %I.%I for each row execute function %I.%I()',
@@ -1815,8 +1823,8 @@ create or replace function pgpm._regrain_reconcile(
   p_parent regclass, p_child name, p_lo text, p_hi text, p_step text, p_cursor text, p_batch int
 ) returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_delta name; v_ncast text; v_keycols text; v_dkey text;
-  v_skey text; v_cols text; v_wm bigint; v_elig text; v_ctl text; v_sub_name name; v_n int := 0; r record;
+  cfg pgpm.config; v_nsp name; v_rel name; v_delta name; v_ncast text; v_keycols_q text; v_dkey_q text;
+  v_skey_q text; v_cols_q text; v_wm bigint; v_elig text; v_ctl_q text; v_sub_name name; v_n int := 0; r record;
   v_lo_lit text; v_hi_lit text; v_cur_lit text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -1829,11 +1837,11 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum),
          '(' || string_agg('d.' || quote_ident(attname), ', ' order by attnum) || ')',
          '(' || string_agg('s.' || quote_ident(attname), ', ' order by attnum) || ')'
-    into v_keycols, v_dkey, v_skey
+    into v_keycols_q, v_dkey_q, v_skey_q
     from pg_attribute where attrelid = format('%I.%I', v_nsp, v_delta)::regclass
       and attnum > 0 and not attisdropped and attname <> 'pgpm_seq';
   -- generated columns are omitted from the reinsert: they recompute, they are never inserted into
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped and attgenerated = '';
 
   -- The delta is populated by a trigger and nothing analyzes it, so on its first ticks it carries no usable
@@ -1853,13 +1861,13 @@ begin
   -- 300k delta, against 1.0 ms once the pgpm_seq index is usable. That made the tick scale with the delta
   -- instead of with the budget, so draining a large delta cost O(delta^2 / batch). uuidv7 compares
   -- correctly this way because a UUIDv7 sorts by its embedded timestamp, which is why the copy can do it too.
-  v_ctl     := quote_ident(cfg.control_column);
+  v_ctl_q   := quote_ident(cfg.control_column);
   v_lo_lit  := pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
   v_hi_lit  := pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
   v_cur_lit := pgpm._encode(cfg.control_kind, p_cursor, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
 
   -- eligible: in this child's range AND behind the cursor
-  v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl, v_lo_lit, v_hi_lit, v_cur_lit);
+  v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl_q, v_lo_lit, v_hi_lit, v_cur_lit);
 
   execute format('select max(pgpm_seq) from (select pgpm_seq from %I.%I where %s order by pgpm_seq limit %s) t',
                  v_nsp, v_delta, v_elig, greatest(p_batch, 1)) into v_wm;
@@ -1886,14 +1894,14 @@ begin
     execute format(
       'delete from %I.%I d where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
           and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L, %L, %L, %L)) = %L)',
-      v_nsp, v_sub_name, v_dkey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
+      v_nsp, v_sub_name, v_dkey_q, v_keycols_q, v_nsp, v_delta, v_wm, v_elig,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
       cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, r.sub_lo);
     execute format(
       'insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
           and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, k.%I::text, %L, %L, %L, %L, %L, %L, %L)) = %L)',
-      v_nsp, v_sub_name, v_cols, v_cols, v_nsp, p_child, v_skey, v_keycols, v_nsp, v_delta, v_wm, v_elig,
+      v_nsp, v_sub_name, v_cols_q, v_cols_q, v_nsp, p_child, v_skey_q, v_keycols_q, v_nsp, v_delta, v_wm, v_elig,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, cfg.control_column,
       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
       cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, r.sub_lo);
@@ -1996,7 +2004,7 @@ create or replace function pgpm.regrain_step(
   p_parent regclass, p_child name, p_target_step text default null, p_batch int default null
 ) returns text language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols text; v_ncast text; v_pkjoin text; v_keyidx oid;
+  cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols_q text; v_ncast text; v_pkjoin_q text; v_keyidx oid;
   v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
@@ -2018,7 +2026,7 @@ begin
   end if;
   v_child      := format('%I.%I', v_nsp, p_child)::regclass;
   v_child_name := p_child;   -- may be renamed below (#266); v_child is an oid and follows it for free
-  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols
+  select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_parent and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
   -- the reused-key equijoin (d.<key> = s.<key>, every key column): the copy is an anti-join against it, so
@@ -2033,13 +2041,13 @@ begin
                and i.indpred is null and i.indexprs is null limit 1))
     into v_keyidx;
   if v_keyidx is not null then
-    select string_agg(format('d.%I = s.%I', a.attname, a.attname), ' and ' order by k.ord) into v_pkjoin
+    select string_agg(format('d.%I = s.%I', a.attname, a.attname), ' and ' order by k.ord) into v_pkjoin_q
       from pg_index i
       cross join lateral unnest(i.indkey) with ordinality as k(attnum, ord)
       join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
      where i.indexrelid = v_keyidx;
   end if;
-  if v_pkjoin is null then return 'nokey'; end if;
+  if v_pkjoin_q is null then return 'nokey'; end if;
 
   -- frozen? (whole range at/below the current grid floor, so no live write still lands in it)
   v_frontier := pgpm._frontier_native(p_parent);
@@ -2261,7 +2269,7 @@ begin
          and not exists (select 1 from %7$I.%8$I d where %9$s)
        order by s.%2$I
        limit %5$s
-    $f$, v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols, v_nsp, v_sub_name, v_pkjoin);
+    $f$, v_child::text, cfg.control_column, v_lo_lit, v_hi_lit, v_batch, v_cols_q, v_nsp, v_sub_name, v_pkjoin_q);
     get diagnostics v_moved = row_count;
     if v_moved > 0 then
       insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'regrain_copy', v_sub_lo, v_sub_hi, v_moved);
@@ -2439,8 +2447,8 @@ declare
   v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
-  v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef text; j int;
-  v_pgpm_clash text;   -- #311: existing relations occupying the <index>_pgpm names step 9b needs
+  v_idx_names text[]; v_idx_defs text[]; v_ctl_attnum int; v_uniq_bad text; v_old name; v_new name; v_pdef_q text; j int;
+  v_pgpm_clash_q text;   -- #311: existing relations occupying the <index>_pgpm names step 9b needs
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
   v_uq_cols text[]; v_bare_uq text;
   v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
@@ -2756,12 +2764,12 @@ begin
   --
   -- Names every collision at once: one per retry would make an operator with several re-run the
   -- conversion once per index to discover them.
-  select string_agg(quote_ident(n || '_pgpm'), ', ' order by n) into v_pgpm_clash
+  select string_agg(quote_ident(n || '_pgpm'), ', ' order by n) into v_pgpm_clash_q
     from unnest(coalesce(v_idx_names, '{}'::text[])) as n
    where to_regclass(format('%I.%I', v_nsp, n || '_pgpm')) is not null;
-  if v_pgpm_clash is not null then
+  if v_pgpm_clash_q is not null then
     raise exception 'pg_partition_magician: cannot transmute % -- the name(s) (%) are already taken, and transmute needs them for the partitioned copies of this table''s secondary indexes. Most likely leftovers from an interrupted run. Drop them, then re-run transmute.',
-      p_parent, v_pgpm_clash;
+      p_parent, v_pgpm_clash_q;
   end if;
 
   -- Refuse the one trigger shape a partitioned table cannot host (#277). Measured on PG 17.10: this is
@@ -3205,9 +3213,9 @@ begin
     for j in 1 .. array_length(v_idx_names, 1) loop
       v_old  := v_idx_names[j]::name;
       v_new  := (v_old || '_pgpm')::name;
-      v_pdef := regexp_replace(v_idx_defs[j], '^CREATE (UNIQUE )?INDEX \S+ ON ',
-                               'CREATE \1INDEX ' || quote_ident(v_new) || ' ON ONLY ');
-      execute v_pdef;
+      v_pdef_q := regexp_replace(v_idx_defs[j], '^CREATE (UNIQUE )?INDEX \S+ ON ',
+                                 'CREATE \1INDEX ' || quote_ident(v_new) || ' ON ONLY ');
+      execute v_pdef_q;
       execute format('alter index %I.%I attach partition %I.%I', v_nsp, v_new, v_nsp, v_old);
     end loop;
   end if;
@@ -4807,7 +4815,7 @@ $$;
 create or replace function pgpm.incoming_fk_orphans(p_parent regclass)
 returns table (referencing_table regclass, constraint_name name, orphan_rows bigint)
 language plpgsql as $$
-declare r pgpm.dropped_fk%rowtype; c pg_constraint%rowtype; v_join text; v_notnull text; v_cnt bigint;
+declare r pgpm.dropped_fk%rowtype; c pg_constraint%rowtype; v_join_q text; v_notnull_q text; v_cnt bigint;
 begin
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is not null and validated_at is null order by id loop
@@ -4816,12 +4824,12 @@ begin
     if not found then continue; end if;
     select string_agg(format('r.%I = p.%I', fa.attname, pa.attname), ' and '),
            string_agg(format('r.%I is not null', fa.attname), ' and ')
-      into v_join, v_notnull
+      into v_join_q, v_notnull_q
       from unnest(c.conkey, c.confkey) with ordinality as u(fk_att, pk_att, ord)
       join pg_attribute fa on fa.attrelid = c.conrelid and fa.attnum = u.fk_att
       join pg_attribute pa on pa.attrelid = c.confrelid and pa.attnum = u.pk_att;
     execute format('select count(*)::bigint from %s r where %s and not exists (select 1 from %s p where %s)',
-                   c.conrelid::regclass::text, v_notnull, c.confrelid::regclass::text, v_join) into v_cnt;
+                   c.conrelid::regclass::text, v_notnull_q, c.confrelid::regclass::text, v_join_q) into v_cnt;
     referencing_table := r.referencing_table; constraint_name := r.constraint_name; orphan_rows := v_cnt;
     return next;
   end loop;

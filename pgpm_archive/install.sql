@@ -133,7 +133,7 @@ $$;
 
 -- key discovery, shared by every reader that has to order a read spanning more than one child's
 -- heap (where ctid is no longer comparable): archive._pq_to_parquet_range, the Parquet range
--- reader, calls this. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin discovery: a PRIMARY KEY
+-- reader, calls this. Identical contract to pgpm.regrain_step's own v_keyidx/v_pkjoin_q discovery: a PRIMARY KEY
 -- preferred, else a predicate/expression-free UNIQUE CONSTRAINT, never a bare UNIQUE INDEX
 -- unbacked by a constraint. Returns null for a genuinely keyless relation -- the same 'nokey'
 -- contract regrain() already enforces, an inherited limitation, not a new gap. (On a partitioned

@@ -35,6 +35,27 @@ and absence-of-setup look identical unless you separate them deliberately.
   harness, which runs every tick in its own transaction, alongside the lock guards, which
   need a second concurrent session that one pgTAP file cannot give them.
 
+## `_q` means the identifiers are already quoted
+
+A plpgsql local ending in `_q` holds text whose identifiers have already been through
+`quote_ident` (usually `string_agg(quote_ident(attname), ', ')` over a column list). Splice it
+with `%s`. `%I` over it would quote it a second time, into garbage. A local without the suffix is
+raw and takes `%I`.
+
+The suffix exists because the two are indistinguishable at the call site: `format(..., v_cols, ...)`
+reads the same whether `v_cols` was pre-quoted or someone forgot `%I` (issue #409). It is not
+advisory. `scripts/check_quoted_splices.py` fails CI when a quote-derived `text` local lacks the
+suffix, AND when a suffixed one is assigned from something that quotes nothing, so reading the name
+is worth something. Run it (and its `--selftest`) before pushing a change to any `install.sql`.
+
+Two boundaries worth knowing, both deliberate. The rule is about the VALUE, not its destination, so
+a quoted list that only ever reaches an error message is marked too: that keeps the rule
+exception-free, and an allowlist is the thing that rots. And a fragment assembled OUT of `_q`
+pieces (`v_elig := format('%1$s >= %2$L', v_ctl_q, v_lo_lit)`) is NOT required to be marked -- it is
+a predicate, not an identifier list, and the `_q` names it is built from already show its
+provenance. Widening past that puts the suffix on nearly every local, at which point it marks
+nothing.
+
 ## `./test.sh all` is not what CI runs
 
 `all` means all four PostgreSQL **versions**, not all tracks. The `timescale`, `observe`,
