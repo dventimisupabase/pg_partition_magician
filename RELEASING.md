@@ -77,14 +77,21 @@ install.sql also carries a line for it:
 alter table pgpm.config add column if not exists obtain_retry_after timestamptz;
 ```
 
-There are fourteen such lines and they are hand-maintained. **Any change to a `create table` body in
-install.sql needs a matching backfill line in the same commit.** Adding a column and forgetting the
-line leaves every fresh install correct and every existing install broken, and it is invisible to the
-pgTAP suite, which installs fresh into one database per file and never upgrades anything.
+Those lines are hand-maintained. **Any change to a `create table` body in install.sql needs a
+matching backfill line in the same commit.** Adding a column and forgetting the line leaves every
+fresh install correct and every existing install broken, and it is invisible to the pgTAP suite,
+which installs fresh into one database per file and never upgrades anything.
 
 `bench/upgrade_in_place.sh` is the guard for exactly this: it installs, degrades the database to an
 older shape, re-runs install.sql, and requires the result to be catalog-identical to a fresh install
 with its managed tables still working. Its mutation is `upgrade_no_column_backfill`.
+
+**The backfill line also needs an entry in that guard's `DEGRADE_COLS`**, which is what says the
+column gets dropped before the upgrade runs, and so what makes the backfill line exercised at all.
+The list is hardcoded on purpose (deriving it from the backfill lines would make the guard circular
+against its own mutation), so the guard checks it in both directions instead and fails naming any
+backfilled column the list omits -- it had drifted to 15 entries against 25 backfill lines before
+anything checked that way round (#417). Its mutation is `upgrade_degrade_list_drift`.
 
 The same rule applies to anything else an existing database would miss: a new table needs
 `create table if not exists`, a dropped column needs `drop column if exists`, and a changed function

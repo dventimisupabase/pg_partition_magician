@@ -6,7 +6,7 @@
 # THE DEFECT. install.sql IS the upgrade path for the install.sql channel: operators re-run the file
 # over a live database. Fresh installs get every column from the `create table` bodies, but an EXISTING
 # database only gets a new column if install.sql also carries an
-# `alter table ... add column if not exists` line for it. Those 14 backfill lines are hand-maintained,
+# `alter table ... add column if not exists` line for it. Those backfill lines are hand-maintained,
 # and nothing enforces them. Add a column to a `create table` body, forget the backfill line, and every
 # test in the suite still passes: the whole pgTAP suite installs FRESH, one database per file, so it
 # never exercises an upgrade at all. The break lands only on an operator who already had pgpm
@@ -37,6 +37,16 @@
 #      that can no longer obtain is not an upgrade anyone wants, and every assertion above it is
 #      satisfied by a database that merely sits there.
 #
+# AND TWO PRECONDITIONS ON DEGRADE_COLS ITSELF, before any of that, running in OPPOSITE directions.
+# The list is hardcoded and has to be (see the comment on it below), so something has to stop it
+# rotting, and one direction does not: "every listed column exists in a fresh install" catches the
+# list naming a column the product has DROPPED, while "every backfilled column is in the list"
+# catches the product GAINING one the list forgot. Drift only ever goes the second way -- every new
+# column is an opportunity to forget -- and for a long time only the first check existed, which is
+# how the list came to sit at 15 entries against 25 backfill lines with nothing reporting anything
+# (issue #417). Ten backfill lines were exercised by nobody, including the two that carry #405's
+# claim that a crashed transmute stays reapable.
+#
 # Usage: upgrade_in_place.sh <container> <db> [install.sql]
 # The install path defaults to the real one; bench/discriminate.sh passes a MUTANT copy instead, to
 # prove this guard actually fails when the defect is present.
@@ -59,9 +69,17 @@ check() { # <label> <actual> <expected>
 # exists`. Hardcoded rather than parsed out of install.sql on purpose. Deriving it from the backfill
 # lines would make the guard circular, since the mutation works by DELETING one of those lines: the
 # derived list would lose the same entry, the degrade would not drop it, and the guard would pass
-# against its own defect. The precondition below is what keeps a hardcoded list from rotting.
+# against its own defect. The two preconditions below are what keep a hardcoded list from rotting.
+# In install.sql's own order, so a new backfill line has an obvious place to go.
 DEGRADE_COLS="
 pgpm.config:obtain_retry_after
+pgpm.config:text_time_prefix
+pgpm.config:text_time_width
+pgpm.config:text_time_radix
+pgpm.config:text_time_unit
+pgpm.config:text_time_alphabet
+pgpm.config:text_time_discard_bits
+pgpm.config:text_time_epoch
 pgpm.config:regrain_batch
 pgpm.config:regrain_max_blocks
 pgpm.config:regrain_to
@@ -70,9 +88,12 @@ pgpm.config:retain_batch
 pgpm.config:archive_fn
 pgpm.config:archive_byte_budget
 pgpm.config:archive_probe_sample
+pgpm.config:archive_batch
 pgpm.part:attached
 pgpm.part:retiring_at
 pgpm.part:retiring_oid
+pgpm.transmute_inflight:owner_pid
+pgpm.transmute_inflight:owner_backend_start
 pgpm.dropped_fk:restored_at
 pgpm.dropped_fk:validated_at
 pgpm.dropped_fk:validate_retry_after
@@ -103,6 +124,46 @@ done | grep -c 1)
 check "precondition: all degrade-list columns exist when fresh" "$present" "$N_DEGRADE"
 if [ "$present" != "$N_DEGRADE" ]; then
   echo "      the DEGRADE_COLS list is stale; fix it before trusting anything below"; exit 1
+fi
+
+# PRECONDITION, the other direction (issue #417). The one above catches the list naming a column the
+# product has DROPPED. It cannot catch the product GAINING a backfilled column the list does not
+# name -- and that is the direction drift actually goes, so for a long time it reported nothing while
+# ten of twenty-five backfill lines went unexercised. So: read the backfill lines out of the install
+# file that is about to be run, and fail when one of them is not in the list.
+#
+# This does NOT make the guard circular, and the asymmetry is exactly why. The mutation deletes a
+# backfill line, and a missing backfill LINE is not a missing LIST entry: this check still passes
+# under the mutant, the degrade still drops the column, and the catalog-hash assertion below is
+# still what fails. The check that would be circular is the converse -- "every list entry has a
+# backfill line" -- which would fail under the mutant for a reason that is not the defect, and it is
+# deliberately absent.
+#
+# Parse the file being INSTALLED, not the repo's copy, so this describes the run that is happening.
+BACKFILL_RAW=$(docker exec "$C" grep -i 'add column if not exists' "$INSTALL" | grep -v '^[[:space:]]*--')
+N_LOOSE=$(printf '%s\n' "$BACKFILL_RAW" | grep -c .)
+if [ "$N_LOOSE" -lt 1 ]; then
+  echo "FAIL  found no backfill lines at all in $INSTALL: this precondition is reading nothing"; exit 1
+fi
+# The loose match above is case-insensitive and this strict parse is not, on purpose: a backfill line
+# written in a style this regex cannot read shows up as a count mismatch and fails loudly, rather than
+# as a line the check silently does not cover. Comparing the two counts is the liveness witness for
+# the parse -- without it, a regex that had quietly stopped matching would report nothing unlisted.
+BACKFILLED=$(printf '%s\n' "$BACKFILL_RAW" \
+  | sed -nE 's/^[[:space:]]*alter table ([a-z_]+\.[a-z_]+) add column if not exists ([a-z_]+).*/\1:\2/p')
+N_BACKFILL=$(printf '%s\n' "$BACKFILLED" | grep -c ':')
+check "precondition: every backfill line parsed" "$N_BACKFILL" "$N_LOOSE"
+if [ "$N_BACKFILL" != "$N_LOOSE" ]; then
+  echo "      a backfill line this parser cannot read is a column it cannot check for; fix the regex"; exit 1
+fi
+
+unlisted=$(printf '%s\n' "$BACKFILLED" | grep ':' | while read -r col; do
+  printf '%s\n' "$DEGRADE_COLS" | grep -qxF "$col" || printf '%s ' "$col"
+done)
+unlisted="${unlisted% }"
+check "precondition: every backfilled column is degraded" "${unlisted:-none}" "none"
+if [ -n "$unlisted" ]; then
+  echo "      add them to DEGRADE_COLS; their backfill lines are exercised by nothing until you do"; exit 1
 fi
 
 # ---------------------------------------------------------------------------- an older install, with state

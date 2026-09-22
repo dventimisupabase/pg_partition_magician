@@ -321,6 +321,24 @@ MUTATIONS = {
         "to say only the operators who are not evaluating it.",
         [("alter table pgpm.config add column if not exists obtain_retry_after timestamptz;\n", "", 1)],
     ),
+    "upgrade_degrade_list_drift": (
+        "bench/upgrade_in_place.sh",
+        "install.sql gains a backfilled column that bench/upgrade_in_place.sh's hardcoded DEGRADE_COLS "
+        "does not name. Unlike every other mutation here the defect being modelled lives in the GUARD, "
+        "not in the product, and the product is moved because that is the only way to reproduce it: the "
+        "guard degrades an install by dropping the columns on that list, so a backfill line for a column "
+        "it omits is exercised by nothing, and the guard goes on claiming it covers 'every column "
+        "install.sql backfills'. Measured at 958156c the list was 15 entries against 25 backfill lines "
+        "(issue #417) -- among the ten missing, the two pgpm.transmute_inflight owner columns that carry "
+        "#405's claim that a crashed transmute stays reapable. Nothing reported it, because the only "
+        "precondition ran the other way (every LISTED column must exist fresh), which catches a column "
+        "the product dropped and never one it gained. What must FAIL here is the new opposite "
+        "precondition, by name; a mutant that instead failed the fresh-oracle install would be a "
+        "non-zero exit for the wrong reason, so keep the added column nullable and inert.",
+        [("alter table pgpm.config add column if not exists archive_batch int default 1;\n",
+          "alter table pgpm.config add column if not exists archive_batch int default 1;\n"
+          "alter table pgpm.config add column if not exists mutant_unlisted_col int;\n", 1)],
+    ),
     "frontier_data_only": (
         "bench/frontier_drought.sh",
         "Pre-#325: uuidv7's (and, since the text_time control kind, text_time's) forward frontier was "

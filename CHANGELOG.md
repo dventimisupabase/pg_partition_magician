@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+- **`bench/upgrade_in_place.sh` degraded 15 of the 25 columns it claimed to, and nothing said so
+  (#417).** The guard proves that re-running `install.sql` over an existing database upgrades it
+  rather than half-breaking it: it drops "every column `install.sql` backfills with `add column if
+  not exists`" from a populated install, re-runs the file, and requires the result to hash-match a
+  fresh oracle. `DEGRADE_COLS` is that list, and it held **15 entries against 25 backfill lines**.
+  Ten backfill lines were exercised by nothing: the seven `text_time` `pgpm.config` columns
+  (#334/#335), `pgpm.config.archive_batch`, and
+  `pgpm.transmute_inflight.owner_pid`/`owner_backend_start` -- the last two being the columns #405's
+  whole claim rests on, that a conversion whose session died stays reapable. On an upgraded install
+  that backfill was unverified.
+
+  The list's one precondition ran the wrong way. "Every LISTED column exists in a fresh install"
+  catches the list naming a column the product has DROPPED, and the list was not stale in that
+  direction, so it passed and reported nothing. It cannot catch the product GAINING a backfilled
+  column the list forgot, which is the direction drift actually goes: every new column is an
+  opportunity to forget one.
+
+  So the guard gains a second precondition running the other way -- read the backfill lines out of
+  the install file about to be run, and fail naming any that `DEGRADE_COLS` omits -- and the ten
+  missing columns are now degraded. The hardcoding stays, because deriving the list from those same
+  lines would make the guard circular against its own mutation, and the new check is one-directional
+  for the same reason: `upgrade_no_column_backfill` DELETES a backfill line, and a missing backfill
+  *line* is not a missing *list entry*, so the check still passes under that mutant and the
+  catalog-hash assertion is still what fails it. Confirmed by running it, not assumed. The converse
+  check ("every list entry has a backfill line") would fail under that mutant for a reason that is
+  not the defect, and is deliberately absent.
+
+  The new precondition has a mutation of its own, `upgrade_degrade_list_drift`: it gives
+  `install.sql` a backfilled column the list does not name, and the guard has to fail on that
+  precondition, by name. It is the first mutation here whose modelled defect lives in the guard
+  rather than in the product, the product being moved only because that is the one way to reproduce
+  it. The parse carries its own liveness witness: the loose match is case-insensitive and the strict
+  one is not, so a backfill line written in a style the parser cannot read surfaces as a loud count
+  mismatch instead of a line the check silently does not cover.
+
+  The same defect one level up turned out to be sitting in `.github/workflows/perf.yml`, and is
+  fixed with it: its path filter enumerated the guards it covers, and four of the thirteen the perf
+  track runs were not on it. `bench/upgrade_in_place.sh` was one, so a change to the very file this
+  entry is about triggered no perf job at all on its own. The filter matches `bench/*.sh` now, which
+  is a shape rather than a list and so cannot fall behind.
+
 - **`bench/restore_fk_lock.sh` stops racing a 4 ms window, and its liveness witness can now fail
   (#416).** The guard polled `pg_stat_activity` until it saw `restore_incoming_fks` active and only
   then began writing. Measured on PG 17.11 against its own fixture, the fixed restore takes
