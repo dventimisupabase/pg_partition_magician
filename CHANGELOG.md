@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-22
+
+**Upgrading in place? Read this first.** `obtain` has moved out of `maintain()` into its own
+procedure and its own `pg_cron` job (#347), and `pgpm.schedule()` is operator-invoked, so **an
+existing install does not pick the new job up by installing this file**. Until you re-run
+`pgpm.schedule()`, nothing extends the forward grid: `maintain()` no longer obtains at all, and
+with no `DEFAULT` partition (#288) a write past the last bound is refused rather than absorbed.
+`maintain_all()` detects the state and logs the new `warn_obtain_unscheduled` action once per
+sweep, so it is visible rather than silent, but it does not self-heal. **Re-run
+`pgpm.schedule()` right after upgrading.**
+
+Three smaller surface changes, none of which needs action:
+
+- `pgpm.part` gains `retiring_oid` (#407) and `pgpm.transmute_inflight` gains
+  `owner_pid`/`owner_backend_start` (#405), all backfilled null. Null reads as "not anchored" and
+  "no live owner" respectively, so a retirement or conversion already in flight across the upgrade
+  behaves exactly as it did before.
+- Two new `pgpm.log.action` values, `fail_retain_identity` (#407) and `warn_obtain_unscheduled`
+  (#347). Both are prefixed non-success events, per the naming rule; alerts matching exact values
+  are unaffected. `fail_retain_identity` is counted in `status().retain_drop_failures` and, unlike
+  its neighbours there, never clears itself.
+- `pgpm.set_regrain` now refuses a target step coarser than `partition_step` (#341), where it
+  previously accepted one and produced a regrain that could not converge. A caller relying on the
+  old acceptance gets an error instead of a wedge.
+
+This release also carries five security fixes from the #346 hardening campaign, none of which
+shipped in 0.4.0: #405 (an advisory-lock denial of service any connected role could trigger with
+no grants at all), #406 (an unpinned publishing CLI handed a live token), plus #407, #408/#409
+and #410. The campaign is closed; its two remaining findings are tracked as #421 and #422.
+
 - **The dbdev minifier decided what a line was without knowing where it sat (#410).**
   `scripts/build_dbdev_package.sh` trims `pgpm_core/install.sql` from 329,376 chars to fit dbdev's
   250,000-char cap by dropping blank lines, full-line `--` comments and `COMMENT ON` statements. The

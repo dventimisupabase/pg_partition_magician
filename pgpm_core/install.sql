@@ -5019,7 +5019,7 @@ create or replace view pgpm.partitions as
 -- history can only start where the table does.
 -- =============================================================================
 create or replace function pgpm.version()
-returns text language sql immutable as $$ select '0.4.0'::text $$;
+returns text language sql immutable as $$ select '0.5.0'::text $$;
 
 create table if not exists pgpm.installed (
   id         bigint      generated always as identity primary key,
