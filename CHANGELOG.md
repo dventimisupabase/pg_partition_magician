@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-23
+
+**Upgrading in place needs no action this time.** `pgpm.part` gains `child_oid`, and unlike the
+columns 0.5.0 added it is **backfilled** as part of re-running `install.sql`: through `pg_inherits`
+for an attached partition, so what gets adopted is a partition of that parent by construction, and by
+name for a not-yet-attached regrain child. A row whose name no longer resolves is left null, reads as
+unanchored, and behaves exactly as before.
+
+Two things will look different, neither of which is a migration step:
+
+- **Three new `pgpm.log.action` values** -- `fail_archive_identity` (#421),
+  `fail_write_block_identity` (#429), and wider use of the existing `fail_retain_identity` (#428).
+  All are prefixed non-success events per the naming rule, so alerts matching exact action values are
+  unaffected; all three count in `status().retain_drop_failures`, and none of them ever clears
+  itself. A non-zero count where there was none means a partition's name has stopped resolving to the
+  relation pgpm recorded for it, and the runbook's retention-triage section now leads with them.
+- **pgpm now refuses where it previously acted.** That is the whole content of this release: four
+  places resolved a partition or table by *name* and then read, dropped or replaced whatever answered,
+  with nothing asserting it was the object they meant. Each now checks an oid first and stops. In a
+  healthy install none of this is reachable and nothing changes.
+
+This release closes the last of the #346 security-hardening campaign's successors. #411's
+per-function time-of-check/time-of-use pass is fully worked through: #421, #428, #429 and #422.
+
 - **`from_hypertable_cutover` locked a name and then `DROP`ped it, without verifying the oid (#422).**
   It resolved `p_hypertable` to a name pair once at the top, did a great deal of work, then
   `lock table <nsp>.<rel>`, `drop table <nsp>.<rel>`, and renamed the copy into place. `LOCK TABLE`
