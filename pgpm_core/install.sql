@@ -1488,11 +1488,62 @@ $$;
 
 -- idempotent: a no-op if the child is already blocked, so a repeat _enforce_write_blocks tick (every
 -- maintain() call revisits every attached child) never raises a duplicate-trigger error.
+--
+-- IDENTITY, BEFORE THE DDL (issue #429). This resolves p_child by NAME and then issues CREATE
+-- TRIGGER against whatever comes back, and _enforce_write_blocks calls it for every attached child
+-- on every maintain() tick. Without the check below, a relation that has taken a partition's name
+-- gets a pgpm trigger rejecting all of its INSERTs, UPDATEs and DELETEs -- DDL against a relation
+-- pgpm never identified, on a table it was never handed, recorded nowhere in its own catalog.
+--
+-- The second consequence is the one that made #421 reachable rather than theoretical:
+-- _archive_step's candidate query gates on _is_write_blocked, so a substituted name is only ever
+-- ELIGIBLE for archiving because this step made it so. Maintenance manufactured its own candidate.
+-- Refusing here is therefore not redundant with #421's own check, it is upstream of it.
+--
+-- The check lives HERE rather than in _enforce_write_blocks' loop, even though that loop already
+-- holds the pgpm.part row this has to re-read. The loop is only one of the callers; retire() has two
+-- more, and they are safe today only because #430's identity check happens to sit upstream of them.
+-- A check in the function cannot be reintroduced by a caller that did not know to make it.
+--
+-- Logged and RETURNS, never raises. Raising would propagate out through retire(), which calls this
+-- outside any handler, and turn a wedge into an error; it would also reach _enforce_write_blocks'
+-- per-child handler, which would log it as skip_write_block -- and `skip_` means a deferral a later
+-- tick clears, which this is precisely not. There is no later tick on which the name goes back to
+-- meaning the right relation, so it gets its own prefixed action and status() counts it with the
+-- other things that stall retention: no write block means no archiving, and no drop.
+--
+-- A null child_oid is unanchored and skips the check, same as everywhere else, so an upgrade never
+-- wedges a partition it has nothing to compare against.
+--
+-- `v_now is not null and ... <> ...`, NOT the `is distinct from` used by the identity checks in
+-- retire() and _archive_step, and the difference is deliberate. Those two fire on a name that
+-- resolves to NOTHING as well, because there the next thing they would do is act on the relation --
+-- read it, or DROP it -- and failing closed is the whole point. Here there is no wrong relation to
+-- act on: if the name resolves to nothing, the `::regclass` cast below raises, _enforce_write_blocks'
+-- per-child handler catches it, and `skip_write_block` is logged carrying the real error. That path
+-- predates this check (issue #360, and tests/94 is built on it), and intercepting it here would
+-- replace a tested, accurate report with a misleading one -- this refusal means "something else
+-- holds the name", which is not what a dropped partition is. A pgpm.part row whose relation is gone
+-- is forget_missing's business, and retire() already counts it via fail_retain_identity.
 create or replace function pgpm._install_write_block(p_parent regclass, p_child name)
 returns void language plpgsql as $$
-declare v_nsp name; v_child regclass;
+declare v_nsp name; v_child regclass; v_now regclass; r record;
 begin
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  select p.lo, p.hi, p.child_oid into r
+    from pgpm.part p where p.parent_table = p_parent and p.child_name = p_child;
+  if found and r.child_oid is not null then
+    v_now := to_regclass(format('%I.%I', v_nsp, p_child));
+    if v_now is not null and v_now::oid <> r.child_oid then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_write_block_identity', r.lo, r.hi,
+                format('%I.%I is oid %s now, not the oid %s recorded for this partition when it was created; refusing to write-block it',
+                       v_nsp, p_child, v_now::oid::text, r.child_oid));
+      return;
+    end if;
+  end if;
+
   v_child := format('%I.%I', v_nsp, p_child)::regclass;
   if exists (select 1 from pg_trigger where tgrelid = v_child and tgname = 'pgpm_write_block') then
     return;
@@ -1506,6 +1557,15 @@ $$;
 -- the reverse: an operator loosening config.retain can make a previously-eligible partition
 -- ineligible again, so this needs to run just as often as _install_write_block. drop ... if exists
 -- makes it just as idempotent on a child that was never blocked.
+--
+-- DELIBERATELY NOT ANCHORED, unlike the install above (issue #429). The asymmetry is the point.
+-- Refusing to install on a relation pgpm has not identified is protective; refusing to REMOVE from
+-- one is the opposite. A pre-#429 pgpm installed this trigger on whatever held the name, so an
+-- install upgrading into that fix can already have one sitting on a relation it never managed,
+-- rejecting every write to it -- and an anchored removal would refuse to touch the very trigger
+-- pgpm itself wrongly created, leaving that relation read-only permanently. Resolving by name is
+-- what lets an upgraded pgpm clean up after an older one. The statement is `drop trigger if
+-- exists`, so on anything pgpm never blocked it remains a no-op.
 create or replace function pgpm._remove_write_block(p_parent regclass, p_child name)
 returns void language plpgsql as $$
 declare v_nsp name;
@@ -4725,10 +4785,13 @@ begin
     -- pgpm.part recorded, so no chunk is ever written for it, _archive_fully_covered never goes true,
     -- and retire()'s drop precondition never opens. Retention is stalled just as hard as by a failed
     -- drop, and like fail_retain_identity it never clears itself.
+    -- `fail_write_block_identity` (issue #429) is the same mismatch one step earlier again, and it
+    -- stalls the same chain from the top: a partition that never gets its write block is never an
+    -- archive candidate, so it is never covered, so it is never dropped.
     select count(*) into v_drop_fails from pgpm.log
       where parent_table = r.parent_table
         and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach',
-                       'fail_retain_identity', 'fail_archive_identity')
+                       'fail_retain_identity', 'fail_archive_identity', 'fail_write_block_identity')
         and id > coalesce(v_last_retain_id, 0);
     -- Partitions whose concurrent detach has been dispatched and not yet completed (issue #268).
     -- Non-zero is normal for a tick or two while cron performs the detach; persistently non-zero with

@@ -329,16 +329,20 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
    with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
-   (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach`, `fail_retain_identity` or
-   `fail_archive_identity` rows, `method`).
+   (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach`, `fail_retain_identity`,
+   `fail_archive_identity` or `fail_write_block_identity` rows, `method`).
 
-   **The two `*_identity` actions need no foreign key and no detach, so check for them first.** Both
+   **The three `*_identity` actions need no foreign key and no detach, so check for them first.** All
    say the same thing: a partition's name no longer resolves to the relation pgpm recorded for it
-   (`method` carries the oids and which anchor disagreed). `fail_archive_identity` is the archive step
-   refusing to read it, rather than exporting whatever now holds the name and recording a coverage
-   claim from it; `fail_retain_identity` is `retire` refusing to detach or drop it. Nothing was
-   archived and nothing was dropped in either case, and a `fail_archive_identity` at
-   `archive_batch`'s default of `1` also holds up that table's other partitions.
+   (`method` carries the oids, and for `fail_retain_identity` which anchor disagreed). They differ
+   only in which step refused, and therefore in how far the partition got:
+   `fail_write_block_identity` is the write-block step declining to put its trigger on the relation
+   holding the name, which also means the partition never becomes an archive candidate;
+   `fail_archive_identity` is the archive step refusing to read it, rather than exporting whatever
+   now holds the name and recording a coverage claim from it; `fail_retain_identity` is `retire`
+   refusing to detach or drop it. Nothing was archived and nothing was dropped in any case, and a
+   `fail_archive_identity` at `archive_batch`'s default of `1` also holds up that table's other
+   partitions.
 
    Neither **ever** clears itself, which is what separates them from everything else in this list:
    there is no later tick on which the name goes back to meaning the right relation. Find out what

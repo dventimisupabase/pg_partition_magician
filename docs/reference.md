@@ -795,6 +795,12 @@ step, `retain`, restore any preserved FK once the table is quiescent, and -- whe
 Every step is isolated in its own subtransaction under a short `lock_timeout`, so it never blocks or
 deadlocks the live workload; a step that loses a lock race is deferred and retried next tick.
 
+The write-block step resolves each child by name and issues `CREATE TRIGGER` against the result, so
+it checks `pgpm.part.child_oid` first and refuses on a mismatch, logging `fail_write_block_identity`
+rather than putting a pgpm trigger on a relation it has not identified. Removal is deliberately *not*
+anchored: a pre-#429 pgpm could strand that trigger on a substituted relation, leaving it rejecting
+every write, and resolving by name is what lets an upgraded pgpm lift it off again.
+
 A procedure, and each step commits before the next begins, so no step's locks outlive it. Those commits
 mean `maintain` and `maintain_all`, like `transmute`, must be called at the **top level**, never inside
 a surrounding transaction; `pg_cron` runs its command as a top-level statement, so the scheduled path
@@ -997,6 +1003,15 @@ result to `pgpm.part.child_oid`, recorded when the partition entered the catalog
 including a name that resolves to nothing at all -- it logs `fail_archive_identity` with both OIDs in
 `method` and skips that partition, continuing with the rest of the batch. Nothing is read, so no
 ledger row is written, so `_archive_fully_covered` stays false and the drop precondition stays shut.
+
+**The write-block step makes the same check first, and this one is still not redundant.** A child is
+only an archive candidate once `pgpm._install_write_block` has put its trigger on it, and that
+function resolved the name and issued `CREATE TRIGGER` against whatever answered -- so until #429 a
+substituted name became eligible for archiving *because maintenance had made it so*. It now refuses
+and logs `fail_write_block_identity` instead (see [`maintain`](#maintain)). What that does **not**
+cover is an install that ran an older pgpm: the trigger may already be sitting on the substitute, and
+`pgpm._is_write_blocked` stays name-based on purpose, so any such trigger still makes the name
+eligible. The archive-side check is the backstop for exactly that, which is why both exist.
 
 Like `fail_retain_identity`, the refusal is permanent rather than retryable: no later tick makes the
 name mean the right relation again. It counts in `status().retain_drop_failures`, and shows up as
@@ -1256,9 +1271,10 @@ One row per managed table. Beyond the static config it surfaces:
   is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
   one and the FK's own `ON DELETE` refused the delete), `fail_retain_detach` (nowhere to dispatch a
   concurrent detach to), `fail_retain_identity` (the partition's name no longer resolves to the
-  relation whose detach was dispatched) and `fail_archive_identity` (the same mismatch found one step
-  earlier, by the archive step, so coverage never completes and the drop gate never opens), since all
-  five wedge retention the same way.
+  relation whose detach was dispatched), `fail_archive_identity` (the same mismatch found one step
+  earlier, by the archive step, so coverage never completes and the drop gate never opens) and
+  `fail_write_block_identity` (the same mismatch one step earlier again, so the partition never
+  becomes an archive candidate at all), since all six wedge retention the same way.
 - `parent_missing` -- the managed relation itself is **gone**: dropped without
   [`untransmute`](#untransmute), leaving the `pgpm.config` row pointing at an oid with no `pg_class`
   entry. Everything else in the row still reports (it comes from pgpm's own catalog), but
@@ -1455,7 +1471,7 @@ The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 | `attached` | `boolean` | false while a regrain is still filling it standalone; true once attached |
 | `retiring_at` | `timestamptz` | set when `retire` dispatches a concurrent detach for this partition, so recovery can tell whose detach a pending one was; null for every partition on the ordinary one-step drop path |
 | `retiring_oid` | `oid` | which relation that dispatch meant. The detach travels to pg_cron as text naming the partition, and is re-resolved there; this is what lets `retire` refuse to act when the name has stopped resolving to it (see [identity](#what-retire-checks-a-partitions-identity-against)). Null alongside a null `retiring_at`, and for a retirement already in flight when the column was added |
-| `child_oid` | `oid` | which relation this row is about, recorded where the partition enters this table (`obtain`, regrain's standalone child, `transmute`'s monolith) rather than at retirement. The archive step checks `child_name` against it before reading it (see [the archive step's identity check](#the-archive-steps-identity-check)), and `retire` checks it before any side effect -- which is what anchors the ordinary one-step `DROP` that `retiring_oid` leaves uncovered (see [identity](#what-retire-checks-a-partitions-identity-against)). A rename does not change an OID, so regrain's own transitional rename leaves it correct. Null reads as unanchored; an upgrade backfills it for every row whose name still resolves |
+| `child_oid` | `oid` | which relation this row is about, recorded where the partition enters this table (`obtain`, regrain's standalone child, `transmute`'s monolith) rather than at retirement. The write-block step checks `child_name` against it before issuing any DDL, the archive step checks it before reading the child (see [the archive step's identity check](#the-archive-steps-identity-check)), and `retire` checks it before any side effect -- which is what anchors the ordinary one-step `DROP` that `retiring_oid` leaves uncovered (see [identity](#what-retire-checks-a-partitions-identity-against)). A rename does not change an OID, so regrain's own transitional rename leaves it correct. Null reads as unanchored; an upgrade backfills it for every row whose name still resolves |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.
@@ -1491,7 +1507,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_regrain_capture` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 | `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
-| `fail_retain_identity` / `fail_archive_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [identity](#what-retire-checks-a-partitions-identity-against)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)). `method` names the OIDs and which anchor disagreed. Neither clears itself on a later tick |
+| `fail_retain_identity` / `fail_archive_identity` / `fail_write_block_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [identity](#what-retire-checks-a-partitions-identity-against)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)) / the write-block step refused to put its trigger on it. `method` names the OIDs and, for the first, which anchor disagreed. None clears itself on a later tick |
 
 ### `pgpm.dropped_fk`
 
