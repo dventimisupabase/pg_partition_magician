@@ -410,6 +410,17 @@ value so those ids are not re-issued. The swap is one transaction: it
 commits whole or rolls back whole, leaving the source intact on any failure. Requires `from_hypertable_copy`
 to have run (the destination must exist). Parameters past `p_interval` pass through to `transmute`.
 
+**Do not rename or replace either side of the swap while the cutover is preparing.** The source's name is
+resolved once at the start, and the index pre-builds above are deliberately outside the lock, so that is the
+longest stretch in which the name can stop meaning what it meant -- and `LOCK TABLE` freezes whatever a name
+means *at lock time*. The cutover therefore locks the source **by oid** and then requires the name to still
+resolve back to it, and does the same for the destination against the oid its own existence check found,
+locking that too. Either mismatch **aborts** the cutover with an error naming both oids: there is no partial
+progress to preserve (the swap is one transaction, and the copy and any drained batches survive), and
+adapting to the new name would silently migrate a table the operator did not ask for. Re-run the cutover once
+the name is settled. A destination substituted *before* the cutover was called is out of reach of this check,
+since nothing in the module records what `from_hypertable_copy` built.
+
 ```sql
 call pgpm.from_hypertable_copy('public.metrics', 'ts', p_track_changes => true);
 -- ... the application keeps writing (inserts, updates, deletes) ...
