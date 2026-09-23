@@ -329,8 +329,18 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    partitions at the head of the backlog -- not a failure, just run more maintenance ticks (or check
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
    with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
-   (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach` or `fail_retain_identity` rows,
-   `method`).
+   (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach`, `fail_retain_identity` or
+   `fail_archive_identity` rows, `method`).
+
+   `fail_archive_identity` is the one that needs no foreign key and no detach, so check it first on a
+   table with `archive_fn` set: a partition's name no longer resolves to the relation pgpm recorded
+   for it (`method` carries both oids), so the archive step refused to read it rather than export
+   whatever now holds the name and record a coverage claim from it. Nothing was archived and nothing
+   was dropped, and at `archive_batch`'s default of `1` this also holds up that table's other
+   partitions. Like `fail_retain_identity` below it does **not** clear itself: find out what took the
+   name, then either put the intended relation back under it or clear the stale bookkeeping with
+   `pgpm.forget_missing()` (if the parent itself is gone) or `delete from pgpm.part where
+   parent_table = ... and child_name = ...`.
 
 2. If anything has a foreign key **pointing at** this table, check the two failures specific to that. A
    referenced partition cannot be dropped outright; it is detached first, by a cron job.

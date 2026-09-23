@@ -24,14 +24,20 @@
 #      the DROP list). This asserts the conditions for the defect were present before looking for it.
 #   2. The pgpm catalog after the upgrade is IDENTICAL to a fresh install of the same code: every
 #      column of every table and view, with its type. This is the assertion the mutation breaks.
-#   3. Data survived BY IDENTITY, not by count. The fixture is asymmetric on purpose (3 inserted, 1
+#   3. A backfilled column's VALUE, where restoring the column empty is not good enough (issue #421).
+#      pgpm.part.child_oid is what the archive step checks a candidate's name against, and a null one
+#      reads as unanchored -- so an upgrade that recreated the column and populated nothing would
+#      leave every partition an existing install already had permanently unprotected, with assertion
+#      2 perfectly green. Checked BY IDENTITY: each row's child_oid must be the oid its OWN name
+#      resolves to, so a backfill writing one plausible oid everywhere fails too.
+#   4. Data survived BY IDENTITY, not by count. The fixture is asymmetric on purpose (3 inserted, 1
 #      deleted, 2 surviving) so that a lost insert and a resurrected delete cannot cancel out into a
 #      row count that still looks right.
-#   4. Registration survived: the config row still names the same control column and step, so the
+#   5. Registration survived: the config row still names the same control column and step, so the
 #      upgrade did not quietly reset the managed table's settings to defaults.
-#   5. The upgrade was RECORDED: pgpm.installed holds two rows, the second one this version. Distinct
+#   6. The upgrade was RECORDED: pgpm.installed holds two rows, the second one this version. Distinct
 #      from 2: it separates "the file ran to the end" from "the schema happens to look right".
-#   6. LIVENESS WITNESS: the machine still runs afterwards. maintain_obtain() (issue #347 split obtain
+#   7. LIVENESS WITNESS: the machine still runs afterwards. maintain_obtain() (issue #347 split obtain
 #      out of maintain()/maintain_all(), so this is now the call that mints partitions) on the table
 #      that existed BEFORE the upgrade mints a new partition, named. A structurally perfect install
 #      that can no longer obtain is not an upgrade anyone wants, and every assertion above it is
@@ -92,6 +98,7 @@ pgpm.config:archive_batch
 pgpm.part:attached
 pgpm.part:retiring_at
 pgpm.part:retiring_oid
+pgpm.part:child_oid
 pgpm.transmute_inflight:owner_pid
 pgpm.transmute_inflight:owner_backend_start
 pgpm.dropped_fk:restored_at
@@ -216,11 +223,24 @@ if ! install_into "$DB" >/tmp/up_upgrade.log 2>&1; then
 fi
 
 check "the pgpm catalog matches a fresh install exactly" "$(q "$DB" "$CATALOG_SQL")" "$ORACLE"
+
+# ASSERTION 3 (#421). Reported as anchored/total so "0 rows examined" cannot read as success: the
+# expectation is built from the children this fixture actually had before the degrade, not from the
+# same query that produces the answer.
+NPARTS=$(echo "$CHILDREN_BEFORE" | tr ',' '\n' | grep -c .)
+ANCHORED=$(q "$DB" "select count(*) filter (where p.child_oid is not null
+                                              and p.child_oid = to_regclass(format('%I.%I', n.nspname, p.child_name))::oid)
+                           || '/' || count(*)
+                      from pgpm.part p
+                      join pg_class c on c.oid = p.parent_table
+                      join pg_namespace n on n.oid = c.relnamespace
+                     where p.parent_table = 'public.up_t'::regclass")
+check "the upgrade backfilled child_oid, to each child's own oid" "$ANCHORED" "$NPARTS/$NPARTS"
 check "rows survived, by identity"                       "$(q "$DB" "select string_agg(body, ',' order by body) from public.up_t")" "$BODIES_BEFORE"
 check "registration survived (control column / step)"    "$(q "$DB" "select control_column||'/'||partition_step from pgpm.config where parent_table = 'public.up_t'::regclass")" "$CONFIG_BEFORE"
 check "the upgrade run was recorded"                     "$(q "$DB" "select count(*)||'/'||max(version) from pgpm.installed")" "2/$(q "$FRESH" "select pgpm.version()")"
 
-# ASSERTION 6, liveness. The pre-existing managed table must still be maintainable. Move the frontier
+# ASSERTION 7, liveness. The pre-existing managed table must still be maintainable. Move the frontier
 # to the top of the covered range so the next tick has real work: one id below the last bound, since
 # `hi` is exclusive. It cannot be moved PAST that bound -- with no DEFAULT partition (#288) an insert
 # beyond the last one is rejected rather than extending the grid, so the frontier is always inside it.

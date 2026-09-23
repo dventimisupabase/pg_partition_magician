@@ -272,6 +272,31 @@ MUTATIONS = {
           "    end if;\n"
           "  end if;\n", "", 1)],
     ),
+    "archive_step_unanchored_name": (
+        "bench/archive_identity_substitution.sh",
+        "Pre-#421 _archive_step(): nothing checks that the candidate's NAME still resolves to the "
+        "relation pgpm.part recorded for it. Deleting the identity check is the whole defect, "
+        "because every step after it already acts on child_name by name -- _next_archive_chunk "
+        "sizes the chunk from whatever answers to it, and the ledger row that follows records a "
+        "coverage claim for a range those rows never came from. That ledger is retire()'s drop "
+        "precondition via _archive_fully_covered, so the bogus claim does not merely put a wrong "
+        "object in the bucket: it opens the gate and the next retain() tick DROPs the relation "
+        "holding the name. No race is needed -- a rename is enough. child_oid and its select-list "
+        "entry are left in place deliberately: the defect being modelled is 'the anchor is not "
+        "consulted', not 'the anchor does not exist', and a mutant that dropped the column too "
+        "would fail the test file on its liveness witnesses and look like a catch for the wrong "
+        "reason.",
+        [("    v_now := to_regclass(format('%I.%I', v_nsp, r.child_name));\n"
+          "    if r.child_oid is not null and v_now::oid is distinct from r.child_oid then\n"
+          "      insert into pgpm.log (parent_table, action, lo, hi, method)\n"
+          "        values (p_parent, 'fail_archive_identity', r.lo, r.hi,\n"
+          "                format('%I.%I is oid %s now, not the oid %s recorded for this "
+          "partition; refusing to archive it',\n"
+          "                       v_nsp, r.child_name, coalesce(v_now::oid::text, 'nothing'), "
+          "r.child_oid));\n"
+          "      continue;\n"
+          "    end if;\n\n", "", 1)],
+    ),
     "transmute_no_lock_timeout": (
         "bench/transmute_lock_timeout.sh",
         "Pre-#309 transmute: no lock_timeout on any phase, so it waits indefinitely for the ACCESS "
@@ -320,6 +345,22 @@ MUTATIONS = {
         "database that already had pgpm installed comes out of the upgrade missing the column, which is "
         "to say only the operators who are not evaluating it.",
         [("alter table pgpm.config add column if not exists obtain_retry_after timestamptz;\n", "", 1)],
+    ),
+    "upgrade_child_oid_backfill_noop": (
+        "bench/upgrade_in_place.sh",
+        "The upgrade recreates pgpm.part.child_oid and populates nothing (issue #421). Deletes only "
+        "the backfill UPDATE for ATTACHED partitions, leaving the `add column if not exists` line "
+        "and the standalone-regrain-child UPDATE in place -- so the catalog-shape assertion stays "
+        "green and the column is there, null, for every partition an existing install already had. "
+        "That is the whole defect: a null child_oid reads as unanchored by design, so the archive "
+        "step's identity check silently does nothing on precisely the installs that have been "
+        "running longest, and no fresh install anywhere in the suite can show it. What must FAIL "
+        "here is the child_oid assertion by name; a mutant that dropped the column instead would "
+        "fail the catalog hash and look like a catch for the wrong reason.",
+        [("update pgpm.part p set child_oid = i.inhrelid\n"
+          "  from pg_inherits i join pg_class c on c.oid = i.inhrelid\n"
+          " where i.inhparent = p.parent_table and c.relname = p.child_name\n"
+          "   and p.attached and p.child_oid is null;\n", "", 1)],
     ),
     "upgrade_degrade_list_drift": (
         "bench/upgrade_in_place.sh",

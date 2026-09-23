@@ -52,7 +52,8 @@
 --
 -- Requires pgpm_core (any version that ships pgpm._run_archive_strategy/_is_write_blocked/
 -- _archive_fully_covered/_native_type -- these predate this script, not new in any particular
--- release). Not part of pgpm_core/install.sql and never will be without a real feature proposal
+-- release), plus pgpm.part.child_oid for the identity check below (issue #421; added after this
+-- script, so an older core needs that check removed along with the column reference). Not part of pgpm_core/install.sql and never will be without a real feature proposal
 -- and its own issue/PR -- this is scratch space for an operator to paste into a session and run,
 -- not a shipped, versioned function.
 --
@@ -68,6 +69,8 @@ declare
   r record;
   v_resume_lo text;
   v_ncast text;
+  v_nsp name;
+  v_now regclass;
   v_result pgpm.archive_result;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -79,7 +82,7 @@ begin
   end if;
   v_ncast := pgpm._native_type(cfg.control_kind);
 
-  select p.child_name, p.lo, p.hi into r
+  select p.child_name, p.lo, p.hi, p.child_oid into r
     from pgpm.part p
    where p.parent_table = p_parent
      and p.attached
@@ -90,6 +93,22 @@ begin
 
   if not found then
     return format('nothing eligible left to archive for %s', p_parent);
+  end if;
+
+  -- The same identity check pgpm._archive_step makes, for the same reason (#421), because this
+  -- writes the same kind of pgpm.archive_ledger row and that ledger is retire()'s drop precondition:
+  -- a coverage claim built by reading whatever answers to child_name is what authorises dropping the
+  -- partition that name was recorded for. Returned as a message rather than logged as
+  -- fail_archive_identity -- this is a hand-run function, so its caller is reading the output, and it
+  -- has no business writing into pgpm's own audit trail. Unlike _archive_step's check, nothing in
+  -- bench/ guards this one: the script is scratch space with no harness at all, which is a reason to
+  -- keep it consistent with the shipped path, not a reason to leave the gap open here.
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_now := to_regclass(format('%I.%I', v_nsp, r.child_name));
+  if r.child_oid is not null and v_now::oid is distinct from r.child_oid then
+    return format('%I.%I is oid %s now, not the oid %s recorded for this partition -- REFUSING to archive it. '
+                  'Something took the name. Put the intended relation back under it, or clear the stale pgpm.part row.',
+                  v_nsp, r.child_name, coalesce(v_now::oid::text, 'nothing'), r.child_oid);
   end if;
 
   -- resume from wherever this child's ledger coverage already left off, the same watermark
