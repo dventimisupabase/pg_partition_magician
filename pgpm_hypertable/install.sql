@@ -609,11 +609,18 @@ declare
   v_pseq_q text; v_curnext bigint; v_i int;
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
   v_in_refs text[]; v_in_names text[]; v_in_defs text[];   -- incoming FKs captured across the swap (#264)
+  v_dest_oid regclass;   -- which relation the destination check found, re-verified under lock (#422)
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
-  if to_regclass(format('%I.%I', v_nsp, v_dest)) is null then
+  -- Keep the OID this check resolved, not just the fact that something answered (#422). The swap
+  -- below renames this relation INTO the source's name, so it is the half of the swap that ends with
+  -- a relation BECOMING the production table -- and between here and there the destination is
+  -- unlocked (nothing takes a lock on it until the first index pre-build, and the pre-drain's
+  -- per-batch commits release even that). Verified under lock at the swap.
+  v_dest_oid := to_regclass(format('%I.%I', v_nsp, v_dest));
+  if v_dest_oid is null then
     raise exception 'pg_partition_magician: from_hypertable_cutover(%) found no copy to cut over -- run from_hypertable_copy first',
       p_hypertable;
   end if;
@@ -692,7 +699,44 @@ begin
     v_idx_tmps := array_append(v_idx_tmps, v_tmp);
   end loop;
 
-  execute format('lock table %I.%I in access exclusive mode', v_nsp, v_rel);
+  -- LOCK, THEN VERIFY (issue #422). Everything above resolved p_hypertable to a name pair ONCE, at
+  -- the top, and a great deal happens before this line -- most expensively the index pre-builds,
+  -- which are deliberately out here so the locked window stays brief, and which are therefore the
+  -- longest stretch in which the name can stop meaning what it meant. LOCK TABLE freezes whatever a
+  -- name means AT LOCK TIME, so locking by name is only half the pattern; without the other half the
+  -- DROP below destroys a relation this procedure never identified.
+  --
+  -- Lock the OID, not the resolved name: p_hypertable::text renders the CURRENT name of the relation
+  -- the caller passed, so the lock lands on the hypertable actually being cut over even if it has
+  -- been renamed, and nothing can slip in between the lock and the check. THEN require the name to
+  -- still resolve back to it. Once that holds, the name is pinned for the rest of the transaction --
+  -- a rename needs ACCESS EXCLUSIVE, which this now holds -- so every later `%I.%I` on the source is
+  -- safe by construction.
+  --
+  -- Aborts rather than adapting. There is no partial progress worth keeping: the swap is one
+  -- transaction and rolls back whole, the online copy and any drained batches survive, and re-running
+  -- the cutover once the name is sorted out costs only the index pre-builds. Adapting -- taking the
+  -- source's new name and carrying on -- would silently migrate a table the operator did not name.
+  execute format('lock table %s in access exclusive mode', p_hypertable::text);
+  if to_regclass(format('%I.%I', v_nsp, v_rel)) is distinct from p_hypertable then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) resolved % .% at the start, but that name is oid % now -- something renamed or replaced the source while the cutover was preparing; refusing to drop a relation it did not identify. Re-run the cutover once the name is settled.',
+      p_hypertable, quote_ident(v_nsp), quote_ident(v_rel),
+      coalesce(to_regclass(format('%I.%I', v_nsp, v_rel))::oid::text, 'nothing');
+  end if;
+
+  -- The destination half of the same swap (#422). It is renamed INTO the source's name below, so an
+  -- unverified one does not merely get dropped, it BECOMES the table. Lock it by the oid the
+  -- existence check resolved and require the name to still mean that, for the same reason and with
+  -- the same abort. What this does NOT cover, deliberately: a destination already substituted before
+  -- this procedure was ever called. Nothing in this module records what from_hypertable_copy built,
+  -- so there is no earlier identity to compare against -- that needs the module-wide oid recording
+  -- #422 sketches, which this change does not do.
+  execute format('lock table %s in access exclusive mode', v_dest_oid::text);
+  if to_regclass(format('%I.%I', v_nsp, v_dest)) is distinct from v_dest_oid then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) found destination % .% as oid % at the start, but that name is oid % now -- something replaced the copy while the cutover was preparing; refusing to rename an unverified relation into %.',
+      p_hypertable, quote_ident(v_nsp), quote_ident(v_dest), v_dest_oid::oid,
+      coalesce(to_regclass(format('%I.%I', v_nsp, v_dest))::oid::text, 'nothing'), quote_ident(v_rel);
+  end if;
   if v_track then
     -- change-tracking catch-up: reconcile every touched key against the now-frozen source. Delete each
     -- dirty key's copied version from the destination, then re-insert its current source row -- which is

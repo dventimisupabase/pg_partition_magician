@@ -85,6 +85,25 @@ end;
 $$;
 """
 
+# from_hypertable_cutover's two lock-then-verify halves (#422), each mutated separately so a guard
+# failure names which one went missing.
+HT_CUTOVER_SOURCE_VERIFY = """  execute format('lock table %s in access exclusive mode', p_hypertable::text);
+  if to_regclass(format('%I.%I', v_nsp, v_rel)) is distinct from p_hypertable then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) resolved % .% at the start, but that name is oid % now -- something renamed or replaced the source while the cutover was preparing; refusing to drop a relation it did not identify. Re-run the cutover once the name is settled.',
+      p_hypertable, quote_ident(v_nsp), quote_ident(v_rel),
+      coalesce(to_regclass(format('%I.%I', v_nsp, v_rel))::oid::text, 'nothing');
+  end if;
+
+"""
+
+HT_CUTOVER_DEST_VERIFY = """  execute format('lock table %s in access exclusive mode', v_dest_oid::text);
+  if to_regclass(format('%I.%I', v_nsp, v_dest)) is distinct from v_dest_oid then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) found destination % .% as oid % at the start, but that name is oid % now -- something replaced the copy while the cutover was preparing; refusing to rename an unverified relation into %.',
+      p_hypertable, quote_ident(v_nsp), quote_ident(v_dest), v_dest_oid::oid,
+      coalesce(to_regclass(format('%I.%I', v_nsp, v_dest))::oid::text, 'nothing'), quote_ident(v_rel);
+  end if;
+"""
+
 RESTORE_INLINE = """    if v_readded and not v_is_part then
       begin
         execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
@@ -445,6 +464,30 @@ MUTATIONS = {
           "  execute format('drop trigger if exists pgpm_write_block on %I.%I', v_nsp, p_child);\n"
           "end;\n"
           "$$;\n", 1)],
+    ),
+    "hypertable_cutover_unverified_source": (
+        "bench/hypertable_cutover_identity.sh",
+        "Pre-#422 from_hypertable_cutover(): it locks the SOURCE by the name it resolved at the top "
+        "and never re-resolves it. LOCK TABLE freezes whatever a name means at lock time, so locking "
+        "by name is only half the standard pattern; a rename landing in the window is acquired "
+        "cleanly and the procedure goes on to DROP TABLE a relation it never identified. The window "
+        "that matters is the index pre-builds -- deliberately outside the lock so the outage stays "
+        "brief, and therefore the longest stretch in it -- which is exactly where part A of "
+        "tests/timescale/db/17 lands its substitution. Restores the by-name lock verbatim; the "
+        "destination half is left in place so a failure names which half went missing.",
+        [(HT_CUTOVER_SOURCE_VERIFY,
+          "  execute format('lock table %I.%I in access exclusive mode', v_nsp, v_rel);\n\n", 1)],
+    ),
+    "hypertable_cutover_unverified_dest": (
+        "bench/hypertable_cutover_identity.sh",
+        "The other half of the same swap: the destination is existence-checked at the top of the "
+        "cutover and then renamed INTO the source's name at the bottom, with nothing verifying it is "
+        "still the relation that check found -- and nothing locking it until the first index "
+        "pre-build, which the pre-drain's per-batch commits release anyway. An unverified "
+        "destination does not merely get dropped, it BECOMES the production table. Deletes only the "
+        "destination lock-and-verify, leaving the source half, so part A still passes and only part "
+        "B of tests/timescale/db/17 catches this.",
+        [(HT_CUTOVER_DEST_VERIFY, "", 1)],
     ),
     "transmute_no_lock_timeout": (
         "bench/transmute_lock_timeout.sh",
@@ -892,6 +935,8 @@ $$;''',
 # bench/discriminate.sh reads this via --list to know which base file AND which container a
 # mutation's guard needs; anything not listed here defaults to the core install + core container.
 MUTATION_SRC = {
+    "hypertable_cutover_unverified_source": "pgpm_hypertable/install.sql",
+    "hypertable_cutover_unverified_dest": "pgpm_hypertable/install.sql",
     "archive_lz77_hash_scratch": "pgpm_archive/install.sql",
     "archive_encode_array_agg_unnest": "pgpm_archive/install.sql",
     "archive_deflate_six_arrays": "pgpm_archive/install.sql",
@@ -913,6 +958,11 @@ MUTATION_SRC = {
 # same patterns, and still has to break its guard.
 MUTATION_TRACK = {
     "maintain_no_commits_trace": "locktrace",
+    # The hypertable cutover's guard needs a real TimescaleDB, which is a separate image and a
+    # separate track for the same reason locktrace is: `./test.sh discriminate` must stay runnable
+    # without it. run_timescale invokes these while its own container is already up.
+    "hypertable_cutover_unverified_source": "timescale",
+    "hypertable_cutover_unverified_dest": "timescale",
 }
 
 

@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- **`from_hypertable_cutover` locked a name and then `DROP`ped it, without verifying the oid (#422).**
+  It resolved `p_hypertable` to a name pair once at the top, did a great deal of work, then
+  `lock table <nsp>.<rel>`, `drop table <nsp>.<rel>`, and renamed the copy into place. `LOCK TABLE`
+  freezes whatever a name means *at lock time*, so locking by name is only half the standard pattern;
+  nothing re-resolved it afterwards, and the missing half is what turns a rename in the window into a
+  `DROP TABLE` on a relation the procedure never identified.
+
+  Most of that window turns out to be self-protecting, and it is worth recording which part is not. A
+  rename before the cutover starts is caught by the `found no copy to cut over` check. A rename during
+  the online pre-drain is caught too, but by a mechanism the issue did not name: the drain *steps*
+  re-resolve the name per batch and raise `found no delta`, so the part of the window that commits
+  repeatedly, and therefore looks widest, is the safest. What is left is the index pre-builds --
+  explicitly the O(rows) work kept outside the lock so the outage stays brief, and so the longest
+  stretch in the window, with nothing in it that re-resolves the source.
+
+  The cutover now locks the source **by oid** (`p_hypertable::text` renders the current name of the
+  relation actually passed in, so the lock lands on it even after a rename) and then requires the name
+  to resolve back to it. It does the same for the **destination**, against the oid its own existence
+  check resolved, and locks that too: the destination is renamed *into* the source's name, so an
+  unverified one does not merely get dropped, it becomes the production table. Either mismatch aborts.
+
+  Two limits, stated rather than implied. The destination check covers the window from the existence
+  check to the swap; a destination substituted before the cutover was ever called is out of reach,
+  because nothing in this module records what `from_hypertable_copy` built. And the lock could not
+  simply move earlier: building the indexes outside it is what keeps the blocking window bounded by
+  the catch-up rather than by the table size.
+
 - **`_install_write_block` created its trigger on whatever answered to the name (#429).** It resolves
   the child by name and issues `CREATE TRIGGER` against the result, and `_enforce_write_blocks` calls
   it for every attached child on every `maintain()` tick -- so a relation that had taken a

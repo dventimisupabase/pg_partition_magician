@@ -283,6 +283,14 @@ run_timescale() {
       $DC "${px[@]}" -d postgres -q -c "drop database if exists $db" >/dev/null
     done
 
+    # #422's cutover-identity guard proves itself the way every other guard does -- by being run
+    # against a mutant that puts its defect back -- but it needs a real TimescaleDB, so its
+    # mutations are registered under MUTATION_TRACK=timescale rather than the default track. Same
+    # reasoning as locktrace: `./test.sh discriminate` has to stay runnable on a laptop without this
+    # image. Run here, inside the tag loop, because this is where the container is already up.
+    echo "--- discriminate (timescale-scoped mutations) ---"
+    bash "$(dirname "$0")/bench/discriminate.sh" --track=timescale pgpm_test-timescale || fail=1
+
     $DC --profile "$prof" down -v
   done
   if [ "$fail" -ne 0 ]; then echo "TimescaleDB track: FAIL"; return 1; fi
