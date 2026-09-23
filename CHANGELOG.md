@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+- **The archive path carried a partition's identity as a name, with nothing anchoring it (#421).**
+  `pgpm._archive_step` selects `child_name` out of `pgpm.part`, and every step downstream re-resolves
+  that string on its own: the write-block eligibility test matches it against `pg_class`,
+  `_next_archive_chunk` reads `schema.child` three times to size the chunk, and `archive_fn` is handed
+  the bare name. Nothing asserted that the relation answering to it was the partition the row was
+  written for.
+
+  That needed no race. A name that has stopped meaning what it meant is a state pgpm already knows is
+  reachable -- `pgpm.forget_missing` exists for it -- and on this path it is not read-only reporting:
+  the chunk is sized from the substitute's rows, and the `pgpm.archive_ledger` row that follows claims
+  coverage of a range those rows never came from. That ledger is `retire()`'s drop precondition, so the
+  bogus claim opened the gate and the next `retain()` tick dropped the relation holding the name.
+
+  `pgpm.part` gains `child_oid`, recorded where a partition *enters* the catalog (`obtain`, regrain's
+  standalone child, `transmute`'s monolith) rather than at retirement the way `retiring_oid` is -- that
+  one is null for every partition the archive step ever touches. `_archive_step` resolves each
+  candidate's name against it before reading anything, and on a mismatch (including a name that
+  resolves to nothing) logs the new `fail_archive_identity` action and skips that partition, leaving
+  the rest of the batch to proceed. Nothing is read, so no ledger row is written, so coverage never
+  completes and the drop precondition stays shut.
+
+  Two notes for an upgrade, neither needing action. `child_oid` is **backfilled**, from `pg_inherits`
+  for an attached partition and by name for a standalone regrain child, so an existing install is
+  anchored the moment it upgrades rather than only for partitions minted afterward; a row whose name
+  no longer resolves is left null, reads as unanchored, and behaves exactly as before. And
+  `fail_archive_identity` is a prefixed non-success event per the naming rule, so alerts matching exact
+  action values are unaffected; it counts in `status().retain_drop_failures` and, like
+  `fail_retain_identity`, never clears itself.
+
 ## [0.5.0] - 2026-09-22
 
 **Upgrading in place? Read this first.** `obtain` has moved out of `maintain()` into its own

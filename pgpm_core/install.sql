@@ -206,12 +206,57 @@ create table if not exists pgpm.part (
   -- unanchored and are left to behave exactly as they did before, rather than wedging an upgrade
   -- mid-retirement on a check that has nothing to compare against.
   retiring_oid oid,
+  -- WHICH RELATION this row is about, by OID, recorded where the partition ENTERS this catalog --
+  -- obtain's _create_partition, regrain's standalone child, transmute's monolith (issue #421).
+  -- child_name is a NAME, and every consumer of it re-resolves that name independently: the archive
+  -- step picks a candidate out of this table, _is_write_blocked matches it against pg_class,
+  -- _next_archive_chunk reads %I.%I to size the chunk, and the archive_fn is handed the bare string.
+  -- None of them could tell that the relation answering to it is the one this row was written for.
+  --
+  -- That needs no race to go wrong. A name that has stopped meaning what it meant -- an operator
+  -- renamed the partition aside, something else took the name -- is a state pgpm already knows is
+  -- reachable, which is why pgpm.forget_missing exists; #346 accepted forget_missing's own name-only
+  -- matching precisely BECAUSE it is read-only reporting. The archive path is not: a chunk sized
+  -- from a substitute's rows becomes a pgpm.archive_ledger row claiming coverage of a range those
+  -- rows never came from, and _archive_fully_covered consults that ledger as retire()'s drop
+  -- precondition. A bad export therefore does not merely put a wrong object in the bucket -- it
+  -- satisfies the gate that authorises a DROP.
+  --
+  -- Recorded at CREATION rather than at retirement, which is what separates this from retiring_oid
+  -- above: that one is set as retire() dispatches a detach, so it is null for every partition the
+  -- archive step ever touches. A rename does not change an OID, so regrain's own transitional rename
+  -- (#266) updates child_name and leaves this correct with nothing to do.
+  --
+  -- Null means "no OID was recorded", which reads as unanchored and behaves exactly as before. The
+  -- backfill below fills it for every row an upgrade finds resolvable, so an existing install is
+  -- anchored from the moment it upgrades rather than only for partitions minted afterward -- but it
+  -- can only adopt what is true AT THAT MOMENT. An install upgraded after a substitution has already
+  -- happened records the substitute; there is nothing in the catalog that could tell it otherwise.
+  child_oid    oid,
   primary key (parent_table, child_name)
 );
 -- upgrade path for installs that predate these columns
 alter table pgpm.part add column if not exists attached boolean not null default true;
 alter table pgpm.part add column if not exists retiring_at timestamptz;
 alter table pgpm.part add column if not exists retiring_oid oid;
+alter table pgpm.part add column if not exists child_oid oid;
+
+-- Backfill child_oid (issue #421). `where child_oid is null` makes this a one-time adoption per row:
+-- re-running this installer never re-adopts, so a row anchored at one upgrade is not silently
+-- re-pointed at whatever holds its name at the next one.
+--
+-- An ATTACHED partition is resolved through pg_inherits, not by name, so what gets adopted is a
+-- partition OF THIS PARENT by construction -- strictly better than to_regclass, which would take any
+-- relation of that name in the schema. A not-yet-attached regrain child is not in pg_inherits at all
+-- (it is standalone until the swap), so it has nothing but its name to go on; a row whose name does
+-- not resolve is left null and stays unanchored, which is exactly the state forget_missing clears.
+update pgpm.part p set child_oid = i.inhrelid
+  from pg_inherits i join pg_class c on c.oid = i.inhrelid
+ where i.inhparent = p.parent_table and c.relname = p.child_name
+   and p.attached and p.child_oid is null;
+update pgpm.part p set child_oid = to_regclass(format('%I.%I', n.nspname, p.child_name))::oid
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+ where c.oid = p.parent_table and not p.attached and p.child_oid is null;
 
 -- In-flight conversions (issue #275). transmute runs in three transactions -- add the bound, validate it,
 -- cut over -- so that the O(rows) validation scan is not held under the ACCESS EXCLUSIVE lock the ADD
@@ -741,8 +786,11 @@ begin
                  p_nsp, p_name, p_nsp, p_rel, v_lo_lit, v_hi_lit);
   perform pgpm._own_like_parent(format('%I.%I', p_nsp, p_rel)::regclass,
                                 format('%I.%I', p_nsp, p_name)::regclass);
-  insert into pgpm.part (parent_table, child_name, lo, hi)
-    values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi) on conflict do nothing;
+  -- child_oid: WHICH relation this row is about (#421), recorded in the same statement that first
+  -- names it, resolved from the CREATE TABLE two lines up rather than trusted from anywhere else.
+  insert into pgpm.part (parent_table, child_name, lo, hi, child_oid)
+    values (format('%I.%I', p_nsp, p_rel)::regclass, p_name, p_lo, p_hi,
+            format('%I.%I', p_nsp, p_name)::regclass::oid) on conflict do nothing;
   insert into pgpm.log (parent_table, action, lo, hi, method)
     values (format('%I.%I', p_nsp, p_rel)::regclass, 'obtain', p_lo, p_hi, 'plain');
 end;
@@ -1710,16 +1758,26 @@ $$;
 -- runs the configured strategy, and records progress. Returns how many chunks were recorded this
 -- call. A 'none' strategy (archive_fn null) has nothing to do -- every child is already "covered"
 -- per _archive_fully_covered above.
+--
+-- IDENTITY, BEFORE ANY READ OF THE CHILD (issue #421). What this loop selects out of pgpm.part is a
+-- NAME, and everything downstream of it re-resolves that name independently and by itself: the
+-- eligibility test above matches it against pg_class, _next_archive_chunk reads %I.%I three times to
+-- size the chunk, and archive_fn is handed the bare string (its signature takes `p_child name`, a
+-- published extension point that pgpm.set_archive_fn type-checks, so widening it to carry an OID is
+-- not available). The check below is therefore made ONCE here, at the top of each candidate's turn,
+-- which is the only place that covers all of them.
 create or replace function pgpm._archive_step(p_parent regclass)
 returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_ncast text; r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
+  cfg pgpm.config; v_ncast text; v_nsp name; v_now regclass;
+  r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.archive_fn is null then return 0; end if;
 
   v_ncast := pgpm._native_type(cfg.control_kind);
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
   -- oldest first, matching retain()'s own convention -- archiving history in age order. The
   -- eligibility checks live in the WHERE clause (not a `continue` inside the loop, the old shape)
@@ -1727,7 +1785,7 @@ begin
   -- candidate, so archive_batch caps how many DIFFERENT partitions get a turn this call, not how
   -- many rows happen to be scanned before finding that many.
   for r in execute format(
-    'select p.child_name from pgpm.part p
+    'select p.child_name, p.child_oid, p.lo, p.hi from pgpm.part p
       where p.parent_table = %L::regclass and p.attached
         and pgpm._is_write_blocked(%L::regclass, p.child_name)
         and not pgpm._archive_fully_covered(%L::regclass, p.child_name)
@@ -1735,6 +1793,31 @@ begin
       limit %s',
     p_parent::text, p_parent::text, p_parent::text, v_ncast, coalesce(cfg.archive_batch::text, 'all'))
   loop
+
+    -- Two independent facts have to agree, exactly as in retire()'s own identity check (#407): the
+    -- name resolves, and it resolves to the OID recorded when this partition entered pgpm.part.
+    -- `is distinct from` so a name that resolves to nothing at all trips this too. A null child_oid
+    -- is unanchored (see the column's own note) and is left to behave as it did before.
+    --
+    -- `continue`, not a raise or a return: one partition whose name has stopped meaning what it
+    -- meant is not a reason to abandon the tick, and the loop above is already the per-candidate
+    -- shape that makes skipping one of them the natural thing to do. It is still fail-CLOSED for the
+    -- partition itself -- no chunk is read, no ledger row is written, so _archive_fully_covered
+    -- stays false and retire()'s drop precondition stays shut -- and it stays closed, because there
+    -- is no later tick on which the name goes back to meaning the right relation. That makes it a
+    -- wedge an operator has to resolve (pgpm.forget_missing, or putting the name back), which is why
+    -- it is logged as a prefixed non-success action and counted by status() alongside the other
+    -- things that stall retention. At archive_batch's default of 1 it also stops this parent's
+    -- archiving behind it, which is the correct reading: pgpm's catalog is provably wrong about
+    -- which relation is which, and retention should not march on past that.
+    v_now := to_regclass(format('%I.%I', v_nsp, r.child_name));
+    if r.child_oid is not null and v_now::oid is distinct from r.child_oid then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_archive_identity', r.lo, r.hi,
+                format('%I.%I is oid %s now, not the oid %s recorded for this partition; refusing to archive it',
+                       v_nsp, r.child_name, coalesce(v_now::oid::text, 'nothing'), r.child_oid));
+      continue;
+    end if;
 
     select * into v_range from pgpm._next_archive_chunk(p_parent, r.child_name);
     if not found then continue; end if;
@@ -2388,8 +2471,12 @@ begin
         execute format('alter table %I.%I add constraint %I %s not valid', v_nsp, v_sub_name, r.conname, r.def);
         execute format('alter table %I.%I validate constraint %I', v_nsp, v_sub_name, r.conname);
       end loop;
-      insert into pgpm.part (parent_table, child_name, lo, hi, attached)
-        values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false) on conflict (parent_table, child_name) do nothing;
+      -- child_oid (#421): the fine child is standalone here and joins pg_inherits only at the swap,
+      -- so this is the only point at which its identity can be recorded from the CREATE that made it.
+      insert into pgpm.part (parent_table, child_name, lo, hi, attached, child_oid)
+        values (p_parent, v_sub_name, v_sub_lo, v_sub_hi, false,
+                format('%I.%I', v_nsp, v_sub_name)::regclass::oid)
+        on conflict (parent_table, child_name) do nothing;
     end if;
     execute format($f$
       insert into %7$I.%8$I (%6$s)
@@ -3383,8 +3470,12 @@ begin
 
   -- record the original table, now the bounded MONOLITH coarse child, as an attached partition
   -- (REDESIGN.md section 7) so obtain's overlap check and status() see it.
-  insert into pgpm.part (parent_table, child_name, lo, hi, attached)
-    values (v_parent, v_monolith, v_lo_native, v_hi_native, true);
+  -- child_oid (#421). p_parent, not a fresh lookup of v_monolith: a regclass argument resolved to an
+  -- OID at call time, and the rename above moved that OID to the monolith name (the same fact the
+  -- note on v_parent records) -- so this is the original relation's identity carried through the
+  -- conversion, not a re-resolution of the name it now answers to.
+  insert into pgpm.part (parent_table, child_name, lo, hi, attached, child_oid)
+    values (v_parent, v_monolith, v_lo_native, v_hi_native, true, p_parent::oid);
 
   -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
   -- always preserve-managed now, re-added against the new parent by restore_incoming_fks on a later tick.
@@ -4601,10 +4692,15 @@ begin
     -- (no pgpm_detach cron job to dispatch to) and `fail_retain_identity` (issue #407, the child's
     -- name no longer resolves to the object whose detach was dispatched) wedge retention exactly as a
     -- failed drop does, so they belong in the same since-last-progress count.
+    -- `fail_archive_identity` (issue #421) is here for the same reason one step earlier in the
+    -- lifecycle: the archive step refused a candidate whose name no longer resolves to the relation
+    -- pgpm.part recorded, so no chunk is ever written for it, _archive_fully_covered never goes true,
+    -- and retire()'s drop precondition never opens. Retention is stalled just as hard as by a failed
+    -- drop, and like fail_retain_identity it never clears itself.
     select count(*) into v_drop_fails from pgpm.log
       where parent_table = r.parent_table
         and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach',
-                       'fail_retain_identity')
+                       'fail_retain_identity', 'fail_archive_identity')
         and id > coalesce(v_last_retain_id, 0);
     -- Partitions whose concurrent detach has been dispatched and not yet completed (issue #268).
     -- Non-zero is normal for a tick or two while cron performs the detach; persistently non-zero with

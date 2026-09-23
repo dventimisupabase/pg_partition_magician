@@ -964,6 +964,36 @@ archive a whole large partition as one giant operation, chunk it instead.
   raising `archive_byte_budget` alone and reintroducing the per-partition timeout risk to get the
   same speed `archive_batch` would have bought for free on that axis.
 
+#### The archive step's identity check
+
+What `_archive_step` selects out of `pgpm.part` is a **name**, and every step downstream of it
+re-resolves that name independently: the write-block eligibility test matches it against `pg_class`,
+`_next_archive_chunk` reads `schema.child` to size the chunk, and `archive_fn` is handed the bare
+string (its signature takes `p_child name`, a published extension point `pgpm.set_archive_fn`
+type-checks, so it cannot be widened to carry an OID).
+
+That matters without any race. If `child_name` stops naming the partition it was recorded for --
+someone renamed the partition aside, something else took the name -- the chunk is sized from whatever
+now holds it, and the `pgpm.archive_ledger` row that follows claims coverage of a range those rows
+never came from. That ledger is `retire()`'s drop precondition, so a bad chunk does not merely put a
+wrong object in the bucket: it opens the gate that authorises a `DROP`.
+
+So before reading anything about a candidate, `_archive_step` resolves its name and compares the
+result to `pgpm.part.child_oid`, recorded when the partition entered the catalog. On a mismatch --
+including a name that resolves to nothing at all -- it logs `fail_archive_identity` with both OIDs in
+`method` and skips that partition, continuing with the rest of the batch. Nothing is read, so no
+ledger row is written, so `_archive_fully_covered` stays false and the drop precondition stays shut.
+
+Like `fail_retain_identity`, the refusal is permanent rather than retryable: no later tick makes the
+name mean the right relation again. It counts in `status().retain_drop_failures`, and shows up as
+`retain_backlog` flat while that count climbs. Recovery is an operator decision -- put the intended
+relation back under that name, or clear the stale row with
+[`forget_missing`](#forget_missing). At `archive_batch`'s default of `1` a wedged partition also
+holds up that parent's other partitions, which is deliberate: pgpm's catalog is demonstrably wrong
+about which relation is which, and retention should not march on past that. A null `child_oid` (a
+partition recorded before the column existed, whose name no longer resolved at upgrade time) is
+unanchored and skips the check entirely.
+
 #### Sizing `archive_byte_budget`: there is no single optimal size
 
 Four considerations pull in different directions, and no formula resolves all of them at once --
@@ -1211,8 +1241,10 @@ One row per managed table. Beyond the static config it surfaces:
   child whose chunked archiving simply hasn't caught up yet -- see `retire`). Non-zero means a partition
   is genuinely stuck. Counts `fail_retain_drop`, `fail_retain_crossing` (a live row references an aged
   one and the FK's own `ON DELETE` refused the delete), `fail_retain_detach` (nowhere to dispatch a
-  concurrent detach to) and `fail_retain_identity` (the partition's name no longer resolves to the
-  relation whose detach was dispatched), since all four wedge retention the same way.
+  concurrent detach to), `fail_retain_identity` (the partition's name no longer resolves to the
+  relation whose detach was dispatched) and `fail_archive_identity` (the same mismatch found one step
+  earlier, by the archive step, so coverage never completes and the drop gate never opens), since all
+  five wedge retention the same way.
 - `parent_missing` -- the managed relation itself is **gone**: dropped without
   [`untransmute`](#untransmute), leaving the `pgpm.config` row pointing at an oid with no `pg_class`
   entry. Everything else in the row still reports (it comes from pgpm's own catalog), but
@@ -1409,6 +1441,7 @@ The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 | `attached` | `boolean` | false while a regrain is still filling it standalone; true once attached |
 | `retiring_at` | `timestamptz` | set when `retire` dispatches a concurrent detach for this partition, so recovery can tell whose detach a pending one was; null for every partition on the ordinary one-step drop path |
 | `retiring_oid` | `oid` | which relation that dispatch meant. The detach travels to pg_cron as text naming the partition, and is re-resolved there; this is what lets `retire` refuse to act when the name has stopped resolving to it (see [the dispatch gap](#the-dispatch-gap-and-what-retiring_oid-is-for)). Null alongside a null `retiring_at`, and for a retirement already in flight when the column was added |
+| `child_oid` | `oid` | which relation this row is about, recorded where the partition enters this table (`obtain`, regrain's standalone child, `transmute`'s monolith) rather than at retirement. This is what the archive step checks `child_name` against before reading it (see [the archive step's identity check](#the-archive-steps-identity-check)). A rename does not change an OID, so regrain's own transitional rename leaves it correct. Null reads as unanchored; an upgrade backfills it for every row whose name still resolves |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.
@@ -1444,6 +1477,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_regrain_capture` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 | `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
+| `fail_retain_identity` / `fail_archive_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [the dispatch gap](#the-dispatch-gap-and-what-retiring_oid-is-for)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)). `method` carries both OIDs. Neither clears itself on a later tick |
 
 ### `pgpm.dropped_fk`
 
