@@ -33,6 +33,31 @@ BOUNDARY_RE = re.compile(
 # Put the inline VALIDATE back where #265 removed it. Anchored on the comment block that replaced it, so
 # a stale pattern fails loudly rather than yielding an unmutated copy.
 RESTORE_MARKER = "    -- The VALIDATE deliberately does NOT happen here (#265)."
+# retire()'s identity check, whole (#407 widened by #428). Shared by three mutations that each take a
+# different bite out of it, so the exact text lives in one place: a block this long, duplicated, is a
+# block that drifts in one copy and silently stops matching in the other -- and a mutation that
+# stops matching is one mutate.py refuses to build, which reads as a broken guard rather than a
+# stale pattern until someone goes and looks.
+RETIRE_IDENTITY_BLOCK = """  if r.retiring_oid is not null or r.child_oid is not null then
+    v_now := to_regclass(format('%I.%I', v_nsp, p_child));
+    v_why := concat_ws(' and ',
+      case when r.retiring_oid is not null and v_now::oid is distinct from r.retiring_oid
+           then format('not the oid %s this retirement dispatched a detach for', r.retiring_oid) end,
+      case when r.child_oid is not null and v_now::oid is distinct from r.child_oid
+           then format('not the oid %s recorded for this partition when it was created', r.child_oid) end);
+    if v_why <> '' then
+      if r.retiring_oid is not null then
+        perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));
+      end if;
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_retain_identity', r.lo, r.hi,
+                format('%I.%I is oid %s now, %s; refusing to detach or drop it',
+                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), v_why));
+      return false;
+    end if;
+  end if;
+"""
+
 RESTORE_INLINE = """    if v_readded and not v_is_part then
       begin
         execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
@@ -258,19 +283,57 @@ MUTATIONS = {
         "place deliberately: the defect being modelled is 'the anchor is not consulted', not 'the "
         "anchor does not exist', and a mutant that dropped the column too would fail the test file "
         "on its liveness witnesses and look like a catch for the wrong reason.",
-        [("  if r.retiring_oid is not null then\n"
+        [(RETIRE_IDENTITY_BLOCK, "", 1)],
+    ),
+    "retire_drop_child_oid_ignored": (
+        "bench/retire_identity_unreferenced.sh",
+        "Pre-#428 retire(): the identity check consults retiring_oid ONLY. That anchor is set inside "
+        "the `if v_referenced` branch, as retire() dispatches a concurrent detach, so it is null for "
+        "every partition nothing points a foreign key at -- which is the ordinary one-step path, and "
+        "the one whose bare `drop table schema.child` has nothing else between it and the write "
+        "block. Narrows the entry condition back to retiring_oid and removes the child_oid arm of "
+        "the reason string, which together is exactly what #428 widened. child_oid itself is left in "
+        "place: the defect being modelled is 'the anchor is not consulted on this path', not 'the "
+        "anchor does not exist', and a mutant that dropped the column would fail the test file on "
+        "its liveness witnesses and look like a catch for the wrong reason. Breaks part A of "
+        "tests/103; part B still passes, which is what tells the two mutations apart.",
+        [("  if r.retiring_oid is not null or r.child_oid is not null then\n",
+          "  if r.retiring_oid is not null then\n", 1),
+         ("           then format('not the oid %s this retirement dispatched a detach for', "
+          "r.retiring_oid) end,\n"
+          "      case when r.child_oid is not null and v_now::oid is distinct from r.child_oid\n"
+          "           then format('not the oid %s recorded for this partition when it was created', "
+          "r.child_oid) end);\n",
+          "           then format('not the oid %s this retirement dispatched a detach for', "
+          "r.retiring_oid) end);\n", 1)],
+    ),
+    "retire_identity_coalesced_anchors": (
+        "bench/retire_identity_unreferenced.sh",
+        "The plausible-but-wrong #428: fall back from retiring_oid to child_oid rather than checking "
+        "both. It closes the gap #428 was filed for, so part A of tests/103 still passes -- which is "
+        "the point of having this mutation as well as the other one. What it misses is that "
+        "retiring_oid is ITSELF resolved by name, out of pg_inherits at dispatch time, so a "
+        "substitution that landed before the dispatch is adopted BY that anchor; coalesce then picks "
+        "the adopted one, the comparison passes forever, and the one anchor that still remembers the "
+        "original is never consulted. Part B constructs exactly that state and must FAIL here. The "
+        "reason string deliberately keeps the child_oid wording so part A's message assertion still "
+        "passes: this mutant must be caught by part B alone, not by a message mismatch elsewhere.",
+        [(RETIRE_IDENTITY_BLOCK,
+          "  if coalesce(r.retiring_oid, r.child_oid) is not null then\n"
           "    v_now := to_regclass(format('%I.%I', v_nsp, p_child));\n"
-          "    if v_now::oid is distinct from r.retiring_oid then\n"
-          "      perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));\n"
+          "    if v_now::oid is distinct from coalesce(r.retiring_oid, r.child_oid) then\n"
+          "      if r.retiring_oid is not null then\n"
+          "        perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));\n"
+          "      end if;\n"
           "      insert into pgpm.log (parent_table, action, lo, hi, method)\n"
           "        values (p_parent, 'fail_retain_identity', r.lo, r.hi,\n"
-          "                format('%I.%I is oid %s now, not the oid %s this retirement dispatched a "
-          "detach for; refusing to detach or drop it',\n"
+          "                format('%I.%I is oid %s now, not the oid %s recorded for this partition "
+          "when it was created; refusing to detach or drop it',\n"
           "                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), "
-          "r.retiring_oid));\n"
+          "coalesce(r.retiring_oid, r.child_oid)));\n"
           "      return false;\n"
           "    end if;\n"
-          "  end if;\n", "", 1)],
+          "  end if;\n", 1)],
     ),
     "archive_step_unanchored_name": (
         "bench/archive_identity_substitution.sh",

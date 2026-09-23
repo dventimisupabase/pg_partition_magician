@@ -627,7 +627,7 @@ The sequence, per partition:
 is detached but carries no `retiring_at` was detached by something other than pgpm, and `retire` refuses to
 drop it.
 
-##### The dispatch gap, and what `retiring_oid` is for
+##### What `retire` checks a partition's identity against
 
 What leaves `retire` is command **text**, and a command text can only name a relation -- there is no way to
 write an OID into `ALTER TABLE ... DETACH PARTITION`. pg_cron picks that text up on a later tick, in a
@@ -643,12 +643,26 @@ call, before any side effect: the name must still resolve, and resolve to that O
 re-dispatch, and in particular no `DROP`. The detach can still land on a substitute; the destructive half
 cannot.
 
-That refusal is permanent, not retryable: no later tick makes the name mean the right object again. It
-shows up as `retain_detaching` stuck non-zero with `retain_drop_failures` climbing, and the `method` column
-carries both OIDs. Recovery is an operator decision -- put the intended relation back under that name, or
-delete the `pgpm.part` row if it is gone for good. `retiring_oid` is null for every partition on the
-ordinary one-step drop path, and for a retirement that was already in flight when the column was added;
-both are treated as unanchored and behave as they did before.
+**That anchor only covers partitions being retired through a detach.** `retiring_oid` is set inside the
+referenced-partition branch, so it is null for every unreferenced one -- the ordinary one-step path, whose
+bare `DROP TABLE schema.child` has nothing at all between it and the write block. `pgpm.part.child_oid` is
+what covers that path: recorded when the partition entered the catalog rather than at retirement, so it is
+populated for every partition. `retire` consults both, and a disagreement with **either** refuses.
+
+The two are checked independently rather than one falling back to the other, and the difference is not
+academic. `retiring_oid` is itself resolved *by name*, out of `pg_inherits` at dispatch time, so a
+substitution that landed before the dispatch is adopted by that anchor -- comparing the name against it
+then passes forever, and `coalesce(retiring_oid, child_oid)` would never reach the one anchor that still
+remembers the original. The `method` column names whichever anchor disagreed, so a stale dispatch and a
+stale catalog row are distinguishable.
+
+That refusal is permanent, not retryable: no later tick makes the name mean the right object again. On the
+detach path it shows up as `retain_detaching` stuck non-zero with `retain_drop_failures` climbing; on the
+one-step path as `retain_backlog` flat with the same count climbing. Recovery is an operator decision --
+put the intended relation back under that name, or delete the `pgpm.part` row if it is gone for good. A
+null anchor is not consulted at all: `retiring_oid` is null for every partition on the one-step path and
+for a retirement already in flight when the column was added, and `child_oid` is null for a row whose name
+no longer resolved when the backfill ran. Both read as unanchored and behave as they did before.
 
 ### `_detach_reap`
 
@@ -1440,8 +1454,8 @@ The registry of managed partitions. `lo`/`hi` are native-grid values as text.
 | `created_at` | `timestamptz` | when created |
 | `attached` | `boolean` | false while a regrain is still filling it standalone; true once attached |
 | `retiring_at` | `timestamptz` | set when `retire` dispatches a concurrent detach for this partition, so recovery can tell whose detach a pending one was; null for every partition on the ordinary one-step drop path |
-| `retiring_oid` | `oid` | which relation that dispatch meant. The detach travels to pg_cron as text naming the partition, and is re-resolved there; this is what lets `retire` refuse to act when the name has stopped resolving to it (see [the dispatch gap](#the-dispatch-gap-and-what-retiring_oid-is-for)). Null alongside a null `retiring_at`, and for a retirement already in flight when the column was added |
-| `child_oid` | `oid` | which relation this row is about, recorded where the partition enters this table (`obtain`, regrain's standalone child, `transmute`'s monolith) rather than at retirement. This is what the archive step checks `child_name` against before reading it (see [the archive step's identity check](#the-archive-steps-identity-check)). A rename does not change an OID, so regrain's own transitional rename leaves it correct. Null reads as unanchored; an upgrade backfills it for every row whose name still resolves |
+| `retiring_oid` | `oid` | which relation that dispatch meant. The detach travels to pg_cron as text naming the partition, and is re-resolved there; this is what lets `retire` refuse to act when the name has stopped resolving to it (see [identity](#what-retire-checks-a-partitions-identity-against)). Null alongside a null `retiring_at`, and for a retirement already in flight when the column was added |
+| `child_oid` | `oid` | which relation this row is about, recorded where the partition enters this table (`obtain`, regrain's standalone child, `transmute`'s monolith) rather than at retirement. The archive step checks `child_name` against it before reading it (see [the archive step's identity check](#the-archive-steps-identity-check)), and `retire` checks it before any side effect -- which is what anchors the ordinary one-step `DROP` that `retiring_oid` leaves uncovered (see [identity](#what-retire-checks-a-partitions-identity-against)). A rename does not change an OID, so regrain's own transitional rename leaves it correct. Null reads as unanchored; an upgrade backfills it for every row whose name still resolves |
 
 Primary key `(parent_table, child_name)`. The non-overlap invariant holds over `attached = true` rows
 only; an in-flight child may transiently sit inside a still-attached coarse child.
@@ -1477,7 +1491,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_regrain_capture` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 | `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
-| `fail_retain_identity` / `fail_archive_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [the dispatch gap](#the-dispatch-gap-and-what-retiring_oid-is-for)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)). `method` carries both OIDs. Neither clears itself on a later tick |
+| `fail_retain_identity` / `fail_archive_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [identity](#what-retire-checks-a-partitions-identity-against)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)). `method` names the OIDs and which anchor disagreed. Neither clears itself on a later tick |
 
 ### `pgpm.dropped_fk`
 

@@ -332,15 +332,21 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach`, `fail_retain_identity` or
    `fail_archive_identity` rows, `method`).
 
-   `fail_archive_identity` is the one that needs no foreign key and no detach, so check it first on a
-   table with `archive_fn` set: a partition's name no longer resolves to the relation pgpm recorded
-   for it (`method` carries both oids), so the archive step refused to read it rather than export
-   whatever now holds the name and record a coverage claim from it. Nothing was archived and nothing
-   was dropped, and at `archive_batch`'s default of `1` this also holds up that table's other
-   partitions. Like `fail_retain_identity` below it does **not** clear itself: find out what took the
-   name, then either put the intended relation back under it or clear the stale bookkeeping with
-   `pgpm.forget_missing()` (if the parent itself is gone) or `delete from pgpm.part where
-   parent_table = ... and child_name = ...`.
+   **The two `*_identity` actions need no foreign key and no detach, so check for them first.** Both
+   say the same thing: a partition's name no longer resolves to the relation pgpm recorded for it
+   (`method` carries the oids and which anchor disagreed). `fail_archive_identity` is the archive step
+   refusing to read it, rather than exporting whatever now holds the name and recording a coverage
+   claim from it; `fail_retain_identity` is `retire` refusing to detach or drop it. Nothing was
+   archived and nothing was dropped in either case, and a `fail_archive_identity` at
+   `archive_batch`'s default of `1` also holds up that table's other partitions.
+
+   Neither **ever** clears itself, which is what separates them from everything else in this list:
+   there is no later tick on which the name goes back to meaning the right relation. Find out what
+   took it, then either put the intended relation back under that name or clear the stale bookkeeping
+   with `pgpm.forget_missing()` (if the parent itself is gone) or `delete from pgpm.part where
+   parent_table = ... and child_name = ...`. Renaming a partition is safe if you update
+   `pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded
+   identity stays right.
 
 2. If anything has a foreign key **pointing at** this table, check the two failures specific to that. A
    referenced partition cannot be dropped outright; it is detached first, by a cron job.
@@ -359,13 +365,12 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
      `ON DELETE` (`NO ACTION` or `RESTRICT`) refuses to let it go. `method` carries PostgreSQL's own
      error naming the constraint. This is the constraint doing its job, not a pgpm fault: remove the
      referencing rows, or change the referential action, if you meant retention to win.
-   - `fail_retain_identity` -- the partition's name no longer resolves to the relation whose detach was
-     dispatched (`method` carries both oids). The detach travels to pg_cron as text naming the
-     partition and is re-resolved in that session a tick or more later, so pgpm records the oid at
-     dispatch and refuses to detach or drop anything else under that name. This one does **not** clear
-     itself on a later tick, and nothing was destroyed: find out what took the name. Either put the
-     intended relation back under it, or, if it is genuinely gone, `delete from pgpm.part where
-     parent_table = ... and child_name = ...` to retire the bookkeeping.
+   - `fail_retain_identity` -- covered in step 1, because it is not specific to a referenced
+     partition. The detach-specific half is worth knowing here though: the detach travels to pg_cron
+     as text naming the partition and is re-resolved in that session a tick or more later, so pgpm
+     records the oid at dispatch (`pgpm.part.retiring_oid`) as well as the one recorded when the
+     partition was created (`child_oid`), and refuses when the name stops resolving to **either**.
+     `method` says which, so a stale dispatch and a stale catalog row are distinguishable.
    - `retain_detaching` non-zero for many ticks with none of these logged means the detach is
      dispatched but the `pgpm` job is not running: check `cron.job_run_details`.
 

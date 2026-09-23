@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **`retire`'s ordinary one-step `DROP` was unanchored (#428).** #407 gave `retire` an identity check
+  but scoped it to the defect #407 was about: its anchor, `pgpm.part.retiring_oid`, is set only inside
+  the referenced-partition branch, as `retire` dispatches a concurrent detach. For a partition nothing
+  points a foreign key at -- the overwhelmingly common case -- it is null on every call, the check was
+  skipped whole, and the closing `drop table schema.child` destroyed whatever answered to the name.
+  `pgpm.part.child_oid` (#421) is the anchor that path was missing, since it is recorded at creation
+  and so populated for every partition, and `retire` now consults it before any side effect.
+
+  **The two anchors are checked independently, not coalesced**, and the difference is not academic:
+  `retiring_oid` is itself resolved *by name*, out of `pg_inherits` at dispatch time, so a
+  substitution that landed before the dispatch is adopted by that anchor and comparing the name
+  against it passes forever. `coalesce(retiring_oid, child_oid)` would never reach the one anchor that
+  still remembers the original. A disagreement with either refuses, and `method` names which, so a
+  stale dispatch and a stale catalog row are distinguishable.
+
+  No new action value and no new column: this reuses `fail_retain_identity`, which already counts in
+  `status().retain_drop_failures` and already never clears itself. The `method` text has changed shape
+  to name the disagreeing anchor; alerts matching the action value are unaffected. A null anchor is
+  still not consulted, so nothing an upgrade cannot compare gets wedged.
+
 - **The archive path carried a partition's identity as a name, with nothing anchoring it (#421).**
   `pgpm._archive_step` selects `child_name` out of `pgpm.part`, and every step downstream re-resolves
   that string on its own: the write-block eligibility test matches it against `pg_class`,
