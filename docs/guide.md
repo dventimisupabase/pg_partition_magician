@@ -688,6 +688,12 @@ things follow, and none of them are optional:
   `fail_retain_identity` in the log and a retirement that stays wedged until you sort the name out, rather
   than a dropped table. `status().retain_detaching` tells you when a retirement is in flight.
 
+  This guard is **not** limited to a retirement in flight, or to a referenced partition. `retire` also
+  checks the oid recorded when the partition was created, so the ordinary one-step `DROP` refuses a
+  substituted name too, and logs the same action. If you genuinely need to rename a partition, update
+  `pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded
+  identity stays right, which is exactly what `regrain`'s own transitional rename does.
+
 **When a live row genuinely references an aged one**, pgpm executes the policy you already declared in the
 foreign key's `ON DELETE` clause, rather than inventing one:
 

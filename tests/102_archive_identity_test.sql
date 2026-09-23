@@ -117,7 +117,12 @@ select results_eq(
   $$ values ('fail_archive_identity'::text, '0'::text, '1000'::text) $$,
   'refused as exactly fail_archive_identity, naming the partition''s own range');
 
--- THE CONSEQUENCE. The refusal is only worth anything if it keeps the drop gate shut.
+-- THE CONSEQUENCE. The refusal is only worth anything if it keeps the drop gate shut. The previous
+-- assertion is the coverage-specific claim; this one is only that the DROP does not happen. Since
+-- #428 there are two independent reasons it does not -- coverage never completed, AND retire()'s own
+-- identity check now consults child_oid on the one-step path too -- so this no longer isolates the
+-- archive gate by itself, and it logs a fail_retain_identity alongside the archive refusals (counted
+-- at the end of this file).
 select ok(not pgpm._archive_fully_covered('public.ai102', :'ai_doomed'),
   'the coverage gate stays shut: nothing was archived, so nothing claims it was');
 select ok(not pgpm.retire('public.ai102', :'ai_doomed'),
@@ -149,9 +154,13 @@ select is(
   (select count(*)::int from pgpm.log
     where parent_table = 'public.ai102'::regclass and action = 'fail_archive_identity'),
   2, 'both refusals are logged: this never clears itself');
+-- 3, not 2: the two fail_archive_identity above plus the one fail_retain_identity the retire() call
+-- logged, which since #428 refuses the same substituted name on its own anchor. Spelled out rather
+-- than left as a bare number, because a count that silently absorbs a new action value is exactly
+-- how a since-last-progress counter stops meaning anything.
 select is(
   (select retain_drop_failures from pgpm.status() where parent = 'public.ai102'::regclass),
-  2::bigint,
-  'status() counts them alongside the other things that stall retention, so an operator sees the wedge');
+  3::bigint,
+  'status() counts all three alongside the other things that stall retention, so an operator sees the wedge');
 
 select * from finish();

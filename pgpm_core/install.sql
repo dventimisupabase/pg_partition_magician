@@ -1207,7 +1207,7 @@ create or replace function pgpm.retire(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_boundary text; r record;
-  v_referenced boolean; v_child regclass; v_now regclass;
+  v_referenced boolean; v_child regclass; v_now regclass; v_why text;
   v_cross text[]; v_coltype text; v_lo_lit text; v_hi_lit text; v_deleted int; v_reason text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -1217,7 +1217,7 @@ begin
   end if;
 
   -- the claim: one owner per partition at a time
-  select p.lo, p.hi, p.attached, p.retiring_at, p.retiring_oid into r
+  select p.lo, p.hi, p.attached, p.retiring_at, p.retiring_oid, p.child_oid into r
     from pgpm.part p
    where p.parent_table = p_parent and p.child_name = p_child
      for update skip locked;
@@ -1233,32 +1233,60 @@ begin
 
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  -- IDENTITY, BEFORE ANY SIDE EFFECT (issue #407). retiring_oid is set only on a retirement that has
-  -- already dispatched a detach, and it says WHICH object that dispatch meant. Everything from here
-  -- down acts on p_child by NAME -- installing the write block, deleting crossing keys, re-pointing
-  -- the cron job, and finally the DROP -- so the name has to be proved to still mean that object
-  -- before the first of them, not just before the last.
+  -- IDENTITY, BEFORE ANY SIDE EFFECT (issues #407 and #428). Everything from here down acts on
+  -- p_child by NAME -- installing the write block, deleting crossing keys, re-pointing the cron job,
+  -- and finally the DROP -- so the name has to be proved to still mean the right relation before the
+  -- first of them, not just before the last.
   --
-  -- Two independent facts have to agree: the name resolves, and it resolves to the recorded OID.
-  -- Either alone is forgeable -- a name can be taken by a new relation, and a pg_class OID can in
-  -- principle be reused once its original is gone -- and neither is checkable by the cron session
-  -- that runs the detach, which is handed nothing but the name. `is distinct from` so a name that
-  -- resolves to nothing at all trips this too.
+  -- TWO ANCHORS, CHECKED INDEPENDENTLY, because they record different things and each catches a
+  -- substitution the other cannot see:
+  --
+  --   retiring_oid (#407) is which object THIS RETIREMENT dispatched a detach for. It exists because
+  --   the detach leaves the session as command TEXT and is re-resolved by pg_cron later, with no
+  --   lock held across the gap. It is null for every partition not being retired through a detach --
+  --   which is every unreferenced one, i.e. the ordinary one-step DROP path.
+  --
+  --   child_oid (#421) is which object this pgpm.part ROW has always been about, recorded when the
+  --   partition entered the catalog. It is populated for every partition, so it is what covers the
+  --   one-step path retiring_oid leaves open (#428) -- the path that ends in a bare `drop table
+  --   schema.child` with nothing else between it and the write block.
+  --
+  -- Coalescing them would be wrong, not merely weaker. retiring_oid is itself resolved BY NAME, out
+  -- of pg_inherits at dispatch time, so a substitution that landed BEFORE the dispatch is adopted by
+  -- that anchor: comparing the name against it then passes forever, and `coalesce(retiring_oid,
+  -- child_oid)` would never reach the one anchor that still remembers the original. Checking both
+  -- means a disagreement with EITHER refuses, and the message says which, so an operator is not left
+  -- to guess whether they are looking at a stale dispatch or a stale row.
+  --
+  -- In each case two independent facts have to agree: the name resolves, and it resolves to the
+  -- recorded OID. Either alone is forgeable -- a name can be taken by a new relation, and a pg_class
+  -- OID can in principle be reused once its original is gone. `is distinct from` so a name that
+  -- resolves to nothing at all trips this too. A null anchor is unanchored and is simply not
+  -- consulted, which is what keeps an upgrade from wedging a partition it has nothing to compare.
   --
   -- Fails closed and STAYS closed: logged, false, partition untouched, every tick. There is no later
   -- tick on which the name goes back to meaning the right object, so this is a wedge an operator has
   -- to look at, not a deferral -- and status() counts it as one. On the way out the standing job is
   -- disarmed IF it is still holding this retirement's own command, which by now names the
   -- substitute; conditionally, because this branch runs on every tick for as long as the wedge
-  -- lasts, and an unconditional disarm would clobber another parent's dispatch just as often.
-  if r.retiring_oid is not null then
+  -- lasts, and an unconditional disarm would clobber another parent's dispatch just as often. Only
+  -- when retiring_oid is set, because that is the only case in which a detach was ever armed -- on
+  -- the one-step path there is nothing to disarm and nothing that could be holding the job.
+  if r.retiring_oid is not null or r.child_oid is not null then
     v_now := to_regclass(format('%I.%I', v_nsp, p_child));
-    if v_now::oid is distinct from r.retiring_oid then
-      perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));
+    v_why := concat_ws(' and ',
+      case when r.retiring_oid is not null and v_now::oid is distinct from r.retiring_oid
+           then format('not the oid %s this retirement dispatched a detach for', r.retiring_oid) end,
+      case when r.child_oid is not null and v_now::oid is distinct from r.child_oid
+           then format('not the oid %s recorded for this partition when it was created', r.child_oid) end);
+    if v_why <> '' then
+      if r.retiring_oid is not null then
+        perform pgpm._idle_detach_job(pgpm._detach_cmd(p_parent, v_nsp, p_child));
+      end if;
       insert into pgpm.log (parent_table, action, lo, hi, method)
         values (p_parent, 'fail_retain_identity', r.lo, r.hi,
-                format('%I.%I is oid %s now, not the oid %s this retirement dispatched a detach for; refusing to detach or drop it',
-                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), r.retiring_oid));
+                format('%I.%I is oid %s now, %s; refusing to detach or drop it',
+                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), v_why));
       return false;
     end if;
   end if;
