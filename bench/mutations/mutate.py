@@ -58,6 +58,33 @@ RETIRE_IDENTITY_BLOCK = """  if r.retiring_oid is not null or r.child_oid is not
   end if;
 """
 
+# _install_write_block's identity check (#429), and the whole of _remove_write_block, which is
+# deliberately NOT anchored. Both live here as constants for the same reason the retire block does.
+WRITE_BLOCK_IDENTITY_BLOCK = """  select p.lo, p.hi, p.child_oid into r
+    from pgpm.part p where p.parent_table = p_parent and p.child_name = p_child;
+  if found and r.child_oid is not null then
+    v_now := to_regclass(format('%I.%I', v_nsp, p_child));
+    if v_now is not null and v_now::oid <> r.child_oid then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_write_block_identity', r.lo, r.hi,
+                format('%I.%I is oid %s now, not the oid %s recorded for this partition when it was created; refusing to write-block it',
+                       v_nsp, p_child, v_now::oid::text, r.child_oid));
+      return;
+    end if;
+  end if;
+
+"""
+
+REMOVE_WRITE_BLOCK_FN = """create or replace function pgpm._remove_write_block(p_parent regclass, p_child name)
+returns void language plpgsql as $$
+declare v_nsp name;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  execute format('drop trigger if exists pgpm_write_block on %I.%I', v_nsp, p_child);
+end;
+$$;
+"""
+
 RESTORE_INLINE = """    if v_readded and not v_is_part then
       begin
         execute format('alter table %s validate constraint %I', r.referencing_table::text, r.constraint_name);
@@ -359,6 +386,65 @@ MUTATIONS = {
           "r.child_oid));\n"
           "      continue;\n"
           "    end if;\n\n", "", 1)],
+    ),
+    "write_block_unanchored_name": (
+        "bench/write_block_identity.sh",
+        "Pre-#429 _install_write_block(): it resolves p_child by NAME and issues CREATE TRIGGER "
+        "against whatever comes back, with no assertion that the relation is the partition "
+        "pgpm.part recorded. _enforce_write_blocks calls it for every attached child on every "
+        "maintain() tick, so a relation that has taken a partition's name gets a pgpm trigger "
+        "rejecting all of its INSERTs, UPDATEs and DELETEs -- DDL on a table pgpm was never handed, "
+        "recorded nowhere in its own catalog. It is also what MAKES a substituted name an archive "
+        "candidate, since _archive_step gates on _is_write_blocked, so this is upstream of #421's "
+        "own refusal rather than redundant with it. Deletes the check only; child_oid stays, "
+        "because the defect being modelled is 'the anchor is not consulted', not 'the anchor does "
+        "not exist'.",
+        [(WRITE_BLOCK_IDENTITY_BLOCK, "", 1)],
+    ),
+    "write_block_refuses_missing_relation": (
+        "bench/write_block_identity.sh",
+        "The tempting consistency fix: widen _install_write_block's check to `is distinct from`, so "
+        "it also fires when the name resolves to NOTHING, matching retire() and _archive_step. It "
+        "is wrong here and the asymmetry is deliberate. Those two fire on null because the next "
+        "thing either would do is act on the relation; this one has no wrong relation to act on, "
+        "and the null case already has accurate, tested handling -- the ::regclass cast raises, "
+        "_enforce_write_blocks' per-child handler catches it, and skip_write_block carries the real "
+        "error (issue #360). Making this fire instead reports 'something else holds the name' about "
+        "a partition that was simply dropped, AND stops tests/94's poison raising at all, which "
+        "quietly retires the loop-isolation coverage that whole file exists for. Part C of "
+        "tests/104 is what catches it.",
+        [("    if v_now is not null and v_now::oid <> r.child_oid then\n",
+          "    if v_now::oid is distinct from r.child_oid then\n", 1),
+         ("                       v_nsp, p_child, v_now::oid::text, r.child_oid));\n",
+          "                       v_nsp, p_child, coalesce(v_now::oid::text, 'nothing'), "
+          "r.child_oid));\n", 1)],
+    ),
+    "write_block_remove_anchored": (
+        "bench/write_block_identity.sh",
+        "The symmetrical-looking mistake #429 deliberately did NOT make: anchoring "
+        "_remove_write_block as well as the install. It reads as consistency -- pgpm should not "
+        "touch a relation it has not identified -- but the two directions are not equivalent. A "
+        "pre-#429 pgpm installed this trigger on whatever held the name, so an install upgrading "
+        "into the fix can already have one stranded on a relation it never managed, rejecting every "
+        "write to it; an anchored removal then refuses to touch the very trigger pgpm itself "
+        "wrongly created, and that relation stays read-only permanently with no pgpm-side recovery. "
+        "Part B of tests/104 is the only thing that catches this, which is why it exists.",
+        [(REMOVE_WRITE_BLOCK_FN,
+          "create or replace function pgpm._remove_write_block(p_parent regclass, p_child name)\n"
+          "returns void language plpgsql as $$\n"
+          "declare v_nsp name; v_oid oid;\n"
+          "begin\n"
+          "  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = "
+          "c.relnamespace where c.oid = p_parent;\n"
+          "  select p.child_oid into v_oid from pgpm.part p\n"
+          "   where p.parent_table = p_parent and p.child_name = p_child;\n"
+          "  if v_oid is not null and to_regclass(format('%I.%I', v_nsp, p_child))::oid is distinct "
+          "from v_oid then\n"
+          "    return;\n"
+          "  end if;\n"
+          "  execute format('drop trigger if exists pgpm_write_block on %I.%I', v_nsp, p_child);\n"
+          "end;\n"
+          "$$;\n", 1)],
     ),
     "transmute_no_lock_timeout": (
         "bench/transmute_lock_timeout.sh",

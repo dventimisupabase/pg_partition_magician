@@ -555,16 +555,17 @@ reference](reference.md#archive-strategy-contract) for the full calling contract
 add-on](../pgpm_archive/README.md) for two ready-made S3 strategies
 (`pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) built on this contract.
 
-**Do not rename a partition out from under an archive strategy.** The strategy is handed the
-partition's *name*, and a name that has stopped meaning what it meant would have the chunk sized from
-whatever now holds it -- and the coverage that records would be what lets the real partition be
-dropped. So pgpm records each partition's oid when it creates it, and the archive step refuses a
-candidate whose name no longer resolves to it: you get `fail_archive_identity` in the log and a
-partition that stays put, rather than a wrong object in your bucket and a drop authorised by it. Like
-`fail_retain_identity` below, it stays wedged until you sort the name out. If you do need to rename
-one, update `pgpm.part.child_name` in the same transaction and nothing else: a rename does not change
-an oid, so the recorded identity is still right afterwards. That is exactly what `regrain`'s own
-transitional rename does.
+**Do not rename a partition out from under pgpm.** Every step of the retention lifecycle is handed
+the partition's *name*, and a name that has stopped meaning what it meant would have the write block
+installed on the wrong relation, the chunk sized from its rows, and the coverage that records is what
+lets the real partition be dropped. So pgpm records each partition's oid when it creates it, and
+every step that would act on the name checks it first: you get `fail_write_block_identity`,
+`fail_archive_identity` or `fail_retain_identity` in the log, depending on how far the partition got,
+and a partition that stays put rather than a wrong object in your bucket and a drop authorised by it.
+All three stay wedged until you sort the name out. If you do need to rename one, update
+`pgpm.part.child_name` in the same transaction and nothing else: a rename does not change an oid, so
+the recorded identity is still right afterwards. That is exactly what `regrain`'s own transitional
+rename does.
 
 `status().retain_backlog` tracks partitions still waiting on their turn to drop; it falling tick over
 tick is normal draining (either a paced backlog or archiving still catching up), while flat with

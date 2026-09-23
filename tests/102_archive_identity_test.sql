@@ -87,10 +87,20 @@ select is((select count(*)::int from pg_inherits i
             where i.inhparent = 'public.ai102'::regclass and i.inhrelid = :'ai_real'::oid),
   1, 'LIVENESS: the rename did not detach it -- the parent still routes reads to it');
 
--- The next tick's write-block pass resolves child_name and installs its trigger on whatever holds
--- the name, which is what MAKES the substitute an archive candidate. Without this the substitute is
--- simply skipped and the refusal below would pass against a step that never reached it.
-select pgpm._enforce_write_blocks('public.ai102');
+-- The substitute has to be WRITE-BLOCKED to be an archive candidate at all: _archive_step's query
+-- gates on _is_write_blocked, so without a trigger here the step never reaches it and every refusal
+-- below would pass against a step that did nothing.
+--
+-- Installed by hand, and the reason matters (#429). Until #429 this state arrived on its own: the
+-- per-tick write-block pass resolved child_name and put the trigger on whatever held it, which is
+-- exactly how maintenance manufactured its own bad candidate. pgpm now refuses to do that, so the
+-- only remaining way in is the one modelled here -- an install that ran a PRE-#429 pgpm, which left
+-- the trigger behind before upgrading. That is precisely why the check below is still worth having
+-- and is not made redundant by #429: _is_write_blocked stays name-based on purpose, so a trigger
+-- from any source still makes a substituted name eligible, and this is the backstop for it.
+select format($$ create trigger pgpm_write_block before insert or update or delete
+                   on public.%I for each row execute function pgpm._write_block_raise() $$,
+              :'ai_doomed') \gexec
 
 select ok(pgpm._is_write_blocked('public.ai102', :'ai_doomed'),
   'LIVENESS: the substitute is write-blocked, so it satisfies _archive_step''s eligibility test');

@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **`_install_write_block` created its trigger on whatever answered to the name (#429).** It resolves
+  the child by name and issues `CREATE TRIGGER` against the result, and `_enforce_write_blocks` calls
+  it for every attached child on every `maintain()` tick -- so a relation that had taken a
+  partition's name got a pgpm trigger rejecting all of its `INSERT`s, `UPDATE`s and `DELETE`s. DDL on
+  a table pgpm was never handed, recorded nowhere in its own catalog.
+
+  It is also what made #421 reachable rather than theoretical: `_archive_step`'s candidate query
+  gates on `_is_write_blocked`, so a substituted name was only ever *eligible* for archiving because
+  this step had made it so. Maintenance manufactured its own bad candidate. The check now lives in
+  `_install_write_block` itself rather than in the reconciling loop, so a caller that does not know
+  about it cannot reintroduce the defect; on a mismatch it logs the new `fail_write_block_identity`
+  and returns without issuing DDL, rather than raising (which would propagate out of `retire`, and
+  would be logged as a `skip_`, implying a deferral that a later tick clears -- which this is not).
+
+  **`_remove_write_block` is deliberately left resolving by name.** Refusing to install on an
+  unidentified relation is protective; refusing to *remove* is the opposite. A pre-#429 pgpm could
+  already have stranded this trigger on a relation it never managed, leaving it rejecting every
+  write, and an anchored removal would refuse to touch the very trigger pgpm itself wrongly created.
+  Resolving by name is what lets an upgraded pgpm clean up after an older one.
+
+  `fail_write_block_identity` is a prefixed non-success event per the naming rule, so alerts matching
+  exact action values are unaffected; it counts in `status().retain_drop_failures` and, like its two
+  siblings, never clears itself. No new column and no migration.
+
 - **`retire`'s ordinary one-step `DROP` was unanchored (#428).** #407 gave `retire` an identity check
   but scoped it to the defect #407 was about: its anchor, `pgpm.part.retiring_oid`, is set only inside
   the referenced-partition branch, as `retire` dispatches a concurrent detach. For a partition nothing
