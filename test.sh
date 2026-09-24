@@ -353,10 +353,10 @@ run_observe() {  # pg_flight_recorder observability track: impact_report correla
 # The pgpm_archive track: PG17 + pgsql-http against a real MinIO container standing in for S3.
 # Builds one template database (pgpm_arch_tmpl) carrying the fixtures and both modules, then runs
 # every tests/archive/db/*.sql via pg_prove against its OWN clone of it -- the same one-database-per-file
-# pattern the default matrix uses, for the same reason (the clone loop below states it in full). MinIO
-# has no docker-compose service of its own for the `mc` client, so bucket setup runs as a one-off
-# `docker run` against the network name pinned in docker-compose.yml (pgpm_test_net) rather than a
-# compose-managed service.
+# pattern the default matrix uses, for the same reason (the clone loop below states it in full). Bucket
+# setup is a one-off `docker run` of curlimages/curl against the network name pinned in
+# docker-compose.yml (pgpm_test_net) rather than a compose-managed service: a SigV4-signed PUT, so it
+# needs no MinIO client image at all (issue #436: the `mc` image vanished along with the server's).
 run_archive() {
   local prof="archive" svc="archive" fail=0
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
@@ -373,10 +373,24 @@ run_archive() {
     docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1 && break
     sleep 1
   done
-  # quay.io, not Docker Hub: minio/mc hit the same "pull access denied" break as the minio/minio
-  # server image did (docker-compose.yml), for the same reason -- see the comment there.
-  docker run --rm --network "$net" --entrypoint sh quay.io/minio/mc -c \
-    "mc alias set local http://minio:9000 minioadmin minioadmin && mc mb -p local/archive-test-bucket" >/dev/null
+  # Create the bucket with a SigV4-signed PUT from the same curl image the health wait already uses,
+  # instead of the `mc` client (its image went away with MinIO's server image, issue #436). 200 is
+  # created, 409 is "already exists" from an earlier run; anything else is a real failure. Then READ
+  # the bucket back and require 200: a missing bucket answers 404 here, so this is a witness that the
+  # setup actually happened, not just that the PUT returned.
+  local s3=( docker run --rm --network "$net" curlimages/curl -s -o /dev/null -w '%{http_code}'
+             --aws-sigv4 aws:amz:us-east-1:s3 -u minioadmin:minioadmin )
+  local code
+  code=$("${s3[@]}" -X PUT http://minio:9000/archive-test-bucket) || code="curl exit $?"
+  if [ "$code" != 200 ] && [ "$code" != 409 ]; then
+    echo "archive track: FAIL -- creating the MinIO bucket returned $code"
+    $DC --profile "$prof" down -v; return 1
+  fi
+  code=$("${s3[@]}" http://minio:9000/archive-test-bucket/) || code="curl exit $?"
+  if [ "$code" != 200 ]; then
+    echo "archive track: FAIL -- the MinIO bucket is not readable after creation ($code)"
+    $DC --profile "$prof" down -v; return 1
+  fi
 
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
