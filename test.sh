@@ -412,8 +412,17 @@ run_archive() {
     local ab adb; ab="$(basename "$af")"; an=$((an + 1)); adb="pgpm_a$an"
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database $adb template pgpm_arch_tmpl" >/dev/null
-    $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab" \
-      || fail=1
+    if ! $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab"; then
+      fail=1
+      # A pgTAP assertion can only say WHAT is missing (a ledger row, a covered range). maintain()'s
+      # per-step handlers swallow the WHY into pgpm.log as skip_*/fail_* rows, and the drop below takes
+      # them with it, so a red run on a runner nobody can log into explains nothing. Print them first.
+      echo "--- $ab: pgpm.log skip_*/fail_* rows in $adb (why maintain()'s steps did nothing) ---"
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select to_char(at, 'HH24:MI:SS.MS') || '  ' || action || '  ' || coalesce(method, '') from pgpm.log where action like 'skip\_%' or action like 'fail\_%' order by at" || true
+      echo "--- $ab: pgpm.part in $adb (attached, write-blocked, archive-covered) and pgpm.archive_ledger ---"
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select parent_table || '.' || child_name || '  [' || lo || ', ' || hi || ')  attached=' || attached || '  write_blocked=' || pgpm._is_write_blocked(parent_table, child_name) || '  covered=' || pgpm._archive_fully_covered(parent_table, child_name) from pgpm.part order by parent_table::text, lo::numeric" || true
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select 'ledger  ' || parent_table || '  [' || lo || ', ' || hi || ')  ' || child_name || '  key=' || coalesce(s3_key, '<null>') || '  rows=' || coalesce(rows_archived::text, '<null>') from pgpm.archive_ledger order by parent_table::text, lo::numeric" || true
+    fi
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
   done
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null
