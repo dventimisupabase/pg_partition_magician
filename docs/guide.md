@@ -60,7 +60,7 @@ partition on a companion column instead.
 
 **The frontier.** For `time` the frontier is `now()`; for `id` it is `max(control)`, the newest point
 the data has reached. `uuidv7` and `text_time` are time grids fed by data: their frontier is
-`greatest(max(control), now())` (#325), so it tracks the newest row while writes are current and falls
+`greatest(max(control), now())`, so it tracks the newest row while writes are current and falls
 back to the clock when they lag, rather than freezing wherever the data last landed. An interval is "open" while the frontier
 is inside it (still receiving writes) and "closed" once the frontier moves past its upper bound.
 
@@ -506,10 +506,11 @@ brief lock) when nothing references the table. Two consequences in the monolith 
   so its transient disk is bounded by the span you are *keeping*, not by the whole child. On a table you
   want aggressively retained, enable auto-regrain (or regrain by hand) to let retention reach the history
   sooner.
-- **A referenced partition is retired in two steps, not one.** If any foreign key points at the managed
-  table, a plain `DROP` cannot reclaim the partition at all, so retention detaches it first. That path is
-  asynchronous and needs `pgpm.schedule()`; see [Retention with an incoming foreign
-  key](#retention-with-an-incoming-foreign-key).
+- **A referenced partition is retired over several ticks, not one.** If any foreign key points at the
+  managed table, retention first deletes any aged rows that something still references, which fires that
+  key's `ON DELETE` and can reach into the referencing table; then it detaches the partition on a later
+  tick; then it drops it. That path needs `pgpm.schedule()`; see
+  [Retention with an incoming foreign key](#retention-with-an-incoming-foreign-key).
 
 **Retention is a standing floor, not just an aging process.** The policy is "no data with a control value
 below the horizon persists" -- aging is just the usual way rows cross that line. A row inserted with a
@@ -661,42 +662,14 @@ synchronous `regrain()` is atomic end to end.
 ### Retention with an incoming foreign key
 
 A foreign key pointing at the managed table changes how [retention](#retain) reclaims a partition, whether
-or not it was `preserve`-managed, and whether or not anything actually references the aged rows.
+or not it was `preserve`-managed. Retiring a referenced partition is a sequence rather than a single
+`DROP`, and its first step is the one that can touch a table you did not hand to pgpm.
 
-`DROP TABLE <partition>` is refused on a pure **catalog** dependency: an FK against a partitioned parent
-puts one constraint row per referenced partition on the referencing table, and the refusal is identical
-whether one row references, zero rows reference, or the referencing table is empty. So retention detaches
-first, which severs that per-partition constraint and leaves the drop unguarded. The referencing table's
-own foreign key survives and keeps enforcing.
-
-The detach has to be `CONCURRENTLY` -- the plain form holds `ACCESS EXCLUSIVE` on your managed table for
-as long as it takes to scan the *referencing* table -- and PostgreSQL will not run that from a function.
-So pgpm dispatches it to a standing `pgpm_detach` cron job and completes the drop on a later tick. Three
-things follow, and none of them are optional:
-
-- **`pgpm.schedule()` is required to retire a referenced partition.** Without the `pgpm_detach` job there
-  is nowhere to dispatch to, and `retire` logs `fail_retain_detach` rather than reclaiming. If you
-  scheduled pgpm before upgrading, re-run `pgpm.schedule()` once to create the second job.
-- **Retirement spans at least one extra tick.** `status().retain_detaching` counts partitions whose
-  detach is in flight. Retention was already eventual, so this lengthens a delay rather than adding one.
-- **Writes to the *referencing* table are blocked while the detach runs**, once per retirement, for a
-  duration set by that table's size. Reads of it, and your managed table entirely, are unaffected. This is
-  irreducible: it is PostgreSQL proving the foreign key still holds. An index on the referencing column is
-  ordinary good practice but does not reduce it.
-- **Do not rename or replace a partition while its retirement is in flight.** What reaches cron is text
-  naming the partition, re-resolved in that session a tick later, so pgpm records the partition's oid at
-  dispatch and refuses to detach or drop anything else that turns up under the name. You get
-  `fail_retain_identity` in the log and a retirement that stays wedged until you sort the name out, rather
-  than a dropped table. `status().retain_detaching` tells you when a retirement is in flight.
-
-  This guard is **not** limited to a retirement in flight, or to a referenced partition. `retire` also
-  checks the oid recorded when the partition was created, so the ordinary one-step `DROP` refuses a
-  substituted name too, and logs the same action. If you genuinely need to rename a partition, update
-  `pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded
-  identity stays right, which is exactly what `regrain`'s own transitional rename does.
-
-**When a live row genuinely references an aged one**, pgpm executes the policy you already declared in the
-foreign key's `ON DELETE` clause, rather than inventing one:
+**First, rows that are still referenced are deleted, under the `ON DELETE` rule you declared.** If a live
+row in the referencing table points at a row in the aged partition, pgpm issues a `DELETE` for exactly
+those keys and lets PostgreSQL apply whatever the foreign key says. That can reach beyond the managed
+table: `CASCADE` deletes the referencing rows, and if those rows are themselves referenced with `CASCADE`,
+the deletion carries on into that table too.
 
 | `ON DELETE` | what happens to the referencing row | retention |
 |---|---|---|
@@ -704,16 +677,44 @@ foreign key's `ON DELETE` clause, rather than inventing one:
 | `SET NULL` / `SET DEFAULT` | kept, reference severed | proceeds |
 | `NO ACTION` (the default) / `RESTRICT` | untouched | **blocked**, with PostgreSQL's own error |
 
-pgpm issues a `DELETE` for exactly the crossing keys and lets PostgreSQL apply whatever was declared;
-the work is bounded by the crossing, not by the partition or the referencing table. A blocked retirement
-logs `fail_retain_crossing` carrying the constraint's own error, counts in `status().retain_drop_failures`,
-and leaves the partition whole. That is not a pgpm limitation to work around: a `NO ACTION` foreign key is
-a statement that these rows must not disappear while something points at them, and retention honouring it
-is the constraint doing its job. Change the referential action, or remove the referencing rows, if you
-meant otherwise.
+The work is bounded by the crossing rows, not by the partition or the referencing table. A successful
+crossing is logged `retain_crossing` with the key and row counts, because this is the one point where
+retiring a partition writes outside the partition itself. A blocked one logs `fail_retain_crossing`
+carrying the constraint's own error, counts in `status().retain_drop_failures`, and leaves the partition
+whole. That is not a pgpm limitation to work around: a `NO ACTION` foreign key is a statement that these
+rows must not disappear while something points at them, and retention honouring it is the constraint doing
+its job. Change the referential action, or remove the referencing rows, if you meant otherwise. When
+nothing references the aged rows, this step deletes nothing and logs nothing.
 
-Successful crossings are logged `retain_crossing` with the key and row counts, because this is the one
-point where retiring a partition writes to a table you did not hand to pgpm.
+**Then the partition is detached, on a later tick, by the `pgpm_detach` cron job.** A referenced partition
+cannot be dropped while it is attached, even when no row references it and even when the referencing table
+is empty. `retire` cannot run that detach itself, so it hands it to a standing cron job and returns; that
+is what makes this path asynchronous, and what `pgpm.schedule()` is for here.
+
+**Then it is dropped**, by the next `retire` call that finds it detached. The referencing table's own
+foreign key survives the whole sequence and keeps enforcing.
+
+Three things follow, and none of them are optional:
+
+- **`pgpm.schedule()` is required to retire a referenced partition.** Without the `pgpm_detach` job there
+  is nowhere to hand the detach to, and `retire` logs `fail_retain_detach` rather than reclaiming. If you
+  scheduled pgpm before upgrading, re-run `pgpm.schedule()` once to create that job.
+- **Retirement spans at least one extra tick.** `status().retain_detaching` counts partitions whose
+  detach is in flight. Retention was already eventual, so this lengthens a delay rather than adding one.
+- **Writes to the *referencing* table are blocked while the detach runs**, once per retirement, for a
+  duration set by that table's size. Reads of it, and your managed table entirely, are unaffected. This is
+  irreducible: it is PostgreSQL proving the foreign key still holds. An index on the referencing column is
+  ordinary good practice but does not shorten it.
+
+**Do not rename or replace a partition while its retirement is in flight.** The detach reaches the cron
+job as text naming the partition, so pgpm records the partition's oid when it dispatches and refuses to
+detach or drop anything else that turns up under the name. You get `fail_retain_identity` in the log, with
+both oids in `method`, and a retirement that stays wedged until you sort the name out, rather than a
+dropped table. `status().retain_detaching` tells you when a retirement is in flight. The same refusal
+guards the ordinary one-step `DROP`, against the oid recorded when the partition was created, so a
+substituted name is refused on every retirement path. If you genuinely need to rename a partition, update
+`pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded identity
+stays right, which is exactly what `regrain`'s own transitional rename does.
 
 ## Secondary indexes
 
@@ -734,8 +735,8 @@ Two facts about Postgres drive the design:
 2. Attaching a partition whose rows are not certified in range forces a scan under `ACCESS EXCLUSIVE`,
    which would block the workload.
 
-pgpm sidesteps #2 with a scan-skip attach: certify the bound with a validated `CHECK` *before* the attach,
-so the attach itself is metadata-only. Certifying it is `VALIDATE CONSTRAINT`, whose own
+pgpm sidesteps the second with a scan-skip attach: certify the bound with a validated `CHECK` *before* the
+attach, so the attach itself is metadata-only. Certifying it is `VALIDATE CONSTRAINT`, whose own
 `SHARE UPDATE EXCLUSIVE` lock blocks nobody, and it gets a transaction to itself so no earlier statement's
 lock is still held while it scans. See
 [The cutover moves no rows](#the-cutover-moves-no-rows) for what that does and does not cost.

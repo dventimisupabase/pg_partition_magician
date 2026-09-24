@@ -1297,10 +1297,12 @@ begin
     return false;
   end if;
 
-  -- Is anything pointing at this parent at all (issue #268)? Without an incoming FK the bare DROP
-  -- below works and costs nothing, so the overwhelmingly common path stays byte-identical: no marker,
-  -- no cron round trip, no waiting a tick. Gating here also confines the concurrent detach, and the
-  -- reaper hazard that comes with it, to the tables that actually need them.
+  -- Is anything pointing at this parent at all (issue #268)? With an incoming FK a bare DROP is refused
+  -- on the referencing table's per-partition constraint row, whether or not any row references this
+  -- child (see the section header above; the operator docs state only the consequence). Without one
+  -- the bare DROP below works and costs nothing, so the overwhelmingly common path stays
+  -- byte-identical: no marker, no cron round trip, no waiting a tick. Gating here also confines the
+  -- concurrent detach, and the reaper hazard that comes with it, to the tables that actually need them.
   v_referenced := exists (select 1 from pg_constraint
                            where confrelid = p_parent and contype = 'f' and conparentid = 0);
 
@@ -3253,6 +3255,14 @@ begin
   -- and a resume must reuse the recorded bound. It pushes hi further out so a fast writer cannot cross it
   -- while the scan runs: the bound rejects writes at or past hi for as long as it is in place, which with
   -- the phase split is the whole conversion rather than a single locked statement.
+  --
+  -- The headroom is PERMANENT, not scoped to the conversion; the operator docs state only that consequence,
+  -- and this is why. The zero-scan ATTACH requires the already-validated CHECK to exactly imply the attached
+  -- bound, so whatever hi is certified here is the only bound the cutover can attach with, and it becomes
+  -- the monolith's partition bound. There is no cheaper way to widen the transient write-ceiling protection
+  -- without also widening the monolith's permanent range. regrain_step's frozen precondition is a
+  -- whole-child test against that same hi, so headroom sized to cover a write-ceiling window of seconds
+  -- also delays regrain eligibility for the ENTIRE monolith by the same number of grid steps.
   for v_i in 1 .. greatest(coalesce(p_bound_headroom, 0), 0) loop
     v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native);
   end loop;
