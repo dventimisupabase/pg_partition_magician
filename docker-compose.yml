@@ -86,15 +86,25 @@ services:
   # Mac get the same bytes, and a deleted image fails the pull loudly instead of a retagged one silently
   # pulling something else.
   #
-  # No `command:`: this image's entrypoint starts the server itself (data under /bitnami/minio/data,
-  # as uid 1001) and honours MINIO_ROOT_USER / MINIO_ROOT_PASSWORD, so tests/archive/fixtures.sql's
+  # The image's own entrypoint is BYPASSED, and this is load-bearing. Bitnami's setup.sh starts a
+  # TEMPORARY MinIO server, provisions the `mc` client against it, stops it, and only then execs the
+  # real server. Every readiness signal a caller can observe answers 200 on the temporary one too, so
+  # on a slow GitHub runner test.sh's health wait, its bucket setup and tests/archive/db/04 were all
+  # served by the provisioning server, and tests/archive/db/08's first PUT then met the real server
+  # still loading: `HTTP 503 XMinioServerNotInitialized`, twice in a row on #437, invisible from a Mac
+  # where the whole handover takes under a second. Running the `minio` binary directly, as the image's
+  # own uid 1001 against its declared data volume, gives ONE server process whose first 200 is the
+  # only 200 there will be. It also makes the service image-agnostic: any image carrying a `minio`
+  # binary works with this same entrypoint and command, so a future swap is a one-line change here.
+  # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are read by the binary itself, so tests/archive/fixtures.sql's
   # endpoint and credentials are unchanged. The bucket is created by test.sh with a SigV4-signed curl
-  # PUT rather than the `mc` client, whose image vanished with the server's; that keeps the setup
-  # image-agnostic, so a future swap of this service is a one-line change here.
+  # PUT rather than the `mc` client, whose image vanished with the server's.
   minio:
     profiles: ["archive"]
     image: bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
     container_name: pgpm_test-archive-minio
+    entrypoint: ["minio"]
+    command: ["server", "/bitnami/minio/data", "--address", ":9000"]
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin

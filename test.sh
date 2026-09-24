@@ -369,10 +369,20 @@ run_archive() {
   $DC --profile "$prof" up -d
 
   wait_pg "$prof" "$svc" 60
+  # /minio/health/cluster, not /minio/health/live: `live` answers 200 as soon as the process listens,
+  # while `cluster` is MinIO's readiness probe and stays 503 until the server has finished initializing
+  # -- the window in which a PUT gets `XMinioServerNotInitialized`. Loud on timeout: a silent fall-through
+  # here used to surface later as an unexplained pgTAP failure inside a database this script then dropped.
+  local ready=""
   for _ in $(seq 1 60); do
-    docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1 && break
+    if docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/cluster >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
   done
+  if [ -z "$ready" ]; then
+    echo "archive track: FAIL -- MinIO never reported ready (/minio/health/cluster) within 60 s"
+    docker logs pgpm_test-archive-minio 2>&1 | tail -20
+    $DC --profile "$prof" down -v; return 1
+  fi
   # Create the bucket with a SigV4-signed PUT from the same curl image the health wait already uses,
   # instead of the `mc` client (its image went away with MinIO's server image, issue #436). 200 is
   # created, 409 is "already exists" from an earlier run; anything else is a real failure. Then READ
