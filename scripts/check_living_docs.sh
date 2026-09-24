@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guard the LIVING documentation against the two ways it rots. Run by CI (the `Living docs` lint job).
+# Guard the LIVING documentation against the ways it rots. Run by CI (the `Living docs` lint job).
 #
 # WHY THIS EXISTS. The repo carries two kinds of markdown and used to mark neither: documents that must be
 # TRUE against the code, and point-in-time artifacts kept for history. With no boundary between them, a
@@ -13,6 +13,10 @@
 # CHECK 2: no living document may link to a frozen artifact. A link from a living doc is precisely what
 # makes a frozen one look current -- which is how a superseded design note became "the operating model" in
 # three separate documents. Frozen -> living links are fine and encouraged; only this direction is barred.
+#
+# CHECK 4: no OPERATOR document may cite an issue number. An issue number is provenance for a maintainer; to
+# an operator it is a dead end that implies they must read a GitHub thread to understand their own database.
+# Provenance belongs in CHANGELOG.md, commit messages and code comments, none of which this checks.
 #
 # CHANGELOG.md is excluded from BOTH: its entries are historical by design and must keep naming the
 # machinery they removed.
@@ -86,5 +90,23 @@ for t in "${FROZEN[@]}"; do
   fi
 done
 [ "$fail" = 0 ] && echo "PASS  every frozen artifact is labelled"
+
+echo
+echo "== check 4: operator docs must not cite issue numbers =="
+# `#` immediately followed by digits. A markdown anchor is `](#name)` and no heading id here starts with a
+# digit, so `(#325)`, `issue #347`, `pre-#429` and `post-#94` all trip it and `[link](#set_obtain)` does
+# not. Scoped to the three operator documents on purpose: README.md is the front door and CHANGELOG.md is
+# where provenance belongs. Verified to FAIL against the docs as they stood before issue #434 (13 hits).
+OPERATOR=(docs/guide.md docs/reference.md docs/runbook.md)
+found=0
+for f in "${OPERATOR[@]}"; do
+  [ -f "$f" ] || continue
+  if grep -nE '#[0-9]+' "$f" >/dev/null 2>&1; then
+    printf 'FAIL  %s cites an issue number; state the behaviour and leave the provenance to CHANGELOG.md\n' "$f"
+    grep -nE '#[0-9]+' "$f" | sed 's/^/        /'
+    fail=1; found=1
+  fi
+done
+[ "$found" = 0 ] && echo "PASS  no operator document cites an issue number"
 
 exit "$fail"

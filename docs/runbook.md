@@ -427,7 +427,7 @@ silently adopting stale data. An in-flight child is also tracked in `pgpm.part` 
 **Steps.**
 
 1. The error names the orphan. Confirm it is a leftover standalone table, not a live attached partition --
-   it is a partition of no parent, and (post-#94) it may show in `pgpm.partitions` with `attached = false`:
+   it is a partition of no parent, and it may show in `pgpm.partitions` with `attached = false`:
 
    ```sql
    select inhparent::regclass from pg_inherits
@@ -526,8 +526,8 @@ it captures appends as it goes). Migrate during a quieter write window when poss
 
 **Symptom.** Any of: `pgpm.status()` shows `parent_missing = true` for a row whose `parent` prints as a bare
 number instead of a table name; `pgpm.log` fills with `skip_obtain` / `skip_write_block` / `skip_retain`
-every tick, all giving `syntax error at or near "<number>"` as the reason; or, on a version predating
-issue 296, `pgpm.status()` raises that syntax error and returns **no rows at all** for any managed table.
+every tick, all giving `syntax error at or near "<number>"` as the reason; or, on a version before 0.2.0,
+`pgpm.status()` raises that syntax error and returns **no rows at all** for any managed table.
 
 **What it means.** Someone ran `DROP TABLE` on a pgpm-managed parent instead of
 [`pgpm.untransmute`](reference.md#untransmute). `pgpm.config.parent_table` is a `regclass`, which carries no
