@@ -269,6 +269,7 @@ declare
   v_nsp name; v_rel name; v_dest name; v_cols_q text; r record;
   v_delta name; v_trgfn name; v_trg name; v_keyidx oid; v_keycols_q text; v_newvals_q text; v_oldvals_q text;
   v_keyconname name; v_keytmp text;
+  v_ctl_typid regtype; v_bound_tpl text; v_lo text; v_hi text;
 begin
   perform pgpm.from_hypertable_preflight(p_hypertable, p_control);
   select n.nspname, c.relname into v_nsp, v_rel
@@ -277,6 +278,22 @@ begin
   select string_agg(quote_ident(attname), ', ' order by attnum) into v_cols_q
     from pg_attribute where attrelid = p_hypertable and attnum > 0 and not attisdropped
       and attgenerated = '';   -- omit generated columns: they recompute on insert, never inserted into
+
+  -- The chunk-bound rendering for the dimension's type (see the chunk loop below for why each form is what
+  -- it is). Resolved and refused HERE, before anything commits: the tracking apparatus and the destination
+  -- skeleton both commit, and a refusal after either would strand an empty <rel>_pgpm_dest for the cutover
+  -- to find and rename into place.
+  select a.atttypid into v_ctl_typid
+    from pg_attribute a where a.attrelid = p_hypertable and a.attname = p_control and not a.attisdropped;
+  v_bound_tpl := case v_ctl_typid
+    when 'timestamp with time zone'::regtype    then '%L::timestamptz'
+    when 'timestamp without time zone'::regtype then '(%L::timestamptz at time zone ''UTC'')'
+    when 'date'::regtype                        then '(%L::timestamptz at time zone ''UTC'')::date'
+  end;
+  if v_bound_tpl is null then
+    raise exception 'pg_partition_magician: from_hypertable_copy(%) cannot bound the chunk copy on dimension % of type %: only timestamptz, timestamp and date dimensions are supported',
+      p_hypertable, p_control, v_ctl_typid;
+  end if;
 
   -- change tracking (p_track_changes): install an AFTER-ROW trigger on the source BEFORE the copy reads
   -- anything, so every insert/update/delete during the online window is logged by its key into a delta
@@ -362,11 +379,35 @@ begin
   -- online chunk-bounded copy: one chunk-range per transaction (the time predicate drives chunk exclusion
   -- to a single-chunk read; ORDER BY the control column clusters the destination for cheap transmute/regrain
   -- later). The source keeps serving traffic throughout.
+  --
+  -- The bounds are rendered in the dimension's OWN type (#459). timescaledb_information.chunks shows every
+  -- time dimension's range_start/range_end as timestamptz: the slice's raw microseconds handed to
+  -- _timescaledb_functions.to_timestamp(bigint), for a timestamp (no tz) or date dimension exactly as for a
+  -- timestamptz one. Spliced with a bare %L, that instant rendered in the SESSION TimeZone
+  -- ('2024-01-01 09:00:00+09' under Asia/Tokyo) and, coerced to a timestamp column, DROPPED the offset, so
+  -- every chunk range shifted by the UTC offset. East of UTC the oldest chunk's first N hours fell below the
+  -- union of the ranges and no chunk copied them, and the cutover's > max(dest) catch-up cannot reach rows
+  -- below its watermark, so they were gone after the migration. West of UTC the last chunk's tail was missed
+  -- and rescued by the catch-up only by accident, and a date dimension lost its last day.
+  --   timestamptz  %L::timestamptz                            the literal carries its offset, so it is exact
+  --   timestamp    (%L::timestamptz at time zone 'UTC')       the view is the raw value rendered AS a UTC
+  --                                                           instant (to_timestamp_without_timezone is the
+  --                                                           same C function with a timestamp result), so
+  --                                                           converting back AT UTC returns the exact
+  --                                                           wall-clock value the chunk's own CHECK names
+  --   date         (%L::timestamptz at time zone 'UTC')::date the same, to the day
+  -- Verified against pg_get_constraintdef of the chunk's dimension CHECK. Each is a constant expression, so
+  -- the planner still folds it and excludes the other chunks. Any other dimension type has a NULL
+  -- range_start in the view (an integer dimension reports range_start_integer instead), and the old
+  -- predicate would have copied nothing at all; v_bound_tpl was resolved, and such a dimension refused,
+  -- up top before anything committed.
   for r in select range_start, range_end from timescaledb_information.chunks
             where hypertable_schema = v_nsp and hypertable_name = v_rel order by range_start loop
-    execute format('insert into %I.%I (%s) select %s from %I.%I where %I >= %L and %I < %L order by %I',
+    v_lo := format(v_bound_tpl, r.range_start);
+    v_hi := format(v_bound_tpl, r.range_end);
+    execute format('insert into %I.%I (%s) select %s from %I.%I where %I >= %s and %I < %s order by %I',
                    v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel,
-                   p_control, r.range_start, p_control, r.range_end, p_control);
+                   p_control, v_lo, p_control, v_hi, p_control);
     commit;
   end loop;
   -- The destination was just CREATE TABLE LIKE'd and bulk-loaded, so it has no planner stats (reltuples=0).

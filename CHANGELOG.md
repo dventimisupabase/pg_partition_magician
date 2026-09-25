@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **`from_hypertable_copy` applies each chunk's bounds in the dimension's own type**, so a `timestamp`
+  (without time zone) or `date` dimension migrates whole under any session `TimeZone` (#459). The chunks
+  view renders every time dimension's `range_start`/`range_end` as `timestamptz`, and the copy spliced them
+  as bare literals, which render in the session zone (`'2024-01-01 09:00:00+09'` under `Asia/Tokyo`) and,
+  coerced to a `timestamp` column, lose the offset. Every chunk range shifted by the UTC offset. East of
+  UTC the oldest chunk's first hours were copied by no chunk (540 of 2880 rows in the reproduction), and
+  because the cutover's catch-up only reaches rows past `max(control)` in the destination, they were gone
+  after the migration; west of UTC the last chunk's tail was missed by the copy and came back only through
+  the catch-up; a `date` dimension lost its last day west of UTC. A `timestamptz` dimension was never
+  affected. Bounds are now `::timestamptz`, `at time zone 'UTC'`, or the `::date` of that, per dimension
+  type: exactly the value each chunk's own CHECK constraint names. A hypertable on any other dimension type
+  is refused by the copy up front, before it creates anything, rather than bounded on a `NULL` (the view
+  has no `range_start` for it, and the old predicate would have copied nothing into a destination the
+  cutover would then have renamed into place). `tests/timescale/db/19` pins the `Asia/Tokyo` and
+  `America/Los_Angeles` cases by row identity, with witnesses that the zone was in effect and that the view
+  rendered the bounds with an offset.
 - **`archive.to_s3_parquet` resolves its child in the parent's schema, and both manual archive functions
   check the child's identity** (#464). `to_s3_parquet` cast the bare child name to `regclass`, so it
   resolved through the caller's `search_path`: from a session whose `search_path` did not reach a managed
