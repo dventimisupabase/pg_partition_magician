@@ -2245,6 +2245,41 @@ $$;
 -- settings.
 -- ---------------------------------------------------------------------------
 
+-- Both synchronous functions take the child as a NAME, and a name is only a relation relative to a
+-- schema. This resolves it in p_parent's schema, never through the caller's search_path:
+-- archive.to_s3_parquet used to cast the bare name to regclass, so a session whose search_path did
+-- not reach the parent's schema was refused the real child with `relation does not exist`, and once
+-- any relation of that name existed in public, that relation's rows went out under the partition's
+-- key (issue #464). archive.to_s3 always read `%I.%I` off the parent's namespace and was right about
+-- the schema, but a name in the right schema can still be the wrong relation.
+--
+-- So, second, the resolved oid is compared against the one pgpm.part recorded when the partition
+-- entered it, exactly as the automatic path's pgpm._archive_step does before it reads a child
+-- (fail_archive_identity, #421): this is the manual path's twin of that check. A raise rather than a
+-- log row, because there is no tick to skip and the caller is a session that will read the error.
+-- A null child_oid is unanchored and skips the comparison, same as everywhere else, so an upgrade
+-- never wedges a manual archive it has nothing to compare against; and a name pgpm.part has no row
+-- for at all is resolved but not checked, since the synchronous functions never required the child
+-- to be tracked.
+create or replace function archive._resolve_child(p_parent regclass, p_child name, p_caller text)
+returns regclass language plpgsql as $$
+declare v_nsp name; v_now regclass; v_anchor oid;
+begin
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_now := to_regclass(format('%I.%I', v_nsp, p_child));
+  if v_now is null then
+    raise exception 'pg_partition_magician: %.% does not exist; % resolves p_child in the schema of p_parent, not through search_path',
+      quote_ident(v_nsp), quote_ident(p_child), p_caller;
+  end if;
+  select p.child_oid into v_anchor from pgpm.part p where p.parent_table = p_parent and p.child_name = p_child;
+  if v_anchor is not null and v_now::oid <> v_anchor then
+    raise exception 'pg_partition_magician: %.% is oid % now, not the oid % recorded for this partition; refusing to archive it',
+      quote_ident(v_nsp), quote_ident(p_child), v_now::oid, v_anchor;
+  end if;
+  return v_now;
+end;
+$$;
+
 -- Small partitions (one part's worth or less) take a plain single PUT; bigger ones stream
 -- through S3 multipart, holding at most one part in memory at a time.
 create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
@@ -2269,6 +2304,8 @@ begin
     raise exception 'archive.to_s3: credentials missing from vault';
   end if;
 
+  -- identity before any read of the child (#464): %I.%I below names the same relation this resolves
+  perform archive._resolve_child(p_parent, p_child, 'archive.to_s3');
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select a.atttypid::regtype::text into v_ctltype
     from pg_attribute a where a.attrelid = p_parent and a.attname = pcfg.control_column;
@@ -2387,7 +2424,7 @@ $$;
 create or replace function archive.to_s3_parquet(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
-  cfg archive.config;
+  cfg archive.config; v_child regclass;
   v_key_id text; v_secret text; v_key text; v_payload bytea; v_resp http_response;
 begin
   select * into cfg from archive.config where parent_table = p_parent;
@@ -2399,7 +2436,10 @@ begin
     raise exception 'archive.to_s3_parquet: credentials missing from vault';
   end if;
 
-  v_payload := archive._pq_to_parquet(p_child::regclass, cfg.compress);
+  -- in the parent's schema and checked against pgpm.part's oid (#464), not `p_child::regclass`,
+  -- which resolved the bare name through the caller's search_path
+  v_child := archive._resolve_child(p_parent, p_child, 'archive.to_s3_parquet');
+  v_payload := archive._pq_to_parquet(v_child, cfg.compress);
   v_key := cfg.prefix || p_child || '.parquet';
 
   v_resp := archive.s3_signed_request_bytea('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key, '',

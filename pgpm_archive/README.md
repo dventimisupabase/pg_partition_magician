@@ -56,6 +56,13 @@ nothing (an in-flight multipart upload is aborted), so an object that does land 
 only thing that trips it is a write to the partition during the export: run it against a partition
 nothing is still writing to, then drop.
 
+Both manual functions resolve `child` in the parent's schema, never through your session's
+`search_path`, and verify its identity the same way the automatic path does before reading it: if
+the name no longer resolves to the relation pgpm recorded for that partition, the call fails with a
+`pg_partition_magician:` error naming both oids and uploads nothing. A `child` that does not exist
+in the parent's schema is refused too, with a `pg_partition_magician:` error saying so, even when a
+same-named relation is visible through `search_path`.
+
 See the [reference](../docs/reference.md#archive-strategy-contract) for the full `archive_fn`
 contract and the [guide](../docs/guide.md#archiving-before-a-drop) for the operator's view.
 
