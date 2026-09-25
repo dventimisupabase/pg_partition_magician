@@ -651,6 +651,8 @@ $$;
 
 -- native grid value -> a literal of the COLUMN type. The 4 trailing params are text_time-only
 -- (default null for every other kind, which never reads them) -- see pgpm.config's text_time_* columns.
+-- the two-argument shape shipped in 0.1.0 and 0.2.0; kept beside this one, a two-argument call is ambiguous (#441)
+drop function if exists pgpm._encode(text, text);
 create or replace function pgpm._encode(p_kind text, p_native text,
   p_tt_prefix text default null, p_tt_width int default null,
   p_tt_radix int default null, p_tt_unit text default null,
@@ -667,6 +669,8 @@ end;
 $$;
 
 -- a stored COLUMN value -> native grid value. Same text_time_* trailing params as _encode.
+-- the two-argument shape shipped in 0.1.0 and 0.2.0; same hazard as _encode (#441)
+drop function if exists pgpm._decode(text, text);
 create or replace function pgpm._decode(p_kind text, p_colvalue text,
   p_tt_prefix text default null, p_tt_width int default null,
   p_tt_radix int default null, p_tt_unit text default null,
@@ -4788,6 +4792,8 @@ $$;
 -- ANYONE UPGRADING PAST THIS CHANGE WHO HAS ALREADY RUN pgpm.schedule() MUST RE-RUN IT. maintain_all()
 -- also logs a 'warn_obtain_unscheduled' row to pgpm.log once per sweep as a backstop for anyone who
 -- misses this note.
+-- schedule(text) shipped in 0.2.0 through 0.4.0; kept beside this shape, pgpm.schedule() is ambiguous (#441)
+drop function if exists pgpm.schedule(text);
 create or replace function pgpm.schedule(p_every text default '* * * * *',
                                           p_obtain_every text default '* * * * *')
 returns bigint language plpgsql as $$
@@ -5447,6 +5453,8 @@ end $$;
 -- FK (one this swap never touched via suspend_incoming_fks) is left for the next tick's own,
 -- unscoped call instead of being swept up under the swap's own lock. null (the default) preserves
 -- today's "restore everything unrestored for this parent" behavior for every other caller.
+-- (regclass) shipped in 0.2.0 through 0.4.0; kept beside this shape, maintain's every-tick call is ambiguous (#441)
+drop function if exists pgpm.restore_incoming_fks(regclass);
 create or replace function pgpm.restore_incoming_fks(p_parent regclass, p_ids bigint[] default null)
 returns int language plpgsql as $$
 declare

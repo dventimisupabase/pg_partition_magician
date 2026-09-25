@@ -97,6 +97,19 @@ The same rule applies to anything else an existing database would miss: a new ta
 `create table if not exists`, a dropped column needs `drop column if exists`, and a changed function
 needs `create or replace` rather than `create`.
 
+**Any change to a function's or procedure's argument list needs a matching
+`drop function if exists <old signature>` line in the same commit**, for the same reason a new column
+needs its backfill line. `create or replace` across a changed argument list replaces nothing: it creates
+a second overload beside the first, and when the new argument has a default the old call shape matches
+both and every call fails with `is not unique`. That is how `pgpm.schedule()` and the
+`restore_incoming_fks` call `maintain` makes every tick came to be ambiguous on every install upgraded
+from 0.4.0 or older (#441), with the upgrade itself reporting success. A fresh install has nothing to
+drop, so the pgTAP suite cannot see a missed line, and neither can `upgrade_in_place.sh`, whose origin
+is a degraded fresh install. `bench/upgrade_from_release.sh` is the guard that can: it installs a real
+released artifact (v0.2.0's `install.sql`, fetched from the tag), transmutes a table under it, upgrades,
+and requires the routine catalog to be identical to a fresh install's, by name. Its mutation is
+`upgrade_stale_overloads_kept`.
+
 ## Channels
 
 Three install channels exist, and they are not equally exercised:
