@@ -78,6 +78,21 @@ jobs:
           python3 scripts/check_track_filters.py --selftest
           python3 scripts/check_track_filters.py
 
+  review-tooling-selftest:
+    name: Review tooling self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # scripts/review/ is the mechanical half of an adversarial review pass (docs/adversarial-review.md).
+      # Each script proves its own classification and arithmetic on fixtures, the same way
+      # check_quoted_splices.py does: a classifier that silently mis-sorted a seed hit as a finding
+      # would inflate precision in the very measurement meant to catch a reviewer reaching.
+      - name: Seed planting, claim classification and pass metrics must agree with their fixtures
+        run: |
+          python3 scripts/review/plant_seeds.py --selftest
+          python3 scripts/review/classify_claims.py --selftest
+          python3 scripts/review/pass_metrics.py --selftest
+
   shellcheck:
     name: Shell scripts
     runs-on: ubuntu-latest
