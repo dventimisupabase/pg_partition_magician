@@ -971,11 +971,19 @@ $$;
 -- it has to be unique per range: a name that would exceed PostgreSQL's 63-byte identifier limit is
 -- REFUSED rather than truncated (#510, below).
 --
--- Rendered in p_tz for day and coarser granularities (#455): "the month it is in partition_tz", which
--- is what the operator who chose the zone reads off the name. Sub-day granularities render in UTC
--- instead: a DST-observing zone's wall clock repeats an hour every autumn, so two adjacent hourly cells
--- would share a label, and obtain skips a candidate whose name already exists, which would be a hole at
--- every fall-back. UTC never repeats an hour.
+-- The label's zone follows the cell's definition. A calendar cell (month, year) is defined on the wall
+-- clock in p_tz, so it is labelled by its wall month there (#455): "the month it is in partition_tz",
+-- which is what the operator who chose the zone reads off the name. A fixed-second cell (day, week,
+-- hour, minute) is an absolute lattice from the anchor instant, zone-free by construction, and is
+-- labelled by the UTC reading of its start (#503): two instants a whole number of days apart never share
+-- a UTC date, and two an hour apart never share a UTC hour. The wall clock of a DST-observing zone does
+-- both. It repeats an hour every autumn, which is why sub-day labels were in UTC from the start; and the
+-- day lattice drifts an hour against local midnight twice a year, so the two day cells straddling a
+-- fall-back could start on the same wall date (00:00 EDT and 23:00 EST of the same Sunday when the
+-- anchor is a summer midnight; the 00:00Z cells of the Sunday and the Monday in Atlantic/Azores). obtain
+-- skips a candidate whose name already exists, so a shared label was a permanent one-day hole, and it
+-- also meant set_partition_tz on a day grid moved every label onto its neighbour's. Labelled in UTC, a
+-- day grid's zone changes nothing about it at all: bounds and names are both absolute.
 drop function if exists pgpm._part_name(name, text, text, text);
 create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text,
                                            p_hi_native text, p_tz text)
@@ -988,12 +996,12 @@ begin
   if p_kind in ('time', 'uuidv7', 'text_time') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     v_secs   := extract(epoch from p_step::interval);
-    v_label_tz := p_tz;
+    v_label_tz := case when v_months > 0 then p_tz else 'UTC' end;
     if    v_months >= 12 and v_months % 12 = 0 then fmt := 'YYYY';
     elsif v_months > 0                          then fmt := 'YYYY_MM';
     elsif v_secs  >= 86400                       then fmt := 'YYYY_MM_DD';
-    elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';   v_label_tz := 'UTC';
-    else                                              fmt := 'YYYY_MM_DD_HH24MI'; v_label_tz := 'UTC';
+    elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';
+    else                                              fmt := 'YYYY_MM_DD_HH24MI';
     end if;
     v_lo := to_char(p_lo_native::timestamptz at time zone v_label_tz, fmt);
     if v_coarse then v_hi := to_char(p_hi_native::timestamptz at time zone v_label_tz, fmt); end if;

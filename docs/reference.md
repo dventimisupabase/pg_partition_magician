@@ -1525,9 +1525,10 @@ built from a non-UTC session has to be told which zone that was.
 is refused: it has no calendar and never reads the zone. A change is **refused** when the newest
 partition's upper bound is not a grid boundary in the new zone, because `obtain` would then skip every
 candidate that half-overlaps the current tail and create the first one past it, leaving a permanent
-hole. A day-denominated step is the same lattice in every zone, so its zone can always change (only the
-names move); a month or year step can only be moved to the zone the grid was in fact built in. Each
-accepted call writes a `set_partition_tz` row to `pgpm.log` with `old -> new` in `method`.
+hole. A day-denominated step is the same lattice in every zone and its partitions are named by UTC date,
+so its zone can always change and nothing about the grid moves; a month or year step can only be moved to
+the zone the grid was in fact built in. Each accepted call writes a `set_partition_tz` row to `pgpm.log`
+with `old -> new` in `method`.
 
 ## Observability
 
@@ -1959,9 +1960,12 @@ is `<rel>_p<lo>_to_<hi>`, both bounds formatted at the step's granularity:
 - time/uuidv7/text_time: `events_p2026_03` (a fine month), `events_p2026_03_to_2026_07` (the monolith)
 - id: `events_p0000000000000010000`, `events_p0000000000000000000_to_0000000000000060000`
 
-Day and coarser labels are rendered in `config.partition_tz`. Hour and minute labels are rendered in UTC,
-because a zone with daylight saving repeats an hour every autumn and two adjacent cells would otherwise
-share a name.
+Month and year labels are rendered in `config.partition_tz`, the zone those calendar cells are defined
+in. Day and shorter labels are rendered in UTC: those steps are a fixed number of seconds from the anchor
+whatever the zone, and in a zone with daylight saving the day lattice drifts an hour against local
+midnight twice a year, so two adjacent day cells could otherwise start on the same wall date (as two
+adjacent hour cells share a wall hour every autumn) and share a name. UTC never repeats a date or an
+hour.
 
 The name is a human-facing label; `pgpm.part` holds the authoritative bounds. The `_to_` form is also
 what keeps `transmute`'s orphan check from mistaking a monolith for a leftover of an interrupted regrain.

@@ -1217,6 +1217,21 @@ begin
   end if;
 """, "", 1)],
     ),
+    "part_name_day_label_in_zone": (
+        "bench/day_label_utc.sh",
+        "Pre-#503 _part_name: a day or week label is the wall DATE of the cell's start in partition_tz, "
+        "although the day lattice is an absolute 86400 s lattice from the anchor instant. In a zone with "
+        "daylight saving that lattice drifts an hour against local midnight twice a year, so the two "
+        "cells straddling a fall-back can start on the same wall date (00:00 EDT and 23:00 EST of the "
+        "same Sunday when the anchor is a summer midnight; the 00:00Z cells of the Sunday and the Monday "
+        "in Atlantic/Azores) and share a name; and after set_partition_tz to a zone west of the old one "
+        "every cell's new label is its predecessor's old one. obtain and extend_to skip a candidate whose "
+        "name already exists before their overlap check, so the second cell of the pair is never built: a "
+        "permanent one-day hole that refuses writes. tests/125's adapter pairs, its New York grid across "
+        "the fall-back and its zone change on a UTC day grid are what catch it.",
+        [("    v_label_tz := case when v_months > 0 then p_tz else 'UTC' end;\n",
+          "    v_label_tz := case when v_months > 0 or v_secs >= 86400 then p_tz else 'UTC' end;\n", 1)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "

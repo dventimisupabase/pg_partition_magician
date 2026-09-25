@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Day and week partitions are named by the UTC date they start on, in every `partition_tz`** (#503).
+  A day-denominated step is an absolute 86400 s lattice from the anchor instant, but `_part_name`
+  rendered its label as the wall date of the cell's start in `partition_tz`. In a zone with daylight
+  saving that lattice drifts an hour against local midnight twice a year, so two adjacent cells could
+  start on the same wall date: with the anchor at a summer midnight, the New York cells starting 00:00
+  EDT and 23:00 EST of the fall-back Sunday; with the default anchor, the 00:00Z cells of the fall-back
+  Sunday and the Monday in `Atlantic/Azores`. And `set_partition_tz`, documented as safe on a day step
+  because "only the names move", moved every label onto the previous cell's after a change to a zone
+  west of the old one. `obtain` and `extend_to` skip a candidate whose name already exists, so the
+  second cell of any such pair was never built: a permanent one-day hole that refused every write once
+  the frontier reached it, with nothing logged and a healthy `status()`. Fixed-second cells (day, week,
+  hour, minute) are now all labelled by the UTC reading of their start, the rule hour and minute labels
+  already followed; month and year cells keep their wall-month label in `partition_tz`. A day grid's
+  zone is therefore a pure setting: its bounds and names are both absolute. Names of existing day
+  partitions are not changed (the name is a label; `pgpm.part` holds the bounds). `tests/125` pins the
+  rule, `bench/day_label_utc.sh` runs it against `part_name_day_label_in_zone`, and `tests/111`'s three
+  day-label expectations follow the new rule.
 - **Archive coverage follows the partition, not a stale name** (#511). `pgpm.archive_ledger` is keyed
   `(parent_table, lo)` and matches chunks to their partition by `child_name`, and two things changed
   what a name meant without touching it. `regrain`'s swap dropped a partly archived source (allowed since

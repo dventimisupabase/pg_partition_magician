@@ -61,8 +61,8 @@ select is((select fl from a_ny where step = '1 day'), '2026-11-01 00:00:00+00'::
   'day floor sits on the absolute 86400 s lattice from the anchor');
 select is((select nx from a_ny where step = '1 day'), '2026-11-02 00:00:00+00'::timestamptz,
   'day next is exactly 86400 s later across the fall-back, not the 25 h calendar day New York would add');
-select is((select nm from a_ny where step = '1 day'), 'ev_p2026_10_31',
-  'day name is the pinned-zone wall date of the cell start (00:00Z is 20:00 EDT on October 31)');
+select is((select nm from a_ny where step = '1 day'), 'ev_p2026_11_01',
+  'day name is the UTC date of the cell start (00:00Z is 20:00 EDT on October 31, but a fixed-step cell is labelled in UTC like the hourly ones below, so adjacent cells never share a name; #503)');
 select is((select fl from a_ny where step = '1 week'), '2026-10-31 00:00:00+00'::timestamptz,
   'week floor: 2026-10-31 is a whole number of weeks after the Saturday anchor');
 select is((select nx from a_ny where step = '1 week'), '2026-11-07 00:00:00+00'::timestamptz,
@@ -191,11 +191,11 @@ select is(
 select is(
   (select string_agg(e.payload || '=' || c.relname, ',' order by e.payload)
      from public.gt_u e join pg_class c on c.oid = e.tableoid where e.payload in ('edt', 'est')),
-  'edt=gt_u_p' || to_char((select d from fb) - 1, 'YYYY_MM_DD') || ',est=gt_u_p' || to_char((select d from fb) - 1, 'YYYY_MM_DD'),
-  'both land in the one cell that covers them (the cell starting 00:00Z, which is 20:00 EDT the evening before)');
+  'edt=gt_u_p' || to_char((select d from fb), 'YYYY_MM_DD') || ',est=gt_u_p' || to_char((select d from fb), 'YYYY_MM_DD'),
+  'both land in the one cell that covers them (the cell starting 00:00Z on the Sunday, labelled by that UTC date although it starts 20:00 EDT the evening before)');
 select is(
   (select c.relname::text from public.gt_u e join pg_class c on c.oid = e.tableoid where e.payload = 'tail'),
-  'gt_u_p' || to_char((select d from fb) + 3, 'YYYY_MM_DD'),
+  'gt_u_p' || to_char((select d from fb) + 4, 'YYYY_MM_DD'),
   'the row four days past the transition (the hunt''s failing insert) landed in its cell');
 
 -- ==================== (d) timestamp and date control columns ====================
@@ -315,12 +315,13 @@ select is(
   (select string_agg(method, ',') from pgpm.log where parent_table = 'public.gt_ev'::regclass and action = 'set_partition_tz'),
   'America/New_York -> America/New_York',
   'exactly the accepted call was logged as set_partition_tz, old -> new; the refused ones logged nothing');
--- a daily grid is on the absolute lattice in every zone, so a zone change only moves the names
+-- a daily grid is on the absolute lattice in every zone and its names are UTC dates (#503), so a zone
+-- change moves nothing about it
 select lives_ok(
   $$ select pgpm.set_partition_tz('public.gt_u', 'Europe/London') $$,
   'set_partition_tz accepts a zone change on a day-denominated grid (same lattice everywhere)');
 select is((select partition_tz from pgpm.config where parent_table = 'public.gt_u'::regclass), 'Europe/London',
-  'the daily grid now renders in London');
+  'the daily grid records London; its bounds and names are absolute, so nothing else about it changes');
 
 -- ==================== (f) transmute refuses a session zone it could not record ====================
 set timezone = 'XYZ5';
