@@ -1042,8 +1042,11 @@ reaches it again. The first tick that keeps a block it would otherwise have lift
 `pgpm.archive_ledger` rows: the next tick lifts the block, and if the partition is ever blocked again
 archiving starts over from its `lo`. Coverage a tick finds on a partition that has **no** trigger (one
 removed by hand, or lifted by a pgpm older than this rule) is discarded for the same reason and logged
-as `archive_coverage_reset` with the number of chunks that went. Write-blocked is one of
-`retire()`'s drop preconditions (see [`retire`](#retire)).
+as `archive_coverage_reset` with the number of chunks that went. That test is made of the relation
+`pgpm.part.child_oid` records, never of whatever currently holds the name: when another relation has
+taken a partition's name, the tick refuses on identity (`fail_write_block_identity`, above) and leaves
+the real partition's coverage alone. Write-blocked is one of `retire()`'s drop preconditions (see
+[`retire`](#retire)).
 
 Chunked archiving: `archived=N` counts how many chunks this tick recorded via
 `pgpm._archive_step` -- see [Archive strategy contract](#archive-strategy-contract) for the

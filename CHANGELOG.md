@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **A substituted partition name no longer discards the real partition's archive coverage** (#518).
+  `_enforce_write_blocks` decided "coverage found without its block" by name,
+  `_is_write_blocked(child_name)`, at the top of its loop body, before the identity check
+  `_install_write_block` makes further down. A relation holding a partition's name has no trigger, so
+  the tick deleted the `pgpm.archive_ledger` rows describing the real partition (still attached, still
+  write-blocked, merely renamed aside) and logged `archive_coverage_reset` in the same tick that logged
+  `fail_write_block_identity` for the same child; once the name was sorted out, archiving started over
+  from `lo`. No row was lost, but ledger rows naming archived objects were destroyed on the strength of a
+  relation that was not the partition, against the guide's promise that every step acting on a name
+  checks it first. The loop now resolves each child's name against `pgpm.part.child_oid` before anything
+  it decides by that name, with the same predicate as the install (a null anchor compares as nothing; a
+  name resolving to nothing stays on the `skip_write_block` path), and a substituted name suppresses the
+  discard: the identity refusal is the whole of what the tick does for that child.
+  `tests/129_coverage_reset_identity_test.sql` reproduces the substitution, asserts by identity that the
+  ledger row survives and that the first tick after the name is restored archives from the watermark
+  rather than from `lo`, and pins the positive side (trigger really gone, identity intact: still
+  discarded) and the unanchored side (a null `child_oid` is not a mismatch);
+  `bench/coverage_reset_identity.sh` drives it against the `coverage_reset_by_name` and
+  `coverage_reset_unanchored_is_mismatch` mutations, which `./test.sh discriminate` requires it to fail.
+
 - **The guide's database.dev snippet names the version this tree installs, and the reference names only
   log actions pgpm writes** (#521). `docs/guide.md`'s `create extension ... version '0.4.0'` sat two
   releases behind `extension.control`'s `0.6.0`, because RELEASING.md's list of files to bump at release
@@ -343,6 +363,7 @@
   which value; `bench/cutover_trigger_state.sh` drives the same file for `./test.sh discriminate`, where
   the `transmute_trigger_state_dropped` and `untransmute_trigger_state_dropped` mutations each put one
   site's defect back.
+
 - **A regrain reconcile pass consumes from the delta exactly the captured rows it applied, never
   "everything at or below a watermark"** (#497). `_regrain_reconcile` read its batch watermark, its list
   of touched fine children, each child's delete and reinsert, and its final `delete from <delta> where
