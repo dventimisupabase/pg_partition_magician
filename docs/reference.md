@@ -803,8 +803,19 @@ partition until archiving has fully covered it, so discarding it would destroy e
 is protecting. Once materialized, the ordinary pipeline applies: `maintain` write-blocks it,
 archives it, and `retire` drops it once covered. The cost is copying rows that are about to be dropped,
 which is paid only on tables that archive. The
-source stays whole and **attached** until that swap, so a read of the parent is never short. Returns
-`prepared` (the first tick, which installs change capture and copies nothing), `reconciled:N`,
+source stays whole and **attached** until that swap, so a read of the parent is never short.
+
+The skip is decided once, as the cursor passes the sub-range, and the swap **re-checks it** against the
+retention policy in force at that moment. If a skipped sub-range is no longer entirely below the horizon
+(`set_retain` loosened retention, to a longer value or `null`, after the skip), the swap **refuses** with an
+error naming the range, because dropping the source would destroy rows the table is now configured to
+keep. The refusal locks and changes nothing: the source stays attached, the cursor stays at `hi`, and the
+run resumes from there. Set `retain` back and the next tick swaps, or [`regrain_cancel`](#regrain_cancel)
+and re-run under the new policy. Through `maintain` the refusal appears as a `skip_regrain` row carrying
+the message. A sub-range that already has a fine child is never skipped, even once it ages: its copy is
+finished instead, so an attached partition always holds its whole range.
+
+Returns `prepared` (the first tick, which installs change capture and copies nothing), `reconciled:N`,
 `copied:N`, `reconciling:N` (the swap is waiting for the captured backlog to clear), `swapped:K` (regrain
 complete, K children attached), or a soft no-progress status: `active` (not frozen yet) or `nosubdiv`
 (the step does not subdivide). This is the unit `maintain` paces across ticks; because it copies, the
@@ -1378,6 +1389,12 @@ block stays, it is archived to completion, and the tick that keeps the block log
 `skip_write_block_lift` once. See write-blocking under [`maintain`](#maintain) for why, and for how to
 make such a partition writable again.
 
+Loosening while a regrain is in flight (`config.regrain_cursor` set) raises a **warning**, not a refusal.
+Sub-ranges that regrain has already skipped as aged under the old value are re-checked against the new
+one at the swap (see [`regrain_step`](#regrain_step)), which refuses while any of them is no longer below
+the horizon. The change itself is safe; the swap waits until `retain` is set back or the run is
+cancelled with [`regrain_cancel`](#regrain_cancel).
+
 ## Observability
 
 ### `status`
@@ -1709,7 +1726,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `obtain` | a forward partition created (`method` = `plain`) |
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
-| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range (only when `archive_fn` is unset; discarded with the source, never copied) / attached a fine child (`method` = `check_skip`) / completed (`method` = `copy_swap_drop`) |
+| `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range that has no fine child yet (only when `archive_fn` is unset; discarded with the source, never copied, once the swap has re-checked that it is still below the horizon) / attached a fine child (`method` = `check_skip`) / completed (`method` = `copy_swap_drop`) |
 | `regrain_prepare` / `regrain_capture_orphan` / `regrain_reconcile` / `regrain_reconcile_aged` / `regrain_rename` / `regrain_restart` / `regrain_cancel` | the cross-tick regrain's own steps: change capture installed / a leftover capture table cleared / the source-is-authority reconcile before the swap (and its below-horizon counterpart) / the source renamed onto the target grid / a stale run restarted / a run cancelled by `regrain_cancel()` |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `from_hypertable_carry_fk` | (`pgpm_hypertable` only) an outgoing FK re-added onto the migrated destination during `from_hypertable_copy` |

@@ -177,8 +177,12 @@ cannot make progress yet.
    - A `maintain` summary of `regrain=active` means the monolith has **not frozen yet** (the current
      interval still lands in it); it will regrain once the frontier crosses `B`.
    - `regrain=copied:N` is healthy forward progress (one budget-sized copy microbatch); `regrain=swapped:K`
-     is a completed regrain (K fine children attached). A `skip_regrain` log row is a lock-race deferral, and
-     a `regrain_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
+     is a completed regrain (K fine children attached). A `skip_regrain` log row is usually a lock-race
+     deferral, and a `regrain_aged` row is a below-horizon sub-range skipped under a retention policy; both
+     are normal. The exception is a `skip_regrain` whose `method` begins `pg_partition_magician: refusing to
+     swap`: `retain` was loosened after the regrain had already skipped sub-ranges as aged, and the swap is
+     waiting rather than dropping rows the new policy keeps. Set `retain` back and the next tick swaps, or
+     `regrain_cancel` and re-run under the new policy.
    - `regrain=reconciling:N` tick after tick, with `regrain_delta_pending` not falling, means writes into
      the coarse child are outpacing the reconcile and the swap is correctly refusing to start. The table
      is consistent and reads are unaffected; raise `regrain_batch` or wait for the write burst to pass.

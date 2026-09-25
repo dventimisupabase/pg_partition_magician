@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+- **regrain's aged skip is re-checked at the swap, and never fires on a half-copied sub-range** (#448).
+  As the cursor passed a sub-range entirely below the retention horizon, `regrain_step` skipped it
+  (`regrain_aged`) and that decision lived on only as the advanced cursor. Two consequences.
+  `set_retain(parent, null)`, or a longer value, before the swap made the policy say keep while the rows
+  were still visible through the attached source, and the swap's `DROP` took them (39,999 rows in the
+  hunt that found this). And a sub-range partially copied in one tick whose range aged before the next
+  was skipped anyway, so the swap attached its partial child and the parent served a fraction of the
+  range as the whole of it.
+
+  Now the swap walks every sub-range of the source on the target grid, before it locks anything, and
+  **refuses**, naming the range, when one that has no fine child to attach is no longer below the
+  current horizon: the source stays attached, the cursor stays at `hi`, and the run resumes once
+  `retain` is set back (or `regrain_cancel` it and re-run under the new policy; through `maintain` the
+  refusal is a `skip_regrain` row carrying the message). The skip itself no longer fires on a sub-range
+  that already has a fine child: its copy is finished instead, which is what lets the swap treat "a
+  child exists" as "its copy is complete". `set_retain` **warns**, rather than refuses, when it loosens
+  retention under an in-flight regrain, since the change is safe and only the swap's timing is affected.
+  New internal `pgpm._regrain_has_child(parent, lo, hi)`, the one notion of "this sub-range has a fine
+  child" both sites share, answered from `pgpm.part` because that is what the swap attaches from.
+  Guarded by `tests/121`: four sub-ranges skipped as aged, `set_retain(null)`, the swap refuses and every
+  sampled aged row is still served by identity; a longer value, and the refusal names the first range no
+  longer below the horizon; the original value, and the very next tick swaps. Then a batch smaller than
+  a sub-range, one tick copying 100 of 249 rows, the frontier moving the horizon past it, and the
+  following ticks finishing the copy, so that after the swap no attached partition holds a strict subset
+  of its source range.
 - **Fix: `regrain_step`'s reconcile no longer discards captured changes in a clamped first sub-range**
   (#446). When a coarse child's `lo` is off the target grid (a weekly `regrain_to` on a monthly monolith,
   which `set_regrain` accepts; a `7000` target on a child starting at `20000`), `regrain_step` clamps the
