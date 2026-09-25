@@ -132,6 +132,14 @@ REGRAIN_SWAP_PENDING_CHECK = """  v_delta_n := pgpm._regrain_delta_count(p_paren
       v_child_name, v_delta_n, v_lo, v_hi;
   end if;
 """
+# untransmute's lock-and-recheck (#443), matched from its marker comment through the end of its `if`,
+# so the mutant reads as the pre-#443 function rather than as a comment describing a lock that is not
+# there. Anchored on the marker rather than the code so a rewording of the explanation fails loudly
+# here instead of quietly leaving the lock in place.
+UNTRANSMUTE_RECHECK_RE = re.compile(
+    r"^  -- THE GATE, AGAIN, UNDER THE LOCK \(#443\)\..*?\n  end if;\n\n",
+    re.MULTILINE | re.DOTALL,
+)
 
 # name -> (guard it must break, why this is the right defect, [(find, replace, expected_count)])
 # #344's hoist: the new parent's CREATE TABLE ... PARTITION BY RANGE, identity, owner, grants,
@@ -537,6 +545,17 @@ MUTATIONS = {
         "the FIRST rename, which relocating this one block alone already flips.",
         [(TRANSMUTE_CUTOVER_HOIST, "", 1),
          ("  -- 7b (triggers).", TRANSMUTE_CUTOVER_HOIST + "  -- 7b (triggers).", 1)],
+    ),
+    "untransmute_no_recheck_under_lock": (
+        "bench/untransmute_race.sh",
+        "Pre-#443 untransmute: the outside-rows check runs once, under ACCESS SHARE, and the DETACH and "
+        "DROP that act on its answer take their ACCESS EXCLUSIVE later. A writer whose forward-partition "
+        "insert is uncommitted at the check and committed before that lock is granted has its row "
+        "dropped with the parent, and pgpm.log records the untransmute as a success. Removes the "
+        "lock-and-recheck block only: the unlocked check and the READ COMMITTED precondition stay, so "
+        "the mutant still refuses a row that was already committed (tests/27) and is caught by "
+        "nothing but the race.",
+        [(UNTRANSMUTE_RECHECK_RE, "", 1)],
     ),
     "regrain_no_delta_analyze": (
         "bench/regrain_perf.sh",

@@ -234,6 +234,15 @@ It is a **one-way door** once any row lives outside the monolith's range -- a fo
 frontier crosses `B`, or finer children from a regraining -- because a
 metadata-only reverse would lose those rows.
 
+The door is checked twice. Once before anything is touched, under no lock a writer would feel, so a
+refusal never blocks anyone. And again under the **`ACCESS EXCLUSIVE` lock on the parent** that the
+detach and drop need, taken explicitly just before them, so a row that commits into a forward partition
+while `untransmute` is waiting for that lock is refused rather than dropped with the parent. The wait is
+bounded by the caller's `lock_timeout`, and a refusal rolls the whole call back, leaving the table exactly
+as it was. `untransmute` must run in a `READ COMMITTED` transaction (the default): a stricter isolation
+level cannot give the under-lock check a snapshot taken after the lock, so it refuses up front rather than
+proceed on a stale one.
+
 ## Migrating from TimescaleDB (`from_hypertable`)
 
 An **optional add-on** (`pgpm_hypertable/install.sql`) for migrating a TimescaleDB **Apache-edition** hypertable

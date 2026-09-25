@@ -3894,6 +3894,7 @@ returns regclass language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_monreg regclass; v_restored regclass;
   v_mon name; v_mon_lo text; v_mon_hi text; v_ncast text; v_outside boolean;
+  v_gate_q text; v_door text;   -- #443: the outside-rows check and its refusal, asked twice
   v_idcols name[]; v_idmax bigint[]; v_col name; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
   r pgpm.dropped_fk%rowtype; v_cdelta name; v_cfn name;
@@ -3902,6 +3903,17 @@ begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then
     raise exception 'pg_partition_magician: % is not managed by pgpm (nothing to untransmute)', p_parent;
+  end if;
+
+  -- #443: the gate below is asked a second time under ACCESS EXCLUSIVE, and that second answer is only
+  -- worth something if its snapshot postdates the lock. READ COMMITTED takes a fresh snapshot per
+  -- statement, so it does; REPEATABLE READ and SERIALIZABLE pin the transaction's first snapshot, taken
+  -- before this function was even entered, and the re-check would be blind to exactly the row it exists
+  -- to see. Refuse rather than proceed on a stale one. (READ UNCOMMITTED is READ COMMITTED in PostgreSQL
+  -- and passes too.) Nothing in pgpm calls untransmute, so only a direct caller ever meets this.
+  if current_setting('transaction_isolation') not in ('read committed', 'read uncommitted') then
+    raise exception 'pg_partition_magician: untransmute(%) must run in a READ COMMITTED transaction (this one is %): its outside-rows check is repeated under ACCESS EXCLUSIVE and needs a snapshot taken after that lock is granted, which a stricter isolation level cannot provide',
+      p_parent, current_setting('transaction_isolation');
   end if;
 
   select n.nspname, c.relname into v_nsp, v_rel
@@ -3923,12 +3935,17 @@ begin
     raise exception 'pg_partition_magician: cannot untransmute % -- no managed partition found', p_parent;
   end if;
   v_monreg := format('%I.%I', v_nsp, v_mon)::regclass;
-  execute format('select exists (select 1 from %s where %I >= %L or %I < %L)',
+  -- Built once and asked twice (#443): here, unlocked, as the cheap refusal that takes no lock a writer
+  -- would feel when the door is already shut; and again under ACCESS EXCLUSIVE just before the DETACH,
+  -- which is the answer that is acted on.
+  v_gate_q := format('select exists (select 1 from %s where %I >= %L or %I < %L)',
                  p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch),
-                 cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch)) into v_outside;
+                 cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch));
+  v_door := format('pg_partition_magician: cannot untransmute %s -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or regraining begins.',
+                   p_parent::text);
+  execute v_gate_q into v_outside;
   if v_outside then
-    raise exception 'pg_partition_magician: cannot untransmute % -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or regraining begins.',
-      p_parent;
+    raise exception '%', v_door;
   end if;
 
   -- capture the identity columns and their current max BEFORE dropping anything (transmute moved
@@ -3967,6 +3984,26 @@ begin
   -- the definitions replay verbatim.
   select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
     into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
+
+  -- THE GATE, AGAIN, UNDER THE LOCK (#443). The check above ran under ACCESS SHARE, which excludes no
+  -- writer: an insert into a forward partition that was uncommitted when it ran was invisible to it, and
+  -- if that insert commits before the DETACH below is granted its ACCESS EXCLUSIVE, the parent is
+  -- dropped with the row in it and the log calls that a success. So take the lock the DETACH is about
+  -- to take anyway, explicitly and one statement early, and ask the question again under it: nothing
+  -- can commit into the parent now, and READ COMMITTED (required at the top) gives this statement a
+  -- snapshot taken after the lock was granted, so what it sees is final. A refusal here rolls the whole
+  -- call back, and the caller's lock_timeout bounds the wait exactly as it bounded the DETACH's.
+  --
+  -- Locking HERE rather than before the first check is the choice that keeps the exclusive window
+  -- where it was: it opens on the same line it always did (the DETACH took this very lock) and grows by
+  -- one probe of partitions that are empty whenever it passes, instead of also covering the identity,
+  -- FK and trigger capture above. Named through p_parent, whose ACCESS SHARE from the first check is
+  -- held to the end of this transaction and so pins the name against a concurrent rename.
+  execute format('lock table %s in access exclusive mode', p_parent::text);
+  execute v_gate_q into v_outside;
+  if v_outside then
+    raise exception '%', v_door;
+  end if;
 
   -- detach the MONOLITH (the original table, holding everything; PK + secondary indexes intact), then
   -- drop the childless parent -- which cascades the empty DEFAULT and any empty forward partitions, and
