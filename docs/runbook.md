@@ -186,6 +186,10 @@ cannot make progress yet.
      swap's residual reconcile` is the swap refusing to drop the source with changes unapplied. The tick
      rolled back whole, the source is still attached, and the next tick reconciles the backlog before
      swapping; nothing is lost. It should not recur, and one that does is worth reporting.
+   - A `TRUNCATE` of the table, or of the coarse child, fails with `pg_partition_magician: cannot
+     TRUNCATE ... a regrain is in flight on it` for as long as the regrain is in flight. That is
+     deliberate: a truncate cannot be captured, and the swap would otherwise put every truncated row
+     back. Cancel with `pgpm.regrain_cancel` first, or truncate after the swap.
 
 4. If disk is the constraint, see [Disk is filling during a regrain](#disk-is-filling-during-a-regrain).
 

@@ -2108,6 +2108,29 @@ begin
 end;
 $$;
 
+-- TRUNCATE is the one write the row trigger cannot see (issue #449). It fires no row trigger, so a truncate
+-- of the source mid-regrain leaves the delta empty, and TRUNCATE parent never reaches the standalone copies
+-- (they are not partitions until the swap), so the swap would attach copies of every row the operator just
+-- removed: 9,999 rows back from the dead in the hunt that found it. Refuse it instead, the way the write
+-- ceiling does: loud refusal over silent divergence. This is the function behind a BEFORE TRUNCATE
+-- statement trigger that _regrain_capture_install puts on the source child beside the row trigger and that
+-- every teardown of the row trigger (swap, regrain_cancel, the janitor) removes with it, so its presence IS
+-- the in-flight marker and it needs no state of its own. BEFORE, so the whole statement fails before
+-- anything is truncated. TRUNCATE parent cascades to the source as a partition and fires the partition's
+-- own statement trigger, so both spellings are refused. Installed ENABLE ALWAYS: an ordinary trigger is
+-- skipped under session_replication_role = replica, and a truncate slipping past there would be the same
+-- resurrection. One shared function rather than a per-parent one: the message needs nothing the trigger
+-- context does not already carry, and the parent is one pg_inherits lookup away.
+create or replace function pgpm._regrain_truncate_guard() returns trigger
+language plpgsql as $$
+declare v_parent text;
+begin
+  select i.inhparent::regclass::text into v_parent from pg_inherits i where i.inhrelid = tg_relid;
+  raise exception 'pg_partition_magician: cannot TRUNCATE %.% -- a regrain is in flight on it (parent %). TRUNCATE fires no row trigger, so the rows it removes cannot be captured, and the swap would attach copies of them. Cancel the regrain first with pgpm.regrain_cancel(%), or truncate after the swap completes.',
+    tg_table_schema, tg_table_name, coalesce(v_parent, '?'), coalesce(v_parent, '<parent>');
+end;
+$$;
+
 -- Install capture for a regrain of p_child: mint the per-parent delta table and trigger function if this
 -- parent has never regrained, clear any residue from a previous regrain, and put the trigger on the source
 -- child. CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which conflicts with ROW EXCLUSIVE, so in-flight DML
@@ -2189,6 +2212,12 @@ begin
   -- is a change the reconcile cannot honour. Re-created per regrain, so a regrain begun after the upgrade
   -- gets it without a repair step; one already in flight keeps its origin-only trigger until it swaps.
   execute format('alter table %I.%I enable always trigger pgpm_regrain_capture', v_nsp, p_child);
+  -- #449: TRUNCATE fires no row trigger, so it is refused for as long as the row trigger is up (see
+  -- _regrain_truncate_guard). Same lock, same tick, torn down wherever the row trigger is.
+  execute format('drop trigger if exists pgpm_regrain_truncate_guard on %I.%I', v_nsp, p_child);
+  execute format('create trigger pgpm_regrain_truncate_guard before truncate on %I.%I for each statement execute function pgpm._regrain_truncate_guard()',
+                 v_nsp, p_child);
+  execute format('alter table %I.%I enable always trigger pgpm_regrain_truncate_guard', v_nsp, p_child);
 end;
 $$;
 
@@ -2406,6 +2435,7 @@ begin
             and not pgpm._native_gt(cfg.control_kind, cfg.regrain_cursor, r.hi);      -- cursor <= hi
       if not v_keep then
         execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+        execute format('drop trigger if exists pgpm_regrain_truncate_guard on %I.%I', v_nsp, r.child_name);   -- #449
         insert into pgpm.log (parent_table, action, lo, hi, method)
           values (p_parent, 'regrain_capture_orphan', r.lo, r.hi, r.child_name);
       end if;
@@ -2434,6 +2464,7 @@ begin
 
   for r in select child_name from pgpm.part where parent_table = p_parent loop
     execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, r.child_name);
+    execute format('drop trigger if exists pgpm_regrain_truncate_guard on %I.%I', v_nsp, r.child_name);   -- #449
   end loop;
 
   select delta into v_delta from pgpm._regrain_capture_names(p_parent);
@@ -2822,8 +2853,9 @@ begin
   end loop;
   delete from pgpm.part where parent_table = p_parent and child_name = v_child_name;   -- not p_child: #266 may have renamed it
   execute format('drop table %s', v_child::text);
-  -- the capture trigger went with the dropped source (#267); clear the delta so the next regrain of this
-  -- parent starts from an empty one and status() does not report a phantom backlog.
+  -- the capture trigger (#267) and the TRUNCATE guard (#449) went with the dropped source; clear the delta
+  -- so the next regrain of this parent starts from an empty one and status() does not report a phantom
+  -- backlog.
   select delta into v_delta_name from pgpm._regrain_capture_names(p_parent);
   if to_regclass(format('%I.%I', v_nsp, v_delta_name)) is not null then
     execute format('truncate %I.%I', v_nsp, v_delta_name);
