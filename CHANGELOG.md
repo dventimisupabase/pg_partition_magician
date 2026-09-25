@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **A `p_incoming_fks => 'preserve'` conversion that fails after phase 1 no longer loses the incoming
+  foreign keys (#444).** The cutover is where the referencing table's key is dropped now, in the same
+  transaction that records it in `pgpm.dropped_fk`. It used to be dropped in the first of `transmute`'s
+  three transactions, with the record written only in the third, so a stray row failing phase 2's
+  `VALIDATE` (or a lock timeout in the cutover) left the key gone from the referencing table with no
+  record anywhere: `transmute_abort` reported the table restored, the referencing table accepted orphans,
+  and a clean re-run had nothing to restore. Now a failure in phase 1 or 2 leaves every incoming key
+  exactly where it was, a failure in the cutover rolls the drop back with it, and referential integrity
+  on the referencing table is off only between a completed cutover and `restore_incoming_fks`. Nothing
+  in phases 1 or 2 ever needed the key gone; the drop was simply left behind when the conversion was
+  split. Two things came free: the drop's wait for the referencing table's lock is now bounded by
+  `p_lock_timeout` (it used to wait indefinitely, before anything was claimed), and the cutover drops
+  what is live at that moment rather than a list captured at the start, so a key the operator dropped
+  during the validation scan is not recorded as pgpm's to restore. `tests/112` pins the phase 2
+  failure, the abort, the cutover failure under a lock on the referencing table, and the resume path.
 - **`from_hypertable_copy` applies each chunk's bounds in the dimension's own type**, so a `timestamp`
   (without time zone) or `date` dimension migrates whole under any session `TimeZone` (#459). The chunks
   view renders every time dimension's `range_start`/`range_end` as `timestamptz`, and the copy spliced them

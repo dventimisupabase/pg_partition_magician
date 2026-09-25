@@ -2867,7 +2867,7 @@ declare
   v_pgpm_clash_q text;   -- #311: existing relations occupying the <index>_pgpm names step 9b needs
   v_add_pk boolean := false; v_add_uniq boolean := false; v_reuse_idx oid; v_reuse_conname name;
   v_uq_cols text[]; v_bare_uq text;
-  v_fk record; v_dropped jsonb := '[]'::jsonb; v_e jsonb; v_fk_eligible boolean;
+  v_fk record; v_fk_eligible boolean;
   v_out_names text[]; v_out_defs text[]; v_bad_out text; v_i2 int;   -- outgoing FKs (#263)
   v_uchk_n bigint; v_uchk_frac numeric;
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
@@ -3213,12 +3213,23 @@ begin
       p_parent, v_bad_trg;
   end if;
 
-  -- 0. incoming FKs (capture before the rename; record after the new parent exists). pgpm never
-  -- rewrites the PK, so the referenced unique key (the reused PK) always survives and an incoming FK
-  -- can be re-pointed at the new parent verbatim on a later tick -- the 'preserve' lifecycle. It cannot
-  -- ride through in place: the rename below makes the ORIGINAL table the monolith child, so a surviving FK
-  -- would go on referencing that partition instead of the new parent, silently narrowing to one partition.
-  -- We refuse by default (the operator opts into the drop-and-restore dance).
+  -- 0. incoming FKs: the GATE, and only the gate. pgpm never rewrites the PK, so the referenced unique
+  -- key (the reused PK) always survives and an incoming FK can be re-pointed at the new parent verbatim on
+  -- a later tick -- the 'preserve' lifecycle. It cannot ride through in place: the cutover's rename makes
+  -- the ORIGINAL table the monolith child, so a surviving FK would go on referencing that partition instead
+  -- of the new parent, silently narrowing to one partition. We refuse by default (the operator opts into
+  -- the drop-and-restore dance), and a key that could not be re-added afterwards is refused here too,
+  -- before anything is committed.
+  --
+  -- What this step does NOT do is drop anything (#444). The drop lives in the cutover (step 0c), in the
+  -- same transaction as the pgpm.dropped_fk row that lets restore_incoming_fks re-add it. It used to be
+  -- here, which was harmless while transmute was one transaction and became a data-loss path when #275
+  -- split it into three: the drop committed with phase 1, the record waited for phase 3, and a failure in
+  -- between (a stray row past the bound failing phase 2's VALIDATE, a lock timeout in the cutover) left
+  -- the key gone from the referencing table with nothing anywhere to say it had existed. transmute_abort
+  -- then reported the table restored, the referencing table accepted orphans, and a clean re-run found no
+  -- key to record. Nothing in phase 1 or 2 needs the key gone -- ADD CONSTRAINT NOT VALID and VALIDATE
+  -- touch only this table -- so there was never a reason for it to be early.
   if exists (select 1 from pg_constraint where confrelid = p_parent and contype = 'f') then
     if p_incoming_fks = 'error' then
       raise exception
@@ -3228,7 +3239,7 @@ begin
            from pg_constraint where confrelid = p_parent and contype = 'f');
     else   -- 'preserve'
       for v_fk in
-        select c.conrelid::regclass as reltbl, c.conname, pg_get_constraintdef(c.oid) as def,
+        select c.conrelid::regclass as reltbl, c.conname,
                (select array_agg(a.attname::text order by k.ord) from unnest(c.confkey) with ordinality as k(attnum, ord)
                   join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) as rcols
           from pg_constraint c where c.confrelid = p_parent and c.contype = 'f'
@@ -3245,9 +3256,6 @@ begin
           raise exception 'pg_partition_magician: cannot preserve incoming FK % on % -- it references (%), but the parent''s reused key is (%). An incoming FK must reference the reused primary key or unique constraint to be preserved.',
             v_fk.conname, v_fk.reltbl, array_to_string(v_fk.rcols, ', '), array_to_string(coalesce(v_pkcols, '{}'), ', ');
         end if;
-        v_dropped := v_dropped || jsonb_build_object(
-          'reltbl', v_fk.reltbl::text, 'conname', v_fk.conname::text, 'def', v_fk.def);
-        execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
       end loop;
     end if;
   end if;
@@ -3439,8 +3447,9 @@ begin
   -- Metadata only, and atomic: a raise from here rolls the whole cutover back.
   --
   -- One set_config covers every wait in this phase, since it is one transaction: the RENAME's ACCESS
-  -- EXCLUSIVE on the live table, and the outgoing-FK re-add's SHARE ROW EXCLUSIVE on each REFERENCED
-  -- table (#263), which queues behind writers there rather than on the table being converted. A timeout
+  -- EXCLUSIVE on the live table, the incoming-FK drops' ACCESS EXCLUSIVE on each REFERENCING table
+  -- (#444), and the outgoing-FK re-add's SHARE ROW EXCLUSIVE on each REFERENCED table (#263), which
+  -- queues behind writers there rather than on the table being converted. A timeout
   -- here aborts the cutover whole and leaves the phase-1 bound in place -- the recorded, resumable state
   -- transmute_abort and maintain_all's sweep already handle.
   perform set_config('lock_timeout', p_lock_timeout, true);   -- `set local` did not survive the COMMIT
@@ -3563,8 +3572,46 @@ begin
     execute format('comment on column %s.%I is %L', v_parent::text, v_colcom.attname, v_colcom.c);
   end loop;
 
+  -- 0c. drop the incoming FKs and record each, HERE (#444). Eligibility was settled by the gate at step 0,
+  -- before anything was committed; this drops whatever is live NOW rather than replaying a list captured
+  -- then, so a key the operator dropped during the validation scan is not recorded as ours to restore,
+  -- and one they added is not left behind to follow the rename into the monolith. (The hypertable
+  -- module's swap works the same way: preflight settles eligibility, the cutover drops what is live.)
+  --
+  -- Before the rename, for two reasons. pg_get_constraintdef names the referenced table by its CURRENT
+  -- name, and it is that name, not the monolith's, that restore_incoming_fks replays verbatim against the
+  -- new parent. And a foreign key tracks the table it references by OID, so left in place through the
+  -- rename it would reference the monolith partition, the silent narrowing the gate describes.
+  --
+  -- Immediately before the rename, not earlier in the phase. Dropping an FK takes ACCESS EXCLUSIVE on the
+  -- REFERENCED table too (measured on PG 17: AccessExclusiveLock on both relations), so when there is a
+  -- key to drop this is the statement that starts the outage on the live table; placed any earlier it
+  -- would hold that lock across the staging work above, which #344 moved ahead of the rename precisely so
+  -- that it would run under no such lock. Here it adds one metadata-only statement to the window. It also
+  -- puts the wait for the referencing table's lock under this phase's lock_timeout, which the step 0 drop
+  -- never was: a long read of the referencing table used to stall the conversion indefinitely, before
+  -- anything had been claimed.
+  --
+  -- Recorded against v_parent, the new parent, which is why the record could never have been written in
+  -- phase 1: the parent did not exist yet. Sharing this transaction with the drop is the whole fix. A
+  -- failure anywhere in the cutover rolls the drop back along with everything else, so a key is gone from
+  -- the referencing table only in a database where pgpm.dropped_fk says so.
+  if p_incoming_fks <> 'error' then
+    for v_fk in
+      select c.conrelid::regclass as reltbl, c.conname, pg_get_constraintdef(c.oid) as def
+        from pg_constraint c where c.confrelid = p_parent and c.contype = 'f'
+       order by c.conname
+    loop
+      execute format('alter table %s drop constraint %I', v_fk.reltbl::text, v_fk.conname);
+      insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
+        values (v_parent, v_fk.reltbl, v_fk.conname, v_fk.def);
+      insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_fk.conname);
+    end loop;
+  end if;
+
   -- 1. THE TWO RENAMES, BACK-TO-BACK (#344). The first is the ACCESS EXCLUSIVE-acquiring statement that
-  -- starts the outage; doing the second immediately after -- before anything else runs -- means the live
+  -- starts the outage (the incoming-FK drop above shares that role when there is one); doing the second
+  -- immediately after -- before anything else runs -- means the live
   -- name already resolves to the correctly-positioned parent by the time the trigger replay below (the one
   -- step that needs the literal name, not just the OID) executes.
   execute format('alter table %s rename to %I', p_parent::text, v_monolith);
@@ -3693,14 +3740,6 @@ begin
   -- conversion, not a re-resolution of the name it now answers to.
   insert into pgpm.part (parent_table, child_name, lo, hi, attached, child_oid)
     values (v_parent, v_monolith, v_lo_native, v_hi_native, true, p_parent::oid);
-
-  -- record any dropped incoming FKs (the recorded definition already names the new parent); these are
-  -- always preserve-managed now, re-added against the new parent by restore_incoming_fks on a later tick.
-  for v_e in select value from jsonb_array_elements(v_dropped) loop
-    insert into pgpm.dropped_fk (parent_table, referencing_table, constraint_name, definition)
-    values (v_parent, (v_e->>'reltbl')::regclass, v_e->>'conname', v_e->>'def');
-    insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_e->>'conname');
-  end loop;
 
   -- Build the forward grid (#288). With no DEFAULT, a write past the monolith has nowhere to go until
   -- these exist, so they are created here rather than waiting for the first maintenance tick. obtain needs

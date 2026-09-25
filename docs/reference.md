@@ -111,7 +111,11 @@ Parameters:
 - `p_incoming_fks` -- `'error'` (the default: refuse if any incoming FK exists) or `'preserve'` (drop each
   for the conversion and re-add it against the new parent, which `maintain` does on a later tick, or
   `restore_incoming_fks` does now). `'drop'` is also accepted, but it is **not** a third behavior: it takes
-  the same path as `'preserve'`, so the keys are recorded and restored just the same.
+  the same path as `'preserve'`, so the keys are recorded and restored just the same. The drop happens in
+  the cutover, the last of the conversion's three transactions, in the same transaction that records the
+  key, so a conversion that fails or is abandoned before then leaves every incoming FK exactly where it
+  was, and one that fails in the cutover rolls the drop back with it. Referential integrity on the
+  referencing table is off only between a completed cutover and the restore.
 - `p_force_uuidv7` -- skip the uuidv7 plausibility refusal (see below).
 - `p_tt_prefix`, `p_tt_width`, `p_tt_radix`, `p_tt_unit` -- **text_time only**, and all four are required
   together when the control column is `text`/`varchar`. They describe the column's shape: a constant
@@ -210,7 +214,9 @@ pgpm.transmute_abort(p_parent regclass) returns boolean
 
 Abandons a conversion that died between transactions, dropping the `pgpm_monolith_bound` `CHECK` it left
 on the table and clearing its `pgpm.transmute_inflight` row. Returns `false` if there is no in-flight
-conversion to abandon, and raises if one is still running in another session.
+conversion to abandon, and raises if one is still running in another session. That is all there is to
+undo: incoming foreign keys are dropped only by the cutover, so a conversion that never got there left
+them in place, and there is nothing for this to re-add.
 
 It **abandons; it does not resume**. Finishing a half-done conversion of a live table unattended is a
 larger action than pgpm will take on your behalf. To try again, call `transmute` again: it finds the

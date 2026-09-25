@@ -247,7 +247,8 @@ long-running query against your table stalls all of it for as long as that query
 window, lower it under heavy traffic. A timeout is safe to retry: re-running `transmute` resumes.
 
 **If a conversion dies partway, the bound outlives it** and the table goes on refusing those writes.
-`pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was. You rarely
+`pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was; its incoming
+foreign keys were never touched, because those are dropped only by the cutover itself. You rarely
 need to: every `maintain_all` tick sweeps for abandoned conversions and undoes them, deciding "abandoned"
 from whether the session that claimed the conversion is still connected rather than from a timeout, so a
 long scan is never mistaken for a dead one. Re-running `transmute` resumes from the recorded bound rather
@@ -636,9 +637,11 @@ parent -- so its multi-tick copy needs no such handling; only its atomic swap to
 `transmute` offers two modes for incoming FKs:
 
 - **`p_incoming_fks => 'error'` (default):** detect incoming FKs and refuse, mutating nothing.
-- **`p_incoming_fks => 'preserve'`:** record and drop each incoming FK for the conversion (the referencing
-  table is otherwise untouched), then re-add it against the new parent on a later maintenance tick.
-  (`'drop'` is accepted too, but takes the same path: the keys are recorded and restored just the same.)
+- **`p_incoming_fks => 'preserve'`:** the cutover drops each incoming FK and records it in the same
+  transaction (the referencing table is otherwise untouched); it is re-added against the new parent on a
+  later maintenance tick. A conversion that fails before the cutover, or in it, leaves the key where it
+  was. (`'drop'` is accepted too, but takes the same path: the keys are recorded and restored just the
+  same.)
 
 With `'preserve'`, `pgpm.restore_incoming_fks(parent)` re-adds each FK against the new parent; `maintain`
 calls it automatically, so on the scheduled path you do nothing. It is a no-op while an in-flight,
@@ -654,8 +657,10 @@ select pgpm.restore_incoming_fks('public.events');   -- maintenance does this fo
 Two honest points about the window the FK is dropped:
 
 - **RI is off on the referencing table while the FK is down.** Writes to the referencing table go
-  unchecked during that window, and `status().fks_suspended` surfaces it. `'preserve'` is opt-in; if the
-  referencing table takes heavy writes, keep the window short (restore promptly) or `pause`.
+  unchecked during that window, and `status().fks_suspended` surfaces it. The window opens at the
+  cutover, not when `transmute` is called: the validation scan runs with the key still in place.
+  `'preserve'` is opt-in; if the referencing table takes heavy writes, keep the window short (restore
+  promptly) or `pause`.
 - **An orphan written during that window will not brick the restore.** The re-add is split: `ADD
   CONSTRAINT ... NOT VALID` (which already enforces every *new* write) is committed separately from
   `VALIDATE`. If a pre-existing orphan blocks `VALIDATE`, the FK is left `NOT VALID` (still enforcing new
