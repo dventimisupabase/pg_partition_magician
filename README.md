@@ -169,6 +169,7 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
   troubleshooting.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
+- **[Adversarial review](docs/adversarial-review.md)**: how pgpm is hunted for defects, and when to stop.
 - **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
 - **[Releasing](RELEASING.md)**: what a version number covers, and how a release is cut.
 - **[Security policy](SECURITY.md)**: how to report a vulnerability, and what is in scope.
