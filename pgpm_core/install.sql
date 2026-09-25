@@ -1808,6 +1808,15 @@ begin
   end if;
 
   begin
+    -- THE REGRAIN THIS DROP WOULD ORPHAN GOES WITH IT (issue #519). If this partition is the source of
+    -- an in-flight regrain, its fine copies, its captured changes and config.regrain_cursor would
+    -- outlive it with nothing left to reclaim them: auto-regrain answers 'none' once no coarse child
+    -- remains, and the janitor only tears down capture the cursor does not cover. _regrain_reclaim
+    -- takes exactly that regrain's state and no other's (see there for why reclaiming beats refusing,
+    -- and why it is not regrain_cancel). In the drop's own subtransaction, ahead of the DROP, so a lock
+    -- lost on a copy leaves the source whole and this retirement retried next tick, and so the cancel
+    -- is recorded before the drop it makes room for.
+    perform pgpm._regrain_reclaim(p_parent, p_child, r.lo, r.hi);
     execute format('drop table %I.%I', v_nsp, p_child);
     delete from pgpm.part where parent_table = p_parent and child_name = p_child;
     insert into pgpm.log (parent_table, action, lo, hi) values (p_parent, 'retain_drop', r.lo, r.hi);
@@ -3165,6 +3174,107 @@ begin
 
   update pgpm.config set regrain_cursor = null where parent_table = p_parent;
   insert into pgpm.log (parent_table, action, rows) values (p_parent, 'regrain_cancel', v_dropped);
+  return v_dropped;
+end;
+$$;
+
+-- retire()'s counterpart to regrain_cancel (issue #519): reclaim the state of a regrain whose SOURCE
+-- retention is about to drop, and nothing else.
+--
+-- With auto-regrain, an archive_fn and retention all on, two pipelines work a wholly-aged coarse child
+-- at once: _archive_step covers it so that retire() can drop it whole, and regrain_step copies it so
+-- that the swap can replace it with fine children. Whichever finishes first wins, and when archiving
+-- won, retire dropped the source and left everything the regrain had built behind: not-attached
+-- pgpm.part rows no partition covers, real tables still holding the rows retention had just dropped,
+-- config.regrain_cursor pointing into a range that no longer existed, and no later tick able to
+-- reclaim any of it -- auto-regrain answers 'none' with no coarse child left, the janitor only tears
+-- down capture the cursor does not cover, and regrain_cancel is an operator verb nobody is told to
+-- run. The rows were archived from the source, so nothing was lost, but the documented pipeline (a
+-- materialized sub-range is blocked, archived and dropped after the swap) was not kept, and the
+-- leftovers held disk and misreported status().inflight_partitions for good.
+--
+-- Reclaim rather than refuse, because a refusal is a wedge with no exit: set_regrain(parent, null)
+-- leaves the cursor and the capture in place (the documented way to abandon an auto-regrain), and the
+-- janitor keeps a trigger the cursor covers, so a retire that waited for the regrain would wait
+-- forever on a table whose operator was told abandoning was safe. And there is nothing to wait FOR: a
+-- coarse child whose whole range is past the horizon drops in one step (retain's contract), and every
+-- fine child this regrain could produce would be retire-eligible the moment it attached, archived a
+-- second time and dropped. The copies hold nothing the archive does not.
+--
+-- SCOPED TO THE SOURCE, not the parent, which is why this is not a call to regrain_cancel: that verb
+-- tears capture off every child and drops every not-attached row of the parent, which is right for an
+-- operator abandoning "the regrain" and wrong here, where the regrain in flight may be on a different
+-- child than the one retiring. Three effects, each gated by its own evidence:
+--   copies  -- every not-attached pgpm.part row whose range lies inside [p_lo, p_hi) was copied out of
+--              this child and can never be attached once it is gone (the swap needs its source),
+--              whichever regrain made it.
+--   delta   -- only when THIS child carries the capture trigger. The delta is per parent and its writer
+--              is that trigger; pgpm runs one regrain per parent, so the trigger's presence here means
+--              every captured key is a change to this source, whose archive already reflects it and
+--              whose copies are going. Never otherwise: a delta belonging to a regrain of another child
+--              is that regrain's to reconcile, and discarding it is the #267 loss.
+--   cursor  -- when this child carries the capture, or when the cursor lies STRICTLY inside
+--              (p_lo, p_hi). A cursor exactly at a bound is ambiguous: a regrain just prepared on the
+--              neighbour above sits at this child's hi, one awaiting its swap on the neighbour below
+--              sits at this child's lo (the janitor's inclusive-hi rule has the same seam), so at a
+--              bound only the capture says whose it is.
+-- The capture and TRUNCATE-guard triggers on the child would go with the child; they are dropped here
+-- explicitly so the function is complete on its own, and so a source that is detached but not yet
+-- dropped is covered too. The delta is cleared with DELETE, not TRUNCATE: this runs inside a retention
+-- tick under lock_timeout, and there is no writer left to fence.
+--
+-- Logged as regrain_cancel with `method` naming retire, because that is what it is: the same statement
+-- the operator verb makes, made by retention. `rows` is the number of copies discarded, so a reader of
+-- pgpm.log can tell a cancel that reclaimed real work from one that cleared a stale cursor.
+create or replace function pgpm._regrain_reclaim(p_parent regclass, p_child name, p_lo text, p_hi text)
+returns int language plpgsql as $$
+declare
+  cfg pgpm.config; v_nsp name; v_ncast text; v_delta name; v_capture boolean; v_cursor_in boolean;
+  v_dropped int := 0; v_purged bigint := 0; r record;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  if not found then return 0; end if;
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  v_ncast := pgpm._native_type(cfg.control_kind);
+
+  v_capture := pgpm._regrain_capture_active(p_parent, p_child);
+  v_cursor_in := cfg.regrain_cursor is not null
+             and (v_capture
+                  or (pgpm._native_gt(cfg.control_kind, cfg.regrain_cursor, p_lo)         -- lo < cursor
+                      and pgpm._native_gt(cfg.control_kind, p_hi, cfg.regrain_cursor)));  -- cursor < hi
+
+  for r in execute format(
+    'select child_name from pgpm.part where parent_table = %L::regclass and not attached'
+    || ' and lo::%s >= %L::%s and hi::%s <= %L::%s order by lo::%s',
+    p_parent::text, v_ncast, p_lo, v_ncast, v_ncast, p_hi, v_ncast, v_ncast)
+  loop
+    execute format('drop table if exists %I.%I', v_nsp, r.child_name);
+    delete from pgpm.part where parent_table = p_parent and child_name = r.child_name;
+    v_dropped := v_dropped + 1;
+  end loop;
+
+  if v_capture then
+    execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, p_child);
+    execute format('drop trigger if exists pgpm_regrain_truncate_guard on %I.%I', v_nsp, p_child);
+    select delta into v_delta from pgpm._regrain_capture_names(p_parent);
+    if to_regclass(format('%I.%I', v_nsp, v_delta)) is not null then
+      execute format('delete from %I.%I', v_nsp, v_delta);
+      get diagnostics v_purged = row_count;
+    end if;
+  end if;
+
+  if v_cursor_in then
+    update pgpm.config set regrain_cursor = null where parent_table = p_parent;
+  end if;
+
+  if v_capture or v_cursor_in or v_dropped > 0 then
+    insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+      values (p_parent, 'regrain_cancel', p_lo, p_hi, v_dropped,
+              format('retire dropped %I.%I, the source of this regrain, whole: its range is past the retention horizon and archiving covers it, so the regrain had nothing left to win for retention; %s fine cop%s discarded, %s captured change%s discarded, regrain_cursor %s',
+                     v_nsp, p_child, v_dropped, case when v_dropped = 1 then 'y' else 'ies' end,
+                     v_purged, case when v_purged = 1 then '' else 's' end,
+                     case when v_cursor_in then 'cleared' else 'left alone (it is not this child''s)' end));
+  end if;
   return v_dropped;
 end;
 $$;

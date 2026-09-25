@@ -707,7 +707,8 @@ the count dropped. A coarse partition that merely *straddles* the horizon is **n
 still holds within-horizon data, so its aged span is not reclaimed for as long as it straddles.
 
 A coarse child is **not exempt from retention, only all-or-nothing about it**: once its whole range is
-past the horizon it drops like any other partition, in one step. What `regrain` changes is the
+past the horizon it drops like any other partition, in one step, even while a `regrain` is splitting it
+(see [`retire`](#retire) for what becomes of that regrain). What `regrain` changes is the
 *granularity* of that reclamation, not whether it happens -- split into fine children, each drops on its
 own schedule, so storage falls gradually rather than in one cliff (and `regrain` reclaims below-horizon
 sub-ranges directly rather than materializing partitions only to drop them). `null` retention drops
@@ -753,6 +754,20 @@ concurrent transaction (each partition has exactly one owner at a time), or the 
 write-blocked but not yet `pgpm._archive_fully_covered` -- chunked archiving simply hasn't caught up yet.
 Only a genuinely unexpected failure in the `DROP` itself is logged (`fail_retain_drop`) and returns
 `false`.
+
+If the partition it drops is the coarse **source of an in-flight regrain**, `retire` takes that regrain's
+state with it, in the same transaction as the `DROP`: the not-yet-attached fine copies inside the
+partition's range (their tables and their `pgpm.part` rows), the captured changes in the delta when the
+partition carries the capture trigger, and `config.regrain_cursor`. It logs one `regrain_cancel` row for
+the partition's range ahead of the `retain_drop`, with `rows` counting the copies discarded and `method`
+saying that `retire` did it. This is the one-step drop the [`retain`](#retain) contract promises a
+wholly-aged coarse child, applied while a regrain happens to be splitting it: every fine child that
+regrain could still produce would be retire-eligible the moment it attached, so the regrain has nothing
+left to win, and the copies hold nothing the archive does not (the drop is gated on full coverage as
+always). A regrain in flight on a **different** child of the same parent is untouched, and a `retire`
+that returns `false` reclaims nothing. Without this the copies, the cursor and the delta outlived their
+source with no tick able to reclaim them: auto-regrain reports `none` once no coarse child remains, and
+the capture sweep only tears down what the cursor does not cover.
 
 #### Retiring a partition an incoming FK references
 
@@ -890,7 +905,10 @@ with its `pgpm.part` row, logged as `archive_coverage_reset` with the source's n
 `(parent_table, lo)`, so left in place they would collide with the first fine child's own first chunk,
 and they describe a relation that no longer exists. The fine children hold every row and archive from
 their own `lo` under their own blocks; the objects the source's chunks already wrote stay in the archive,
-unreferenced by the ledger. The
+unreferenced by the ledger. A source whose **whole** range is below the horizon is being
+archived and retired in parallel with its regrain, and the two race: if archiving covers it before the
+swap, `retire` drops it whole and cancels the regrain, reclaiming its copies (see [`retire`](#retire));
+if the swap lands first, the fine children are archived and retired one by one. The
 source stays whole and **attached** until that swap, so a read of the parent is never short.
 
 The skip is decided once, as the cursor passes the sub-range, and the swap **re-checks it** against the
@@ -985,6 +1003,10 @@ longer covers, logging `regrain_capture_orphan`, but that is a backstop for a cu
 route, not a way to abandon a run: it drops no copies and clears no delta. To stop a run deliberately and get
 the disk back, or to clear one left half-done with auto-regrain already off (`config.regrain_cursor` set,
 `regrain_to` null), call this.
+
+`retire` makes the same cancellation, scoped to the one source it is dropping, when retention drops the
+coarse child a regrain is splitting (see [`retire`](#retire)). That is logged `regrain_cancel` too, with
+`method` naming `retire`.
 
 ### `regrain_history`
 
@@ -1929,7 +1951,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `retain_drop` | a partition dropped by retention (via `retain()` or `retire()`) |
 | `retain_detach` / `retain_crossing` / `detach_reap` | a concurrent detach dispatched for a referenced partition / rows deleted to honour a crossing FK's declared `ON DELETE` / an abandoned concurrent detach finalized |
 | `regrain_copy` / `regrain_aged` / `regrain_attach` / `regrain` | a regrain microbatch copied rows into a fine child / skipped a below-horizon sub-range that has no fine child yet (only when `archive_fn` is unset; discarded with the source, never copied, once the swap has re-checked that it is still below the horizon) / attached a fine child (`method` = `check_skip`) / completed (`method` = `copy_swap_drop`) |
-| `regrain_prepare` / `regrain_capture_orphan` / `regrain_reconcile` / `regrain_reconcile_aged` / `regrain_rename` / `regrain_restart` / `regrain_cancel` | the cross-tick regrain's own steps: change capture installed / a leftover capture table cleared / the source-is-authority reconcile before the swap (and its below-horizon counterpart) / the source renamed onto the target grid / a stale run restarted / a run cancelled by `regrain_cancel()` |
+| `regrain_prepare` / `regrain_capture_orphan` / `regrain_reconcile` / `regrain_reconcile_aged` / `regrain_rename` / `regrain_restart` / `regrain_cancel` | the cross-tick regrain's own steps: change capture installed / a leftover capture table cleared / the source-is-authority reconcile before the swap (and its below-horizon counterpart) / the source renamed onto the target grid / a stale run restarted / a run cancelled by `regrain_cancel()`, or by `retire` dropping the run's source whole (`method` names `retire`, `rows` counts the copies discarded) |
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `from_hypertable_carry_fk` | (`pgpm_hypertable` only) an outgoing FK re-added onto the migrated destination during `from_hypertable_copy` |
 | `forget_missing` | `forget_missing()` cleared a parent's registration because its relation no longer exists; `rows` carries how many partition rows were cleared with it |

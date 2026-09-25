@@ -619,6 +619,7 @@ run_perf() {
     "bench/month_step_dst_gap.sh pgpm_perf22"
     "bench/transmute_resume_zone.sh pgpm_perf23"
     "bench/archive_chunk_ties.sh pgpm_perf38"
+    "bench/retire_regrain_source.sh pgpm_perf39"
   )
   local selected=()
   local n=${#guards[@]} idx
