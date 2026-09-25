@@ -383,8 +383,8 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Thrift compact protocol: field headers, typed field writers, lists, structs
 -- ---------------------------------------------------------------------------
--- Compact types used here: BOOLEAN_TRUE/FALSE unused (no bool fields in the
--- subset of the spec this writer touches); I32=5 I64=6 BINARY=8 LIST=9 STRUCT=12.
+-- Compact types used here: BOOLEAN_TRUE=1 BOOLEAN_FALSE=2 (a bool's value rides in the type nibble
+-- of its field header; there is no value byte) I32=5 I64=6 BINARY=8 LIST=9 STRUCT=12.
 
 create or replace function archive._pq_field_hdr(p_last_id int4, p_field_id int4, p_ctype int4) returns bytea
 language plpgsql immutable as $$
@@ -412,6 +412,11 @@ $$;
 create or replace function archive._pq_write_i64(p_last_id int4, p_field_id int4, p_val int8) returns bytea
 language sql immutable as $$
   select archive._pq_field_hdr(p_last_id, p_field_id, 6) || archive._pq_varint(archive._pq_zigzag(p_val));
+$$;
+
+create or replace function archive._pq_write_bool(p_last_id int4, p_field_id int4, p_val boolean) returns bytea
+language sql immutable as $$
+  select archive._pq_field_hdr(p_last_id, p_field_id, case when p_val then 1 else 2 end);
 $$;
 
 create or replace function archive._pq_write_binary(p_last_id int4, p_field_id int4, p_val bytea) returns bytea
@@ -1522,15 +1527,39 @@ language sql immutable as $$
       || archive._pq_stop();
 $$;
 
+-- The Thrift `union LogicalType` (parquet.thrift) selecting TIMESTAMP with the given adjustment flag
+-- and a MICROS unit, as a struct payload for _pq_build_schema_leaf's p_logical_type. The writer emits
+-- it for `timestamp` (without time zone) columns only, with p_adjusted_to_utc => false: the legacy
+-- ConvertedType TIMESTAMP_MICROS that every timestamp column also carries has no way to say "this is
+-- a wall clock, not an instant" (readers take it as isAdjustedToUTC=true), and a wall clock is what a
+-- `timestamp` is (issue #465). It goes BESIDE the ConvertedType rather than replacing it, which is
+-- what pyarrow does for a naive timestamp (ARROW-5878): a reader that knows logical types prefers
+-- this one and hands back a naive timestamp, and one that predates them still sees a timestamp,
+-- labelled UTC, rather than a bare INT64. A timestamptz leaf keeps its ConvertedType alone; readers
+-- already take that as an instant, which it is.
+create or replace function archive._pq_logical_timestamp_micros(p_adjusted_to_utc boolean) returns bytea
+language sql immutable as $$
+  select archive._pq_write_struct(0, 8,                                          -- LogicalType.TIMESTAMP
+             archive._pq_write_bool(0, 1, p_adjusted_to_utc)                     --   isAdjustedToUTC
+          || archive._pq_write_struct(1, 2,                                      --   unit: TimeUnit
+                 archive._pq_write_struct(0, 2, archive._pq_stop())              --     TimeUnit.MICROS {}
+              || archive._pq_stop())
+          || archive._pq_stop())
+      || archive._pq_stop();
+$$;
+
 -- p_converted: parquet ConvertedType code, or -1 for "none"
 -- p_type_length (FIXED_LEN_BYTE_ARRAY's declared byte width -- uuid's fixed 16, or a decimal
--- column's own computed width) and p_scale/p_precision (DECIMAL's schema-level annotation) are all
--- optional trailing params, each omitted from the Thrift struct when null -- byte-for-byte
--- unchanged for the six original types, which pass none of them. Field-id deltas are tracked via
--- v_last rather than hardcoded literals, since which fields actually get written now varies.
+-- column's own computed width), p_scale/p_precision (DECIMAL's schema-level annotation) and
+-- p_logical_type (an already-encoded `union LogicalType` payload, today only
+-- _pq_logical_timestamp_micros(false) for a `timestamp` column) are all optional trailing params,
+-- each omitted from the Thrift struct when null -- byte-for-byte unchanged for the six original
+-- types, which pass none of them. Field-id deltas are tracked via v_last rather than hardcoded
+-- literals, since which fields actually get written now varies.
 create or replace function archive._pq_build_schema_leaf(
   p_name text, p_ptype int4, p_converted int4, p_nullable boolean,
-  p_type_length int4 default null, p_scale int4 default null, p_precision int4 default null
+  p_type_length int4 default null, p_scale int4 default null, p_precision int4 default null,
+  p_logical_type bytea default null
 ) returns bytea
 language plpgsql immutable as $$
 declare
@@ -1551,6 +1580,9 @@ begin
   end if;
   if p_precision is not null then
     buf := buf || archive._pq_write_i32(v_last, 8, p_precision); v_last := 8;               -- precision
+  end if;
+  if p_logical_type is not null then
+    buf := buf || archive._pq_write_struct(v_last, 10, p_logical_type); v_last := 10;       -- logicalType
   end if;
   buf := buf || archive._pq_stop();
   return buf;
@@ -1784,10 +1816,23 @@ begin
       p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype in ('timestamptz','timestamp') then
+    -- Both land as INT64 microseconds since the Unix epoch, but they get there differently. A
+    -- timestamptz is an instant: extract(epoch) of it is the same number in every session. A
+    -- `timestamp` is a wall clock with no instant of its own, and `%I::timestamptz` would read that
+    -- wall clock in the SESSION zone, so the same table archived by the pg_cron worker (cluster
+    -- default zone) and by `call pgpm.maintain()` from a differently-zoned psql produced different
+    -- bytes, while NDJSON's row_to_json kept the wall clock either way (issue #465). `at time zone
+    -- 'UTC'` reads the wall clock as if it were UTC, Parquet's representation of a naive timestamp,
+    -- and the leaf says so (LogicalType TIMESTAMP isAdjustedToUTC=false, _pq_logical_timestamp_micros).
     execute format(
-      'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
-              coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from %I::timestamptz) * 1000000)::int8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
-         from %s',
+      case when p_pgtype = 'timestamp'
+        then 'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
+                     coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from (%I at time zone ''UTC'')) * 1000000)::int8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
+                from %s'
+        else 'select coalesce(array_agg(%I is not null order by %s), ''{}''::boolean[]),
+                     coalesce(string_agg(archive._pq_plain_int64(round(extract(epoch from %I::timestamptz) * 1000000)::int8), ''''::bytea order by %s) filter (where %I is not null), ''''::bytea)
+                from %s'
+      end,
       p_col, v_order_q, p_col, v_order_q, p_col, v_from_q)
       into is_present, values_payload;
   elsif p_pgtype = 'uuid' then
@@ -1933,7 +1978,9 @@ begin
           case when p_compress then 2 else 0 end,
           case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
     v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i],
-      v_col_typelen[i], v_col_scale[i], v_col_precision[i]);
+      v_col_typelen[i], v_col_scale[i], v_col_precision[i],
+      -- a `timestamp` is a wall clock, not an instant: say so, or readers take TIMESTAMP_MICROS as UTC-adjusted (#465)
+      p_logical_type => case when v_col_pgtypes[i] = 'timestamp' then archive._pq_logical_timestamp_micros(false) end);
   end loop;
 
   v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
@@ -2080,7 +2127,9 @@ begin
           case when p_compress then 2 else 0 end,
           case when p_compress then length(v_page_header) + length(v_page_bytes) else null end));
     v_schema_elements := v_schema_elements || archive._pq_build_schema_leaf(v_col_names[i], v_col_ptypes[i], v_col_converted[i], v_col_nullable[i],
-      v_col_typelen[i], v_col_scale[i], v_col_precision[i]);
+      v_col_typelen[i], v_col_scale[i], v_col_precision[i],
+      -- a `timestamp` is a wall clock, not an instant: say so, or readers take TIMESTAMP_MICROS as UTC-adjusted (#465)
+      p_logical_type => case when v_col_pgtypes[i] = 'timestamp' then archive._pq_logical_timestamp_micros(false) end);
   end loop;
 
   v_row_group := archive._pq_build_row_group(v_column_chunks, length(v_body) - length(v_magic), v_num_rows);
@@ -2539,3 +2588,7 @@ drop function if exists archive._pq_encode_column_data(text, text, text, boolean
 -- be worse than a stale overload: it is the one that still splices a caller's text verbatim, and it
 -- would stay resolvable by anything calling positionally.
 drop function if exists archive._pq_encode_column_data(text, text, text, boolean, text, int4, int4);
+-- archive._pq_build_schema_leaf again: #465 gave it an eighth trailing optional param
+-- (p_logical_type), so its 7-arg version goes the same way. With both installed, a call passing only
+-- the four required arguments matches both and is refused as "not unique".
+drop function if exists archive._pq_build_schema_leaf(text, int4, int4, boolean, int4, int4, int4);

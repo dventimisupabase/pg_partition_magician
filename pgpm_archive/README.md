@@ -91,6 +91,14 @@ the budget past a few MiB with compression on.
   strings because this flat writer does not emit Parquet's nested `LIST` structure. Array dimensions
   and non-default lower bounds are not preserved. Composite types are refused outright. One row group,
   no dictionary encoding, no statistics.
+- **Timestamps**: `timestamptz` is an instant, written as microseconds since the Unix epoch and
+  annotated `TIMESTAMP_MICROS` (UTC-adjusted), so a reader shows it in its own zone. `timestamp`
+  (without time zone) is a wall clock with no instant of its own: it is written as that wall clock
+  read as if it were UTC and annotated `TIMESTAMP(isAdjustedToUTC=false)` beside the legacy
+  `TIMESTAMP_MICROS`, the pair pyarrow itself writes for a naive timestamp, so DuckDB and pyarrow
+  give back the same wall clock the NDJSON path emits, whatever `TimeZone` the archiving session ran
+  under. A reader that predates Parquet's logical types sees only `TIMESTAMP_MICROS` and shows that
+  wall clock labelled UTC.
 - **Payload size**: `archive.to_s3` (NDJSON) streams through S3 multipart in bounded memory once a
   partition exceeds one ~8MiB part, so it handles any size. `archive.to_s3_parquet` has no
   multipart path and would not benefit from one -- a Parquet file's footer needs every row group's
