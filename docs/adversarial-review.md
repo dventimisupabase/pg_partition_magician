@@ -142,7 +142,8 @@ Recorded per pass, in this order, so the count of findings is never read alone.
 | seeds `K`, recall | seeds planted; fraction reported by at least one finder |
 | claims | total claims across finders |
 | findings | claims that survived verification |
-| precision | findings / claims |
+| per finder | claims and precision for each finder, with the model it ran on when the pass split model tiers |
+| precision | (findings + seed hits) / claims that had a reproduction; a correctly reported seed is a true report, and a hypothesis is not a claim |
 | findings by tier | Tier 1 through Tier 5 |
 | root causes | distinct root causes behind the findings, and how many the fix phase closed as a class rather than an instance |
 | known and open | re-found findings from earlier passes still unfixed |
