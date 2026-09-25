@@ -1221,7 +1221,7 @@ pgpm.status() returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text, fks_suspended bigint, fks_unvalidated bigint,
   history_unregrained boolean, retain_drop_failures bigint, retain_backlog bigint,
-  retain_detaching bigint, parent_missing boolean
+  retain_detaching bigint, parent_missing boolean, regrain_to text
 )
 ```
 
@@ -1260,6 +1260,76 @@ One row per managed table. Beyond the static config it surfaces:
   dropped. Non-zero is normal while `retain_batch` paces a backlog across ticks, or while a write-blocked
   child's chunked archiving is still catching up -- either way it should fall tick over tick. A flat
   `retain_backlog` with climbing `retain_drop_failures` is retention genuinely wedged.
+- `regrain_to` -- the auto-regrain target step (`config.regrain_to`), null when auto-regrain is off.
+  Whether the history is being split at all is the first thing to check when `coarse_partitions` looks
+  stalled, and it is here so that check needs no second query.
+
+### `progress`
+
+```sql
+pgpm.progress(p_parent regclass default null) returns table (
+  parent regclass, control_kind text, parent_missing boolean,
+  frontier text, write_child name, write_ceiling text, freeze_margin text, freeze_in interval,
+  coarse_frozen bigint,
+  regrain_to text, regrain_child name, regrain_cursor text, regrain_pct_range numeric,
+  regrain_rows_copied bigint, regrain_rows_total_est bigint, regrain_delta_pending bigint,
+  regrain_started_at timestamptz, regrain_elapsed interval, regrain_eta interval
+)
+```
+
+The drill-down `status` is not: one table's position in the transmute, freeze, regrain sequence. One row
+per managed table, or just `p_parent`'s (an unmanaged table is refused by name rather than answered with
+no rows). It answers two questions that otherwise need `pgpm.part`, `pgpm.config`, `pgpm.log` and the
+grid arithmetic by hand.
+
+**When will the monolith freeze?** A coarse child can only be regrained once the frontier has moved past
+its upper bound, and that bound is what the anchor, the step and any `p_bound_headroom` actually
+produced, not what you meant them to.
+
+- `frontier` -- the write frontier in native terms: `now()` for `time`, `max(control)` for `id`,
+  `greatest(max(control), now())` for `uuidv7` and `text_time`.
+- `write_child` / `write_ceiling` -- the attached partition the frontier sits in, and its upper bound.
+  While `write_child` is the monolith, it has not frozen. Null if the grid has fallen behind the frontier.
+- `freeze_margin` -- `write_ceiling - frontier`: an interval for the time-grid kinds, a count for `id`.
+- `freeze_in` -- the same margin as an `interval`, **only for `time`, `uuidv7` and `text_time`**, whose
+  frontier is a clock and so makes this plain arithmetic. For `id` it is **null**: the frontier is
+  `max(control)`, pgpm keeps no history of it, and a rate to divide by would be a guess. Read
+  `freeze_margin` instead.
+- `coarse_frozen` -- coarse partitions whose whole range is already behind the frontier: frozen, and
+  eligible for regrain. `coarse_frozen > 0` beside a null `regrain_to` is a history that is not going to
+  split by itself.
+
+**How far along is the regrain, and when does it finish?** Populated while a regrain is in flight
+(`config.regrain_cursor` set, and one child carrying change capture); null otherwise.
+
+- `regrain_child` / `regrain_cursor` -- the coarse child being split, and the native lower bound of the
+  sub-range currently being copied. The cursor only ever advances, one sub-range at a time.
+- `regrain_pct_range` -- `(cursor - lo) / (hi - lo)`: the exact fraction of the child's **range** behind
+  the cursor. This is not a row fraction. The cursor moves only when a whole sub-range completes, so it
+  sits still while rows pile up in a large one, and a below-horizon sub-range is advanced over without
+  being copied, so it can jump ahead of the rows. Read it alongside `regrain_rows_copied`.
+- `regrain_rows_copied` -- rows copied by this run, exact, summed from its `regrain_copy` log rows.
+- `regrain_rows_total_est` -- `reltuples` of the source child. An estimate, counting every row in the
+  source including those in aged sub-ranges that will never be copied; null until the child has been
+  analyzed. There is deliberately no fused "N of M rows" figure, because one cannot be produced honestly
+  without a full scan.
+- `regrain_delta_pending` -- captured changes not yet reconciled. A regrain that returns `reconciling:N`
+  tick after tick is waiting on this to fall below `regrain_batch`. Populated whether or not a regrain is
+  in flight (0 when idle).
+- `regrain_started_at` / `regrain_elapsed` -- when this run's `regrain_prepare` was logged, and how long
+  ago that was.
+- `regrain_eta` -- `elapsed * (1 - pct_range) / pct_range`: extrapolated from the range fraction observed
+  so far, so it inherits that fraction's caveats. **Null until `regrain_pct_range > 0`**, which is the
+  whole of the first sub-range: there is nothing to extrapolate from yet, and pgpm does not invent a
+  figure.
+
+```sql
+select write_child, freeze_in, coarse_frozen, regrain_to from pgpm.progress('public.events');
+select regrain_pct_range, regrain_rows_copied, regrain_eta from pgpm.progress('public.events');
+```
+
+A parent dropped without [`untransmute`](#untransmute) is reported with `parent_missing = true` and every
+frontier-derived column null, the same way `status` does, rather than taking the whole row set down.
 
 ### `check_uuidv7`
 
@@ -1423,7 +1493,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `obtain_retry_after` | `timestamptz` | back-off marker after an obtain lock-race deferral |
 | `regrain_max_blocks` | `int` | optional block budget per microbatch (caps wide rows; null = row cap only) |
 | `regrain_to` | `text` | auto-regrain target step (null = off; see `set_regrain`) |
-| `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining) |
+| `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining); [`progress`](#progress) reads it as a fraction of the range |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 | `archive_batch` | `int` | max partitions one `_archive_step` call touches, oldest first (default 1; null = unbounded -- see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |

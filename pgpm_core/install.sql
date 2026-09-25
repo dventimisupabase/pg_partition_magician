@@ -573,6 +573,27 @@ begin
 end;
 $$;
 
+-- where x sits between lo and hi on the native grid, as a fraction: (x - lo) / (hi - lo). The one place
+-- pgpm subtracts native values rather than comparing them; progress() uses it to turn config.regrain_cursor
+-- into an exact fraction of the coarse child's RANGE (issue #343). null for an empty range (hi <= lo), so
+-- a caller never divides by zero. Deliberately not clamped: the cursor is within [lo, hi] by construction,
+-- and a value outside it would be a bug worth seeing rather than one worth hiding.
+create or replace function pgpm._native_frac(p_kind text, p_lo text, p_hi text, p_x text)
+returns numeric language plpgsql immutable as $$
+declare v_span numeric; v_off numeric;
+begin
+  if p_kind = 'id' then
+    v_span := p_hi::numeric - p_lo::numeric;
+    v_off  := p_x::numeric  - p_lo::numeric;
+  else
+    v_span := extract(epoch from (p_hi::timestamptz - p_lo::timestamptz));
+    v_off  := extract(epoch from (p_x::timestamptz  - p_lo::timestamptz));
+  end if;
+  if v_span <= 0 then return null; end if;
+  return v_off / v_span;
+end;
+$$;
+
 -- floor a native value to the partition-grid lower bound
 create or replace function pgpm._grid_floor(p_kind text, p_step text, p_anchor text, p_native text)
 returns text language plpgsql immutable as $$
@@ -4731,9 +4752,13 @@ $$;
 -- config row is pointing at an oid with no pg_class entry. status() used to RAISE on such a row and
 -- therefore return nothing for any table; now it reports it, since naming the dead table is the most
 -- useful thing it can do. pgpm.forget_missing() clears the state.
+-- regrain_to (#343) is config.regrain_to, the auto-regrain target. Whether the history is being split at
+-- all is the first question when coarse_partitions looks stalled, and this was the one field that had to
+-- be read from pgpm.config separately to answer it -- easy to forget next to the more visible counters.
 --
 -- dropped/recreated (not CREATE OR REPLACE) because the redesign widens the return shape with
--- coarse_partitions + history_unregrained (REDESIGN.md section 14), and again for parent_missing (#296).
+-- coarse_partitions + history_unregrained (REDESIGN.md section 14), again for parent_missing (#296), and
+-- again for regrain_to (#343).
 drop function if exists pgpm.status();
 create or replace function pgpm.status()
 returns table (
@@ -4741,7 +4766,7 @@ returns table (
   paused boolean, n_partitions bigint, coarse_partitions bigint, inflight_partitions bigint,
   newest_bound text,
   fks_suspended bigint, fks_unvalidated bigint, history_unregrained boolean, retain_drop_failures bigint,
-  retain_backlog bigint, retain_detaching bigint, parent_missing boolean
+  retain_backlog bigint, retain_detaching bigint, parent_missing boolean, regrain_to text
 )
 language plpgsql as $$
 declare
@@ -4830,7 +4855,7 @@ begin
     newest_bound := v_new;
     fks_suspended := v_fks_susp; fks_unvalidated := v_fks_unval; retain_drop_failures := v_drop_fails;
     retain_backlog := v_retain_backlog; retain_detaching := v_detaching;
-    parent_missing := v_missing;
+    parent_missing := v_missing; regrain_to := r.regrain_to;
     return next;
   end loop;
 end;
@@ -4840,6 +4865,154 @@ $$;
 -- undercounted the interval being drained, and snapshot() UNIONed those children back in. regrain never
 -- opened that gap (it copies and swaps atomically) and there is no drain, so a read of the parent is
 -- never short and there is nothing to union.
+
+-- progress(): the drill-down status() is not (issue #343). status() is one row per table at a glance; this
+-- answers the two questions an operator watching ONE table through transmute -> freeze -> regrain actually
+-- asks, which until now meant triangulating pgpm.part, pgpm.config, pgpm.log and grid arithmetic by hand.
+--
+--   "When will the monolith freeze?" A coarse child can only be regrained once the frontier has left it,
+--   and its upper bound is the product of the anchor, the step and any p_bound_headroom -- derivable from
+--   this file, and derived wrong in production once (a two-hour anchor mixup, noticed only against
+--   pgpm.part). write_child is the attached child the frontier sits in, write_ceiling its hi, and
+--   freeze_margin the distance left. freeze_in is that margin as an interval, populated ONLY for the
+--   time-grid kinds: their frontier is a timestamptz (now(), or greatest(max(control), now())), so the
+--   arithmetic is exact. An `id` frontier is max(control), pgpm keeps no history of it, and a rate to
+--   divide by would be a guess dressed as a measurement -- so freeze_in is null for `id` and the count in
+--   freeze_margin is what there honestly is. coarse_frozen counts the coarse children already past the
+--   frontier and eligible, so "regrain_to is null and nothing will ever happen" reads as coarse_frozen > 0
+--   beside a null regrain_to.
+--
+--   "How far along is the regrain, and when does it finish?" pgpm already keeps the answer, in
+--   config.regrain_cursor: the native lo of the sub-range being copied, which only ever advances (see the
+--   design note above _regrain_capture_names). (cursor - lo) / (hi - lo) is therefore an exact, monotonic
+--   fraction of the RANGE, costing no scan and no new bookkeeping, and the regrain_prepare log row dates
+--   the start. regrain_eta is elapsed * (1 - pct) / pct: extrapolated from observed progress rather than
+--   computed from rows / batch / cadence, so it needs no per-tick timing on the hot path and never
+--   confuses a whole maintenance tick with the copy inside it.
+--
+-- Three numbers here would be lies if fused, so they are kept apart. regrain_pct_range is a fraction of
+-- the RANGE, not of the rows: rows are not uniform across a range, the cursor sits still until a whole
+-- sub-range completes (so it lags while rows pile up), and an aged sub-range is advanced over WITHOUT
+-- being copied (so it leads). regrain_rows_copied is exact, summed from this run's regrain_copy rows, and
+-- regrain_rows_total_est is reltuples, named for what it is. There is no "N of M rows" column, because
+-- one cannot be produced honestly without a full scan. And regrain_eta is null until pct_range > 0: at
+-- prepare, and through every tick of the first sub-range, there is nothing to extrapolate from, and a
+-- fabricated tick-one figure is exactly the kind of number this function exists to replace.
+--
+-- Survives a parent dropped without untransmute the way status() learned to (#296): the row is reported
+-- with parent_missing = true and every frontier-derived column null, rather than one dead table taking
+-- the diagnostic down for every healthy one.
+drop function if exists pgpm.progress(regclass);
+create or replace function pgpm.progress(p_parent regclass default null)
+returns table (
+  parent regclass, control_kind text, parent_missing boolean,
+  frontier text, write_child name, write_ceiling text, freeze_margin text, freeze_in interval,
+  coarse_frozen bigint,
+  regrain_to text, regrain_child name, regrain_cursor text, regrain_pct_range numeric,
+  regrain_rows_copied bigint, regrain_rows_total_est bigint, regrain_delta_pending bigint,
+  regrain_started_at timestamptz, regrain_elapsed interval, regrain_eta interval
+)
+language plpgsql as $$
+declare
+  r pgpm.config; v_nsp name; v_missing boolean; v_frontier text; v_floor text;
+  v_wc_name name; v_wc_hi text;
+  v_rc_name name; v_rc_lo text; v_rc_hi text; v_rc_oid oid; v_reltuples real;
+  v_prep_id bigint; v_prep_at timestamptz;
+begin
+  -- an explicit argument that names an unmanaged table is refused, not answered with zero rows: a typo'd
+  -- name silently returning nothing is the wrong shape for the tool you reach for at 2am
+  if p_parent is not null and not exists (select 1 from pgpm.config c where c.parent_table = p_parent) then
+    raise exception 'pg_partition_magician: % is not managed', p_parent;
+  end if;
+  for r in select * from pgpm.config c where p_parent is null or c.parent_table = p_parent loop
+    -- every output is assigned on every iteration: RETURN NEXT reads the variables as they stand, and a
+    -- value left over from the previous row would be reported as this one's
+    parent := r.parent_table; control_kind := r.control_kind;
+    frontier := null; write_child := null; write_ceiling := null; freeze_margin := null; freeze_in := null;
+    coarse_frozen := null;
+    regrain_to := r.regrain_to; regrain_child := null; regrain_cursor := r.regrain_cursor;
+    regrain_pct_range := null; regrain_rows_copied := null; regrain_rows_total_est := null;
+    regrain_delta_pending := null; regrain_started_at := null; regrain_elapsed := null; regrain_eta := null;
+
+    v_missing := not exists (select 1 from pg_class c where c.oid = r.parent_table);
+    parent_missing := v_missing;
+    if not v_missing then
+      select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       where c.oid = r.parent_table;
+      -- _frontier_native reads the relation for every kind but `time`, and raises for a dead one, which
+      -- is why the missing check gates everything from here down
+      v_frontier := pgpm._frontier_native(r.parent_table);
+      frontier   := v_frontier;
+
+      -- the child taking writes: the attached one with lo <= frontier < hi. At most one, by the
+      -- non-overlap invariant over attached rows; none if the grid has fallen behind the frontier.
+      select p.child_name, p.hi into v_wc_name, v_wc_hi from pgpm.part p
+       where p.parent_table = r.parent_table and p.attached
+         and not pgpm._native_gt(r.control_kind, p.lo, v_frontier)
+         and pgpm._native_gt(r.control_kind, p.hi, v_frontier)
+       limit 1;
+      write_child := v_wc_name; write_ceiling := v_wc_hi;
+      if v_wc_hi is not null then
+        if r.control_kind = 'id' then
+          freeze_margin := (v_wc_hi::numeric - v_frontier::numeric)::text;   -- a count; freeze_in stays null
+        else
+          freeze_in     := v_wc_hi::timestamptz - v_frontier::timestamptz;
+          freeze_margin := freeze_in::text;
+        end if;
+      end if;
+
+      -- coarse children already frozen: whole range at/below the current grid floor, which is exactly
+      -- maintain()'s auto-regrain candidate test
+      v_floor := pgpm._grid_floor(r.control_kind, r.partition_step, r.partition_anchor, v_frontier);
+      select count(*) into coarse_frozen from pgpm.part p
+       where p.parent_table = r.parent_table and p.attached
+         and pgpm._native_gt(r.control_kind, p.hi, pgpm._grid_next(r.control_kind, r.partition_step, p.lo))
+         and not pgpm._native_gt(r.control_kind, p.hi, v_floor);
+
+      regrain_delta_pending := pgpm._regrain_delta_count(r.parent_table);
+    end if;
+
+    -- In flight? The cursor says so, and the child carrying the change-capture trigger says WHICH (exactly
+    -- one per parent, #267). Range-matching the cursor alone would not: at a sub-range boundary the cursor
+    -- equals one child's hi and the next one's lo, and a regrain freshly prepared on the second sits at
+    -- exactly that value.
+    if r.regrain_cursor is not null and not v_missing then
+      select p.child_name, p.lo, p.hi, p.child_oid into v_rc_name, v_rc_lo, v_rc_hi, v_rc_oid from pgpm.part p
+       where p.parent_table = r.parent_table and p.attached
+         and not pgpm._native_gt(r.control_kind, p.lo, r.regrain_cursor)   -- lo <= cursor
+         and not pgpm._native_gt(r.control_kind, r.regrain_cursor, p.hi)   -- cursor <= hi
+         and pgpm._regrain_capture_active(r.parent_table, p.child_name)
+       limit 1;
+      if v_rc_name is not null then
+        regrain_child     := v_rc_name;
+        regrain_pct_range := pgpm._native_frac(r.control_kind, v_rc_lo, v_rc_hi, r.regrain_cursor);
+        -- reltuples, by the oid pgpm.part recorded for the child (#421), falling back to the name for a
+        -- row that predates child_oid. An estimate, and a never-analyzed relation carries -1: null then.
+        select c.reltuples into v_reltuples from pg_class c
+         where c.oid = coalesce(v_rc_oid, to_regclass(format('%I.%I', v_nsp, v_rc_name))::oid);
+        if v_reltuples >= 0 then regrain_rows_total_est := v_reltuples::bigint; end if;
+        -- this run began at its regrain_prepare row (a restart re-prepares, so the latest is always the
+        -- current run's), and the rows copied since it are this run's and no earlier one's
+        select l.id, l.at into v_prep_id, v_prep_at from pgpm.log l
+         where l.parent_table = r.parent_table and l.action = 'regrain_prepare'
+         order by l.id desc limit 1;
+        if v_prep_id is not null then
+          regrain_started_at := v_prep_at;
+          regrain_elapsed    := now() - v_prep_at;
+          select coalesce(sum(l.rows), 0) into regrain_rows_copied from pgpm.log l
+           where l.parent_table = r.parent_table and l.action = 'regrain_copy' and l.id > v_prep_id;
+          if regrain_pct_range > 0 then
+            -- the ratio first, in numeric, then ONE interval multiplication: two roundings would make the
+            -- figure disagree with the same arithmetic done by hand from the columns beside it
+            regrain_eta := regrain_elapsed * ((1 - regrain_pct_range) / regrain_pct_range);
+          end if;
+        end if;
+      end if;
+    end if;
+    return next;
+  end loop;
+end;
+$$;
 
 
 -- ===================== observability: pg_flight_recorder correlation =====================

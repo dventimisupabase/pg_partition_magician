@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+- **`pgpm.progress(p_parent regclass default null)`**: the drill-down `status()` is not (#343). One row
+  per managed table, or one, answering the two questions that watching a production `transmute`, freeze,
+  `regrain` sequence used to leave to hand arithmetic over `pgpm.part`, `pgpm.config`, `pgpm.log` and
+  `cron.job_run_details`. *When will the monolith freeze?* `frontier`, `write_child`, `write_ceiling`,
+  `freeze_margin`, `freeze_in`, `coarse_frozen`. *How far along is the regrain, and when does it finish?*
+  `regrain_child`, `regrain_cursor`, `regrain_pct_range`, `regrain_rows_copied`, `regrain_rows_total_est`,
+  `regrain_delta_pending`, `regrain_started_at`, `regrain_elapsed`, `regrain_eta`. The ETA is extrapolated
+  from `config.regrain_cursor`, which already records exact, monotonic range progress, so it costs no
+  scan and no per-tick timing on the hot path. That is why the issue's question of whether to instrument
+  per-microbatch duration is answered no rather than deferred: an ETA never needed it.
+
+  Three places a plausible number would have been a lie, and what was done instead. `regrain_pct_range`
+  is a fraction of the RANGE and `regrain_rows_copied` a count of rows, never fused into an "N of M":
+  rows are not uniform across a range, the cursor sits still until a whole sub-range completes, and an
+  aged sub-range is advanced over without being copied, so the two legitimately disagree (pinned by
+  `tests/106`, where 40% of the range is behind the cursor with 15% of the rows moved). `freeze_in` is
+  **null for `id` grids**, whose frontier is `max(control)` with no clock and no history to make a rate
+  from; `freeze_margin` carries the count instead. And `regrain_eta` is **null until there is progress**
+  to extrapolate from, which is the whole of the first sub-range, even when rows have already moved.
+- **`status()` gains `regrain_to`**, appended so positional readers are unaffected (#343). The auto-regrain
+  target was the one field that had to be read from `pgpm.config` separately to learn whether the history
+  was being split at all. `status()` is drop-and-recreate, so re-running `install.sql` picks it up.
+- **New internal `pgpm._native_frac(kind, lo, hi, x)`**, the one place pgpm subtracts native grid values
+  rather than comparing them. Internal, so no promise attaches to it.
+- **Runbook: the lock-race deferral row is `skip_regrain`, not `regrain_skip`.** The regrain triage
+  section named the suffixed form, which is exactly the shape the log-naming rule exists to forbid, and
+  a reader filtering on it would have found nothing.
+- The sixth gap in #343, telling a caught-error `skip_regrain` apart from a routine, self-healing
+  `skip_write_block` without reading the source, is not in this change. It touches the log vocabulary
+  across every action value and belongs in its own change; the issue stays open for it.
+
 ## [0.6.0] - 2026-09-23
 
 **Upgrading in place needs no action this time.** `pgpm.part` gains `child_oid`, and unlike the

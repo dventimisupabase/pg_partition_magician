@@ -139,12 +139,16 @@ cannot make progress yet.
 
 **Steps.**
 
-1. See the backlog and whether auto-regrain is on:
+1. See the backlog, whether auto-regrain is on, and whether the monolith has frozen yet:
 
    ```sql
-   select parent, coarse_partitions, history_unregrained from pgpm.status();
-   select parent_table, regrain_to from pgpm.config where regrain_to is not null;   -- auto-regrain targets
+   select parent, coarse_partitions, history_unregrained, regrain_to from pgpm.status();
+   select write_child, write_ceiling, freeze_in, coarse_frozen from pgpm.progress('public.events');
    ```
+
+   While `write_child` is the monolith it has not frozen and nothing can split it; `freeze_in` says how
+   long until it does (time grids only; an `id` grid shows the count of ids left in `freeze_margin`
+   instead). `coarse_frozen > 0` means a coarse child is frozen and waiting.
 
 2. If `regrain_to` is null, the history is intentionally coarse. To split it, either enable paced
    auto-regrain or do it by hand once the monolith has **frozen** (the frontier has moved past its upper
@@ -156,20 +160,28 @@ cannot make progress yet.
    select pgpm.regrain_history('public.events');
    ```
 
-3. If auto-regrain is on but `coarse_partitions` is not falling, check why a tick is not progressing in
-   `pgpm.log`:
+3. If auto-regrain is on but `coarse_partitions` is not falling, see how far the in-flight regrain has
+   got, then check why a tick is not progressing in `pgpm.log`:
 
    ```sql
+   select regrain_child, regrain_pct_range, regrain_rows_copied, regrain_delta_pending, regrain_eta
+     from pgpm.progress('public.events');
    select at, action, method from pgpm.log
     where parent_table = 'public.events'::regclass and action in ('skip_regrain', 'regrain')
     order by id desc limit 10;
    ```
 
+   - `regrain_pct_range` climbing tick over tick is healthy even while `coarse_partitions` holds: the
+     coarse child stays attached until the one atomic swap at the end. `regrain_eta` is null through the
+     first sub-range, then an extrapolation from the range fraction so far.
    - A `maintain` summary of `regrain=active` means the monolith has **not frozen yet** (the current
      interval still lands in it); it will regrain once the frontier crosses `B`.
    - `regrain=copied:N` is healthy forward progress (one budget-sized copy microbatch); `regrain=swapped:K`
-     is a completed regrain (K fine children attached). A `regrain_skip` log row is a lock-race deferral, and
+     is a completed regrain (K fine children attached). A `skip_regrain` log row is a lock-race deferral, and
      a `regrain_aged` row is a below-horizon sub-range skipped under a retention policy; both are normal.
+   - `regrain=reconciling:N` tick after tick, with `regrain_delta_pending` not falling, means writes into
+     the coarse child are outpacing the reconcile and the swap is correctly refusing to start. The table
+     is consistent and reads are unaffected; raise `regrain_batch` or wait for the write burst to pass.
 
 4. If disk is the constraint, see [Disk is filling during a regrain](#disk-is-filling-during-a-regrain).
 
@@ -257,11 +269,14 @@ on a fixed volume it can be a problem if you regrain a large coarse child in one
 
 **Steps.**
 
-1. See what is in flight:
+1. See what is in flight, and how far along it is:
 
    ```sql
    select parent, coarse_partitions, inflight_partitions from pgpm.status();
+   select regrain_pct_range, regrain_rows_copied, regrain_eta from pgpm.progress('public.events');
    ```
+
+   The transient space is reclaimed at the swap, so `regrain_eta` is roughly how long until it comes back.
 
 2. If you are disk-bound, stop starting new work and let the current regrain finish (it drops its source at
    the swap, reclaiming the transient space):

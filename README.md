@@ -89,6 +89,9 @@ select pgpm.resume('public.events');
 
 -- 4. (optional) Split the coarse history into fine partitions, paced across ticks:
 select pgpm.set_regrain('public.events', '1 month');
+
+-- 5. Watch it: when the monolith freezes, how far the regrain has got, and an ETA.
+select * from pgpm.progress('public.events');
 ```
 
 The two-step (transmute paused, then `resume`) lets you inspect before anything moves. `transmute` reuses a
