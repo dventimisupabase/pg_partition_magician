@@ -622,6 +622,12 @@ run_discriminate() {
   # does. MinIO comes up with it (both share profiles: ["archive"] in docker-compose.yml) but
   # goes unused: the LZ77 memory guard never touches S3.
   local aprof="archive" asvc="archive" ca="pgpm_test-archive"
+  # --list needs no container: bringing them up here collided with another harness run on the same
+  # machine (the container names are fixed) for a listing that touches no database.
+  if [ -n "$LIST_ONLY" ]; then
+    bash "$(dirname "$0")/bench/discriminate.sh" "--shard=${SHARD_I}/${SHARD_N}" --list "$c" "$ca"
+    return
+  fi
   $DC --profile "$prof" up -d --wait "$svc"
   $DC --profile "$aprof" build $BUILD_PROGRESS "$asvc"
   $DC --profile "$aprof" up -d
