@@ -3371,6 +3371,7 @@ declare
   v_comment text; v_colcom record; v_pol record; v_trg record; v_bad_trg text;
   v_prev_lock_timeout text;   -- #309: so validating p_lock_timeout leaves the setting untouched
   v_trgdefs text[] := '{}'; v_grant text; v_g record;
+  v_trgnames text[] := '{}'; v_trgstates text[] := '{}';   -- #499: tgname and tgenabled, index-aligned with v_trgdefs
 begin
   if p_control_kind not in ('time', 'id', 'uuidv7', 'text_time') then
     raise exception 'pg_partition_magician: unknown control_kind %', p_control_kind;
@@ -4024,12 +4025,21 @@ begin
   -- emits "... ON public.<original name>", and that name only resolves to the new parent once the staging
   -- parent has taken it, so the captured text replays verbatim with no rewriting. Policies get no such
   -- help (there is no pg_get_policydef) and are rebuilt from pg_policy.
+  --
+  -- The free ride does not include the enabled state (#499): pg_get_triggerdef never emits tgenabled, so
+  -- the replayed CREATE TRIGGER leaves every trigger origin-only ('O') whatever it was. A DISABLED trigger
+  -- would fire again on the next write, and an ENABLE ALWAYS or ENABLE REPLICA one would silently change
+  -- when it fires under session_replication_role. So the name and the state ride alongside, index-aligned
+  -- by the same ORDER BY, and 7b re-applies every non-default state after the replay.
   select pg_get_userbyid(relowner), relacl, relrowsecurity, relforcerowsecurity
     into v_owner, v_acl, v_rls, v_rls_force
     from pg_class where oid = p_parent;
   v_comment := obj_description(p_parent, 'pg_class');
-  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
-    into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
+  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}'),
+         coalesce(array_agg(tgname::text order by tgname), '{}'),
+         coalesce(array_agg(tgenabled::text order by tgname), '{}')
+    into v_trgdefs, v_trgnames, v_trgstates
+    from pg_trigger where tgrelid = p_parent and not tgisinternal;
 
   -- #344: everything below that only touches the NEW parent -- not the original/monolith relation -- runs
   -- BEFORE either rename, under a staging name (v_staging, collision-checked earlier alongside the
@@ -4227,6 +4237,20 @@ begin
     end loop;
     foreach v_grant in array v_trgdefs loop
       execute v_grant;   -- names the ORIGINAL table, which is now the parent: replays verbatim
+    end loop;
+    -- #499: the verbatim text carries no tgenabled, so every trigger just created is origin-only. Put
+    -- back what the original had. At the parent, on purpose: ENABLE/DISABLE TRIGGER on a partitioned
+    -- table recurses to the clones the CREATE above put on every partition (the monolith included), and
+    -- a clone minted for a later partition inherits the parent's state, so one statement per trigger
+    -- is the whole of it.
+    for v_i2 in 1 .. array_length(v_trgdefs, 1) loop
+      if v_trgstates[v_i2] <> 'O' then
+        execute format('alter table %s %s trigger %I', v_parent::text,
+                       case v_trgstates[v_i2] when 'D' then 'disable'
+                                              when 'A' then 'enable always'
+                                              when 'R' then 'enable replica' end,
+                       v_trgnames[v_i2]);
+      end if;
     end loop;
   end if;
 
@@ -4601,6 +4625,7 @@ declare
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
   r pgpm.dropped_fk%rowtype; v_cdelta name; v_cfn name;
   v_trgdefs text[] := '{}'; v_tdef text;   -- #277
+  v_trgnames text[] := '{}'; v_trgstates text[] := '{}';   -- #499: tgname and tgenabled, index-aligned with v_trgdefs
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then
@@ -4683,9 +4708,13 @@ begin
   -- originals in favour of the parent's, which clone down to every partition, and DETACH strips those
   -- clones -- so without this the reversal silently returns a table with no triggers at all. As in
   -- transmute, pg_get_triggerdef names the PARENT, and the restored table takes that name back below, so
-  -- the definitions replay verbatim.
-  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}')
-    into v_trgdefs from pg_trigger where tgrelid = p_parent and not tgisinternal;
+  -- the definitions replay verbatim. And as in transmute (#499), the text carries no tgenabled, so each
+  -- trigger's name and state are captured alongside, index-aligned, and re-applied after the replay.
+  select coalesce(array_agg(pg_get_triggerdef(oid) order by tgname), '{}'),
+         coalesce(array_agg(tgname::text order by tgname), '{}'),
+         coalesce(array_agg(tgenabled::text order by tgname), '{}')
+    into v_trgdefs, v_trgnames, v_trgstates
+    from pg_trigger where tgrelid = p_parent and not tgisinternal;
 
   -- THE GATE, AGAIN, UNDER THE LOCK (#443). The check above ran under ACCESS SHARE, which excludes no
   -- writer: an insert into a forward partition that was uncommitted when it ran was invisible to it, and
@@ -4732,9 +4761,19 @@ begin
   execute format('alter table %s rename to %I', v_monreg::text, v_rel);
   v_restored := format('%I.%I', v_nsp, v_rel)::regclass;
 
-  -- Replay the captured triggers onto the restored table, now that it carries the original name again.
+  -- Replay the captured triggers onto the restored table, now that it carries the original name again,
+  -- then put back each one's enabled state (#499): the replayed text leaves them all origin-only.
   foreach v_tdef in array v_trgdefs loop
     execute v_tdef;
+  end loop;
+  for v_i in 1 .. coalesce(array_length(v_trgdefs, 1), 0) loop
+    if v_trgstates[v_i] <> 'O' then
+      execute format('alter table %s %s trigger %I', v_restored::text,
+                     case v_trgstates[v_i] when 'D' then 'disable'
+                                           when 'A' then 'enable always'
+                                           when 'R' then 'enable replica' end,
+                     v_trgnames[v_i]);
+    end if;
   end loop;
 
   -- re-add every preserved incoming FK against the restored table. The recorded definition names the

@@ -1116,6 +1116,52 @@ $$;''',
              "  drop view pg_temp.archive_pq_snapshot;\n", 3),
         ],
     ),
+    "transmute_trigger_state_dropped": (
+        "bench/cutover_trigger_state.sh",
+        "Pre-#499 transmute cutover (step 7b): the original table's row triggers are replayed onto the "
+        "new parent from pg_get_triggerdef alone, and pg_get_triggerdef never emits tgenabled, so every "
+        "replayed trigger comes back origin-only ('O') whatever it was. A trigger the operator had "
+        "DISABLED fires again on the very next write and silently rewrites what is stored; an ENABLE "
+        "ALWAYS one stops firing under session_replication_role = replica and an ENABLE REPLICA one "
+        "starts firing for ordinary sessions. Nothing is refused or logged. The capture of tgname and "
+        "tgenabled is left in place and unused, so the mutant is exactly 'the state is not re-applied', "
+        "not 'the capture is broken', and tests/124's post-cutover catalog and write assertions are "
+        "what catch it.",
+        [("""    -- #499: the verbatim text carries no tgenabled, so every trigger just created is origin-only. Put
+    -- back what the original had. At the parent, on purpose: ENABLE/DISABLE TRIGGER on a partitioned
+    -- table recurses to the clones the CREATE above put on every partition (the monolith included), and
+    -- a clone minted for a later partition inherits the parent's state, so one statement per trigger
+    -- is the whole of it.
+    for v_i2 in 1 .. array_length(v_trgdefs, 1) loop
+      if v_trgstates[v_i2] <> 'O' then
+        execute format('alter table %s %s trigger %I', v_parent::text,
+                       case v_trgstates[v_i2] when 'D' then 'disable'
+                                              when 'A' then 'enable always'
+                                              when 'R' then 'enable replica' end,
+                       v_trgnames[v_i2]);
+      end if;
+    end loop;
+""", "", 1)],
+    ),
+    "untransmute_trigger_state_dropped": (
+        "bench/cutover_trigger_state.sh",
+        "Pre-#499 untransmute: the parent's row triggers are replayed onto the restored table from "
+        "pg_get_triggerdef alone, so the table handed back carries every trigger ENABLE, however the "
+        "parent had them: a DISABLED trigger fires on the next write, ALWAYS and REPLICA fall back to "
+        "origin-only. The transmute half is left intact, so this mutant is caught by tests/124's "
+        "post-reversal assertions and by nothing before them, which is what shows that half of the "
+        "file discriminates on its own.",
+        [("""  for v_i in 1 .. coalesce(array_length(v_trgdefs, 1), 0) loop
+    if v_trgstates[v_i] <> 'O' then
+      execute format('alter table %s %s trigger %I', v_restored::text,
+                     case v_trgstates[v_i] when 'D' then 'disable'
+                                           when 'A' then 'enable always'
+                                           when 'R' then 'enable replica' end,
+                     v_trgnames[v_i]);
+    end if;
+  end loop;
+""", "", 1)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
