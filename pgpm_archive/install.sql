@@ -216,7 +216,12 @@ begin
                 else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
-  v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
+  -- The wall clock, never now(). now() is the transaction's start time, and S3 and MinIO refuse a
+  -- request whose x-amz-date is more than 15 minutes from their own clock (403 RequestTimeTooSkewed).
+  -- archive.to_s3 signs every part of a multipart export inside one transaction and a maintain()
+  -- tick signs every chunk it archives inside one, so a stamp read from now() had every request past
+  -- the fifteenth minute refused (#520). The credential scope's date is derived from this same stamp.
+  v_amz_date     := to_char(clock_timestamp() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
   v_date         := substr(v_amz_date, 1, 8);
   v_payload_hash := encode(digest(convert_to(p_payload, 'UTF8'), 'sha256'), 'hex');
   v_scope        := v_date || '/' || p_region || '/s3/aws4_request';
@@ -284,7 +289,8 @@ begin
                 else p_endpoint || '/' || p_bucket || '/' || archive._s3_encode_path(p_key) end
         || case when p_query = '' then '' else '?' || p_query end;
 
-  v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
+  -- the wall clock, as in archive.s3_signed_request above (#520)
+  v_amz_date     := to_char(clock_timestamp() at time zone 'utc', 'YYYYMMDD"T"HH24MISS"Z"');
   v_date         := substr(v_amz_date, 1, 8);
   v_payload_hash := encode(digest(p_payload, 'sha256'), 'hex');   -- bytea-native: no encoding involved
   v_scope        := v_date || '/' || p_region || '/s3/aws4_request';

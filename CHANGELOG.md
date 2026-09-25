@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **The SigV4 signers stamp `x-amz-date` from the wall clock, not from the transaction start** (#520).
+  `archive.s3_signed_request` and `archive.s3_signed_request_bytea` read `now()`, which in PostgreSQL is
+  the transaction's start time, so every S3 request a transaction made carried the same stamp, and S3
+  and MinIO refuse one more than 15 minutes from their own clock (HTTP 403 `RequestTimeTooSkewed`).
+  `archive.to_s3` signs a whole multipart export inside one transaction and a `pgpm.maintain()` tick
+  signs every chunk it archives inside one, so an export or a tick that ran past fifteen minutes had
+  every later request refused: a loud abort with the partition kept, but the README's "handles any
+  size" did not hold. Both signers now read `clock_timestamp()`.
+  `tests/archive/db/17_sigv4_wall_clock_test.sql` records the stamps through a stand-in for the http
+  extension and asserts that a stamp taken two seconds into a transaction is later than the
+  transaction start; `bench/archive_sigv4_wall_clock.sh` drives it against the
+  `sigv4_transaction_start_stamp` mutation, which `./test.sh discriminate` requires it to fail.
 - **A refusal assertion around a committing procedure pins the SQLSTATE or the message, and a guard
   keeps every one of them pinned** (#522). pgTAP's `throws_ok` and `throws_like` run the statement
   under test inside a plpgsql function, so a procedure that does NOT refuse runs on to its first COMMIT

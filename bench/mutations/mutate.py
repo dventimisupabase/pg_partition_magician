@@ -1906,6 +1906,21 @@ $$;''',
           "  'pg_partition_magician: cannot transmute % -- the row trigger(s) (ev72t_after) use a transition table%',\n",
           "select throws_ok($$ call pgpm.transmute('public.ev72t', 'id', 1000) $$, NULL,\n", 1)],
     ),
+    "sigv4_transaction_start_stamp": (
+        "bench/archive_sigv4_wall_clock.sh",
+        "Pre-#520 SigV4 signers: archive.s3_signed_request and archive.s3_signed_request_bytea stamp "
+        "x-amz-date, and so the credential scope's date, from now(), which is the TRANSACTION start "
+        "time, not the wall clock. Every request a transaction makes carries the same stamp, and S3 "
+        "and MinIO refuse one more than 15 minutes from their own clock (403 RequestTimeTooSkewed), so "
+        "an archive.to_s3 multipart export or a maintain() tick that runs past fifteen minutes has "
+        "every later request refused: a loud abort with the partition kept, not data loss, but the "
+        "README's 'handles any size' broken for any partition that takes longer than that to export. "
+        "Two sites, one per signer.",
+        [
+            ("  v_amz_date     := to_char(clock_timestamp() at time zone 'utc', 'YYYYMMDD\"T\"HH24MISS\"Z\"');\n",
+             "  v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD\"T\"HH24MISS\"Z\"');\n", 2),
+        ],
+    ),
 }
 
 # name -> source file (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -1928,6 +1943,7 @@ MUTATION_SRC = {
     "parquet_per_column_statements": "pgpm_archive/install.sql",
     "archive_encode_no_partition_tz": "pgpm_archive/install.sql",
     "archive_object_key_digits_only": "pgpm_archive/install.sql",
+    "sigv4_transaction_start_stamp": "pgpm_archive/install.sql",
 }
 
 # name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`
