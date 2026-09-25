@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **`uninstall.sql` now removes regrain's change capture from your schema** (#442). The per-parent delta
+  table, its trigger function and the `pgpm_regrain_capture` row trigger live in the parent's schema, not
+  in `pgpm`, so `drop schema pgpm cascade` never reached them: after an uninstall during a regrain the
+  trigger kept firing on every write to the former source child, appending to a delta table nothing would
+  ever drain, and a parent that had ever regrained kept the table and function for good. The script now
+  walks `pgpm.config` and drops all three for every managed parent before the schema goes, the way
+  `untransmute` already did. Best-effort per parent: a parent dropped without `untransmute` is skipped, a
+  parent whose capture objects the running role cannot drop is reported in a warning naming them, and a
+  re-run with the schema already gone stays a no-op. The guide's uninstall paragraph now says exactly what
+  goes and what stays: your partitioned tables, their partitions and every row, and nothing else pgpm
+  made. The bound `CHECK` a completed `transmute` leaves is nothing, since the cutover drops it; the one
+  it cannot undo, a conversion interrupted between phases, is called out with the `transmute_abort` call
+  to run first. `./test.sh` stages a real regrain before every channel's uninstall check and asserts the
+  trigger is present before, and no relation, function or trigger named for it after.
 - **`from_hypertable_cutover` refuses to swap when the source and the destination disagree, and the
   append-only catch-up no longer loses a row that lands exactly at the watermark** (#460). Without
   `p_track_changes` the cutover caught up rows with control strictly greater than `max(control)` in the

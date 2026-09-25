@@ -131,12 +131,22 @@ create extension "dventimisupabase@pg_partition_magician" version '0.4.0' cascad
 
 You also need `pg_cron` enabled to run scheduled maintenance.
 
-**Uninstall** removes the `pgpm` schema and its cron jobs; your partitioned tables and data are left
-intact:
+**Uninstall** removes the manager and leaves your data. Gone: the `pgpm` schema (configuration,
+registry, log, every function and view), its cron jobs, the write-block triggers on frozen children, and
+regrain's change capture, which lives in your schema rather than in `pgpm`: a `<table>_pgpm_regrain_delta`
+table, a `<table>_pgpm_regrain_capture()` trigger function, and the `pgpm_regrain_capture` trigger on a
+child being regrained. Left: every transmuted table, still a partitioned table under its original name,
+with all of its partitions and rows. Nothing else pgpm made remains in your schema.
 
 ```bash
-psql "$DATABASE_URL" -f pgpm_core/uninstall.sql
+psql "$DATABASE_URL" --single-transaction -f pgpm_core/uninstall.sql
 ```
+
+The one thing uninstall cannot undo is a conversion interrupted between `transmute`'s phases, whose
+bound `CHECK` goes on rejecting writes outside the recorded range (see
+[The cutover moves no rows](#the-cutover-moves-no-rows)). Run
+`select pgpm.transmute_abort('public.events')` on any such table first: uninstall removes the record that
+would otherwise tell you it is there.
 
 ## Transmute a table
 
