@@ -317,7 +317,9 @@ pgpm.from_hypertable_copy(p_hypertable regclass, p_control name, p_track_changes
 
 Phase 1: build the plain destination (`<rel>_pgpm_dest`) and bulk-copy the existing chunks into it online, one
 chunk-range per transaction, clustered by the control column. The source keeps serving traffic. Run this, let
-the workload continue, then run `from_hypertable_cutover` when ready.
+the workload continue, then run `from_hypertable_cutover` when ready. Each chunk's bounds are applied in the
+dimension's own type (`timestamptz`, `timestamp` without time zone, or `date`), so the copy is exact under any
+session `TimeZone`; a hypertable on a dimension of any other type is refused here.
 
 - `p_track_changes` -- capture in-flight **updates and deletes**, not just appends. When `false` (the
   default), the cutover catches up **append-only** (rows whose control column is past the copy watermark),
