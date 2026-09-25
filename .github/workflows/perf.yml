@@ -58,18 +58,44 @@ on:
       - '.github/workflows/perf.yml'
   workflow_dispatch:
 
+# Sharded across runners. One job that ran every guard and then every mutation took 27 minutes and was
+# the critical path of every PR's CI (the pgTAP matrix takes 6). `--shard=I/N` is an interleaved slice
+# of the same list, chosen by index, so every guard and every mutation runs in exactly one job and no
+# guard's environment changes: each still gets its own runner, container and database. A slice that
+# would select nothing FAILS rather than passing vacuously (test.sh and bench/discriminate.sh both
+# enforce it), so mis-sizing N can only make a job red, never quietly skip a guard.
+#
+# `./test.sh perf` and `./test.sh discriminate` with no --shard still run everything, which is what
+# `./test.sh ci` does locally.
 jobs:
+  # The track names below are written literally, not as a matrix variable: scripts/check_track_filters.py
+  # finds a workflow's tracks by reading `./test.sh <track>` out of its run steps, and a templated track
+  # makes the whole workflow invisible to that check (it happened while writing this file).
   perf:
-    name: data-coupled lock and work guards / PG17
+    name: data-coupled lock and work guards ${{ matrix.shard }} / PG17
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/3', '2/3', '3/3']
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Run the perf track
-        run: ./test.sh perf
+      - name: Run the perf track, shard ${{ matrix.shard }}
+        run: ./test.sh perf --shard=${{ matrix.shard }}
 
-      # Every guard above is green on correct code. That alone does not show any of them would notice
-      # a regression, and this repo has repeatedly produced guards that pass while observing nothing.
-      # This rebuilds install.sql with each defect put back and requires the matching guard to FAIL.
-      - name: Prove the guards discriminate
-        run: ./test.sh discriminate
+  # Every guard is green on correct code. That alone does not show any of them would notice a
+  # regression, and this repo has repeatedly produced guards that pass while observing nothing. These
+  # rebuild install.sql with each defect put back and require the matching guard to FAIL.
+  discriminate:
+    name: guards discriminate ${{ matrix.shard }} / PG17
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/4', '2/4', '3/4', '4/4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Prove the guards discriminate, shard ${{ matrix.shard }}
+        run: ./test.sh discriminate --shard=${{ matrix.shard }}

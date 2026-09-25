@@ -27,7 +27,23 @@
 # mutation is run by exactly one of them and none is silently left out.
 set -uo pipefail
 TRACK="perf"
-case "${1:-}" in --track=*) TRACK="${1#--track=}"; shift ;; esac
+SHARD_I=1
+SHARD_N=1
+LIST_ONLY=""
+while :; do
+  case "${1:-}" in
+    --track=*) TRACK="${1#--track=}"; shift ;;
+    # --shard=I/N: run the I-th of N interleaved slices of the mutation list (1-based), so CI can spread
+    # the list over N runners. The mutation's index in the FULL list still names its database, so
+    # shards never collide, and a shard that selects nothing FAILS (the i=0 rule below, per shard).
+    --shard=*) SHARD_I="${1#--shard=}"; SHARD_N="${SHARD_I#*/}"; SHARD_I="${SHARD_I%/*}"; shift ;;
+    --list) LIST_ONLY=1; shift ;;
+    *) break ;;
+  esac
+done
+if ! [[ "$SHARD_I" =~ ^[0-9]+$ && "$SHARD_N" =~ ^[0-9]+$ ]] || [ "$SHARD_I" -lt 1 ] || [ "$SHARD_I" -gt "$SHARD_N" ]; then
+  echo "discriminate: --shard=I/N needs 1 <= I <= N"; exit 2
+fi
 C="${1:?container}"
 CA="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,8 +63,12 @@ if ! python3 "$ROOT/bench/mutations/mutate.py" --list "--track=$TRACK" > "$LIST"
   exit 1
 fi
 
+ran=0
 while IFS=$'\t' read -r name guard why src; do
   i=$((i + 1))
+  if (( (i - 1) % SHARD_N != SHARD_I - 1 )); then continue; fi
+  ran=$((ran + 1))
+  if [ -n "$LIST_ONLY" ]; then printf '%s\t%s\t%s\n' "$name" "$guard" "$src"; continue; fi
   db="pgpm_mut$i"
   printf '\n--- %s\n    breaks: %s\n    src: %s\n    defect: %s\n' "$name" "$guard" "$src" "$why"
 
@@ -79,15 +99,23 @@ while IFS=$'\t' read -r name guard why src; do
   fi
   docker exec "$target_c" psql -U postgres -q -c "drop database if exists $db" >/dev/null 2>&1
 done < "$LIST"
+if [ -n "$LIST_ONLY" ]; then
+  if [ "$ran" = 0 ]; then
+    printf 'FAIL  track %s shard %s/%s selects no mutation; a slice that runs nothing verifies nothing
+' "$TRACK" "$SHARD_I" "$SHARD_N" >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 echo
 # Belt and braces with the listing check above: whatever the reason, finishing having run nothing is
 # a failure, not a pass. This script's whole claim is "these guards were run against their defects
 # and failed"; with i=0 it has no such evidence for anything.
-if [ "$i" = 0 ]; then
-  printf 'FAIL  track %s ran no mutations at all; every guard it covers is unverified\n' "$TRACK"
+if [ "$ran" = 0 ]; then
+  printf 'FAIL  track %s shard %s/%s ran no mutations at all; every guard it covers is unverified\n' "$TRACK" "$SHARD_I" "$SHARD_N"
   fail=1
 fi
-if [ "$fail" = 0 ]; then echo "discriminate: PASS ($i guard(s) verified against their defects)"
+if [ "$fail" = 0 ]; then echo "discriminate: PASS ($ran guard(s) verified against their defects; shard ${SHARD_I}/${SHARD_N} of ${i} mutations)"
 else echo "discriminate: FAIL"; fi
 exit "$fail"

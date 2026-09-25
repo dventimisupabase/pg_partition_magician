@@ -90,13 +90,17 @@ def workflow_info(text):
     def paths(ev):
         node = on.get(ev) if isinstance(on, dict) else None
         return node.get("paths") if isinstance(node, dict) else None
-    tracks = []
+    tracks, templated = [], []
     for job in (doc.get("jobs") or {}).values():
         for step in (job.get("steps") or []):
             run = step.get("run")
             if run:
                 tracks += re.findall(r"\./test\.sh\s+([a-z][a-z0-9_]*)", run)
-    return paths("push"), paths("pull_request"), tracks
+                # `./test.sh ${{ matrix.track }}`: the track is decided at run time, so this parser
+                # cannot see it and would file the workflow under "not a track workflow". That is how
+                # the sharded perf.yml silently left the verified set while it was being written.
+                templated += re.findall(r"\./test\.sh\s+\$\{\{[^}]*\}\}", run)
+    return paths("push"), paths("pull_request"), tracks, templated
 
 
 def matches(pattern, path):
@@ -122,9 +126,15 @@ def matches(pattern, path):
 def check_workflow(name, text, tracks_by_name, exists):
     """Violations for one workflow. `exists` decides whether a candidate reference is a real file,
     so the pure checks below stay testable without a filesystem."""
-    push, pr, tracks = workflow_info(text)
+    push, pr, tracks, templated = workflow_info(text)
     if push is None and pr is None:
         return [], False                       # always runs; cannot drift
+    if templated:
+        return [f"{name}: runs {templated[0]!r}, a track chosen by a matrix variable. This check "
+                f"reads the track name out of the run step to know what the job covers, so a templated "
+                f"track makes the whole workflow invisible to it (it would be reported as not a track "
+                f"workflow). Write the track literally, one job per track, and put the variable in "
+                f"the arguments instead."], True
     if not tracks:
         return [], False                       # not a track workflow; pages.yml, and none of this applies
     v = []
@@ -259,6 +269,13 @@ def selftest():
     case("a filter that does not name itself is caught",
          CLEAN_TEST_SH, CLEAN_WF.replace(", '.github/workflows/demo.yml'", "", 2), "name itself")
 
+    # The real instance: perf.yml's first sharded draft ran `./test.sh ${{ matrix.track }}` and this
+    # script verified one workflow fewer, saying nothing. A track it cannot read must be a violation,
+    # not a silent exit from the checked set.
+    case("a track chosen by a matrix variable is caught, not skipped",
+         CLEAN_TEST_SH, CLEAN_WF.replace("run: ./test.sh demo", "run: ./test.sh ${{ matrix.track }} --shard=1/2"),
+         "matrix variable")
+
     case("a workflow running a track test.sh does not define is caught",
          CLEAN_TEST_SH.replace("run_demo()", "run_other()"), CLEAN_WF, "no run_demo()")
 
@@ -369,7 +386,7 @@ def main():
     # nothing about a file the glob matches that the filter does not.
     tracks_by_name = parse_tracks(open("test.sh").read())
     for name, text in sorted(workflows.items()):
-        push, pr, tracks = workflow_info(text)
+        push, pr, tracks, _templated = workflow_info(text)
         filt = pr if pr is not None else push
         if filt is None:
             continue

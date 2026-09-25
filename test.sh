@@ -9,7 +9,7 @@
 #   ./test.sh timescale                  # the from_hypertable track (TimescaleDB 2.16.1 / PG15)
 #   ./test.sh observe                    # the pg_flight_recorder observability track (PG15)
 #   ./test.sh archive                    # the pgpm_archive track (PG17 + pgsql-http + MinIO)
-#   ./test.sh perf                       # the data-coupled lock and work guards (PG17)
+#   ./test.sh perf                       # the data-coupled lock and work guards (PG17); --shard=I/N runs one interleaved slice
 #   ./test.sh discriminate               # prove each of those guards fails when its defect is present
 #   ./test.sh locktrace                  # eBPF lock-boundary observation (PG17, Linux only)
 #   ./test.sh lockview                   # the lock-sequence renderer's eBPF capture (PG17, Linux only)
@@ -62,9 +62,22 @@ cd "$(dirname "$0")"
 VERSION="all"
 CHANNEL="all"
 TRACK="matrix"
+# --shard=I/N runs the I-th of N interleaved slices of the perf or discriminate track (1-based), so CI
+# can spread one 27-minute sequential job over N runners. Each guard already runs in its own database,
+# and the shard's guards are printed before anything runs, so a slice that would run nothing fails
+# instead of passing vacuously. --list prints the slice and exits without touching Docker.
+SHARD_I=1
+SHARD_N=1
+LIST_ONLY=""
 for arg in "$@"; do
   case "$arg" in
     --channel=*) CHANNEL="${arg#--channel=}" ;;
+    --shard=*)
+      SHARD_I="${arg#--shard=}"; SHARD_N="${SHARD_I#*/}"; SHARD_I="${SHARD_I%/*}"
+      if ! [[ "$SHARD_I" =~ ^[0-9]+$ && "$SHARD_N" =~ ^[0-9]+$ ]] || [ "$SHARD_I" -lt 1 ] || [ "$SHARD_I" -gt "$SHARD_N" ]; then
+        echo "usage: --shard=I/N with 1 <= I <= N (got ${arg#--shard=})"; exit 2
+      fi ;;
+    --list) LIST_ONLY=1 ;;
     15|16|17|18|all) VERSION="$arg" ;;
     timescale) TRACK="timescale" ;;
     observe) TRACK="observe" ;;
@@ -74,7 +87,7 @@ for arg in "$@"; do
     locktrace) TRACK="locktrace" ;;
     lockview) TRACK="lockview" ;;
     ci) TRACK="ci" ;;
-    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf | discriminate | locktrace | lockview | ci"; exit 1 ;;
+    *) echo "usage: ./test.sh [15|16|17|18|all] [--channel=psql|bundle|dbdev|all] | timescale | observe | archive | perf [--shard=I/N] [--list] | discriminate [--shard=I/N] [--list] | locktrace | lockview | ci"; exit 1 ;;
   esac
 done
 
@@ -554,35 +567,43 @@ run_archive() {
 # maintain drives it in production.
 run_perf() {
   local prof="pg17" svc="postgres17" c="pgpm_test-17"
+  # One guard per line: script, its database, optional extra argument. The list is data so that
+  # --shard can slice it; scripts/check_track_filters.py still reads every bench/*.sh reference here.
+  local guards=(
+    "bench/regrain_perf.sh pgpm_perf /repo/pgpm_core/install.sql"
+    "bench/transmute_lock.sh pgpm_perf2"
+    "bench/transmute_cutover_order.sh pgpm_perf11"
+    "bench/transmute_lock_timeout.sh pgpm_perf7"
+    "bench/maintain_lock.sh pgpm_perf3"
+    "bench/restore_fk_lock.sh pgpm_perf5"
+    "bench/retire_detach_lock.sh pgpm_perf6"
+    "bench/upgrade_in_place.sh pgpm_perf8"
+    "bench/upgrade_from_release.sh pgpm_perf18"
+    "bench/frontier_drought.sh pgpm_perf9"
+    "bench/regrain_outgoing_fk_lock.sh pgpm_perf10"
+    "bench/obtain_backoff_headroom.sh pgpm_perf12"
+    "bench/transmute_claim_squat.sh pgpm_perf13"
+    "bench/untransmute_race.sh pgpm_perf16"
+    "bench/retire_detach_substitution.sh pgpm_perf14"
+    "bench/regrain_swap_reconcile.sh pgpm_perf15"
+    "bench/grid_timezone.sh pgpm_perf17"
+  )
+  local selected=()
+  local n=${#guards[@]} idx
+  for ((idx = 0; idx < n; idx++)); do
+    if (( idx % SHARD_N == SHARD_I - 1 )); then selected+=("${guards[$idx]}"); fi
+  done
+  echo ">>> perf track shard ${SHARD_I}/${SHARD_N}: ${#selected[@]} of ${n} guard(s)"
+  if [ "${#selected[@]}" -eq 0 ]; then echo "perf track: FAIL (shard ${SHARD_I}/${SHARD_N} selects no guard; a slice that runs nothing verifies nothing)"; return 1; fi
+  printf '    %s\n' "${selected[@]}"
+  [ -n "$LIST_ONLY" ] && return 0
   $DC --profile "$prof" up -d --wait "$svc"
   psql_run "$prof" "$svc" -q -f /repo/pgpm_core/install.sql >/dev/null
-  local rc=0
-  bash "$(dirname "$0")/bench/regrain_perf.sh"   "$c" pgpm_perf  /repo/pgpm_core/install.sql || rc=1
-  bash "$(dirname "$0")/bench/transmute_lock.sh" "$c" pgpm_perf2                              || rc=1
-  bash "$(dirname "$0")/bench/transmute_cutover_order.sh" "$c" pgpm_perf11                    || rc=1
-  bash "$(dirname "$0")/bench/transmute_lock_timeout.sh" "$c" pgpm_perf7                      || rc=1
-  bash "$(dirname "$0")/bench/maintain_lock.sh" "$c" pgpm_perf3                              || rc=1
-  bash "$(dirname "$0")/bench/restore_fk_lock.sh" "$c" pgpm_perf5                            || rc=1
-  bash "$(dirname "$0")/bench/retire_detach_lock.sh" "$c" pgpm_perf6                          || rc=1
-  bash "$(dirname "$0")/bench/upgrade_in_place.sh" "$c" pgpm_perf8                            || rc=1
-  bash "$(dirname "$0")/bench/upgrade_from_release.sh" "$c" pgpm_perf18                       || rc=1
-  bash "$(dirname "$0")/bench/frontier_drought.sh" "$c" pgpm_perf9                            || rc=1
-  bash "$(dirname "$0")/bench/regrain_outgoing_fk_lock.sh" "$c" pgpm_perf10                    || rc=1
-  bash "$(dirname "$0")/bench/obtain_backoff_headroom.sh" "$c" pgpm_perf12                     || rc=1
-  bash "$(dirname "$0")/bench/transmute_claim_squat.sh" "$c" pgpm_perf13                       || rc=1
-  bash "$(dirname "$0")/bench/untransmute_race.sh" "$c" pgpm_perf16                            || rc=1
-  # The detach-substitution guard (#407) re-runs a pgTAP file the matrix ALREADY runs, which looks
-  # redundant and is not: what runs here is the harness bench/discriminate.sh drives that file
-  # through, and a harness only ever pointed at mutants would be green in `discriminate` even if it
-  # were broken enough to fail against everything. This is the clean-code half of that pair.
-  bash "$(dirname "$0")/bench/retire_detach_substitution.sh" "$c" pgpm_perf14                   || rc=1
-  # Same pattern for #447: tests/107's two-session swap probe, run here on clean code and by
-  # `discriminate` against the mutants that put the 100-pass bound back.
-  bash "$(dirname "$0")/bench/regrain_swap_reconcile.sh" "$c" pgpm_perf15                        || rc=1
-  # Same shape for the grid-zone guard (#455): tests/111 through the harness discriminate.sh drives the
-  # grid_session_timezone mutant through, so a harness broken enough to fail against everything is
-  # caught here on clean code rather than read as "the mutant was caught".
-  bash "$(dirname "$0")/bench/grid_timezone.sh" "$c" pgpm_perf17                                || rc=1
+  local rc=0 entry
+  for entry in "${selected[@]}"; do
+    # shellcheck disable=SC2086  # the entry is three whitespace-separated words by construction
+    set -- $entry; bash "$1" "$c" "${@:2}" || rc=1
+  done
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"
@@ -606,7 +627,7 @@ run_discriminate() {
   $DC --profile "$aprof" up -d
   wait_pg "$aprof" "$asvc" 60
   local rc=0
-  bash "$(dirname "$0")/bench/discriminate.sh" "$c" "$ca" || rc=1
+  bash "$(dirname "$0")/bench/discriminate.sh" "--shard=${SHARD_I}/${SHARD_N}" ${LIST_ONLY:+--list} "$c" "$ca" || rc=1
   $DC --profile "$aprof" down -v
   $DC --profile "$prof" down -v
   return "$rc"
