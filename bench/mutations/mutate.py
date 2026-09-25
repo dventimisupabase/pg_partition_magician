@@ -1091,7 +1091,7 @@ begin
         "absolute so the mutant is exactly 'the zone parameter is not consulted', not 'the day lattice "
         "is broken again', and a catch is a catch for the right reason. tests/111's month-step pairs "
         "(computed under two session zones) and its transmute-under-New-York walk are what catch it.",
-        [("      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);\n",
+        [("      return pgpm._ts_text((v_wall + make_interval(months => v_months)) at time zone p_tz);\n",
           "      return pgpm._ts_text(p_lo::timestamptz + make_interval(months => v_months));\n", 1)],
     ),
     "datestyle_session_render": (
@@ -1216,6 +1216,22 @@ begin
     perform pgpm._part_name(v_rel, cfg.control_kind, p_target_step, cfg.partition_anchor, null, cfg.partition_tz);
   end if;
 """, "", 1)],
+    ),
+    "grid_next_month_unsnapped": (
+        "bench/month_step_dst_gap.sh",
+        "Pre-#505 _grid_next: the calendar step adds the months to the grid value's wall reading as it "
+        "stands. A grid value is the first instant of its month in partition_tz, and where midnight on the "
+        "1st fell in a DST gap (America/Asuncion 2023-10-01, Asia/Amman 2016-04-01) that instant reads "
+        "01:00, so next(floor(Oct)) lands at 01:00 on Nov 1 while floor(Nov) is 00:00 on Nov 1: "
+        "regrain_step's consecutive sub-ranges overlap by that hour, the swap's ATTACH fails 'would "
+        "overlap', and auto-regrain logs skip_regrain on every tick, forever. The snap that steps such a "
+        "value from its wall midnight is removed, and nothing else: an off-grid value never took it. "
+        "tests/127's next(floor(Oct)) = floor(Nov) pairs, its cursor-floors-to-itself check and its "
+        "twelve-step chain are what catch it.",
+        [("      if (date_trunc('month', v_wall) at time zone p_tz) = p_lo::timestamptz then\n"
+          "        v_wall := date_trunc('month', v_wall);\n"
+          "      end if;\n",
+          "", 1)],
     ),
     "part_name_day_label_in_zone": (
         "bench/day_label_utc.sh",

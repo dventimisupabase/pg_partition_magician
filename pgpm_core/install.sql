@@ -875,13 +875,25 @@ $$;
 -- the next grid boundary after p_lo, computed in p_tz
 create or replace function pgpm._grid_next(p_kind text, p_step text, p_lo text, p_tz text)
 returns text language plpgsql immutable as $$
-declare v_months int;
+declare v_months int; v_wall timestamp;
 begin
   if p_kind in ('time', 'uuidv7', 'text_time') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     if v_months > 0 then
-      -- calendar step, on the wall clock in p_tz: the same arithmetic _grid_floor's month branch does
-      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);
+      -- calendar step, on the wall clock in p_tz: the same arithmetic _grid_floor's month branch does.
+      -- Snapped first (#505). A grid value is the first instant of its month in p_tz, and where midnight
+      -- on the 1st fell in a DST gap (America/Asuncion 2023-10-01, Asia/Amman 2016-04-01) that instant
+      -- reads 01:00 on the wall clock: adding the months to the reading as it stands lands an hour past
+      -- the next boundary, next(floor(Oct)) <> floor(Nov), and regrain_step's consecutive sub-ranges
+      -- overlap by that hour (the swap's ATTACH fails "would overlap", skip_regrain on every tick). The
+      -- snap applies only to an instant that IS its month's first instant (the wall midnight of its
+      -- month converts back to exactly it); an off-grid value, such as the anchor set_regrain steps from
+      -- to compare two widths, still moves by a plain calendar month from its own reading.
+      v_wall := p_lo::timestamptz at time zone p_tz;
+      if (date_trunc('month', v_wall) at time zone p_tz) = p_lo::timestamptz then
+        v_wall := date_trunc('month', v_wall);
+      end if;
+      return pgpm._ts_text((v_wall + make_interval(months => v_months)) at time zone p_tz);
     end if;
     -- Fixed step: an absolute number of seconds, NOT `+ p_step::interval`. On a timestamptz, `+ '1 day'`
     -- is a calendar day in the session zone (23 or 25 hours across a DST transition) while _grid_floor's

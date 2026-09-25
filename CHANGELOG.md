@@ -331,6 +331,20 @@
   that lattice). `tests/126` pins the rule, `bench/naive_column_utc_grid.sh` runs it against
   `naive_column_grid_in_session_zone`, and `tests/111` (d) follows it.
 
+- **A month step is one lattice where midnight on the 1st falls in a daylight-saving gap** (#505). Where
+  a zone's clocks jumped forward at midnight on the 1st (`America/Asuncion` on 2023-10-01, `Asia/Amman`
+  on 2016-04-01), `_grid_floor` correctly resolved the boundary to the first instant of the month, which
+  reads 01:00 on the wall clock, but `_grid_next` added the month to that reading as it stood and landed
+  an hour past the next boundary: `next(floor(Oct))` was 01:00 on November 1 while `floor(Nov)` was
+  00:00. `regrain_step` walks its sub-ranges with exactly that pair, so the October child ended an hour
+  after the November child began, the swap's `ATTACH` failed with "would overlap", and under
+  auto-regrain that was `skip_regrain` on every tick, forever. `_grid_next` now steps a month boundary
+  from its month's wall midnight, so the two functions describe one lattice; an off-grid value (the
+  anchor `set_regrain` compares two widths from) still steps by a plain calendar month. `tests/127` pins
+  the pair regrain computes on both gaps and on a twelve-step chain, under two session zones;
+  `bench/month_step_dst_gap.sh` runs it against `grid_next_month_unsnapped`, and the existing
+  `grid_session_timezone` mutation is re-anchored on the rewritten line.
+
 - **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,

@@ -56,9 +56,9 @@ is **time**.
 
 The grid is computed in the **zone of the session that runs the call**, recorded in
 `pgpm.config.partition_tz` and used for every boundary and partition name from then on, whatever zone
-maintenance's session runs in. Month and year boundaries fall at midnight on the 1st in that zone; day
-and shorter steps are a fixed number of seconds from the anchor, named by the UTC date or hour they start
-at. For UTC-aligned boundaries, run `set timezone = 'UTC'` first. The call refuses a session zone that is
+maintenance's session runs in. Month and year boundaries fall at midnight on the 1st in that zone (at the
+first instant of that day where the zone's clocks skipped midnight); day and shorter steps are a fixed
+number of seconds from the anchor, named by the UTC date or hour they start at. For UTC-aligned boundaries, run `set timezone = 'UTC'` first. The call refuses a session zone that is
 not a name in `pg_timezone_names` (a POSIX rule or a bare abbreviation), and the zone can be changed
 afterwards only with [`set_partition_tz`](#set_partition_tz).
 
