@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **Both pgpm triggers now fire under `session_replication_role = replica`** (#450). The write block
+  and the regrain change capture were created in PostgreSQL's default origin-only state, so a session
+  running as `replica`, which is what a logical-replication apply worker runs as and what some bulk
+  loaders set to silence triggers, wrote straight past both: a replica-role `INSERT` landed in a
+  write-blocked partition, where archive coverage was already complete and the row would have been
+  dropped unarchived, and replica-role DML during a regrain went uncaptured and was reverted, lost or
+  resurrected by the swap. Both triggers are now `ENABLE ALWAYS`, asserted directly against
+  `pg_trigger.tgenabled` in `tests/110`, which also shows the refusal and the capture from a
+  replica-role session. **Upgrading in place:** re-running `install.sql` touches no existing trigger, so
+  every write block an older pgpm installed is repaired on the first `maintain` tick afterwards, by the
+  same per-child revisit that already runs every tick. A regrain already in flight across the upgrade
+  keeps its origin-only capture trigger until it swaps; if a replica-role writer can touch that table,
+  `regrain_cancel` it and the next tick re-prepares with the new trigger.
 - **`pgpm.progress(p_parent regclass default null)`**: the drill-down `status()` is not (#343). One row
   per managed table, or one, answering the two questions that watching a production `transmute`, freeze,
   `regrain` sequence used to leave to hand arithmetic over `pgpm.part`, `pgpm.config`, `pgpm.log` and

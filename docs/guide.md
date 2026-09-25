@@ -857,6 +857,9 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   atomic swap, which transiently drops and re-adds any incoming FK within one transaction).
 - **There is no `DEFAULT`**: a write outside the forward grid is refused rather than parked.
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on regrain.
+- **Logical-replication subscribers are covered.** Both pgpm triggers, the write block and the regrain
+  change capture, are enabled `ALWAYS`, so a write applied with `session_replication_role = replica` is
+  refused, or captured, exactly as an ordinary write is.
 - **Unique secondary indexes** are carried when their key includes the partition key; otherwise refused.
 - **The key is never rewritten;** a primary key or unique constraint that includes the control column is
   reused in place, and a keyless table is partitioned keyless. The control column must be `NOT NULL`.
