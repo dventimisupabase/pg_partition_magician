@@ -2134,6 +2134,8 @@ $$;
 -- and re-adds them within its ONE atomic transaction -- invisible to other sessions, so RI is never visibly
 -- off, unlike the move-model's whole-regrain suspension. Retention-aware: a sub-range entirely below the
 -- retention horizon is NOT copied (it is discarded with the source at the DROP), so retention costs no delete.
+-- The swap re-checks each such sub-range against the horizon in force at that moment and refuses if one is
+-- no longer below it (#448), so a retain loosened mid-regrain cannot turn that discard into data loss.
 --
 -- The work is a series of resumable microbatches (regrain_step). Because the source is frozen and is never
 -- deleted from, it cannot drive progress the way a shrinking source would, so progress is tracked
@@ -2583,6 +2585,25 @@ begin
 end;
 $$;
 
+-- Does a not-yet-attached fine child with EXACTLY these bounds exist for p_parent? pgpm.part is the
+-- authority here, not the relation name: the swap attaches from pgpm.part, so this is precisely "will the
+-- swap attach a partition covering this sub-range". Exact bounds, compared natively (bounds are text),
+-- because a not-attached row with other bounds is not this sub-range's child. regrain_step asks it twice
+-- (#448): in the aged-skip loop, so a skip never fires on a sub-range whose copy has already started, and
+-- in the swap's re-check, to find the sub-ranges whose rows are about to go with the source.
+create or replace function pgpm._regrain_has_child(p_parent regclass, p_lo text, p_hi text)
+returns boolean language plpgsql stable as $$
+declare v_kind text;
+begin
+  select control_kind into v_kind from pgpm.config where parent_table = p_parent;
+  return exists (
+    select 1 from pgpm.part p
+     where p.parent_table = p_parent and not p.attached
+       and not pgpm._native_gt(v_kind, p.lo, p_lo) and not pgpm._native_gt(v_kind, p_lo, p.lo)
+       and not pgpm._native_gt(v_kind, p.hi, p_hi) and not pgpm._native_gt(v_kind, p_hi, p.hi));
+end;
+$$;
+
 -- one resumable microbatch of regrain work on coarse child p_child toward target step p_target_step.
 -- Returns: 'copied:N' (copied N rows into the current fine child), 'swapped:K' (cursor reached hi -> detached
 -- the source, attached K fine children, dropped it: regrain done), or a soft no-progress status ('active' =
@@ -2592,7 +2613,7 @@ create or replace function pgpm.regrain_step(
 ) returns text language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_rel name; v_child regclass; v_cols_q text; v_ncast text; v_pkjoin_q text; v_keyidx oid;
-  v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean;
+  v_lo text; v_hi text; v_step text; v_frontier text; v_floor text; v_has boolean; v_walk text;
   v_retain_boundary text; v_batch int; v_reltuples real; v_avg numeric;
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
@@ -2798,6 +2819,14 @@ begin
   --
   -- The cost when archive_fn is set is copying rows that are about to be dropped. They have to be read to
   -- archive them regardless, so it is one extra write of doomed data, and only on tables that archive.
+  --
+  -- And NEVER on a sub-range that already has a fine child (#448). A range half-copied in one tick can
+  -- age before the next (the frontier moved, for an id grid; the clock, for time), and skipping it then
+  -- left its partial child in pgpm.part for the swap to ATTACH holding a fraction of its rows, which the
+  -- parent then served as the whole range until retain got to it. Finishing the copy costs the rest of
+  -- one doomed sub-range, and it is what lets the swap below treat "a child exists" as "its copy is
+  -- complete": the cursor only ever passes a sub-range on a short batch (complete) or on a skip, and a
+  -- skip now requires that there is nothing to leave behind.
   loop
     exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_cursor);   -- cursor >= hi: nothing left to copy
     v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_cursor);
@@ -2806,7 +2835,8 @@ begin
     if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
     v_aged := v_retain_boundary is not null
               and cfg.archive_fn is null                                  -- #278: see above
-              and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
+              and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary)
+              and not pgpm._regrain_has_child(p_parent, v_sub_lo, v_sub_hi);   -- #448: see above
     exit when not v_aged;                                             -- found a sub-range to copy
     insert into pgpm.log (parent_table, action, lo, hi, rows) values (p_parent, 'regrain_aged', v_sub_lo, v_sub_hi, 0);
     v_cursor := v_sub_hi;                                             -- skip the aged sub-range (no copy, no delete)
@@ -2892,6 +2922,42 @@ begin
   perform pgpm._regrain_delta_purge(p_parent, v_lo, v_hi);   -- junk cannot be allowed to wedge the gate
   v_delta_n := pgpm._regrain_delta_count(p_parent);
   if v_delta_n > v_batch then return 'reconciling:' || v_delta_n; end if;
+
+  -- #448: re-check every aged skip against the retention policy in force NOW, before anything is locked
+  -- or mutated. A sub-range the cursor advanced over as aged left no trace but the advanced cursor, and
+  -- its rows are about to go with the source at the DROP below. That is only right if the range is STILL
+  -- entirely below the horizon: pgpm.set_retain(parent, null), or a longer value, between the skip and
+  -- the swap makes the policy say keep while the rows are still visible through the attached source, so
+  -- the DROP would destroy rows the table is now configured to retain (39,999 in the hunt that found
+  -- this). Same walk as the skip loop above (same grid, same clamped first sub-range) and the same
+  -- predicate as v_aged, so the two can only disagree when the policy changed in between.
+  --
+  -- Refuse rather than re-materialize: copying the range here would be an unbounded copy inside the
+  -- swap tick, and the choice (put retain back, or cancel and re-run under the new policy) belongs to
+  -- the operator. Placed BEFORE the incoming-FK suspend and the DETACH, so a refused swap takes no
+  -- ACCESS EXCLUSIVE and mutates nothing; the cursor stays at hi, so the very next tick swaps once retain
+  -- is restored. Only childless sub-ranges are checked: one with a fine child is complete by
+  -- construction (the skip loop never fires on a range with a child, and the copy branch only advances
+  -- the cursor on a short batch), so at the swap every not-attached child holds its whole range.
+  v_walk := v_lo;
+  loop
+    exit when not pgpm._native_gt(cfg.control_kind, v_hi, v_walk);   -- walk >= hi: every sub-range checked
+    v_grid_lo := pgpm._grid_floor(cfg.control_kind, v_step, cfg.partition_anchor, v_walk);
+    v_sub_lo  := case when pgpm._native_gt(cfg.control_kind, v_lo, v_grid_lo) then v_lo else v_grid_lo end;
+    v_sub_hi  := pgpm._grid_next(cfg.control_kind, v_step, v_grid_lo);
+    if pgpm._native_gt(cfg.control_kind, v_sub_hi, v_hi) then v_sub_hi := v_hi; end if;
+    v_has := pgpm._regrain_has_child(p_parent, v_sub_lo, v_sub_hi);
+    if not v_has then
+      v_aged := v_retain_boundary is not null
+                and cfg.archive_fn is null
+                and not pgpm._native_gt(cfg.control_kind, v_sub_hi, v_retain_boundary);
+      if not v_aged then
+        raise exception 'pg_partition_magician: refusing to swap the regrain of %: sub-range [%, %) has no fine child to attach (it was skipped as aged when the cursor passed it) and is no longer entirely below the current retention horizon (%), so the swap''s DROP of the source would destroy rows the table is now configured to keep: retention was loosened mid-regrain (pgpm.set_retain to a longer value or null, or archive_fn set, after the skip). The source stays attached and the run stays resumable. Restore the earlier retain with pgpm.set_retain(%, ...) and the next tick swaps, or abandon this run with pgpm.regrain_cancel(%) and re-run it under the new policy.',
+          v_child_name, v_sub_lo, v_sub_hi, coalesce(v_retain_boundary, 'none: retain is null'), p_parent, p_parent;
+      end if;
+    end if;
+    v_walk := v_sub_hi;
+  end loop;
 
   -- cursor reached hi: every sub-range is copied (or aged and skipped). Swap atomically -- detach the source,
   -- attach every not-yet-attached fine child within its range (metadata-only via each child's validated
@@ -4450,6 +4516,7 @@ declare
   cfg pgpm.config;
   v_old_boundary text;
   v_new_boundary text;
+  v_old_retain text;
   v_hit name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
@@ -4484,6 +4551,7 @@ begin
   -- held to the same arm-from-null rule as any other bounded value, rather than blocked by the bad value.
   v_old_boundary := case when cfg.retain is not null and not pgpm._retain_nonnegative(cfg.control_kind, cfg.retain)
                          then null else pgpm._retain_boundary(cfg) end;
+  v_old_retain   := cfg.retain;
   cfg.retain := p_retain;
   v_new_boundary := pgpm._retain_boundary(cfg);
 
@@ -4502,6 +4570,21 @@ begin
         'destructive knob, so this is refused rather than silently armed for the next tick.',
         p_parent, p_retain, p_parent, v_hit;
     end if;
+  end if;
+
+  -- #448: a regrain in flight has already skipped sub-ranges as aged under the OLD value, and those
+  -- decisions survive only as the advanced cursor. regrain_step's swap re-checks every skipped sub-range
+  -- against the value in force at that moment and refuses if one is no longer below the horizon, so a
+  -- loosening here loses no rows, but it does hold the swap until retain is put back or the run is
+  -- cancelled. Say so now, while the operator is still at the keyboard, rather than as a skip_regrain row
+  -- hours later. A WARNING and not a refusal: the change itself is safe, and refusing it would make the
+  -- retention policy hostage to a background copy. Only a loosening can trip the swap, so only a
+  -- loosening warns.
+  if cfg.regrain_cursor is not null
+     and (v_new_boundary is null
+          or (v_old_boundary is not null and pgpm._native_gt(cfg.control_kind, v_old_boundary, v_new_boundary))) then
+    raise warning 'pg_partition_magician: a regrain of % is in flight (config.regrain_cursor = %). Sub-ranges it has already skipped as aged under retain = % are re-checked against the new value at the swap, which refuses while any of them is no longer below the horizon. Expect the swap to wait until retain is set back, or abandon the run with pgpm.regrain_cancel(%) and re-run it under the new policy.',
+      p_parent, cfg.regrain_cursor, coalesce(v_old_retain, 'null'), p_parent;
   end if;
 
   update pgpm.config set retain = p_retain where parent_table = p_parent;
