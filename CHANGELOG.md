@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **A write block is no longer lifted from a partition `pgpm.archive_ledger` covers** (#452). Coverage is
+  a watermark, and it describes the partition's contents only while the write block has been on it since
+  the first chunk. Eligibility regresses, though: an `id` table's frontier is `max(control)`, so deleting
+  the newest rows moved the horizon back, and `set_retain` loosening moved it back for every kind. The
+  tick lifted the block, a late write landed in a range the ledger already called done, the block came
+  back, archiving resumed from the watermark, and `retire` dropped the partition with a row in it that no
+  strategy had ever been handed. Now the block stays while coverage exists: the partition keeps being
+  archived to completion and is dropped only if retention reaches it again. The first tick that keeps a
+  block it would otherwise have lifted logs `skip_write_block_lift` for that partition, once; to make it
+  writable again, delete its `pgpm.archive_ledger` rows and the next tick lifts the block (archiving
+  starts over from `lo` if it is ever blocked again). Coverage a tick finds on a partition with **no**
+  block (a trigger removed by hand, or lifted by a pgpm older than this rule before an upgrade) is
+  discarded and logged as `archive_coverage_reset` with the chunk count, so an in-place upgrade heals such
+  a partition on its first tick instead of trusting a watermark nothing has been guarding. `tests/114`
+  pins all three by identity (the `id` frontier regression, `set_retain` loosening followed by the
+  documented way out, and the unblocked-coverage backstop), each ending in a drop whose contents equal
+  exactly what the strategy was handed.
 - **`TRUNCATE` is refused while a regrain is in flight** (#449). Change capture is a row trigger, and
   `TRUNCATE` fires none, so a truncate of the coarse child mid-regrain left the delta empty, and a
   truncate of the parent never reached the standalone copies; the swap then attached copies of every
