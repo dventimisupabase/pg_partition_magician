@@ -522,8 +522,15 @@ $$;
 -- Negative values: two's complement of a negative n-byte-wide integer is 2^(8n) + value (value
 -- already negative, so this subtracts its magnitude) -- the standard construction, computed exactly
 -- in `numeric` since PL/pgSQL has no native bignum-to-bytes primitive to lean on. Encodes from the
--- least-significant byte backward (repeated %256/div256, the same shape _pq_varint's loop already
--- uses), landing the most-significant byte at index 0 -- big-endian, as the format requires.
+-- least-significant byte backward (repeated mod 256 / div 256, the same shape _pq_varint's loop
+-- already uses), landing the most-significant byte at index 0 -- big-endian, as the format requires.
+-- div()/mod(), not trunc(v / 256) (issue #461): numeric `/` computes its quotient to a BOUNDED number
+-- of digits, about 16 significant, and ROUNDS to it, so once the running value has 17 or more integer
+-- digits the quotient is rounded to an integer before trunc() sees it and the carry lands in every
+-- higher byte. Every negative reaches that magnitude at width 8 through the 2^(8n) step above (2^64
+-- has 20 digits), so numeric(17,s) and wider, numeric(19,4) included, encoded -1 as 00000000000000ff.
+-- div()/mod() are exact integer operations for numeric at any magnitude, the same reason
+-- pgpm._radix_encode uses them.
 create or replace function archive._pq_plain_decimal(v numeric, p_scale int4, p_bytes int4) returns bytea
 language plpgsql immutable as $$
 declare
@@ -534,8 +541,8 @@ declare
 begin
   v_unsigned := case when v_scaled < 0 then (2::numeric ^ (8*p_bytes)) + v_scaled else v_scaled end;
   for i in reverse (p_bytes-1)..0 loop
-    buf := set_byte(buf, i, (v_unsigned % 256)::int4);
-    v_unsigned := trunc(v_unsigned / 256);
+    buf := set_byte(buf, i, mod(v_unsigned, 256)::int4);
+    v_unsigned := div(v_unsigned, 256);
   end loop;
   return buf;
 end;

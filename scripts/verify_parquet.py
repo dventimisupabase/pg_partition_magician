@@ -552,6 +552,59 @@ def test_numeric_nullable(conn):
     check("nullable numeric(6,3), mixed with nulls", expected, arrow_rows, duck_rows)
 
 
+# The three shapes below are the ones issue #461 was found on. archive._pq_plain_decimal used to
+# step its byte loop with trunc(v / 256), and numeric `/` rounds its quotient to about 16
+# significant digits, so once the running value had 17 or more integer digits the carry landed in
+# every higher byte. Every negative reaches that magnitude at an 8-byte width through the 2^(8n)
+# two's complement step (2^64 has 20 digits), so numeric(17,s) is the narrowest affected shape,
+# and a 19-digit positive reaches it with no two's complement at all. Both readers agreed on the
+# wrong values (numeric(19,4): -1.5 -> 5.0536, -0.0001 -> 0.0255), which is the point of asserting
+# through two of them: agreement on the bytes is not correctness of the bytes, so each fixture pairs
+# the negatives with values the old loop got right (0, small positives) and the near-max positive.
+# Nothing above this comment exercises a width past 5 bytes.
+
+def test_numeric_money_shape_19_4(conn):
+    # 9 bytes wide. The values the issue reports, plus the column's own extremes.
+    make_table(conn, "t_numeric_money", "n numeric(19,4) not null", None)
+    for v in ["-1.5000", "-0.0001", "999999999999999.9999", "-999999999999999.9999",
+              "0.0000", "0.0001", "123456789012345.6789"]:
+        run(conn, "insert into t_numeric_money (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric_money")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric_money", ["n"])
+    check("numeric(19,4): negatives and 19-digit near-max values in a 9-byte DECIMAL (#461)",
+          expected, arrow_rows, duck_rows)
+
+
+def test_numeric_17_2_first_eight_byte_width(conn):
+    # 8 bytes wide, the narrowest width the rounding reached; numeric(16,s) is 7 bytes and never was.
+    make_table(conn, "t_numeric_p17", "n numeric(17,2) not null", None)
+    for v in ["-0.01", "-1.00", "999999999999999.99", "-999999999999999.99", "0.00", "42.42"]:
+        run(conn, "insert into t_numeric_p17 (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric_p17")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric_p17", ["n"])
+    check("numeric(17,2): the narrowest 8-byte DECIMAL, negatives and near-max (#461)",
+          expected, arrow_rows, duck_rows)
+
+
+def test_numeric_38_10_sixteen_byte_width(conn):
+    # 16 bytes wide: the widest DECIMAL pyarrow reads as decimal128 and DuckDB as a native DECIMAL,
+    # so this is the top of the range both readers can check exactly.
+    make_table(conn, "t_numeric_p38", "n numeric(38,10) not null", None)
+    for v in ["-0.0000000001", "-1.5", "9999999999999999999999999999.9999999999",
+              "-9999999999999999999999999999.9999999999", "0", "3.1415926535"]:
+        run(conn, "insert into t_numeric_p38 (n) values (%s)", (v,))
+    conn.commit()
+    raw = to_parquet_bytes(conn, "t_numeric_p38")
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    expected = fetch_expected(conn, "t_numeric_p38", ["n"])
+    check("numeric(38,10): a 16-byte DECIMAL, negatives and 38-digit near-max (#461)",
+          expected, arrow_rows, duck_rows)
+
+
 def test_numeric_no_typmod_refused(conn):
     make_table(conn, "t_numeric_bare", "n numeric not null", None)
     run(conn, "insert into t_numeric_bare (n) values (1.23456789)")
@@ -693,6 +746,9 @@ def main():
         test_numeric,
         test_numeric_negative_scale_precision_edge,
         test_numeric_nullable,
+        test_numeric_money_shape_19_4,
+        test_numeric_17_2_first_eight_byte_width,
+        test_numeric_38_10_sixteen_byte_width,
         test_numeric_no_typmod_refused,
         test_compressed_repetitive_text,
         test_compressed_nullable_mixed,
