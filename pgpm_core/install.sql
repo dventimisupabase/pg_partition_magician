@@ -559,6 +559,73 @@ begin
 end;
 $$;
 
+-- The bounds above are ordered by base-N place value, which is bytewise for every alphabet pgpm
+-- documents (0-9 < A-Z < a-z in ASCII). A RANGE partition on a text column compares under the column's
+-- COLLATION, and the two agree only when the collation orders the digit alphabet the way the arithmetic
+-- does. en_US (glibc and ICU alike) weighs case below letter identity, so 'a' sorts before 'P' while
+-- base62 puts a = 36 above P = 25: random-payload KSUIDs on a default-collation database fail the
+-- pgpm_monolith_bound CHECK at VALIDATE, and a small table that happens to pass routes rows to the wrong
+-- month, where retain drops them early (issue #456). Single-case alphabets (cuid's 0-9a-z, ULID's
+-- Crockford upper, ObjectId's hex) order the same way under both. transmute and check_text_time both
+-- refuse through this before anything is touched.
+--
+-- The comparison is of STRINGS at the declared width, not of single characters: the largest string
+-- whose first digit is c[i] must sort before the smallest whose first digit is c[i+1], that is
+-- '<prefix>c[i]<max digit>...' < '<prefix>c[i+1]<zero digit>...'. A single-character test is not
+-- enough, because a multi-level collation can order two characters at a secondary or tertiary level
+-- (case, accent) and then let a difference at a LATER position, compared at the primary level first,
+-- override it: under en_US 'a' < 'A' and yet 'aZ' > 'Ab'. The string form fails exactly when the two
+-- digits are not separated at the primary level, which is the condition fixed-width digit strings
+-- need. Adjacent pairs suffice, since primary weights are transitive. The other property the bounds
+-- rely on, that a string sorts before any longer string extending it, needs no check here: every
+-- collation PostgreSQL offers is deterministic unless created otherwise, and a deterministic collation
+-- breaks a tie at every level bytewise, where the shorter string is less.
+create or replace function pgpm._check_text_time_collation(
+  p_table regclass, p_control name, p_prefix text, p_width int, p_radix int, p_alphabet text default null)
+returns void language plpgsql as $$
+declare
+  v_alphabet text; v_collnsp name; v_collname name; v_coll_q text; v_dbloc text; v_coltype text; v_pad int;
+  v_bad_i int; v_bad_c1 text; v_bad_c2 text;
+begin
+  v_alphabet := coalesce(p_alphabet, substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix));
+  v_pad := greatest(coalesce(p_width, 1), 1) - 1;
+  select n.nspname, co.collname, format_type(a.atttypid, a.atttypmod)
+    into v_collnsp, v_collname, v_coltype
+    from pg_attribute a
+    join pg_collation co on co.oid = a.attcollation
+    join pg_namespace n on n.oid = co.collnamespace
+   where a.attrelid = p_table and a.attname = p_control and not a.attisdropped;
+  if v_collname is null then
+    return;   -- no collation on the column (not a collatable type), so nothing but bytes orders the bounds
+  end if;
+  v_coll_q := format('%I.%I', v_collnsp, v_collname);
+  -- A text column declared without COLLATE carries the "default" pseudo-collation, which resolves to
+  -- the database's own. The message names that effective locale, since "default" alone tells the
+  -- operator nothing. pg_database's column for the provider locale is daticulocale on 15/16 and
+  -- datlocale on 17+, and is null under libc, hence the row-as-jsonb read.
+  if v_collnsp = 'pg_catalog' and v_collname = 'default' then
+    select coalesce(j->>'datlocale', j->>'daticulocale', j->>'datcollate') into v_dbloc
+      from (select to_jsonb(d) as j from pg_database d where d.datname = current_database()) x;
+  end if;
+  execute format($q$
+    with d(i, c) as (select i, substr(%1$L, i, 1) from generate_series(1, %2$s) as i)
+    select x.i, x.c, y.c
+      from d x join d y on y.i = x.i + 1
+     where not (((%3$L || x.c || %4$L)::text collate %5$s) < ((%3$L || y.c || %6$L)::text collate %5$s))
+     order by x.i limit 1
+  $q$, v_alphabet, length(v_alphabet), coalesce(p_prefix, ''),
+       repeat(substr(v_alphabet, length(v_alphabet), 1), v_pad), v_coll_q, repeat(substr(v_alphabet, 1, 1), v_pad))
+  into v_bad_i, v_bad_c1, v_bad_c2;
+  if v_bad_i is not null then
+    raise exception 'pg_partition_magician: column %.% has collation %, which does not order the text_time digit alphabet the way base-% place value does: digit % (value %) must sort before digit % (value %) in every position, and under that collation it does not. RANGE bounds on a text column compare under the column''s collation while the encoded timestamp orders bytewise, so rows would be routed to the wrong partition: the pgpm_monolith_bound check fails at VALIDATE, or on a table that passes it, rows land in a neighbouring partition and retention drops them early. Give the column a bytewise collation: alter table % alter column % type % collate "C" (rewrites the table), or create the column with collate "C" to begin with.',
+      p_table::text, quote_ident(p_control),
+      case when v_dbloc is not null then format('"default" (the database default, %s)', v_dbloc) else quote_ident(v_collname) end,
+      length(v_alphabet), quote_literal(v_bad_c1), v_bad_i - 1, quote_literal(v_bad_c2), v_bad_i,
+      p_table::text, quote_ident(p_control), v_coltype;
+  end if;
+end;
+$$;
+
 -- native grid type for comparisons: numeric for id, timestamptz otherwise
 create or replace function pgpm._native_type(p_kind text)
 returns text language sql immutable as $$
@@ -3230,6 +3297,10 @@ begin
     if p_tt_discard_bits < 0 then
       raise exception 'pg_partition_magician: p_tt_discard_bits must not be negative (got %)', p_tt_discard_bits;
     end if;
+    -- #456: the alphabet has to order the way base-N place value does UNDER THE COLUMN'S COLLATION, or
+    -- the bounds this kind computes route rows to the wrong partition (see _check_text_time_collation).
+    -- Not gated by p_force_text_time: that flag overrides a sampling heuristic, and this is arithmetic.
+    perform pgpm._check_text_time_collation(p_parent, p_control, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_alphabet);
   end if;
 
   -- Orphaned-child guard (REDESIGN.md): regrain creates each fine child as a standalone table
@@ -5287,6 +5358,9 @@ begin
     end if;
     v_class := substr('0123456789abcdefghijklmnopqrstuvwxyz', 1, p_radix);
   end if;
+  -- #456: the same refusal transmute makes, so an operator who samples first hears it first, instead
+  -- of a plausible fraction for a column whose collation would misroute every mixed-case value.
+  perform pgpm._check_text_time_collation(p_table, p_control, p_prefix, p_width, p_radix, p_alphabet);
   return query execute format($q$
     with s as (select %1$I::text as v from %2$s limit %3$s),
          shaped as (

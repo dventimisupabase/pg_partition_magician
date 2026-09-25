@@ -50,7 +50,12 @@ select lives_ok(
 );
 
 -- ==================================================================== KSUID (base62, s, custom epoch)
-create table public.tt_ksuid (id text primary key, body text);
+-- collate "C": base62 is mixed-case, and a RANGE partition on text compares under the column's
+-- collation, which for en_US (this database's default) is not the bytewise order the bounds are
+-- computed in. transmute refuses the default-collation column; tests/122 owns that refusal and the
+-- random-payload routing proof. The two values here carry a zero payload and ARE the month bounds, so
+-- they could not have caught the misordering either way.
+create table public.tt_ksuid (id text collate "C" primary key, body text);
 insert into public.tt_ksuid (id, body) values
   (pgpm._ts_to_text_time(now() - interval '13 months', '', 27, 62, 's',
      '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 128, timestamptz '2014-05-13 16:53:20+00'), 'oldest'),
