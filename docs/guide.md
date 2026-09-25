@@ -447,6 +447,25 @@ select * from pgpm.status();        -- one row per managed table: partitions, ba
   signal, not a read gap.
 - **`fks_suspended` / `fks_unvalidated`** -- preserve-managed incoming FKs currently dropped (RI off)
   versus re-added `NOT VALID` but blocked from validation by pre-existing orphans.
+- **`regrain_to`** -- the auto-regrain target, or null when the history is deliberately left coarse.
+
+For one table's position in the transmute, freeze, regrain sequence, drill down:
+
+```sql
+select * from pgpm.progress('public.events');
+```
+
+`progress()` answers the two questions `status()` leaves to arithmetic. **When will the monolith
+freeze?** `write_child` is the partition currently taking writes and `write_ceiling` its upper bound as
+actually built, headroom included; `freeze_in` is the time left, for the time-grid kinds only, since an
+`id` frontier has no clock and pgpm does not guess (`freeze_margin` gives the count of ids instead).
+`coarse_frozen > 0` with `regrain_to` null is a history that will not split by itself. **How far along
+is the regrain?** `regrain_pct_range` is the exact fraction of the coarse child's range behind the
+cursor, `regrain_rows_copied` the rows moved so far, `regrain_rows_total_est` the estimated total, and
+`regrain_eta` an extrapolation from the range fraction, null until there is progress to extrapolate
+from. The range fraction and the row count are kept separate on purpose: rows are not spread evenly
+across a range, and a below-horizon sub-range is skipped without being copied, so neither stands in for
+the other. See [`progress`](reference.md#progress) for every column.
 
 For `uuidv7` tables, confirm the column really is time-ordered (not random UUIDv4):
 
