@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **`_detach_reap` no longer finalizes a live concurrent detach** (#453). It finalized every partition
+  flagged pending detach under a managed parent, with no check that the session running the detach was
+  gone. A concurrent detach spends its whole wait phase in exactly that state, for as long as the longest
+  transaction holding a lock on the parent, and `maintain_all` shares a cadence with the `pgpm_detach`
+  job, so the reaper routinely finalized a detach that was alive and waiting: PostgreSQL's
+  wait-for-old-snapshots phase was skipped, and the real detacher then failed with `is not a partition`,
+  once per tick, into `cron.job_run_details`. The reaper now skips a pending partition while any other
+  session is still running its detach. The test is shaped by a measured fact: a detacher parked in its
+  wait phase holds **no** relation lock at all (its first transaction commits before it waits), so "does
+  anyone hold a lock on the partition" cannot see the phase the bug lives in. Three signals, any one of
+  which means live: a lock held or awaited on the partition itself (the finalizing transaction), an
+  active `DETACH PARTITION ... CONCURRENTLY` statement naming the partition (every phase, but visible
+  same-role only), and a backend parked on the vxid of a transaction that has the parent locked (the wait
+  phase, `pg_locks` only, so it covers a hand-run detach under a role whose statement the reaper cannot
+  read). A skipped partition is not logged: a detach in progress is the expected state, not a deferral.
+  The residual failure is deferring a reap by one tick, never finalizing a live detach. `tests/116` pins
+  four cases with the detacher's liveness witnessed before every reap: live and same-role, live in the
+  wait phase and live in the finalizing phase with the reaper run as a role for which the detacher's
+  statement is masked (each isolating one signal), and abandoned with the holder's transaction still open
+  on the parent, which is what tells the signals from a "someone has the parent locked" shortcut.
 - **Fixed: Parquet shifted `timestamp` (without time zone) columns by the session zone** (#465). The
   writer cast a naive timestamp through `::timestamptz`, which reads the wall clock in the SESSION
   zone, so the same partition archived by pg_cron (the cluster's default zone) and by

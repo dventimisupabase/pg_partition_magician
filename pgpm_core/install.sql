@@ -4236,18 +4236,49 @@ $$;
 -- this all exists to fix. `DETACH ... FINALIZE` completes it and clears the flag.
 --
 -- So this runs BEFORE the per-parent loop in maintain_all, like _transmute_reap: it is the most urgent
--- thing in a tick. It FINALIZES unconditionally, because a pending detach is never a state to leave
--- sitting, but it DROPS nothing -- retire() completes its own retirements on the normal path (it can
+-- thing in a tick. It DROPS nothing -- retire() completes its own retirements on the normal path (it can
 -- tell, from pgpm.part.retiring_at, which detach was its own), and an operator's hand-run detach that
 -- was interrupted is finished and then left alone.
+--
+-- But a pending flag is NOT by itself an abandoned detach (issue #453). It is also the normal state of a
+-- LIVE one for the whole of its wait phase, which lasts as long as the longest transaction holding a
+-- lock on the parent; and the pgpm_detach job and maintain_all share a cadence, so this used to meet a
+-- live detach routinely and finalize it. PostgreSQL's wait-for-old-snapshots phase was skipped, and the
+-- real detacher then failed with "is not a partition", once per tick, into cron.job_run_details.
+--
+-- The liveness test is shaped by a measured fact about DETACH CONCURRENTLY: the detacher holds NO
+-- relation lock during its wait phase. Its first transaction (SHARE UPDATE EXCLUSIVE on parent and
+-- partition, set the flag) COMMITS before it starts waiting, and the wait is a bare VirtualXactLock()
+-- on each lock holder's vxid, so "somebody holds a lock on the partition" cannot see the phase the bug
+-- lives in. Three signals instead, any one of which means the detach is live and the row is skipped:
+--   1. some other backend holds or awaits SHARE UPDATE EXCLUSIVE or ACCESS EXCLUSIVE on the partition:
+--      the detacher's finalizing transaction (or anyone else's DDL on it). pg_locks, any role.
+--   2. some other backend in this database is executing a DETACH PARTITION ... CONCURRENTLY that names
+--      the partition. Every phase, including the instants between one wait and the next, but
+--      pg_stat_activity.query is masked for a backend owned by another role, so this is only what the
+--      deployment's two cron jobs (one role, both created by schedule()) see of each other.
+--   3. some other backend is parked on the vxid of a transaction that holds a lock on the parent: the
+--      wait phase itself, in pg_locks only, so from any role. This is what covers an operator's
+--      hand-run detach under a role whose statement text this session cannot read.
+-- A false positive is a one-tick deferral; a false negative is the bug. So the residual failure is
+-- UNDER-reaping, never over-reaping a live one: the same discipline as _session_alive, and tests/41's
+-- rule that no pgpm function reads cross-role wait_event holds (none of the three needs it).
+--
+-- A skipped row is NOT logged. It is the expected state of every concurrent detach for its whole
+-- duration, and maintain_all would otherwise write a row per tick for as long as the longest open
+-- transaction on the parent. A deferral row is for work pgpm wanted to do and could not; here there is
+-- no work of pgpm's, the detach belongs to the session running it, and status().retain_detaching
+-- already counts pgpm's own in-flight retirements.
 create or replace function pgpm._detach_reap()
 returns int language plpgsql as $$
-declare r record; v_n int := 0;
+declare
+  r record; v_n int := 0;
+  v_db oid := (select oid from pg_database where datname = current_database());
 begin
   for r in
     select pn.nspname as pnsp, pc.relname as prel,
            cn.nspname as cnsp, cc.relname as crel,
-           i.inhparent::regclass as parent
+           i.inhparent::regclass as parent, i.inhparent as parent_oid, i.inhrelid as child_oid
       from pg_inherits i
       join pg_class cc on cc.oid = i.inhrelid
       join pg_namespace cn on cn.oid = cc.relnamespace
@@ -4256,6 +4287,29 @@ begin
      where i.inhdetachpending
        and i.inhparent in (select parent_table from pgpm.config)
   loop
+    -- Live, not abandoned: the session running this detach is still here (see the header). Leave the
+    -- row to it, silently.
+    continue when
+         -- 1. its finalizing transaction: SHARE UPDATE EXCLUSIVE or ACCESS EXCLUSIVE on the partition,
+         --    held or awaited
+         exists (select 1 from pg_locks l
+                  where l.locktype = 'relation' and l.database = v_db and l.relation = r.child_oid
+                    and l.mode in ('ShareUpdateExclusiveLock', 'AccessExclusiveLock')
+                    and l.pid <> pg_backend_pid())
+         -- 2. its statement, where this role is allowed to read it
+      or exists (select 1 from pg_stat_activity a
+                  where a.datname = current_database() and a.pid <> pg_backend_pid()
+                    and a.state = 'active'
+                    and a.query ~* 'detach[[:space:]]+partition' and a.query ~* 'concurrently'
+                    and position(lower(r.crel) in lower(a.query)) > 0)
+         -- 3. its wait phase: parked on the vxid of a transaction that holds a lock on the parent
+      or exists (select 1
+                   from pg_locks w
+                   join pg_locks h on h.locktype = 'virtualxid' and h.granted
+                                  and h.virtualxid = w.virtualxid
+                   join pg_locks p on p.pid = h.pid and p.locktype = 'relation' and p.granted
+                                  and p.database = v_db and p.relation = r.parent_oid
+                  where w.locktype = 'virtualxid' and not w.granted and w.pid <> pg_backend_pid());
     begin
       execute format('alter table %I.%I detach partition %I.%I finalize',
                      r.pnsp, r.prel, r.cnsp, r.crel);
