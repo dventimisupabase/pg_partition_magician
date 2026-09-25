@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`pgpm.set_archive_fn` refuses a strategy that does not return `pgpm.archive_result`** (#517). The
+  `regprocedure` cast resolves a name and an argument list and never looks at the return type, and nothing
+  else did, so a strategy declared `returns text` was accepted, against the reference's promise that
+  assignment validates the whole signature. `_run_archive_strategy` reads the strategy's result into a
+  `pgpm.archive_result` variable positionally, so that strategy's one column became `covered_hi`; one that
+  echoed `p_hi` passed the contract check as a perfect answer, wrote a ledger row with `rows_archived null`,
+  and the next `retain()` dropped the partition with nothing archived. `set_archive_fn` now looks the
+  function up in `pg_proc` and refuses one whose return type is not exactly `pgpm.archive_result` (any
+  other type, or `setof`), or an oid that names no function, with an error naming the function, what it
+  returns and the contract, and leaves `config.archive_fn` unchanged. `docs/reference.md` says what the
+  cast checks and what the function checks. `tests/129_set_archive_fn_return_type_test.sql` pairs each
+  refusal with the witness that the cast alone accepts the candidate and that the tick which follows
+  archives through the well-typed twin; `bench/set_archive_fn_return_type.sh` drives it against the
+  `set_archive_fn_no_return_type_check` mutation, which `./test.sh discriminate` requires it to fail.
+
 - **The S3 archive transports read a chunk in the grid's zone** (#501).
   `archive._encode_upload_ndjson_single` and `archive._encode_upload_parquet`, the transports behind
   `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet`, rendered the chunk's `[lo, hi)` into

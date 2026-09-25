@@ -1051,8 +1051,13 @@ immediately drop-ready. Set it with `pgpm.set_archive_fn`:
 select pgpm.set_archive_fn('public.events', 'myschema.my_archiver(regclass,name,text,text)'::regprocedure);
 ```
 
-Casting the second argument to `regprocedure` validates that the function exists with exactly this
-signature right away, not later when a maintenance tick tries to call it. A bare `null` (or calling
+Casting the second argument to `regprocedure` validates that the function exists with exactly these
+argument types right away, not later when a maintenance tick tries to call it, and `pgpm.set_archive_fn`
+then checks what it returns. A function whose return type is not `pgpm.archive_result` (any other type,
+or `setof pgpm.archive_result`), or a reference that names no function, is refused with an error that
+names the function, what it returns and the contract, and `config.archive_fn` is left as it was. The cast
+alone checks only the argument list; without the second check a `returns text` strategy would be
+installed, and a tick would map its one column onto `covered_hi`. A bare `null` (or calling
 `pgpm.set_archive_fn` with no second argument) turns archiving back off.
 
 The calling contract: `archive_fn(p_parent regclass, p_child name, p_lo text, p_hi text) returns

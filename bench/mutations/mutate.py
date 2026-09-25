@@ -769,6 +769,47 @@ MUTATIONS = {
           "  execute format('delete from %I.%I where pgpm_seq <= %s and %s', v_nsp, v_delta,\n"
           "                 (select max(s) from unnest(v_seqs) s), v_elig);\n", 1)],
     ),
+    "set_archive_fn_no_return_type_check": (
+        "bench/set_archive_fn_return_type.sh",
+        "Pre-#517 set_archive_fn: the regprocedure cast alone, which resolves a name and an ARGUMENT list "
+        "and never looks at what the function returns, so a strategy declared `returns text` (or SETOF, or "
+        "an oid naming no function) is stored in config.archive_fn without complaint. _run_archive_strategy "
+        "reads the strategy's result INTO a pgpm.archive_result variable positionally, so at the next tick "
+        "that strategy's one text column lands in covered_hi; one that echoes p_hi passes the contract check "
+        "(#454) as a perfect answer, writes a ledger row with rows_archived null, and retain() drops the "
+        "partition with nothing archived. tests/129 fails against this on each refusal, on the switch that "
+        "should have been left unchanged, on the strategy the tick actually called, and on the ledger row "
+        "that records a positional echo instead of the well-typed twin's 7 rows.",
+        [("""declare v_rettype regtype; v_retset boolean;
+begin
+  -- The regprocedure cast resolves a NAME and an ARGUMENT LIST, so a reference with the wrong
+  -- arguments fails at the cast (42883) and a function with the right arguments and any return type
+  -- at all gets through it. That mattered: _run_archive_strategy reads the strategy's result INTO a
+  -- pgpm.archive_result variable positionally, so a `returns text` strategy's one column landed in
+  -- covered_hi, and one that echoed p_hi passed the contract check as a perfect answer, wrote a
+  -- ledger row with rows_archived null, and the partition was dropped with nothing archived (#517).
+  -- This is the one moment the return type can be checked before a tick acts on it, so it is
+  -- checked here, and the switch is left exactly where it was. SETOF is refused too: the contract
+  -- is one row, and a set is a different signature even when its element type is the right one.
+  if p_archive_fn is not null then
+    select p.prorettype, p.proretset into v_rettype, v_retset from pg_proc p where p.oid = p_archive_fn::oid;
+    if not found then
+      raise exception 'pg_partition_magician: set_archive_fn(%, %) refused -- % does not name a function', p_parent, p_archive_fn, p_archive_fn::oid;
+    end if;
+    if v_retset or v_rettype <> 'pgpm.archive_result'::regtype then
+      raise exception
+        'pg_partition_magician: set_archive_fn(%, %) refused -- the strategy returns %, and the archive_fn contract is '
+        '(p_parent regclass, p_child name, p_lo text, p_hi text) returns pgpm.archive_result. The regprocedure cast checks '
+        'only the argument list; a result of any other shape would be mapped positionally onto covered_hi by a maintenance '
+        'tick, and a strategy echoing p_hi would then pass the contract check and record coverage with nothing archived.',
+        p_parent, p_archive_fn, case when v_retset then 'setof ' else '' end || v_rettype::text;
+    end if;
+  end if;
+  update pgpm.config set archive_fn = p_archive_fn where parent_table = p_parent;
+""",
+          "begin\n"
+          "  update pgpm.config set archive_fn = p_archive_fn where parent_table = p_parent;\n", 1)],
+    ),
     "regrain_no_outgoing_fk": (
         "bench/regrain_outgoing_fk_lock.sh",
         "Pre-#348 regrain_step: a fine child is created via `like ... including constraints`, "
