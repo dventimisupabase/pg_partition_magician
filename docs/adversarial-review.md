@@ -268,6 +268,8 @@ blind spots (seeds missed, by lens): <list>
 | pass | date | pinned | findings (T1) | claims | precision | seeds / recall | notes |
 |---|---|---|---|---|---|---|---|
 | 1 | 2026-09-24 | `a72c5bf` (0.6.0) | 76 (25 filed as T1: #441 to #465) | ~106 | not measured | none | eight finders plus a coordinator; no independent verifier; the 76 each had a reproduction but at least one premise (#441's version range) was later corrected, so precision is unknown. Fixed by #466 to #490, merged 2026-09-25. Baseline only. |
+| 2 | 2026-09-25 | `581e87a` (0.6.0 + 30) | 49 (7 T1; 44 distinct defects in 27 root-cause groups: #496 to #522) | 73 | 1.00 | 9 / 1.00 | ten finders (eight slices, two duplicated on a second model), one verifier per candidate, planted seeds, all under the method; five reproductions rebuilt by verifiers; five tooling defects found and fixed while running; see [the record](reviews/2026-09-25.md). |
 
 Pass 1 predates this document and is recorded as the baseline it is: a high yield with no measured
-sensitivity or precision. Pass 2 is the first to run under the method above.
+sensitivity or precision. Pass 2 was the first to run under the method above; its record is the first
+under `docs/reviews/`.
