@@ -554,6 +554,11 @@ run_archive() {
   # clean-code half of that pair.
   echo "--- chunk literals rendered in partition_tz guard (issue #501) ---"
   bash "$(dirname "$0")/bench/archive_encode_partition_tz.sh" pgpm_test-archive pgpm_enctz || fail=1
+  # The object-key identity guard (#502) re-runs tests/archive/db/16 for the same reason as #408 and
+  # #462 above: this is the harness discriminate.sh drives that file through against its mutant, and
+  # the clean-code half of that pair has to run somewhere too.
+  echo "--- archive object key identity guard (issue #502) ---"
+  bash "$(dirname "$0")/bench/archive_object_key.sh" pgpm_test-archive pgpm_objkey || fail=1
 
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
