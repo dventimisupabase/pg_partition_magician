@@ -1624,6 +1624,11 @@ $$;
 -- ineligible again, so this needs to run just as often as _install_write_block. drop ... if exists
 -- makes it just as idempotent on a child that was never blocked.
 --
+-- UNCONDITIONAL, on purpose. The rule that a block is not lifted from a child pgpm.archive_ledger
+-- covers (issue #452) lives in _enforce_write_blocks below, the one caller that lifts a block
+-- observably. retire()'s crossing path removes and reinstalls the trigger inside a single transaction,
+-- on a child whose coverage is complete by then, and relies on this removing it regardless.
+--
 -- DELIBERATELY NOT ANCHORED, unlike the install above (issue #429). The asymmetry is the point.
 -- Refusing to install on a relation pgpm has not identified is protective; refusing to REMOVE from
 -- one is the opposite. A pre-#429 pgpm installed this trigger on whatever held the name, so an
@@ -1652,22 +1657,80 @@ $$;
 -- or not -- untouched for the entire tick. `order by hi asc` means that even when repeated
 -- contention does limit how far one tick's pass gets, the oldest (most overdue) children are always
 -- the ones attempted first, matching _archive_step's existing oldest-first convention (#237).
+--
+-- A BLOCK IS NOT LIFTED FROM A CHILD THE LEDGER COVERS (issue #452). pgpm.archive_ledger is a
+-- watermark: _next_archive_chunk resumes from max(hi), and _archive_fully_covered is true once that
+-- reaches the child's own hi. The watermark describes the child's CONTENTS only because the trigger
+-- has been on the child since the first chunk was recorded, so nothing can have been written into,
+-- or deleted out of, a covered range. Eligibility, though, regresses: an `id` table's frontier is
+-- max(control), so deleting the newest rows moves the horizon back, and set_retain loosening moves
+-- it back for every kind. Lifting the block on regression let a late write land in a range the
+-- ledger already called done; when the block came back archiving resumed from the watermark,
+-- retire() saw full coverage, and the partition dropped with that row in it and no strategy ever
+-- handed it. So the block stays while coverage exists. The child keeps being archived to completion
+-- under it (_archive_step gates on the trigger, not on the boundary), and whether it is dropped is
+-- retire()'s decision alone, which is no while retention does not reach it. What an operator sees is
+-- a partition still read-only after loosening retain, so the first tick that keeps a block it would
+-- otherwise have lifted logs skip_write_block_lift for that child, ONCE per child: the state lasts as
+-- long as the coverage does, and a row per tick would be noise. The documented way to make the
+-- partition writable is to discard its coverage (delete its pgpm.archive_ledger rows); the next tick
+-- lifts the block, and archiving starts over from lo if the child is ever blocked again. `skip_`,
+-- not `fail_`: nothing is wedged and nothing is wrong, the lift is deferred until the coverage is
+-- gone, and status() must not count it with the things that stall retention.
+--
+-- The guard is HERE and not in _remove_write_block because this is the one caller that lifts a block
+-- observably. retire()'s crossing path removes and reinstalls the trigger inside a single transaction,
+-- on a child whose coverage is complete by then, and must keep doing so unconditionally.
+--
+-- COVERAGE FOUND WITHOUT ITS BLOCK IS DISCARDED: the same invariant, approached from the other side.
+-- Under the rule above a covered child is always blocked, so ledger rows on an unblocked child can
+-- only mean the block left by a path pgpm did not guard: a pgpm older than this rule lifted it before
+-- an upgrade, an operator dropped the trigger by hand, or the rows are left over from an earlier
+-- incarnation of the name (retire() and untransmute both leave ledger rows in place). In each case
+-- the watermark is a claim about contents nothing has been guarding, and trusting it is exactly the
+-- defect, so the rows go, logged as archive_coverage_reset with how many, and archiving restarts from
+-- lo once the child is blocked again (this same tick, if it is eligible). The ledger is read FIRST
+-- and the trigger second, on purpose: a chunk is only ever recorded after the transaction that
+-- installed its trigger committed, so a read that finds coverage and then finds no trigger has found
+-- a trigger that left AFTER the coverage was recorded, never one that has simply not landed yet.
 create or replace function pgpm._enforce_write_blocks(p_parent regclass)
 returns void language plpgsql as $$
 declare
-  cfg pgpm.config; v_boundary text; r record; v_eligible boolean;
+  cfg pgpm.config; v_boundary text; v_nsp name; r record; v_eligible boolean; v_chunks bigint;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   v_boundary := pgpm._retain_boundary(cfg);
+  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  for r in select child_name, hi from pgpm.part where parent_table = p_parent and attached
+  for r in select child_name, lo, hi from pgpm.part where parent_table = p_parent and attached
     order by hi asc
   loop
     begin
       v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
+
+      select count(*) into v_chunks from pgpm.archive_ledger
+       where parent_table = p_parent and child_name = r.child_name;
+      if v_chunks > 0 and not pgpm._is_write_blocked(p_parent, r.child_name) then
+        delete from pgpm.archive_ledger where parent_table = p_parent and child_name = r.child_name;
+        insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+          values (p_parent, 'archive_coverage_reset', r.lo, r.hi, v_chunks,
+                  format('%s archived chunk(s) were recorded for %I.%I under a write block that is no longer on it, so they no longer describe its contents; discarded, and archiving starts over from %s once it is blocked again',
+                         v_chunks, v_nsp, r.child_name, r.lo));
+        v_chunks := 0;
+      end if;
+
       if v_eligible then
         perform pgpm._install_write_block(p_parent, r.child_name);
+      elsif v_chunks > 0 then
+        if not exists (select 1 from pgpm.log
+                        where parent_table = p_parent and action = 'skip_write_block_lift'
+                          and lo = r.lo and hi = r.hi) then
+          insert into pgpm.log (parent_table, action, lo, hi, method)
+            values (p_parent, 'skip_write_block_lift', r.lo, r.hi,
+                    format('retention no longer reaches %I.%I (horizon %s), but %s archived chunk(s) are recorded for it and that coverage is only true while nothing can write to it; keeping the write block. To make the partition writable again, delete its pgpm.archive_ledger rows',
+                           v_nsp, r.child_name, coalesce(v_boundary, 'none'), v_chunks));
+        end if;
       else
         perform pgpm._remove_write_block(p_parent, r.child_name);
       end if;
@@ -1809,7 +1872,10 @@ create index if not exists archive_ledger_parent_child_hi_idx on pgpm.archive_le
 -- rows fit config.archive_byte_budget via a sampled average row width (config.archive_probe_sample
 -- rows), then extends to the next distinct control value past the probed boundary so a run of ties
 -- never splits across two chunks -- identical reasoning to the original, just scoped to the child's
--- own table instead of the parent. Returns no rows once the child is fully covered.
+-- own table instead of the parent. Returns no rows once the child is fully covered. Resuming from
+-- the watermark rather than re-reading from lo is sound only while the write block has been on the
+-- child since the first chunk, which _enforce_write_blocks guarantees (issue #452): it never lifts a
+-- block from a covered child, and discards coverage it finds on an unblocked one.
 create or replace function pgpm._next_archive_chunk(p_parent regclass, p_child name)
 returns table(lo text, hi text)
 language plpgsql as $$
@@ -1887,7 +1953,11 @@ $$;
 -- is 'none' (nothing to protect against a drop). Chunks for a given child are gapless and
 -- monotonically forward by construction (_next_archive_chunk always resumes exactly where the last
 -- one left off), so the ledger's own max(hi) reaching the child's hi is exactly "the union covers
--- [lo, hi)" -- the same watermark reasoning archive._file_watermark already relied on.
+-- [lo, hi)" -- the same watermark reasoning archive._file_watermark already relied on. That union
+-- describes the child's CONTENTS only because the write block has been on it throughout:
+-- _enforce_write_blocks keeps the block on a covered child even when retention stops reaching it, and
+-- discards coverage it finds without one (issue #452), so a row present at the drop was handed to
+-- the strategy.
 create or replace function pgpm._archive_fully_covered(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
 declare cfg pgpm.config; v_ncast text; v_child_hi text; v_watermark text;

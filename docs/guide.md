@@ -526,7 +526,9 @@ select pgpm.set_retain('public.events', '90 days');
 `retain` is the destructive knob -- it decides what gets dropped -- so `set_retain` validates
 `p_retain`'s shape against `control_kind` and **refuses** (does not merely warn) a tighter value that
 would make the very next `retain()` tick drop a partition the old value still kept. Loosening, or
-setting `null` to keep everything, is always safe. See [reference](reference.md#set_retain).
+setting `null` to keep everything, never drops anything and is always accepted; it does not reopen a
+partition that archiving has already begun to cover, which stays read-only (see
+[Archiving before a drop](#archiving-before-a-drop)). See [reference](reference.md#set_retain).
 
 Retain drops a partition only when its **whole range** is older than the horizon, using plain `DROP` (a
 brief lock) when nothing references the table. Two consequences in the monolith model:
@@ -593,6 +595,14 @@ reference](reference.md#archive-strategy-contract) for the full calling contract
 (`archive_fn(p_parent, p_child, p_lo, p_hi) returns pgpm.archive_result`), and [the pgpm_archive
 add-on](../pgpm_archive/README.md) for two ready-made S3 strategies
 (`pgpm.archive_to_s3_ndjson`/`pgpm.archive_to_s3_parquet`) built on this contract.
+
+**A covered partition stays read-only until it drops.** Once archiving has recorded coverage for a
+partition, its write block stays even if retention later stops reaching it (a loosened `retain`, or on
+an `id` table a frontier that moved back because the newest rows were deleted), because the archive is
+only true of a partition nothing has written to since. The partition is archived to completion and
+dropped only if retention reaches it again; the log says so once, as `skip_write_block_lift`. To make
+such a partition writable again, delete its `pgpm.archive_ledger` rows and the next tick lifts the
+block (archiving starts over from the partition's `lo` if it is ever blocked again).
 
 **Do not rename a partition out from under pgpm.** Every step of the retention lifecycle is handed
 the partition's *name*, and a name that has stopped meaning what it meant would have the write block
