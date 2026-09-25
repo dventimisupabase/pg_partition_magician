@@ -594,6 +594,7 @@ run_perf() {
     "bench/regrain_swap_reconcile.sh pgpm_perf15"
     "bench/grid_timezone.sh pgpm_perf17"
     "bench/regrain_reconcile_snapshot.sh pgpm_perf19"
+    "bench/set_archive_fn_return_type.sh pgpm_perf24"
     "bench/cutover_trigger_state.sh pgpm_perf20"
   )
   local selected=()

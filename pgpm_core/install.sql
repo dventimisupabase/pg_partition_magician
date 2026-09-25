@@ -5022,12 +5022,37 @@ $$;
 -- p_archive_fn names any (p_parent regclass, p_child name, p_lo text, p_hi text) returns
 -- pgpm.archive_result function -- pgpm_archive ships two (pgpm.archive_to_s3_ndjson/
 -- archive_to_s3_parquet), or bring your own. Casting the argument to regprocedure validates that
--- the function exists with exactly this signature right away, not later when a maintenance tick
--- tries to call it. null (the default) turns archiving off: retire()'s drop precondition then only
+-- the function exists with exactly these ARGUMENT types right away, not later when a maintenance
+-- tick tries to call it; the check below does the same for what it RETURNS, which the cast never
+-- looks at (#517). null (the default) turns archiving off: retire()'s drop precondition then only
 -- waits on the write-block, never on coverage.
 create or replace function pgpm.set_archive_fn(p_parent regclass, p_archive_fn regprocedure default null)
 returns void language plpgsql as $$
+declare v_rettype regtype; v_retset boolean;
 begin
+  -- The regprocedure cast resolves a NAME and an ARGUMENT LIST, so a reference with the wrong
+  -- arguments fails at the cast (42883) and a function with the right arguments and any return type
+  -- at all gets through it. That mattered: _run_archive_strategy reads the strategy's result INTO a
+  -- pgpm.archive_result variable positionally, so a `returns text` strategy's one column landed in
+  -- covered_hi, and one that echoed p_hi passed the contract check as a perfect answer, wrote a
+  -- ledger row with rows_archived null, and the partition was dropped with nothing archived (#517).
+  -- This is the one moment the return type can be checked before a tick acts on it, so it is
+  -- checked here, and the switch is left exactly where it was. SETOF is refused too: the contract
+  -- is one row, and a set is a different signature even when its element type is the right one.
+  if p_archive_fn is not null then
+    select p.prorettype, p.proretset into v_rettype, v_retset from pg_proc p where p.oid = p_archive_fn::oid;
+    if not found then
+      raise exception 'pg_partition_magician: set_archive_fn(%, %) refused -- % does not name a function', p_parent, p_archive_fn, p_archive_fn::oid;
+    end if;
+    if v_retset or v_rettype <> 'pgpm.archive_result'::regtype then
+      raise exception
+        'pg_partition_magician: set_archive_fn(%, %) refused -- the strategy returns %, and the archive_fn contract is '
+        '(p_parent regclass, p_child name, p_lo text, p_hi text) returns pgpm.archive_result. The regprocedure cast checks '
+        'only the argument list; a result of any other shape would be mapped positionally onto covered_hi by a maintenance '
+        'tick, and a strategy echoing p_hi would then pass the contract check and record coverage with nothing archived.',
+        p_parent, p_archive_fn, case when v_retset then 'setof ' else '' end || v_rettype::text;
+    end if;
+  end if;
   update pgpm.config set archive_fn = p_archive_fn where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 end;
