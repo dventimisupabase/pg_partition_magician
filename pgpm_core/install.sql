@@ -4218,7 +4218,11 @@ begin
   --
   -- Captured through _fk_definition, not pg_get_constraintdef directly (#498): the text is replayed in
   -- another session, so the referenced table has to be schema-qualified whatever THIS session's
-  -- search_path can see.
+  -- search_path can see. A self-referential key's conrelid is p_parent, the oid this cutover is about to
+  -- rename into the monolith child; it is recorded as captured and 0d below moves it, with every other
+  -- record in which this table is the referencer, onto v_parent, the new parent that inherits the name.
+  -- Left on the monolith it was restored onto that one partition, every row routed to a forward
+  -- partition escaped it, and the log said restore_incoming_fk.
   --
   -- Immediately before the rename, not earlier in the phase. Dropping an FK takes ACCESS EXCLUSIVE on the
   -- REFERENCED table too (measured on PG 17: AccessExclusiveLock on both relations), so when there is a
@@ -4245,6 +4249,16 @@ begin
       insert into pgpm.log (parent_table, action, method) values (v_parent, 'drop_incoming_fk', v_fk.conname);
     end loop;
   end if;
+
+  -- 0d. The records in which THIS table is the REFERENCER (#498). pgpm.dropped_fk.referencing_table is an
+  -- oid, and the rename below turns p_parent into the monolith child of this conversion. A key another
+  -- managed parent preserved against this table, whether still dropped or already restored, must keep
+  -- naming the TABLE, which is v_parent from the rename on: restore_incoming_fks would otherwise re-add
+  -- it on the monolith partition alone (relkind 'r', logged restore_incoming_fk) and every row routed to
+  -- a forward partition would escape it, while suspend_incoming_fks would try to drop, from that
+  -- partition, a key that 7a below re-adds at the parent and clones down as inherited. Same transaction
+  -- as the rename, so no session observes a record naming a relation that is no longer the table.
+  update pgpm.dropped_fk set referencing_table = v_parent where referencing_table = p_parent;
 
   -- 1. THE TWO RENAMES, BACK-TO-BACK (#344). The first is the ACCESS EXCLUSIVE-acquiring statement that
   -- starts the outage (the incoming-FK drop above shares that role when there is one); doing the second
@@ -4826,6 +4840,14 @@ begin
   -- secondary indexes, so those names are already the originals.)
   execute format('alter table %s rename to %I', v_monreg::text, v_rel);
   v_restored := format('%I.%I', v_nsp, v_rel)::regclass;
+
+  -- The mirror of transmute's 0d (#498): every dropped_fk record in which THIS table was the referencer
+  -- named the parent, which is gone; the table is v_restored now. That covers a key another managed
+  -- parent preserved against this table (the DETACH above left the parent's key on the monolith as a
+  -- constraint of its own, under the recorded name, so the referenced parent's suspend and validate keep
+  -- finding it) and a self-referential key of this parent's own, which the loop below re-adds on
+  -- v_restored through the same column before the delete at the end forgets its record.
+  update pgpm.dropped_fk set referencing_table = v_restored where referencing_table = p_parent;
 
   -- Replay the captured triggers onto the restored table, now that it carries the original name again,
   -- then put back each one's enabled state (#499): the replayed text leaves them all origin-only.
@@ -6268,7 +6290,9 @@ begin
   -- written during the suspend window; the orphans (if any) are surfaced by status().fks_unvalidated /
   -- pgpm.incoming_fk_orphans() and cleared with pgpm.validate_incoming_fks() once the operator removes
   -- them. The recorded definition names the parent (captured before the rename) schema-qualified (#498),
-  -- so it resolves to the same relation from this session as from the one that captured it.
+  -- so it resolves to the same relation from this session as from the one that captured it, and
+  -- r.referencing_table names the TABLE holding the key: the new parent for a self-referential key, and
+  -- for a referencing table converted since, its parent (transmute's 0d moves the record with the rename).
   for r in select * from pgpm.dropped_fk
             where parent_table = p_parent and restored_at is null
               and (p_ids is null or id = any(p_ids))
