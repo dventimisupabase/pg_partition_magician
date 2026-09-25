@@ -767,9 +767,20 @@ half-detached, with its rows **already invisible through the parent**, so rows a
 table while the partition is neither detached nor dropped. `ALTER TABLE ...
 DETACH PARTITION ... FINALIZE` completes it, logged `detach_reap`.
 
-It finalizes unconditionally (a pending detach is never a state to leave sitting) but drops nothing:
-`retire` completes pgpm's own retirements on the normal path, and an operator's hand-run detach that was
-interrupted is finished and then left alone.
+It finalizes only an **abandoned** detach, never a live one. A concurrent detach spends its whole wait
+phase looking exactly like an abandoned one in the catalog (the partition flagged pending detach, its rows
+already invisible), for as long as the longest transaction holding a lock on the parent, and `maintain_all`
+runs on the same cadence as the `pgpm_detach` job, so it routinely meets one in that state. A pending
+partition is left alone while any other session is still running its detach: one holding or waiting for a
+lock on the partition itself, one parked waiting for a transaction that has the parent locked, or one whose
+current statement is a `DETACH PARTITION ... CONCURRENTLY` naming the partition. The first two are read
+from `pg_locks`, which every role can see, so a detach run by hand under another role is covered as well.
+Nothing is logged for a skipped partition: a detach in progress is the expected state, not a deferral, and
+`status().retain_detaching` already counts pgpm's own. The residual failure is deferring a reap by one
+tick, never finalizing a detach that is still running.
+
+It drops nothing: `retire` completes pgpm's own retirements on the normal path, and an operator's hand-run
+detach that was interrupted is finished and then left alone.
 
 ### `regrain`
 
