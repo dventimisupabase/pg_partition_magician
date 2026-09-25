@@ -3118,7 +3118,10 @@ create or replace procedure pgpm._transmute(
   -- top bits of a WIDER encoded value against a non-Unix epoch (KSUID: discard the low 128 bits of its
   -- whole-payload base62 encoding, epoch 2014-05-13 16:53:20+00).
   p_tt_alphabet text default null, p_tt_discard_bits int default 0,
-  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00',
+  -- uuidv7/text_time only (#457): accept a data-driven frontier that sits far ahead of the clock, and
+  -- with it a monolith hi pinned that far out. False for every other kind's frontier, which cannot skew.
+  p_force_frontier boolean default false
 )
 language plpgsql as $$
 declare
@@ -3136,6 +3139,7 @@ declare
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_monolith name; v_monreg regclass;
   v_frontier_native text; v_min_raw text; v_max_raw text; v_min_native text; v_lo_native text; v_hi_native text;
+  v_max_ts timestamptz; v_skew_limit timestamptz;   -- #457: the decoded data maximum and how far ahead of now() it may sit
   -- #277: everything CREATE TABLE ... LIKE does NOT carry, captured before the rename and replayed onto
   -- the new parent inside the cutover transaction.
   v_owner name; v_acl aclitem[]; v_rls boolean; v_rls_force boolean;
@@ -3632,6 +3636,40 @@ begin
     end;
   end if;
 
+  -- Refuse a DATA maximum that sits far ahead of the clock (#457). For these two kinds the frontier is
+  -- greatest(max(control), now()), so one row minted by a client with a wrong clock sets the frontier, and
+  -- with it the monolith's PERMANENT hi, as far out as that clock was wrong: every row written until then
+  -- lands in the monolith, status() shows nothing abnormal, and the monolith cannot be regrained nor
+  -- anything behind it dropped until now() really passes hi. The sampling gate above cannot see it (one bad
+  -- row in 402 is fraction 0.9975), and `time` is immune because its frontier IS now().
+  --
+  -- The allowance is one partition step plus one hour, measured from now() and NOT from the
+  -- headroom-adjusted bound: p_bound_headroom is the operator asking for a farther hi on purpose, and it
+  -- must not also widen what the data is allowed to impose. One step because the cost of a maximum inside
+  -- the allowance is bounded to what p_bound_headroom => 1 (2 in the worst alignment) would have cost, a
+  -- documented and survivable amount that scales with the granularity the operator chose; one hour on top
+  -- because a fine grid (minutes) must still tolerate ordinary clock skew and small timezone mistakes,
+  -- which are absolute, not proportional to the step. This is a policy refusal about a cost, not
+  -- arithmetic like the ceiling check above, so unlike that one it has an override: p_force_frontier
+  -- accepts the bound knowingly, the same way p_bound_headroom asks for one. The check sits AFTER the
+  -- ceiling refusal on purpose: a random (v4) column forced past the sampling gate decodes to year ~10000
+  -- and must keep getting the ceiling's message, which names the real cause.
+  if p_control_kind in ('uuidv7', 'text_time') and v_max_raw is not null then
+    v_max_ts := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz;
+    v_skew_limit := now() + p_step::interval + interval '1 hour';
+    if v_max_ts > v_skew_limit then
+      if not p_force_frontier then
+        raise exception 'pg_partition_magician: % cannot be partitioned on a % grid using %: its newest value % decodes to %, which is % ahead of now() (%). A time-ordered id dated that far ahead is almost always a client with a wrong clock, and because the frontier is the newer of the data and the clock, that one value would fix the monolith''s permanent upper bound at % instead of %: every row written until then lands in the monolith, which cannot be regrained, and nothing behind it can be dropped, until the clock actually gets there. Delete or correct the rows whose % sorts above % (the value encoding now() + one step + one hour, the most a maximum may lead the clock by) and re-run, or re-run with p_force_frontier => true to accept that bound.',
+          p_parent, p_control_kind, quote_ident(p_control), v_max_raw, v_max_ts, justify_interval(date_trunc('second', v_max_ts - now())), now(),
+          v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, now()::text)),
+          quote_ident(p_control), pgpm._encode(p_control_kind, v_skew_limit::text, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
+      end if;
+      raise notice 'pg_partition_magician: the newest % value % in % decodes to %, % ahead of now(); p_force_frontier accepted it, so the monolith''s permanent upper bound is % rather than %. Rows written until then land in the monolith, and it cannot be regrained until the clock passes that bound.',
+        quote_ident(p_control), v_max_raw, p_parent, v_max_ts, justify_interval(date_trunc('second', v_max_ts - now())),
+        v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, now()::text));
+    end if;
+  end if;
+
   -- ============================ PHASE 1: add the bound (#275) ============================
   --
   -- Certify the monolith's bound BEFORE the rename so the ATTACH below is metadata-only. This is the one
@@ -4056,6 +4094,12 @@ drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval,
 drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, int, boolean, text, boolean, int, text, text, int, int, text, boolean);
 drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, int, timestamptz, boolean, text, boolean, int, text, text, int, int, text, boolean);
 
+-- #457 added one trailing param (p_force_frontier) to both. Same #209/#210 arg-count hazard again: without
+-- these two lines the previous shapes survive an upgrade and every 3-argument call becomes ambiguous
+-- (issue #441). The bigint (id) overload is untouched: an id frontier has no clock to skew against.
+drop procedure if exists pgpm._transmute(regclass, name, text, text, text, int, text, int, boolean, text, boolean, int, text, text, int, int, text, boolean, text, int, timestamptz);
+drop procedure if exists pgpm.transmute(regclass, name, interval, int, interval, int, timestamptz, boolean, text, boolean, int, text, text, int, int, text, boolean, text, int, timestamptz);
+
 -- Time grid: interval width. The control column's type selects the kind -- a uuid column is TREATED as
 -- uuidv7 (ULIDs stored as uuid included; PostgreSQL has no UUIDv7 type to detect, so this is an
 -- assumption check_uuidv7 samples to gate, not a verification: a column that samples as overwhelmingly
@@ -4076,7 +4120,8 @@ create or replace procedure pgpm.transmute(
   p_tt_radix int default null, p_tt_unit text default null,
   p_force_text_time boolean default false,
   p_tt_alphabet text default null, p_tt_discard_bits int default 0,
-  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00',
+  p_force_frontier boolean default false
 ) language plpgsql as $$
 declare v_kind text;
 begin
@@ -4091,7 +4136,7 @@ begin
     p_retain::text, p_regrain_batch, p_paused, p_incoming_fks, p_force_uuidv7,
     p_bound_headroom, p_lock_timeout,
     p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_force_text_time,
-    p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
+    p_tt_alphabet, p_tt_discard_bits, p_tt_epoch, p_force_frontier);
 end;
 $$;
 
@@ -5124,17 +5169,30 @@ $$;
 -- check_uuidv7(): sanity-sample a uuid column. Genuine UUIDv7/ULID values decode
 -- (via their leading 48-bit ms prefix) to plausible recent timestamps and score
 -- ~1.0; random UUIDv4 columns score near 0. A heuristic, not a proof.
+--
+-- sampled/plausible/fraction/oldest/newest are over the SAMPLE (the first p_sample rows in whatever order
+-- the scan returns them). newest_decoded is not: it is the column's actual maximum, found the way
+-- transmute finds its frontier (ORDER BY ... DESC LIMIT 1, an index scan when the control column is the
+-- key), decoded. That is the value one future-dated row hides behind a passing fraction (#457): 1 bad row
+-- in 402 samples at 0.9975, and the sample max only sees it if the row happened to be in the sample.
+-- newest_in_future is that maximum more than one hour past now(), the fixed clock-skew tolerance transmute
+-- also applies; transmute additionally allows one partition step, which this function does not know.
+drop function if exists pgpm.check_uuidv7(regclass, name, int);
 create or replace function pgpm.check_uuidv7(p_table regclass, p_control name, p_sample int default 1000)
-returns table (sampled bigint, plausible bigint, fraction numeric, oldest timestamptz, newest timestamptz)
+returns table (sampled bigint, plausible bigint, fraction numeric, oldest timestamptz, newest timestamptz,
+               newest_decoded timestamptz, newest_in_future boolean)
 language plpgsql as $$
 begin
   return query execute format($q$
-    with s as (select pgpm._uuid_to_ts(%I) as ts from %s limit %s)
+    with s as (select pgpm._uuid_to_ts(%1$I) as ts from %2$s limit %3$s),
+         m as (select pgpm._uuid_to_ts(t.%1$I) as ts from %2$s t order by t.%1$I desc limit 1)
     select count(*)::bigint,
            count(*) filter (where ts between timestamptz '2015-01-01' and now() + interval '1 day')::bigint,
            round(coalesce(count(*) filter (where ts between timestamptz '2015-01-01' and now() + interval '1 day')::numeric
                           / nullif(count(*), 0), 0), 4),
-           min(ts), max(ts)
+           min(ts), max(ts),
+           (select ts from m),
+           (select ts > now() + interval '1 hour' from m)
     from s
   $q$, p_control, p_table::text, p_sample);
 end;
@@ -5148,12 +5206,19 @@ $$;
 -- (never passed to _text_time_to_ts, which would raise on it -- one bad row must not abort the sample);
 -- a row that IS shaped correctly is further checked for decoding to a plausible recent timestamp,
 -- exactly as check_uuidv7 does. Heuristic, not a proof.
+--
+-- newest_decoded / newest_in_future are check_uuidv7's (#457): the column's ACTUAL maximum (not the
+-- sample's), found the way transmute finds its frontier and decoded, and whether it sits more than one hour
+-- past now(). A maximum that does not match the declared shape reports null rather than raising, for the
+-- same reason a malformed sampled row counts as implausible rather than aborting the sample.
+drop function if exists pgpm.check_text_time(regclass, name, text, int, int, text, int, text, int, timestamptz);
 create or replace function pgpm.check_text_time(
   p_table regclass, p_control name, p_prefix text, p_width int, p_radix int, p_unit text,
   p_sample int default 1000,
   p_alphabet text default null, p_discard_bits int default 0,
   p_epoch timestamptz default '1970-01-01 00:00:00+00'
-) returns table (sampled bigint, plausible bigint, fraction numeric)
+) returns table (sampled bigint, plausible bigint, fraction numeric,
+                 newest_decoded timestamptz, newest_in_future boolean)
 language plpgsql as $$
 declare v_class text;
 begin
@@ -5179,6 +5244,15 @@ begin
          ),
          decoded as (
            select pgpm._text_time_to_ts(v, %4$L, %5$s, %7$s, %8$L, %9$L, %10$s, %11$L) as ts from shaped
+         ),
+         m as (select t.%1$I::text as v from %2$s t order by t.%1$I desc limit 1),
+         m_decoded as (
+           select case when left(v, length(%4$L)) = %4$L
+                        and length(v) >= length(%4$L) + %5$s
+                        and substr(v, length(%4$L) + 1, %5$s) !~ %6$L
+                       then pgpm._text_time_to_ts(v, %4$L, %5$s, %7$s, %8$L, %9$L, %10$s, %11$L)
+                  end as ts
+             from m
          )
     select (select count(*) from s where v is not null)::bigint,
            (select count(*) from decoded
@@ -5186,7 +5260,9 @@ begin
            round(coalesce(
              (select count(*) from decoded
                where ts between timestamptz '2015-01-01' and now() + interval '1 day')::numeric
-               / nullif((select count(*) from s where v is not null), 0), 0), 4)
+               / nullif((select count(*) from s where v is not null), 0), 0), 4),
+           (select ts from m_decoded),
+           (select ts > now() + interval '1 hour' from m_decoded)
   $q$, p_control, p_table::text, p_sample, p_prefix, p_width, '[^' || v_class || ']', p_radix, p_unit,
       p_alphabet, p_discard_bits, p_epoch);
 end;

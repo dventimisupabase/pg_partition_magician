@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **`transmute` refuses a `uuidv7`/`text_time` maximum far ahead of the clock (#457).** For these kinds
+  the frontier is `greatest(max(control), now())` and had no upper sanity bound, so one row minted by a
+  client with a wrong clock set the frontier, and with it the monolith's permanent `hi`, years into the
+  future: every row written today landed in the monolith, `check_uuidv7` passed at 0.9975, `status()`
+  showed nothing abnormal, and the monolith could not be regrained nor anything behind it dropped until
+  the clock really got there. `transmute` now refuses, before anything is committed, a newest value that
+  decodes to more than **one partition step plus one hour** past `now()`, naming the offending value, its
+  decoded timestamp, the `hi` it would have imposed and the one the clock alone gives. The allowance is
+  measured from `now()`, not from a `p_bound_headroom`-widened bound; one step because the cost of a
+  maximum inside it is bounded to what `p_bound_headroom => 1` would have cost, one hour so a fine grid
+  still tolerates ordinary clock skew. The check runs after the UUIDv7 ceiling refusal, so a forced random
+  column keeps getting the message that names its real cause. New trailing parameter
+  **`p_force_frontier boolean default false`** on `_transmute` and the interval-width `transmute` accepts
+  the far `hi` knowingly (with a `NOTICE` restating the cost); the previous shapes of both are dropped on
+  upgrade so a 3-argument call cannot become ambiguous. `check_uuidv7` and `check_text_time` gain
+  **`newest_decoded`** (the column's actual maximum, decoded, not the sample's) and **`newest_in_future`**
+  (more than one hour past `now()`), so the row is visible before converting; both are drop-and-recreate,
+  so re-running `install.sql` picks them up. `tests/123`.
 - **regrain's aged skip is re-checked at the swap, and never fires on a half-copied sub-range** (#448).
   As the cursor passed a sub-range entirely below the retention horizon, `regrain_step` skipped it
   (`regrain_aged`) and that decision lived on only as the advanced cursor. Two consequences.

@@ -496,8 +496,11 @@ select * from pgpm.check_text_time('public.events', 'id', 'c', 8, 36, 'ms');
 ```
 
 A low `fraction` means the values do not match the shape or do not decode to plausible timestamps, and
-the table should not be partitioned on that column. For an `id`-partitioned table where you want calendar
-retention, check that a timestamp column rises with the id:
+the table should not be partitioned on that column. Both also report `newest_decoded`, the column's actual
+maximum decoded, and `newest_in_future`, true when it sits more than an hour ahead of the clock: a single
+future-dated row leaves `fraction` near `1.0` yet would pin the monolith's permanent upper bound at its
+date, which `transmute` refuses (see [Caveats](#caveats-and-v1-scope)). For an `id`-partitioned table
+where you want calendar retention, check that a timestamp column rises with the id:
 
 ```sql
 select * from pgpm.check_time_monotonic('public.events', 'id', 'created_at');
@@ -879,6 +882,16 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Monotonicity is the precondition.** UUIDv7/ULID are ms-resolution monotonic with a small
   clock-skew/late-arrival window, and a straggler still lands in whichever partition already covers its
   key. Arbitrary backdated keys break it: with no `DEFAULT`, a key outside the grid is refused outright.
+- **A future-dated id pins the monolith.** For `uuidv7` and `text_time` the frontier is the newer of the
+  column's maximum and the clock, so one row minted by a client whose clock is years wrong would set the
+  monolith's permanent `hi` years out: every row written until then lands in the monolith, `status()` looks
+  normal, and nothing can be regrained or dropped until the clock really gets there. The plausibility
+  sampling does not see one bad row in hundreds. `transmute` therefore refuses a maximum more than one
+  partition step plus one hour ahead of `now()`, naming the value and its decoded timestamp; ordinary skew
+  of minutes is always accepted. Delete or correct the rows and re-run, or accept the far `hi` knowingly
+  with `p_force_frontier => true`. [`check_uuidv7`](reference.md#check_uuidv7) and
+  [`check_text_time`](reference.md#check_text_time) report the maximum as `newest_decoded` and flag it as
+  `newest_in_future` so you can see it before converting.
 - **The cutover moves no rows and blocks nobody:** no row movement, no PK rewrite, no index rebuild, and
   the one `O(rows)` scan runs in its own transaction under `SHARE UPDATE EXCLUSIVE`. What it costs instead
   is a write ceiling: the bound `CHECK` refuses writes outside `[lo, hi)` for the whole conversion (see

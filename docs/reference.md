@@ -34,7 +34,8 @@ pgpm.transmute(
   p_tt_radix int default null, p_tt_unit text default null,
   p_force_text_time boolean default false,
   p_tt_alphabet text default null, p_tt_discard_bits int default 0,
-  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00'
+  p_tt_epoch timestamptz default '1970-01-01 00:00:00+00',
+  p_force_frontier boolean default false
 )
 ```
 
@@ -160,6 +161,21 @@ Parameters:
   refused before anything is committed. On timeout, a failure in phase 1 leaves the table untouched, and
   one in the cutover leaves the recorded, resumable state [`transmute_abort`](#transmute_abort) and
   `maintain_all`'s sweep handle; either way, re-run `transmute` to retry.
+- `p_force_frontier` -- **uuidv7 and text_time only.** For these kinds the frontier is the newer of the
+  column's maximum and `now()`, so one row minted by a client with a wrong clock sets the frontier, and with
+  it the monolith's permanent `hi`, as far ahead as that clock was wrong: every row written until then lands
+  in the monolith, `status()` shows nothing abnormal, and the monolith cannot be regrained nor anything
+  behind it dropped until the clock really passes `hi`. The plausibility sampling cannot see it (one bad row
+  in 402 is fraction 0.9975). So `transmute` refuses, before anything is committed, when the column's newest
+  value decodes to more than **one partition step plus one hour** past `now()`, naming that value, its
+  decoded timestamp, the `hi` it would have imposed and the `hi` the clock alone would give. The allowance
+  is measured from `now()`, never from a `p_bound_headroom`-widened bound: headroom is you asking for a
+  farther `hi`, and it does not also widen what the data may impose. A few minutes of ordinary clock skew is
+  always inside the allowance. The remedy is to delete or correct those rows (the message names the value
+  every offending row sorts above) and re-run; `p_force_frontier => true` accepts the far `hi` knowingly,
+  with a `NOTICE` restating what it costs. See [`check_uuidv7`](#check_uuidv7) and
+  [`check_text_time`](#check_text_time), whose `newest_decoded`/`newest_in_future` show the maximum before
+  you convert.
 
 Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
 excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
@@ -169,7 +185,9 @@ a `uuid` control samples as overwhelmingly random (UUIDv4) and `p_force_uuidv7` 
 control is missing any of `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit`, has a `p_tt_radix` outside
 2-36 with no `p_tt_alphabet` supplied, a `p_tt_alphabet` whose length does not match `p_tt_radix` or that
 repeats a character, a non-positive `p_tt_width`, a negative `p_tt_discard_bits`, or samples as not
-matching the declared shape and `p_force_text_time` is not set; a non-PK `UNIQUE` secondary index does not include the
+matching the declared shape and `p_force_text_time` is not set; a `uuidv7` or `text_time` control's newest
+value decodes to more than one partition step plus one hour past `now()` and `p_force_frontier` is not set
+(a future-dated row would pin the monolith's permanent `hi` there); a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
 `'error'`; a standalone table matching the child-partition naming already exists (an orphan from an
 interrupted run); or a relation already occupies one of the `<index>_pgpm` names the conversion needs for
@@ -1521,12 +1539,21 @@ frontier-derived column null, the same way `status` does, rather than taking the
 
 ```sql
 pgpm.check_uuidv7(p_table regclass, p_control name, p_sample int default 1000)
-  returns table (sampled bigint, plausible bigint, fraction numeric, oldest timestamptz, newest timestamptz)
+  returns table (sampled bigint, plausible bigint, fraction numeric, oldest timestamptz, newest timestamptz,
+                 newest_decoded timestamptz, newest_in_future boolean)
 ```
 
 Samples a `uuid` column and reports the fraction whose decoded 48-bit timestamp prefix is a plausible
 recent time. Genuine UUIDv7/ULID scores `~1.0`; random UUIDv4 scores `~0`. A heuristic, not a proof; this
 is the check `transmute` runs to gate the uuidv7 kind.
+
+`sampled`, `plausible`, `fraction`, `oldest` and `newest` describe the **sample**. `newest_decoded` does
+not: it is the column's actual maximum, found the way `transmute` finds its frontier and decoded, and
+`newest_in_future` is whether that maximum sits more than one hour past `now()`. Look at these before
+converting: a single future-dated row (a client with a wrong clock) leaves `fraction` at `0.99+` and can
+still pin the monolith's permanent `hi` years out, which is why `transmute` refuses one that leads the clock
+by more than one partition step plus one hour (see [`p_force_frontier`](#transmute-time--uuidv7--text_time-grid)).
+Rows to delete or correct are the ones sorting above `pgpm._ts_to_uuid(now() + <step> + interval '1 hour')`.
 
 ### `check_text_time`
 
@@ -1535,7 +1562,8 @@ pgpm.check_text_time(p_table regclass, p_control name, p_prefix text, p_width in
                       p_unit text, p_sample int default 1000,
                       p_alphabet text default null, p_discard_bits int default 0,
                       p_epoch timestamptz default '1970-01-01 00:00:00+00')
-  returns table (sampled bigint, plausible bigint, fraction numeric)
+  returns table (sampled bigint, plausible bigint, fraction numeric,
+                 newest_decoded timestamptz, newest_in_future boolean)
 ```
 
 The `text_time` analogue of `check_uuidv7`: samples a `text`/`varchar` column against a *declared* shape
@@ -1543,6 +1571,12 @@ The `text_time` analogue of `check_uuidv7`: samples a `text`/`varchar` column ag
 that both match the shape and decode to a plausible recent time. A value that does not even match the
 shape counts as implausible directly, rather than raising -- one malformed row must not abort the sample.
 A heuristic, not a proof; this is the check `transmute` runs to gate the text_time kind.
+
+`newest_decoded` and `newest_in_future` are [`check_uuidv7`](#check_uuidv7)'s: the column's actual maximum
+(not the sample's), decoded, and whether it sits more than one hour past `now()`. A maximum that does not
+match the declared shape reports `null` rather than raising. Rows to delete or correct before a refused
+`transmute` are the ones sorting above
+`pgpm._ts_to_text_time(now() + <step> + interval '1 hour', <prefix>, <width>, <radix>, <unit>, ...)`.
 
 ### `check_time_monotonic`
 
