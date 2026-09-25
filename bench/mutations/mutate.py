@@ -103,6 +103,25 @@ HT_CUTOVER_DEST_VERIFY = """  execute format('lock table %s in access exclusive 
       coalesce(to_regclass(format('%I.%I', v_nsp, v_dest))::oid::text, 'nothing'), quote_ident(v_rel);
   end if;
 """
+# The cutover's conservation check, whole (#460): the source counted under the lock, compared with the
+# destination's carried-in count, and the refusal. Deleting it is the pre-#460 cutover exactly: the
+# catch-up runs, nothing compares the two sides, and the DROP goes ahead on a destination that is short.
+HT_CUTOVER_CONSERVATION = """  execute format('select count(*) from %I.%I', v_nsp, v_rel) into v_src_n;
+  if v_src_n <> v_dest_n then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) refusing to swap: the source holds % rows but the destination would hold % after the % catch-up, a difference of %. %',
+      p_hypertable, v_src_n, v_dest_n, case when v_track then 'change-tracking' else 'append-only' end,
+      abs(v_src_n - v_dest_n),
+      case when v_track
+        then 'A write reached the source without firing the change-capture trigger (session_replication_role = replica, or the trigger disabled), so the delta never saw it. Nothing was dropped and the source is whole. Make every writer fire triggers, then re-run from_hypertable_copy with p_track_changes => true.'
+        else format('Rows arrived during the online window with a control value at or below the copy watermark (out-of-order appends, a backfill, or an update or delete of a copied row), which the append-only catch-up cannot see. Nothing was dropped and the source is whole. Re-run from_hypertable_copy(%L, %L, p_track_changes => true), which needs a primary key or unique constraint; on a keyless table, pause writes to the source for the copy instead.',
+                    p_hypertable::text, p_control)
+      end;
+  end if;
+"""
+# The under-lock append-only catch-up's keyed branch, by its condition alone. Six spaces of indentation
+# pick the UNDER-LOCK `if` (inside `if v_watermark is not null then`) and not the pre-lock key-column
+# build, which sits at four; the count check below refuses to build the mutant if that ever changes.
+HT_CATCHUP_KEYED_BRANCH = "      if v_akey is not null then\n"
 
 RESTORE_INLINE = """    if v_readded and not v_is_part then
       begin
@@ -516,6 +535,32 @@ MUTATIONS = {
         "destination lock-and-verify, leaving the source half, so part A still passes and only part "
         "B of tests/timescale/db/17 catches this.",
         [(HT_CUTOVER_DEST_VERIFY, "", 1)],
+    ),
+    "hypertable_catchup_strict_watermark": (
+        "bench/hypertable_late_appends.sh",
+        "Pre-#460 append-only catch-up on a KEYED table: control strictly greater than the copy watermark, "
+        "no key anti-join. A row that lands during the online window with a control value EXACTLY equal to "
+        "max(control) in the destination is never copied; the strict bound exists to avoid duplicating the "
+        "copied row already at that value, and it throws the late one out with it. Sends the keyed branch "
+        "down the keyless path (`if false`), which IS the old catch-up for every table, and leaves the "
+        "conservation check in place. So in part A of tests/timescale/db/20 the check refuses the swap "
+        "that part expects to SUCCEED (a raw ERROR, and the table is still a hypertable: 241 rows would "
+        "have gone forward against 242), and part B's refusal names 241 where 242 is asserted. It fails "
+        "on the lost row, never on a missing refusal -- that is the other mutation's job.",
+        [(HT_CATCHUP_KEYED_BRANCH,
+          "      if false then   -- MUTANT: the pre-#460 strict > on every table, keyed or not\n", 1)],
+    ),
+    "hypertable_cutover_no_conservation": (
+        "bench/hypertable_late_appends.sh",
+        "Pre-#460 from_hypertable_cutover(): nothing under the lock compares the source with the "
+        "destination. Rows that arrived during the online window BELOW the watermark (out-of-order "
+        "appends, backfills, the normal IoT shape) are invisible to the append-only catch-up, and the DROP "
+        "TABLE went ahead on a destination that was short, with no error and no log row. Deletes the "
+        "count comparison whole and leaves the keyed catch-up in place, so part A of "
+        "tests/timescale/db/20 still passes and only parts B and C catch this -- through the refusal "
+        "message, which is the only thing that separates a refusal from a cutover that wrongly ran on to "
+        "its COMMIT inside throws_like.",
+        [(HT_CUTOVER_CONSERVATION, "", 1)],
     ),
     "transmute_no_lock_timeout": (
         "bench/transmute_lock_timeout.sh",
@@ -1000,6 +1045,8 @@ $$;''',
 MUTATION_SRC = {
     "hypertable_cutover_unverified_source": "pgpm_hypertable/install.sql",
     "hypertable_cutover_unverified_dest": "pgpm_hypertable/install.sql",
+    "hypertable_catchup_strict_watermark": "pgpm_hypertable/install.sql",
+    "hypertable_cutover_no_conservation": "pgpm_hypertable/install.sql",
     "archive_lz77_hash_scratch": "pgpm_archive/install.sql",
     "archive_encode_array_agg_unnest": "pgpm_archive/install.sql",
     "archive_deflate_six_arrays": "pgpm_archive/install.sql",
@@ -1026,6 +1073,8 @@ MUTATION_TRACK = {
     # without it. run_timescale invokes these while its own container is already up.
     "hypertable_cutover_unverified_source": "timescale",
     "hypertable_cutover_unverified_dest": "timescale",
+    "hypertable_catchup_strict_watermark": "timescale",
+    "hypertable_cutover_no_conservation": "timescale",
 }
 
 

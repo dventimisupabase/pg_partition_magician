@@ -327,11 +327,26 @@ the workload continue, then run `from_hypertable_cutover` when ready. Each chunk
 dimension's own type (`timestamptz`, `timestamp` without time zone, or `date`), so the copy is exact under any
 session `TimeZone`; a hypertable on a dimension of any other type is refused here.
 
-- `p_track_changes` -- capture in-flight **updates and deletes**, not just appends. When `false` (the
-  default), the cutover catches up **append-only** (rows whose control column is past the copy watermark),
-  which is correct for append-only workloads but **silently loses updates and deletes** to already-copied
-  rows. That append-only tail is pre-drained online before the lock too
-  (`from_hypertable_drain_appends`, run automatically by the cutover). When `true`, the copy installs an
+- `p_track_changes` -- capture in-flight **updates, deletes and out-of-order appends**, not just in-order
+  appends. When `false` (the default), the cutover catches up **append-only**: it takes the rows whose
+  control column is at or past the copy watermark (`max(control)` in the destination) and nothing else.
+  That is correct only for a workload whose rows arrive in control order and are never changed afterwards.
+  It **cannot see updates and deletes** to already-copied rows, and it **cannot see a row that arrives
+  during the window with a control value below the watermark**: multi-writer clock skew, batched device
+  uploads and backfills all produce such rows, and they are the normal shape of an IoT workload. Neither
+  is lost silently: the cutover compares the two sides under its lock and **refuses the swap** on any
+  mismatch (see `from_hypertable_cutover`), so the failure mode is a refused cutover naming both counts,
+  not a table dropped short. A row landing **exactly at** the watermark is taken on a keyed table (the
+  catch-up is inclusive there, with a key anti-join against the destination so the copied row already at
+  that value is not duplicated); on a keyless table it is detected by the same check rather than taken.
+  That append-only tail is pre-drained online before the lock too
+  (`from_hypertable_drain_appends`, run automatically by the cutover).
+
+  **Whenever the table has a primary key or unique constraint, pass `p_track_changes => true`.** The
+  append-only path is the unsafe one for a real workload, and tracking costs one row trigger and one small
+  delta table for the duration of the window. The default is unchanged for now.
+
+  When `true`, the copy installs an
   `AFTER INSERT/UPDATE/DELETE` row trigger on the source that logs the
   touched key values (plus a monotonic `pgpm_seq` ordering column) to a `<rel>_pgpm_delta` table. That
   backlog is reconciled **online, in micro-batches, before the cutover** (`from_hypertable_drain_delta`, run
@@ -339,7 +354,7 @@ session `TimeZone`; a hypertable on a dimension of any other type is refused her
   by the key `transmute` reuses (a primary key or unique constraint), so `p_track_changes => true` is
   **refused on a keyless table** (no key to reconcile by) and on a key with a **nullable (non-control)
   column** (a `NULL` key component can never be reconciled, so the change would be lost). Set it for any
-  workload that updates or deletes rows during the migration window.
+  workload that updates or deletes rows, or can append out of order, during the migration window.
 
 ### `from_hypertable_drain_delta` / `from_hypertable_drain_delta_step`
 
@@ -395,8 +410,10 @@ batch copies the rows in `(watermark, hi]` where `hi` is the control value `p_ba
 it then advances the watermark to `hi`. The driver carries the watermark across batches (read once up front,
 never re-scanning the destination for `max()`) and **commits per batch**; `_step` does one batch (no commit,
 returns the advanced watermark). `p_threshold`, `p_max_iter`, and `p_best_effort` behave as in
-`from_hypertable_drain_delta`. Assumes the append-only contract (no updates/deletes to copied rows), exactly
-as the under-lock catch-up does; use `p_track_changes` for update/delete workloads.
+`from_hypertable_drain_delta`. Assumes the append-only contract (no updates or deletes to copied rows, and
+appends arriving in control order), exactly as the under-lock catch-up does. A row that arrives behind the
+watermark is invisible to both; the cutover's conservation check refuses the swap rather than lose it. Use
+`p_track_changes` for update/delete workloads and for any workload that can append out of order.
 
 ### `from_hypertable_cutover`
 
@@ -417,19 +434,37 @@ destination's primary key and secondary indexes online** (on the private copy, b
 O(rows) work, deliberately kept out of the blocking window). For the append-only path the catch-up watermark
 (`max(control)` on the destination) is also read here, before the lock, so an `O(rows)` `max()` seqscan on a
 keyless destination is not in the blocking window.
-Then it takes a **brief, metadata-only `ACCESS EXCLUSIVE` window**: catch up the writes that arrived during
+Then it takes the **`ACCESS EXCLUSIVE` window**: catch up the writes that arrived during
 the copy (append-only, or a full delta replay when `from_hypertable_copy` ran with `p_track_changes => true`
--- auto-detected via the delta table, so the two phases cannot disagree), drop the hypertable, rename the copy
+-- auto-detected via the delta table, so the two phases cannot disagree), **verify that the source and the
+destination hold the same number of rows** (below), drop the hypertable, rename the copy
 into place, **adopt** the pre-built unique indexes as the original `PRIMARY KEY`/`UNIQUE` constraints
 (`ALTER TABLE ... USING INDEX`, metadata-only) and rename the secondary indexes back to their original names,
 re-add the identity columns (which `CREATE TABLE LIKE` does not carry), then hand off to `transmute`. Because
-the index builds happen before the lock, the blocking window is bounded by the catch-up + metadata, not by the
-table size. It also preserves each identity
+the index builds happen before the lock, the blocking window is the catch-up, one `count(*)` over the source,
+and metadata: the count is the only step in it that reads the whole table, and it is a read, not a rebuild.
+It also preserves each identity
 sequence's exact position: `transmute` seeds past `max(id)`, but if the source sequence was further ahead
 (gaps from rollbacks, caching, or deleted high rows) the migrated sequence is advanced to the source's next
 value so those ids are not re-issued. The swap is one transaction: it
 commits whole or rolls back whole, leaving the source intact on any failure. Requires `from_hypertable_copy`
 to have run (the destination must exist). Parameters past `p_interval` pass through to `transmute`.
+
+**The cutover refuses to swap unless the two sides agree.** Before anything is dropped, and still under the
+lock (so both numbers are exact), it compares `count(*)` over the source with the destination's row count
+after the catch-up. On a mismatch it raises `pg_partition_magician: from_hypertable_cutover(...) refusing to
+swap: the source holds N rows but the destination would hold M ...`, naming both counts and the difference,
+and the whole cutover rolls back: the source is untouched and still a hypertable, the destination copy is
+intact, and nothing was handed to `transmute`. On the append-only path the cause is rows that arrived during
+the online window with a control value at or below the copy watermark (out-of-order appends, a backfill, or
+an update or delete of a copied row). Those rows are below the watermark, so **re-running the cutover cannot
+find them**: re-run `from_hypertable_copy` with `p_track_changes => true` (it drops and rebuilds the
+destination), or, on a keyless table, pause writes to the source for the duration of the copy. On the
+tracking path a mismatch means a write reached the source without firing the capture trigger
+(`session_replication_role = replica`, or the trigger disabled); fix the writer and re-run the copy with
+tracking. The source's `count(*)` runs under the lock and is proportional to the table's size; the
+destination's count is taken before the lock and adjusted by exactly what the catch-up changed, so it adds
+nothing there.
 
 **Do not rename or replace either side of the swap while the cutover is preparing.** The source's name is
 resolved once at the start, and the index pre-builds above are deliberately outside the lock, so that is the
