@@ -88,8 +88,8 @@ to end and only the PR's archive job caught it.
 
 CI runs a `Markdown` job (`.github/workflows/lint.yml`,
 `DavidAnson/markdownlint-cli2-action@v16`) over `**/*.md` using the rules in
-`.markdownlint.json`. `Markdown` is one of the checks `main` requires through the merge queue, so a
-red one blocks the merge; lint locally first rather than discovering it in the queue.
+`.markdownlint.json`. `Markdown` feeds the `Lint summary` check `main` requires, so a red one
+blocks the merge; lint locally first.
 the check green.
 
 - **Match CI's linter version.** The action pins markdownlint **v0.34.0**. Run
@@ -115,15 +115,16 @@ the check green.
 - **`-` or `+` at the start of a wrapped line** reads as a stray list item (MD004/MD032).
   Reword instead of introducing an em dash (house style: no em dashes anywhere).
 
-## PRs land through the merge queue
+## How PRs land
 
 `main` requires three summary checks (`Test Summary`, `Lint summary`, `Perf summary`), resolved review
-threads, and an up-to-date branch. The merge queue satisfies the last one: `gh pr merge --squash`
-enqueues the PR, GitHub builds `main` plus the queued PRs, runs every workflow on that exact tree
-(`merge_group` has no path filter, so the perf, archive and eBPF tracks all run there whatever the PR
-touched), and merges only if it is green. Do not rebase-and-rerun by hand to keep a batch honest; the
-queue does it once per group. A PR whose own checks are red or whose threads are unresolved cannot be
-queued, and a group that turns red is split and retried automatically.
+threads, and an up-to-date branch. Every PR workflow also runs on `merge_group`, and the ruleset that
+would add GitHub's merge queue is written, but the queue itself is only offered on repositories owned
+by an organization and this one is owned by a user account, so the API refuses it (`Invalid rule
+'merge_queue'`). Until the repository moves to an organization, a batch of PRs lands the way pass 1's
+did: rebase onto the `main` the previous merge produced, let CI run on the rebased head, merge, next.
+With the perf track sharded that is about 11 minutes of CI per PR. Do not skip the rerun after a
+conflict-free rebase; #483 rebased cleanly and still broke three tests that called a dropped signature.
 
 ## An unresolved review thread blocks a merge invisibly
 

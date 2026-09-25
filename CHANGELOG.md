@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- **PRs land through a merge queue.** Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
+- **Every PR workflow is merge-queue ready.** (GitHub offers the queue only on organization-owned repositories, so it is not enabled on this user-owned one; the workflows and the ruleset are ready for the day it moves.) Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,
   the new `Lint summary` and `Perf summary`) instead of eight job names. The perf workflow drops its

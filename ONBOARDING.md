@@ -124,7 +124,7 @@ select * from finish();
 - **Branch** off `main` with Conventional Branches: `feat/…`, `fix/…`, `docs/…`,
   `chore/…` (kebab-case). Don't commit to `main` directly.
 - **Conventional Commits** for messages.
-- Workflow: implement → commit → push → PR → `gh pr merge --squash` (which enqueues it; the merge queue merges when green), delete branch,
+- Workflow: implement → commit → push → PR → rebase onto `main` once green → `gh pr merge --squash`, delete branch,
   sync local `main`.
 - **PostgreSQL 15** is the target (realistic older-but-supported workhorse; behavior
   is identical 15–17). Keep SQL PG-15-compatible.
