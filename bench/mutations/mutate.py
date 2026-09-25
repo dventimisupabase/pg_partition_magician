@@ -1392,6 +1392,28 @@ $$;''',
           "   and position(' REFERENCES ' || quote_ident(c.relname) || '(' in d.definition) > 0;\n",
           "", 1)],
     ),
+    "regrain_candidate_ignores_target": (
+        "bench/regrain_candidate_subdivides.sh",
+        "Pre-#515 maintain(): the auto-regrain candidate is the oldest child that is coarse by "
+        "partition_step and frozen, with no test that regrain_to actually SUBDIVIDES it. The two "
+        "predicates that have to agree (the candidate query's, and regrain_step's 'nosubdiv') then agree "
+        "only while the target is no wider than the grid step at every lo, which set_regrain checks once, "
+        "at the anchor. '30 days' on a '1 month' grid passes that check, and a 30-day cell that starts in "
+        "February is wider than the calendar month from there: once the first coarse child has been split "
+        "into such cells, that one is the oldest candidate on every tick, answers 'nosubdiv', and every "
+        "coarse child behind it is never regrained. progress().coarse_frozen is reverted with it so the "
+        "mutant is self-consistent (it counted by the grid's step alone too) and tests/125's mirror "
+        "assertion fails for the same reason rather than by accident. tests/125's second coarse year, "
+        "never reached, is what catches it.",
+        [("      || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo, %L))'   -- #515: the target subdivides it\n"
+          "      || ' and not pgpm._native_gt(%L, p.hi, %L) order by p.lo::%s asc limit 1',\n"
+          "      p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step, cfg.partition_tz,\n"
+          "      cfg.control_kind, cfg.control_kind, cfg.regrain_to, cfg.partition_tz,\n",
+          "      || ' and not pgpm._native_gt(%L, p.hi, %L) order by p.lo::%s asc limit 1',\n"
+          "      p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step, cfg.partition_tz,\n", 1),
+         ("         and pgpm._native_gt(r.control_kind, p.hi, pgpm._grid_next(r.control_kind, coalesce(r.regrain_to, r.partition_step), p.lo, r.partition_tz))\n",
+          "", 1)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.

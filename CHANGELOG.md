@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Auto-regrain selects only a child its target actually subdivides (#515).** `maintain`'s candidate
+  was the oldest frozen child wider than one `partition_step`; `regrain_step` then required that the
+  target step subdivide it, and the two agreed only while the target was no wider than the step at
+  every point of the calendar, which `set_regrain`'s coarser-than-step refusal checks once, at
+  `partition_anchor`. `'30 days'` on a monthly grid passed (narrower than the anchor's January), yet a
+  30-day cell that starts in February is wider than the calendar month from there, so once the first
+  coarse child had been split, that cell was the candidate on every tick, answered `nosubdiv`, and every
+  coarse child behind it was never regrained: silent and permanent. The candidate query now requires
+  both (coarse by the grid's step, and subdividable by the target, `regrain_step`'s own precondition),
+  so a cell the target cannot split is skipped and the next coarse child is worked; such cells stay
+  counted in `status().coarse_partitions`, and `progress().coarse_frozen` mirrors the same test so it
+  reports what auto-regrain will actually work. The refusal itself is unchanged, and its comment now
+  says what it does and does not compare. `tests/125` (a monthly ULID grid split into years, then
+  auto-regrained toward 30 days: the second year is what the unfixed code never reached), guard
+  `bench/regrain_candidate_subdivides.sh`, mutation `regrain_candidate_ignores_target`.
 - **A schema whose name needs quoting no longer wedges archive, retire and regrain** (#512).
   `_is_write_blocked` and `_regrain_capture_active` selected the parent's `nspname` and cast the raw
   name back with `::regnamespace`, whose input parses its text as an SQL identifier: for a managed
