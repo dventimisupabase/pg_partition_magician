@@ -951,8 +951,10 @@ $$;
 -- (a coarse / monolith child, REDESIGN.md section 6) is named _p<lo>_to_<hi> so it can never collide
 -- with the fine child at its low edge. Both bounds are formatted at the step's granularity. hi is
 -- optional: omitted (or equal to the one-step value) yields the fine name, so existing callers are
--- unchanged. The name is a human-facing LABEL only -- pgpm.part holds the authoritative bounds, so the
--- 63-byte identifier limit is cosmetic, never a correctness concern (a hash fallback is future work).
+-- unchanged. The name is a human-facing LABEL (pgpm.part holds the authoritative bounds), but it is also
+-- how obtain, extend_to and regrain_step ask whether a child ALREADY EXISTS (to_regclass on this name), so
+-- it has to be unique per range: a name that would exceed PostgreSQL's 63-byte identifier limit is
+-- REFUSED rather than truncated (#510, below).
 --
 -- Rendered in p_tz for day and coarser granularities (#455): "the month it is in partition_tz", which
 -- is what the operator who chose the zone reads off the name. Sub-day granularities render in UTC
@@ -964,6 +966,7 @@ create or replace function pgpm._part_name(p_relname name, p_kind text, p_step t
                                            p_hi_native text, p_tz text)
 returns name language plpgsql immutable as $$
 declare v_months int; v_secs double precision; fmt text; v_coarse boolean; v_lo text; v_hi text; v_label_tz text;
+        v_name text;
 begin
   v_coarse := p_hi_native is not null
           and pgpm._native_gt(p_kind, p_hi_native, pgpm._grid_next(p_kind, p_step, p_lo_native, p_tz));
@@ -978,19 +981,27 @@ begin
     else                                              fmt := 'YYYY_MM_DD_HH24MI'; v_label_tz := 'UTC';
     end if;
     v_lo := to_char(p_lo_native::timestamptz at time zone v_label_tz, fmt);
-    if v_coarse then
-      v_hi := to_char(p_hi_native::timestamptz at time zone v_label_tz, fmt);
-      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
-    end if;
-    return (p_relname || '_p' || v_lo)::name;
+    if v_coarse then v_hi := to_char(p_hi_native::timestamptz at time zone v_label_tz, fmt); end if;
   else
     v_lo := lpad(floor(p_lo_native::numeric)::text, 19, '0');
-    if v_coarse then
-      v_hi := lpad(floor(p_hi_native::numeric)::text, 19, '0');
-      return (p_relname || '_p' || v_lo || '_to_' || v_hi)::name;
-    end if;
-    return (p_relname || '_p' || v_lo)::name;
+    if v_coarse then v_hi := lpad(floor(p_hi_native::numeric)::text, 19, '0'); end if;
   end if;
+  v_name := p_relname || '_p' || v_lo || case when v_coarse then '_to_' || v_hi else '' end;
+
+  -- #510: refuse, never truncate. The cast to name below silently cuts the text to 63 bytes, and an
+  -- earlier comment here called that cosmetic because pgpm.part holds the bounds. It is not: obtain,
+  -- extend_to and regrain_step decide whether a child already exists BY THIS NAME, so once the label is
+  -- cut every candidate renders the same 63 bytes, the monolith takes that name at transmute, every forward
+  -- cell is skipped as existing, nothing is logged, and the first write past the monolith's hi is refused
+  -- by PostgreSQL with "no partition of relation found for row". Raising here covers every caller at once,
+  -- and every caller can afford it: transmute names the monolith before it has claimed or committed
+  -- anything, set_regrain asks at call time, and obtain, extend_to and regrain_step are functions, so a
+  -- raise unwinds them whole. octet_length, not length: the limit is bytes, and a name may be multibyte.
+  if octet_length(v_name) > 63 then
+    raise exception 'pg_partition_magician: cannot name a partition of % -- % is % bytes, over PostgreSQL''s 63-byte identifier limit, and pgpm never truncates a partition name (obtain and regrain decide whether a partition already exists by name, so truncated names collide and the forward grid silently stops growing). Shorten the table name by at least % byte(s), or use a coarser step, whose labels are shorter.',
+      p_relname, v_name, octet_length(v_name), octet_length(v_name) - 63;
+  end if;
+  return v_name::name;
 end;
 $$;
 
@@ -3628,6 +3639,15 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_default := (v_rel || '_default')::name;
+  -- #510: the staging name is held to the same rule as every partition name (see _part_name): never
+  -- truncated. The cast to name below silently cuts it to 63 bytes, and at a 61-character table name the
+  -- cut staging name equalled the cut monolith name, so phase 3's RENAME failed after phases 1 and 2 had
+  -- committed. _part_name refuses the monolith's own name before anything is committed (further down);
+  -- this is the one derived name it never sees, so it is checked here, first, for the same up-front refusal.
+  if octet_length(v_rel || '_pgpm_new') > 63 then
+    raise exception 'pg_partition_magician: cannot transmute % -- its staging name % is % bytes, over PostgreSQL''s 63-byte identifier limit, and pgpm never truncates a name it derives from the table''s (a truncated one can collide with another). Shorten the table name by at least % byte(s).',
+      p_parent, v_rel || '_pgpm_new', octet_length(v_rel || '_pgpm_new'), octet_length(v_rel || '_pgpm_new') - 63;
+  end if;
   v_staging := (v_rel || '_pgpm_new')::name;
 
   -- control column type vs kind (and the float guard)
@@ -5074,7 +5094,7 @@ drop function if exists pgpm.feathering_validation(regclass, interval, interval)
 create or replace function pgpm.set_regrain(p_parent regclass, p_target_step text default null)
 returns void language plpgsql as $$
 declare
-  cfg pgpm.config;
+  cfg pgpm.config; v_rel name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -5107,6 +5127,17 @@ begin
       'pg_partition_magician: regrain target step % is coarser than partition_step % for % -- '
       'this would wedge auto-regrain permanently; use regrain()/regrain_history() for a one-off '
       'hierarchical split instead', p_target_step, cfg.partition_step, p_parent;
+  end if;
+
+  -- #510: the fine sub-range names at the target step must fit PostgreSQL's 63-byte identifier limit, and
+  -- _part_name refuses rather than truncates. Ask it here, at call time, for the anchor cell's name at the
+  -- target step (labels are fixed-width per granularity, so one cell stands for all of them), rather than
+  -- letting every later tick raise the same refusal from regrain_step and log skip_regrain forever: the
+  -- #341 wedge again, one level down. A finer step has a wider label than partition_step's, so a table
+  -- that passed transmute can still be refused here, and the message says by how many bytes.
+  if p_target_step is not null then
+    select c.relname into v_rel from pg_class c where c.oid = p_parent;
+    perform pgpm._part_name(v_rel, cfg.control_kind, p_target_step, cfg.partition_anchor, null, cfg.partition_tz);
   end if;
 
   update pgpm.config set regrain_to = p_target_step where parent_table = p_parent;

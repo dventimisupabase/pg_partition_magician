@@ -1026,6 +1026,50 @@ begin
           "declare v_nsp name;\nbegin\n  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;\n", 2),
          ("c.relnamespace = v_nsp_oid", "c.relnamespace = v_nsp::regnamespace", 2)],
     ),
+    "part_name_silent_truncation": (
+        "bench/part_name_length.sh",
+        "Pre-#510 _part_name: the length check is gone and the rendered <rel>_p<label> goes straight "
+        "through the cast to name, which silently cuts it to 63 bytes. For a relation name long enough "
+        "that the label itself is cut, every forward candidate renders the same 63 bytes, the monolith "
+        "takes that name at transmute, obtain skips every cell as already existing, nothing is logged, and "
+        "the first write past the monolith's hi is refused by PostgreSQL. tests/124's boundary pairs (a "
+        "64-byte name rendered instead of refused) and its 44-character transmute (a conversion where a "
+        "refusal was promised) are what catch it.",
+        [("""  if octet_length(v_name) > 63 then
+    raise exception 'pg_partition_magician: cannot name a partition of % -- % is % bytes, over PostgreSQL''s 63-byte identifier limit, and pgpm never truncates a partition name (obtain and regrain decide whether a partition already exists by name, so truncated names collide and the forward grid silently stops growing). Shorten the table name by at least % byte(s), or use a coarser step, whose labels are shorter.',
+      p_relname, v_name, octet_length(v_name), octet_length(v_name) - 63;
+  end if;
+""", "", 1)],
+    ),
+    "transmute_staging_name_silent_truncation": (
+        "bench/part_name_length.sh",
+        "Pre-#510 transmute: the staging name <rel>_pgpm_new is cast to name with no length check, so a "
+        "table name of 55 characters or more gets a truncated staging name. In the yearly one-step band "
+        "the partition names fit and the truncated staging name is used as-is; at 61 characters it "
+        "equalled the truncated monolith name and phase 3's RENAME failed after two phases had committed. "
+        "tests/124's 55-character yearly table (a conversion where a refusal was promised) and its "
+        "60-character table (refused for the monolith's name rather than the staging name's, so the "
+        "message names the wrong thing) are what catch it.",
+        [("""  if octet_length(v_rel || '_pgpm_new') > 63 then
+    raise exception 'pg_partition_magician: cannot transmute % -- its staging name % is % bytes, over PostgreSQL''s 63-byte identifier limit, and pgpm never truncates a name it derives from the table''s (a truncated one can collide with another). Shorten the table name by at least % byte(s).',
+      p_parent, v_rel || '_pgpm_new', octet_length(v_rel || '_pgpm_new'), octet_length(v_rel || '_pgpm_new') - 63;
+  end if;
+""", "", 1)],
+    ),
+    "set_regrain_no_name_check": (
+        "bench/part_name_length.sh",
+        "set_regrain records a target step without asking _part_name whether the fine names at that step "
+        "fit. A finer step has a wider label than partition_step's, so a table whose monthly names fit "
+        "can be handed a daily regrain_to whose names do not: nothing refuses at call time, and every "
+        "later tick raises the same error from regrain_step and logs skip_regrain, the #341 wedge one "
+        "level down. tests/124's 52-character table (a daily target recorded where a refusal was "
+        "promised, regrain_to no longer null) is what catches it.",
+        [("""  if p_target_step is not null then
+    select c.relname into v_rel from pg_class c where c.oid = p_parent;
+    perform pgpm._part_name(v_rel, cfg.control_kind, p_target_step, cfg.partition_anchor, null, cfg.partition_tz);
+  end if;
+""", "", 1)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "

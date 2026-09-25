@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- **A name pgpm derives from the table's is never truncated; `transmute` and `set_regrain` refuse
+  instead** (#510). `_part_name` cast `<rel>_p<label>` to `name`, which silently cuts it to 63 bytes, and
+  its comment called that cosmetic because `pgpm.part` holds the bounds. But `obtain` decides whether a
+  forward cell already exists by that name, so for a table name of about 55 characters or more every
+  candidate rendered the same 63 bytes, the monolith took that name at `transmute`, every forward cell was
+  skipped as existing, nothing was logged, and the first write past the monolith's `hi` failed with
+  PostgreSQL's `no partition of relation ... found for row`; one byte longer and the cut monolith name
+  equalled the cut staging name `<rel>_pgpm_new`, so the cutover's RENAME failed after two phases had
+  committed. `_part_name` now refuses a name over 63 bytes with a `pg_partition_magician:` error naming
+  it, its length and the bytes to shorten the table name by, which covers `obtain`, `extend_to`,
+  `regrain_step` and `transmute`, where the monolith is named before anything is claimed or committed;
+  `transmute` holds the staging name to the same rule, and `set_regrain` refuses a target step whose
+  wider labels would not fit at call time rather than logging `skip_regrain` on every tick. The budget is
+  under [Partition naming](docs/reference.md#partition-naming): on a monthly grid the table name can be up
+  to 43 bytes when the data spans more than one month. `tests/124_part_name_length_refused_test.sql` pins
+  the boundary from both sides (a 63-byte name renders, a 64-byte one refuses, and every refusal is paired
+  with the same shape one byte shorter converting and building its forward grid); `bench/part_name_length.sh`
+  runs it under `discriminate` against three mutations (`part_name_silent_truncation`,
+  `transmute_staging_name_silent_truncation`, `set_regrain_no_name_check`).
+
+  **Upgrading in place: a long-named table converted before this fix has no forward grid.** Its monolith
+  carries a cut name and `obtain` skipped every cell. After the upgrade each tick's `obtain` refuses
+  instead and `maintain` logs `skip_obtain` with the message, so the table is visible rather than silent,
+  but nothing repairs it: `untransmute` (a clean reverse, since every row is still in the monolith), rename
+  the table within the budget, and `transmute` again. `select parent_table, child_name from pgpm.part
+  where attached and octet_length(child_name) = 63` lists the candidates; a cut name ends mid-label.
 - **Auto-regrain selects only a child its target actually subdivides (#515).** `maintain`'s candidate
   was the oldest frozen child wider than one `partition_step`; `regrain_step` then required that the
   target step subdivide it, and the two agreed only while the target was no wider than the step at
