@@ -754,6 +754,21 @@ MUTATIONS = {
         "is what tells the two layers apart.",
         [(REGRAIN_SWAP_DRAIN_LOOP, REGRAIN_SWAP_DRAIN_LOOP_BOUNDED, 1)],
     ),
+    "regrain_reconcile_delete_by_watermark": (
+        "bench/regrain_reconcile_snapshot.sh",
+        "Pre-#497 _regrain_reconcile at the one statement where the loss happened: the tick's final "
+        "delete consumes every eligible delta row at or below the batch's highest pgpm_seq, under its "
+        "own READ COMMITTED snapshot, instead of exactly the rows the apply statements addressed. "
+        "pgpm_seq is assigned when the capture trigger fires, inside the writer's transaction, so a "
+        "writer that captured an UPDATE and then held its transaction open across the tick commits a "
+        "row whose pgpm_seq is below the watermark: invisible to the apply statements, visible to the "
+        "final delete, and gone unapplied. The fine child keeps the pre-change row and the swap "
+        "attaches it. tests/124 fails against this on id 150000 reading 'orig' after a clean swap, on "
+        "the witness that T1's capture survived the tick, and on the tick's consumed-row count.",
+        [("  execute format('delete from %I.%I where pgpm_seq = any($1)', v_nsp, v_delta) using v_seqs;\n",
+          "  execute format('delete from %I.%I where pgpm_seq <= %s and %s', v_nsp, v_delta,\n"
+          "                 (select max(s) from unnest(v_seqs) s), v_elig);\n", 1)],
+    ),
     "regrain_no_outgoing_fk": (
         "bench/regrain_outgoing_fk_lock.sh",
         "Pre-#348 regrain_step: a fine child is created via `like ... including constraints`, "

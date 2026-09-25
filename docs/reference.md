@@ -874,7 +874,9 @@ each captured key, so a row inserted, deleted or updated mid-regrain is not lost
 by the swap. The trigger is enabled `ALWAYS`, so DML applied with `session_replication_role = replica` (a
 logical-replication subscriber's apply worker, a loader silencing triggers) is captured like any other.
 The reconcile is bounded by the same budget as the copy and takes the tick when there is work,
-so a burst of DML paces itself rather than landing inside the swap. If writes outpace it the regrain stalls
+so a burst of DML paces itself rather than landing inside the swap. A pass consumes from the delta exactly
+the captured rows it applied, so a change that commits while a pass is running is neither lost nor
+consumed early: it stays in the delta for the next pass. If writes outpace it the regrain stalls
 at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
 work is done under the swap's lock.
 

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **A regrain reconcile pass consumes from the delta exactly the captured rows it applied, never
+  "everything at or below a watermark"** (#497). `_regrain_reconcile` read its batch watermark, its list
+  of touched fine children, each child's delete and reinsert, and its final `delete from <delta> where
+  pgpm_seq <= wm` as separate statements, each under its own READ COMMITTED snapshot. `pgpm_seq` is an
+  identity value assigned when the capture trigger fires, inside the writer's transaction, so a writer
+  that updated an already-copied row, held its transaction open across a tick, and committed while the
+  tick was applying its batch had a capture below the watermark that the apply statements could not see
+  and the final delete could: it was deleted unapplied, the fine child kept the pre-change row, and the
+  swap attached it, silently reverting a committed UPDATE. The batch is now materialised once, as the
+  `pgpm_seq` values of the eligible rows visible in a single snapshot, and every later statement in the
+  tick, the final delete included, addresses the delta by that set; a capture the tick did not see stays
+  in the delta for the next tick, which applies it. `tests/124_regrain_reconcile_snapshot_test.sql`
+  reproduces the three-session interleaving by lock state and asserts by identity that the UPDATE
+  survives the swap; `bench/regrain_reconcile_snapshot.sh` drives it against the
+  `regrain_reconcile_delete_by_watermark` mutation, which `./test.sh discriminate` requires it to fail.
+
 - **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,

@@ -2449,9 +2449,12 @@ begin
 
   if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
     execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);
-    -- monotonic ordering column so a reconcile pass can batch by a pgpm_seq watermark: a batch processes
-    -- and deletes rows at or below the watermark, and anything arriving mid-batch lands higher for the next
-    -- pass. Excluded by name wherever key columns are introspected.
+    -- monotonic ordering column so a reconcile pass can batch the oldest captures first: a batch is the
+    -- first N eligible rows by pgpm_seq that ONE snapshot can see, and the pass consumes exactly those rows
+    -- (#497), never "everything at or below a watermark". The value is assigned when the trigger fires,
+    -- inside the writer's transaction, so a row can commit later than rows carrying higher values; a
+    -- pass addresses the delta by the identity of the rows it saw, and a late-committing row waits for
+    -- the next pass. Excluded by name wherever key columns are introspected.
     execute format('alter table %I.%I add column pgpm_seq bigint generated always as identity', v_nsp, v_delta);
     execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);
   end if;
@@ -2580,7 +2583,7 @@ create or replace function pgpm._regrain_reconcile(
 ) returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_nsp name; v_delta name; v_ncast text; v_keycols_q text; v_dkey_q text;
-  v_skey_q text; v_cols_q text; v_wm bigint; v_elig text; v_ctl_q text; v_sub_name name; v_n int := 0; r record;
+  v_skey_q text; v_cols_q text; v_seqs bigint[]; v_elig text; v_ctl_q text; v_sub_name name; v_n int := 0; r record;
   v_kctl_native_q text;   -- a delta row's control value, read as a NATIVE grid value (#455)
   v_lo_lit text; v_hi_lit text; v_cur_lit text; v_sub_lo text; v_sub_hi text; v_boundary text;
 begin
@@ -2631,18 +2634,31 @@ begin
   -- eligible: in this child's range AND behind the cursor
   v_elig := format('%1$s >= %2$L and %1$s < %3$L and %1$s < %4$L', v_ctl_q, v_lo_lit, v_hi_lit, v_cur_lit);
 
-  execute format('select max(pgpm_seq) from (select pgpm_seq from %I.%I where %s order by pgpm_seq limit %s) t',
-                 v_nsp, v_delta, v_elig, greatest(p_batch, 1)) into v_wm;
-  if v_wm is null then return 0; end if;
+  -- ONE snapshot decides the batch (#497). pgpm_seq is an identity column, assigned when the capture
+  -- trigger fires INSIDE the writer's transaction, so a row can commit later than rows that already
+  -- carry higher values: a writer that captured a change and then held its transaction open across
+  -- this tick commits a row whose pgpm_seq is below everything the batch was cut from. Every statement
+  -- below runs under READ COMMITTED in its own snapshot, so a batch described by a watermark
+  -- ("pgpm_seq <= wm and eligible") was a different set of rows in each of them: the apply statements
+  -- could not see that late-committing row, the final delete could, and it took the row unapplied. The
+  -- fine child kept the pre-change row and the swap attached it: a committed UPDATE reverted, measured.
+  -- So the batch is materialised here as the pgpm_seq values of the eligible rows visible NOW, and every
+  -- later statement, the final delete included, addresses the delta by that set and nothing else. A
+  -- delta row is never updated, only inserted and (here) deleted, so a row in the set stays visible to
+  -- every statement of this tick; a row not in the set is neither applied nor consumed, and waits for
+  -- the next tick, which is the tick that applies it.
+  execute format('select array_agg(pgpm_seq) from (select pgpm_seq from %I.%I where %s order by pgpm_seq limit %s) t',
+                 v_nsp, v_delta, v_elig, greatest(p_batch, 1)) into v_seqs;
+  if v_seqs is null then return 0; end if;
 
   -- one pair of set-based statements per distinct fine child touched, not per key
   for r in execute format(
     'select distinct pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %s, %L, %L, %L, %L, %L, %L, %L), %L) as sub_lo
-       from %I.%I k where pgpm_seq <= %s and %s',
+       from %I.%I k where k.pgpm_seq = any($1)',
     cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, v_kctl_native_q,
     cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
     cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz,
-    v_nsp, v_delta, v_wm, v_elig)
+    v_nsp, v_delta) using v_seqs
   loop
     -- #446: find the fine child by RANGE in pgpm.part, never by re-rendering its name. regrain_step
     -- clamps the first sub-range to the coarse child's own lo when that lo is off the target grid (a
@@ -2683,22 +2699,25 @@ begin
       continue;
     end if;
     execute format(
-      'delete from %I.%I d where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
+      'delete from %I.%I d where %s in (select %s from %I.%I k where k.pgpm_seq = any($1)
           and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %s, %L, %L, %L, %L, %L, %L, %L), %L) = %L)',
-      v_nsp, v_sub_name, v_dkey_q, v_keycols_q, v_nsp, v_delta, v_wm, v_elig,
+      v_nsp, v_sub_name, v_dkey_q, v_keycols_q, v_nsp, v_delta,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, v_kctl_native_q,
       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
-      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz, r.sub_lo);
+      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz, r.sub_lo)
+      using v_seqs;
     execute format(
-      'insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from %I.%I k where k.pgpm_seq <= %s and %s
+      'insert into %I.%I (%s) select %s from %I.%I s where %s in (select %s from %I.%I k where k.pgpm_seq = any($1)
           and pgpm._grid_floor(%L, %L, %L, pgpm._decode(%L, %s, %L, %L, %L, %L, %L, %L, %L), %L) = %L)',
-      v_nsp, v_sub_name, v_cols_q, v_cols_q, v_nsp, p_child, v_skey_q, v_keycols_q, v_nsp, v_delta, v_wm, v_elig,
+      v_nsp, v_sub_name, v_cols_q, v_cols_q, v_nsp, p_child, v_skey_q, v_keycols_q, v_nsp, v_delta,
       cfg.control_kind, p_step, cfg.partition_anchor, cfg.control_kind, v_kctl_native_q,
       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
-      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz, r.sub_lo);
+      cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz, r.sub_lo)
+      using v_seqs;
   end loop;
 
-  execute format('delete from %I.%I where pgpm_seq <= %s and %s', v_nsp, v_delta, v_wm, v_elig);
+  -- consume exactly the rows the statements above addressed: by identity, never by watermark (#497)
+  execute format('delete from %I.%I where pgpm_seq = any($1)', v_nsp, v_delta) using v_seqs;
   get diagnostics v_n = row_count;
   if v_n > 0 then
     insert into pgpm.log (parent_table, action, lo, hi, rows)
