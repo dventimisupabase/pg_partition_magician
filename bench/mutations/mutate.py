@@ -1048,16 +1048,22 @@ $$;''',
     ),
     "archive_order_by_raw_splice": (
         "bench/archive_encode_boundary.sh",
-        "Pre-#408 ORDER BY: archive._pq_encode_column_data joins p_order_by's elements without "
-        "quote_ident, which is what passing the whole ORDER BY list in as `p_order_by text` and "
+        "Pre-#408 ORDER BY: p_order_by's elements are joined without quote_ident wherever that "
+        "list is built, which is what passing the whole ORDER BY list in as `p_order_by text` and "
         "splicing it bare used to amount to. An element carrying a statement terminator then "
-        "reaches the statement as SQL rather than as one (absurd) column name.",
+        "reaches the statement as SQL rather than as one (absurd) column name. Two sites since "
+        "#462: archive._pq_encode_column_data builds the list for its two aggregates, and "
+        "archive._pq_snapshot builds it again, identically, for the row_number() that fixes the "
+        "snapshot's row order. The defect is the missing quote_ident, not the function it is "
+        "missing from, so the mutant removes it from both; a count of 1 here would either refuse "
+        "to build (the stale-pattern refusal below) or, anchored on one site, leave the other "
+        "quoting and misdescribe what pre-#408 code looked like.",
         [(
             """  select string_agg(quote_ident(c), ', ' order by ord) into v_order_q
     from unnest(p_order_by) with ordinality as t(c, ord);""",
             """  select string_agg(c, ', ' order by ord) into v_order_q
     from unnest(p_order_by) with ordinality as t(c, ord);""",
-            1,
+            2,
         )],
     ),
     "parquet_per_column_statements": (
