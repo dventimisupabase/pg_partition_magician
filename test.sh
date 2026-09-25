@@ -146,14 +146,68 @@ load_fixtures() {  # <profile> <service> [db] -- build the demo tables for the p
 }
 
 uninstall_and_verify() {  # <profile> <service>
-  local p="$1" s="$2" result
+  local p="$1" s="$2" result mon
+  # Stage regrain's change capture so the uninstall has something OUTSIDE pgpm to remove (#442). The delta
+  # table, its trigger function and the row trigger all live in the PARENT's schema, so `drop schema pgpm
+  # cascade` cannot reach them; before the fix all three survived uninstall, with the trigger still firing
+  # into a delta table nothing would ever drain. Transmute an id table, freeze its monolith with one row
+  # past hi, and run ONE regrain_step: the 'prepared' tick is the one that installs the trigger. Paused, so
+  # no maintenance tick can touch the fixture between here and the uninstall (regrain_step does not
+  # consult paused).
+  psql_run "$p" "$s" -q <<'SQL' >/dev/null
+create table public.uninst_ev (id bigint primary key, body text);
+insert into public.uninst_ev select g, 'b'||g from generate_series(1, 5000) g;
+call pgpm.transmute('public.uninst_ev', 'id', 1000, p_obtain => 2, p_retain => '2500', p_paused => true);
+insert into public.uninst_ev values (7500, 'sentinel');
+SQL
+  mon=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
+    select child_name from pgpm.part where parent_table = 'public.uninst_ev'::regclass and attached
+     order by lo::numeric limit 1")
+  result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
+    select pgpm.regrain_step('public.uninst_ev', '$mon', '1000', 100)")
+  if [ "$result" != "prepared" ]; then
+    echo "ERROR: regrain_step on the frozen monolith $mon returned '$result', expected 'prepared'"; return 1
+  fi
+  # The liveness witness: the trigger is on the monolith and the function and delta table exist. Without
+  # this, "nothing left behind" is also true of a run that never installed anything.
+  result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
+    select (select count(*) from pg_trigger where tgname = 'pgpm_regrain_capture' and tgrelid = 'public.$mon'::regclass),
+           (select count(*) from pg_proc where pronamespace = 'public'::regnamespace and proname = 'uninst_ev_pgpm_regrain_capture'),
+           (select count(*) from pg_class where oid = to_regclass('public.uninst_ev_pgpm_regrain_delta'))")
+  if [ "$result" != "1|1|1" ]; then
+    echo "ERROR: regrain capture was not installed before uninstall (trigger|function|delta='$result', expected 1|1|1)"; return 1
+  fi
+
   psql_run "$p" "$s" --single-transaction -f /repo/pgpm_core/uninstall.sql >/dev/null
+
   result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
     select (select count(*) from pg_namespace where nspname='pgpm'),
            (select count(*) from cron.job where jobname like 'pgpm%')")
   if [ "$result" != "0|0" ]; then
     echo "ERROR: uninstall left state behind (schemas|cron='$result', expected 0|0)"; return 1
   fi
+  # #442: nothing of regrain's capture may survive in the parent's schema: no relation (the delta table,
+  # its identity sequence, its index), no function, and no trigger on any table.
+  result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
+    select (select count(*) from pg_class where relnamespace = 'public'::regnamespace and relname like '%pgpm_regrain%'),
+           (select count(*) from pg_proc where pronamespace = 'public'::regnamespace and proname like '%pgpm_regrain%'),
+           (select count(*) from pg_trigger where tgname like '%pgpm_regrain%')")
+  if [ "$result" != "0|0|0" ]; then
+    echo "ERROR: uninstall left regrain capture behind (relations|functions|triggers='$result', expected 0|0|0)"; return 1
+  fi
+  # A write to the former source child must go through (a surviving trigger whose function was dropped
+  # would raise here, and ON_ERROR_STOP fails the run) and must have no delta table left to land in. What
+  # the guide promises stays, stays: the partitioned table under its own name with the rows it had, the
+  # sentinel and this write among them.
+  psql_run "$p" "$s" -q -c "insert into public.$mon values (5500, 'after uninstall')" >/dev/null
+  result=$($DC --profile "$p" exec -T "$s" psql -U postgres -d postgres -tA -c "
+    select (select to_regclass('public.uninst_ev_pgpm_regrain_delta') is null),
+           (select string_agg(id::text, ',' order by id) from public.uninst_ev where id > 5000),
+           (select count(*) from public.uninst_ev)")
+  if [ "$result" != "t|5500,7500|5002" ]; then
+    echo "ERROR: after uninstall (no delta|rows past 5000|row count='$result', expected t|5500,7500|5002)"; return 1
+  fi
+  psql_run "$p" "$s" -q -c "drop table public.uninst_ev cascade" >/dev/null
 }
 
 reset_demo() {  # <profile> <service> -- drop fixture tables so the next channel is clean
