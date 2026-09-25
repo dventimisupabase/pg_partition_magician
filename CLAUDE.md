@@ -34,6 +34,14 @@ and absence-of-setup look identical unless you separate them deliberately.
   later transaction than the work it measures. Those assertions belong in a `bench/` shell
   harness, which runs every tick in its own transaction, alongside the lock guards, which
   need a second concurrent session that one pgTAP file cannot give them.
+- **Pin every `throws_*` around a committing procedure.** pgTAP runs the statement under
+  test inside a function, so a procedure that does NOT refuse dies at its first COMMIT there
+  with 2D000 and rolls back into the state a refusal leaves. `throws_ok(sql, NULL, desc)`
+  accepts that: the three-argument overload reads a second argument that is not five octets,
+  NULL included, as the message, so it pins nothing. Pin the message with `throws_like`, or
+  the SQLSTATE with the four-argument `throws_ok(sql, 'P0001', NULL, desc)`.
+  `bench/throws_pinned.sh` fails the perf track on any assertion of that shape that would
+  also accept the 2D000.
 
 ## `_q` means the identifiers are already quoted
 
