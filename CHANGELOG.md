@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **`from_hypertable_cutover` refuses to swap when the source and the destination disagree, and the
+  append-only catch-up no longer loses a row that lands exactly at the watermark** (#460). Without
+  `p_track_changes` the cutover caught up rows with control strictly greater than `max(control)` in the
+  destination. A row arriving during the online window BELOW that watermark (out-of-order appends:
+  multi-writer clock skew, batched device uploads, backfills, the normal IoT shape) was never copied, a row
+  EXACTLY AT it was not copied either, and nothing under the lock compared the two sides, so the source was
+  dropped short with no error and no log row. Three layers, cheapest first. On a keyed table the under-lock
+  catch-up is now inclusive at the watermark with a key anti-join against the destination, bounded to the
+  tail (an unbounded anti-join would be O(rows) under the lock) and materialised and ANALYZEd first so the
+  plan probes the pre-built key index instead of seqscanning the destination (measured: even at 20k rows
+  the direct form planned a Seq Scan of the destination); equality is never a loss and the copied row
+  already there is not duplicated. A keyless table keeps the strict `>`: a duplicate row is legitimate
+  there, so an all-columns anti-join would refuse to copy one. Under the lock, BEFORE the drop, `count(*)`
+  over the frozen source is compared with the destination's count (its pre-lock baseline plus exactly what
+  the catch-up changed, so the destination is not scanned again) and the swap is REFUSED on a mismatch with
+  a message naming both counts, the difference and the fix; the raise precedes every irreversible step, so
+  the source stays whole and still a hypertable. The reference now states the late-arrival caveat as loudly
+  as the update/delete one and recommends `p_track_changes => true` whenever the table has a key; the
+  default is unchanged, a behaviour change worth its own issue. Cost: one `count(*)` over the source joins
+  the locked window, the one step in it that scales with the table. `tests/timescale/db/20` pins all three
+  layers: the equal and 1 us-past rows survive by identity on a keyed table with no duplicate, and a row an
+  hour behind the watermark makes the cutover refuse with `243` vs `242` (keyed) and `243` vs `241`
+  (keyless), source intact. `bench/hypertable_late_appends.sh` proves both assertions discriminate against
+  mutants that put the strict `>` and the missing check back.
 - **A `p_incoming_fks => 'preserve'` conversion that fails after phase 1 no longer loses the incoming
   foreign keys (#444).** The cutover is where the referencing table's key is dropped now, in the same
   transaction that records it in `pgpm.dropped_fk`. It used to be dropped in the first of `transmute`'s

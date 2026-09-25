@@ -595,8 +595,10 @@ end $$;
 -- Simpler than the delta drain: append-only means already-copied rows never change, so it is purely additive
 -- -- no delta, no reconcile, no key, no dest index, and no race (the watermark marches forward; an append
 -- that lands mid-batch has a higher control value and is taken next pass). It assumes the append-only
--- contract (no updates/deletes to copied rows), exactly as the under-lock catch-up already does -- use
--- p_track_changes for update/delete workloads.
+-- contract (no updates/deletes to copied rows, and appends arriving in control order), exactly as the
+-- under-lock catch-up already does -- use p_track_changes for update/delete workloads and for any
+-- workload that can append out of order. What arrives behind the watermark is invisible here and to the
+-- under-lock catch-up alike; the cutover's conservation check (#460) refuses the swap rather than lose it.
 
 -- from_hypertable_drain_appends_step copies ONE batch of appends past p_watermark and returns the new
 -- watermark (the batch's upper control bound, as text); no commit (the driver commits per batch). The batch
@@ -672,8 +674,10 @@ begin
   end loop;
 end $$;
 
--- Phase 2: the cutover (the one non-online window). Brief ACCESS EXCLUSIVE on the source; an append-only
--- catch-up of rows that arrived after the copy watermark (control > max copied); drop the hypertable
+-- Phase 2: the cutover (the one non-online window). ACCESS EXCLUSIVE on the source; an append-only
+-- catch-up of rows that arrived after the copy watermark (control >= max copied with a key anti-join on
+-- a keyed table, control > max copied on a keyless one); a conservation check that refuses the swap
+-- unless the source's count(*) matches the destination's (#460); drop the hypertable
 -- (Timescale's event trigger clears its chunks and catalog); rename the copy into place; rebuild the key,
 -- secondary indexes, and identity columns (CREATE TABLE LIKE carries none of those) with their original
 -- names; then hand off to transmute. The swap + rebuild is one transaction (commits whole or rolls back
@@ -696,6 +700,8 @@ declare
   v_tmp text; v_key_names text[]; v_key_types text[]; v_key_tmps text[]; v_idx_orig text[]; v_idx_tmps text[];
   v_in_refs text[]; v_in_names text[]; v_in_defs text[];   -- incoming FKs captured across the swap (#264)
   v_dest_oid regclass;   -- which relation the destination check found, re-verified under lock (#422)
+  v_akey oid;            -- the key the append-only catch-up anti-joins by; null on a keyless table (#460)
+  v_src_n bigint; v_dest_n bigint; v_n bigint;   -- conservation: source count under lock vs dest baseline + catch-up (#460)
 begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
@@ -747,13 +753,44 @@ begin
     call pgpm.from_hypertable_drain_appends(p_hypertable, p_control, p_drain_batch, p_drain_batch,
                                             1000000, p_best_effort => true);
   end if;
-  -- append-only: read the catch-up watermark (max control in the dest) BEFORE the lock. The dest is private
-  -- and stable from here to the lock (only CREATE INDEX runs, which does not change rows), so this is the
-  -- same value the under-lock catch-up would read -- but doing it here keeps an O(rows) max() seqscan on a
-  -- keyless dest OUT of the locked window (#174). New appends after this read have a higher control value
-  -- and are still caught by the under-lock `control > watermark`.
+  -- Read the destination BEFORE the lock. It is private and stable from here to the lock (only CREATE INDEX
+  -- runs, which does not change rows), so what is read here is what the under-lock work would read -- but
+  -- reading it here keeps an O(rows) seqscan of the dest OUT of the locked window (#174). Two things, one
+  -- scan: the append-only catch-up watermark (max control; new appends after this read have a higher
+  -- control value and are still caught under the lock), and the CONSERVATION BASELINE (#460): count(*) of
+  -- the dest as it stands, which the catch-up below adjusts by exactly the rows it adds or removes
+  -- (row_count) so the check under the lock can compare the two sides without scanning the dest again.
   if not v_track then
-    execute format('select max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_watermark;
+    execute format('select count(*), max(%I) from %I.%I', p_control, v_nsp, v_dest) into v_dest_n, v_watermark;
+  else
+    execute format('select count(*) from %I.%I', v_nsp, v_dest) into v_dest_n;
+  end if;
+  -- The key the append-only catch-up anti-joins by (#460): the PRIMARY KEY, else a UNIQUE constraint, and
+  -- every one of its columns NOT NULL -- a row-constructor `=` never matches a NULL component, so a
+  -- nullable key could re-copy a watermark row it cannot recognise (the control column itself is NOT NULL
+  -- on any hypertable). The same key from_hypertable_copy tracks by; the pre-build just below puts its
+  -- index on the destination before the lock, so the probe is indexed. Null means keyless, and the
+  -- catch-up keeps its strict `>` there (see the lock).
+  if not v_track then
+    select i.indexrelid into v_akey
+      from pg_index i
+      join pg_constraint con on con.conindid = i.indexrelid and con.contype in ('p', 'u')
+     where i.indrelid = p_hypertable
+       and not exists (select 1 from unnest(i.indkey) as kc(attnum)
+                         join pg_attribute a on a.attrelid = i.indrelid and a.attnum = kc.attnum
+                        where not a.attnotnull)
+     order by con.contype = 'p' desc, con.conname
+     limit 1;
+    if v_akey is not null then
+      -- (kc, not k: this procedure declares a record named k for its loops, and plpgsql would substitute it)
+      select '(' || string_agg('d.' || quote_ident(a.attname), ', ' order by kc.ord) || ')',
+             '(' || string_agg('s.' || quote_ident(a.attname), ', ' order by kc.ord) || ')'
+        into v_dkey_q, v_skey_q
+        from pg_index i
+        cross join lateral unnest(i.indkey) with ordinality as kc(attnum, ord)
+        join pg_attribute a on a.attrelid = i.indrelid and a.attnum = kc.attnum
+       where i.indexrelid = v_akey;
+    end if;
   end if;
 
   -- Pre-build the destination's indexes BEFORE taking the exclusive lock, while the destination is still a
@@ -856,6 +893,8 @@ begin
     execute format('select min(%I)::text, max(%I)::text from %I.%I', p_control, p_control, v_nsp, v_delta)
       into v_min_ctl, v_max_ctl;
     execute format('delete from %I.%I d where %s in (%s)', v_nsp, v_dest, v_dkey_q, v_subsel_q);
+    get diagnostics v_n = row_count;
+    v_dest_n := v_dest_n - v_n;
     if v_min_ctl is not null then
       execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s) and %I >= %L::%s and %I <= %L::%s',
                      v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_subsel_q,
@@ -864,13 +903,69 @@ begin
       execute format('insert into %I.%I (%s) select %s from %I.%I s where %s in (%s)',
                      v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, v_skey_q, v_subsel_q);
     end if;
+    get diagnostics v_n = row_count;
+    v_dest_n := v_dest_n + v_n;
   else
     -- append-only catch-up: insert the tail past the watermark (read pre-lock above, off the locked window;
     -- the pre-drain, if it ran, already advanced the dest to within one batch of the head, so this is small).
+    --
+    -- On a KEYED table the bound is inclusive and a key anti-join skips what the destination already holds
+    -- (#460): a row that landed EXACTLY at the watermark during the window is taken rather than lost, and
+    -- the copied row already sitting there is not duplicated. Still bounded to the tail on purpose -- an
+    -- unbounded anti-join would put an O(rows) probe under the lock. A KEYLESS table keeps the strict `>`:
+    -- it has no key to anti-join by, and an all-columns anti-join would be wrong there, since a duplicate
+    -- row is legitimate in a keyless table and it would refuse to copy one. Whatever either form cannot
+    -- see -- a row behind the watermark on any table, a row at it on a keyless one -- the conservation
+    -- check below refuses on, rather than dropping the source short.
+    v_n := 0;
     if v_watermark is not null then
-      execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L',
-                     v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, p_control, v_watermark);
+      if v_akey is not null then
+        -- Materialise the tail first and ANALYZE it, as the tracking branch above does for its delta (#164):
+        -- the anti-join must probe the destination's key index once per tail row, and the planner only
+        -- chooses that when it knows the tail is small. Estimated straight off the source, the tail is sized
+        -- from the newest chunk's statistics, and an overestimate there makes a hash anti-join that seqscans
+        -- the WHOLE destination look cheap -- O(rows) under the lock, on a plan nobody sees. Measured: even
+        -- at 20k rows the direct form planned a Seq Scan of the destination. On commit drop: the swap
+        -- transaction commits below, or rolls back on the refusal, and either ends the temp table.
+        execute 'drop table if exists pgpm_htail';
+        execute format('create temp table pgpm_htail on commit drop as select %s from %I.%I where %I >= %L',
+                       v_cols_q, v_nsp, v_rel, p_control, v_watermark);
+        analyze pgpm_htail;
+        execute format('insert into %I.%I (%s) select %s from pgpm_htail s where not exists (select 1 from %I.%I d where %s = %s)',
+                       v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_dest, v_dkey_q, v_skey_q);
+      else
+        execute format('insert into %I.%I (%s) select %s from %I.%I where %I > %L',
+                       v_nsp, v_dest, v_cols_q, v_cols_q, v_nsp, v_rel, p_control, v_watermark);
+      end if;
+      get diagnostics v_n = row_count;
     end if;
+    v_dest_n := v_dest_n + v_n;
+  end if;
+
+  -- CONSERVATION (#460): the one place the two sides of the swap are compared, and it happens BEFORE the
+  -- identity capture, the incoming-FK drops and the DROP TABLE below, so on a mismatch nothing outside the
+  -- private destination has been touched and the raise rolls the catch-up and the index pre-builds back
+  -- with it: the source is left whole and still a hypertable. Both numbers are exact. The source is frozen
+  -- under the ACCESS EXCLUSIVE just taken, and the destination's is the pre-lock baseline plus exactly what
+  -- the catch-up changed, on a table nothing else writes (the private-destination invariant the watermark
+  -- read already rests on). Counting the source is O(rows) under the lock, and there is no bounded read
+  -- that could replace it: the rows this exists to find are the ones that landed BELOW the watermark,
+  -- anywhere in the table, between the copy and this lock. Counting the destination here too would double
+  -- that cost for nothing, which is why its count is carried in rather than taken again.
+  --
+  -- Refusing beats adapting. The missing rows are below the watermark, so re-running the cutover cannot
+  -- find them either; only a copy that tracks changes (or one taken with writes paused) can, and the
+  -- message says so. Without this check the loss was silent: no error, no log row, a source dropped short.
+  execute format('select count(*) from %I.%I', v_nsp, v_rel) into v_src_n;
+  if v_src_n <> v_dest_n then
+    raise exception 'pg_partition_magician: from_hypertable_cutover(%) refusing to swap: the source holds % rows but the destination would hold % after the % catch-up, a difference of %. %',
+      p_hypertable, v_src_n, v_dest_n, case when v_track then 'change-tracking' else 'append-only' end,
+      abs(v_src_n - v_dest_n),
+      case when v_track
+        then 'A write reached the source without firing the change-capture trigger (session_replication_role = replica, or the trigger disabled), so the delta never saw it. Nothing was dropped and the source is whole. Make every writer fire triggers, then re-run from_hypertable_copy with p_track_changes => true.'
+        else format('Rows arrived during the online window with a control value at or below the copy watermark (out-of-order appends, a backfill, or an update or delete of a copied row), which the append-only catch-up cannot see. Nothing was dropped and the source is whole. Re-run from_hypertable_copy(%L, %L, p_track_changes => true), which needs a primary key or unique constraint; on a keyless table, pause writes to the source for the copy instead.',
+                    p_hypertable::text, p_control)
+      end;
   end if;
   -- (the key constraints + secondary indexes were captured and pre-built on the destination above, before
   -- the lock; the swap below only adopts/renames them -- metadata-only.)
