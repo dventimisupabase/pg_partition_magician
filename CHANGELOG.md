@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **`TRUNCATE` is refused while a regrain is in flight** (#449). Change capture is a row trigger, and
+  `TRUNCATE` fires none, so a truncate of the coarse child mid-regrain left the delta empty, and a
+  truncate of the parent never reached the standalone copies; the swap then attached copies of every
+  row the operator had just removed (9,999 rows resurrected in the hunt that found it). The prepare
+  tick now puts a `BEFORE TRUNCATE` statement trigger (`pgpm_regrain_truncate_guard`) on the source
+  beside the row trigger, and it raises `pg_partition_magician: cannot TRUNCATE ... a regrain is in
+  flight on it` for either spelling (`TRUNCATE parent` cascades to the source as a partition and fires
+  the partition's own trigger), before anything is truncated. Refuse rather than capture, matching the
+  write ceiling: loud refusal over silent divergence. The guard is `ENABLE ALWAYS`, so
+  `session_replication_role = replica` cannot skip it, and it goes wherever the row trigger goes: with
+  the dropped source at the swap, in `regrain_cancel`, and in `maintain`'s sweep of an abandoned
+  regrain. Pinned by `tests/119`, which also proves the replica-mode case discriminates.
 - **Fixed: upgrading from 0.4.0 or older left two ambiguous overloads behind** (#441). `create or
   replace` across a changed argument list does not replace the old function; it adds a second overload
   beside it, and four signature changes were missing their `drop function if exists` lines:

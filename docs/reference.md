@@ -832,6 +832,14 @@ gate. Under `maintain` the `DETACH` gives up after 200 ms (a `skip_regrain` row,
 keeps the residual small; a hand-driven `regrain_step` waits without a timeout, so a large purge committing
 during that wait is reconciled under the lock in full.
 
+`TRUNCATE` is the exception, and it is **refused** rather than honoured. It fires no row trigger, so the
+rows it removes cannot be captured, and a `TRUNCATE` of the parent never reaches the copies (they are not
+partitions until the swap), so the swap would put every truncated row back. While a regrain is in flight, a
+`TRUNCATE` of the parent or of the coarse child fails with `pg_partition_magician: cannot TRUNCATE ... a
+regrain is in flight on it` before anything is truncated, including from a session with
+`session_replication_role = replica`. Cancel the regrain with `regrain_cancel` first, or truncate after the
+swap.
+
 The first tick installs the capture and copies nothing, so budget one tick more than the microbatch count.
 
 ### `regrain_cancel`
@@ -841,7 +849,8 @@ pgpm.regrain_cancel(p_parent regclass) returns int
 ```
 
 Stops an in-flight regrain and reclaims what it has built, returning the number of in-flight fine children
-dropped. It removes change capture, clears the delta, drops every not-yet-attached copy, and resets
+dropped. It removes change capture (and with it the `TRUNCATE` refusal), clears the delta, drops every
+not-yet-attached copy, and resets
 `config.regrain_cursor`. The parent is untouched: the source child still holds every row, so this costs the
 copying work already done and nothing else.
 
