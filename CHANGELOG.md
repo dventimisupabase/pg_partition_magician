@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **`maintain` re-applies its 200 ms `lock_timeout` after the retain boundary too, so auto-regrain's
+  swap gives up instead of blocking the parent** (#514). `set local` dies at `COMMIT`, and `maintain`
+  put `lock_timeout` back after each of its boundaries except the one after `retain`, which is the one
+  that precedes the auto-regrain block. `regrain_step` therefore ran under the session default (`0`,
+  wait forever): with a writer holding one row in the source, the swap's `DETACH` kept its
+  `ACCESS EXCLUSIVE` request on the parent queued for the writer's whole transaction, every read of the
+  parent queued behind that request, and when the writer committed the tick swapped as if nothing had
+  happened, where the reference promises a `skip_regrain` row after 200 ms and a retry next tick. The
+  missing `set_config` is back. `bench/maintain_regrain_lock_timeout.sh` (perf track) holds a row in
+  the source from a second session and runs one tick from a third: the tick must return while the
+  writer still holds, log exactly `skip_regrain` with the lock-timeout message and nothing else, leave a
+  third-session reader unblocked, and swap on a later tick once the writer is gone, with the held row
+  read back from its fine child. Its mutation, `maintain_no_lock_timeout_after_retain`, removes the one
+  line.
 - **regrain's change capture is found by identity, re-minted per regrain, and writable by the parent's
   writers** (#496). The per-parent delta table and trigger function were found by NAME, derived from the
   parent's CURRENT relname, and kept once minted. An ordinary `ALTER TABLE ... RENAME` of the parent
