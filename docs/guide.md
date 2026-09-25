@@ -928,4 +928,11 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **There is no read gap.** A `SELECT` against the parent always sees every row, on the paced path as much
   as the synchronous one, because regrain copies and never moves a row out of an attached partition; see
   [Read consistency](#read-consistency).
-- Tested on PostgreSQL **15, 16, 17, and 18**. Boundaries align to the database timezone (UTC by default).
+- Tested on PostgreSQL **15, 16, 17, and 18**.
+- **Boundaries align to the zone of the session that ran `transmute`**, recorded in
+  `pgpm.config.partition_tz` and used for every later boundary and partition name whatever zone
+  maintenance runs in. Month and year boundaries are midnight on the 1st in that zone; day and shorter
+  steps are a fixed number of seconds, so in a zone with daylight saving a daily boundary sits an hour
+  off local midnight for part of the year. A `timestamp` or `date` column is read as wall time in that
+  zone. For UTC boundaries, `set timezone = 'UTC'` before the call; change the zone afterwards only with
+  `pgpm.set_partition_tz`, which refuses a change the grid built so far is not on.

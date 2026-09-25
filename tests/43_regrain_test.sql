@@ -13,7 +13,7 @@ select pgpm.obtain('public.rf');                    -- empty forward partitions 
 
 select is(
   (select count(*)::int from pgpm.part p where p.parent_table = 'public.rf'::regclass and p.attached
-     and pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '10000', p.lo))),
+     and pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '10000', p.lo, 'UTC'))),
   1, 'transmute left exactly one coarse monolith child');
 
 -- still active (the frontier has not crossed B): regrain refuses.
@@ -31,7 +31,7 @@ select is(
 select is(
   (select count(*)::int from pgpm.part p where p.parent_table = 'public.rf'::regclass and p.attached
      and p.lo::numeric >= 0 and p.hi::numeric <= 60000
-     and not pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '10000', p.lo))),
+     and not pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '10000', p.lo, 'UTC'))),
   6, 'six fine (one-step) children now cover the old monolith range');
 
 select ok(

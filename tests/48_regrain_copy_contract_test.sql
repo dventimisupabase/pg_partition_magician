@@ -48,7 +48,7 @@ begin
     join pg_class c on c.oid = p.parent_table
     join pg_namespace n on n.oid = c.relnamespace
    where p.parent_table = 'public.cc'::regclass and p.attached
-     and pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '50', p.lo));   -- the coarse monolith
+     and pgpm._native_gt('id', p.hi, pgpm._grid_next('id', '50', p.lo, 'UTC'));   -- the coarse monolith
   execute 'select count(*) from ' || v_rel into v_n;
   insert into _moncnt values (v_n);
 end $$;

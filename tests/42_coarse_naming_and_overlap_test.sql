@@ -8,29 +8,29 @@ select plan(8);
 
 -- _part_name: a one-step range is FINE -> existing name, unchanged.
 select is(
-  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00', '2015-04-01 00:00:00+00')::text,
+  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00', '2015-04-01 00:00:00+00', 'UTC')::text,
   'events_p2015_03',
   'time: one-step range -> fine name _p<lo> (unchanged)');
 
 -- _part_name: a multi-step range is COARSE -> _p<lo>_to_<hi>.
 select is(
-  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00', '2026-07-01 00:00:00+00')::text,
+  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00', '2026-07-01 00:00:00+00', 'UTC')::text,
   'events_p2015_03_to_2026_07',
   'time: multi-step range -> coarse name _p<lo>_to_<hi>');
 
--- _part_name: omitting hi keeps the legacy fine behavior (back-compat for existing callers).
+-- _part_name: a null hi is a fine (one-step) range too.
 select is(
-  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00')::text,
+  pgpm._part_name('events', 'time', '1 mon', '2015-03-01 00:00:00+00', null, 'UTC')::text,
   'events_p2015_03',
-  'time: omitted hi -> fine name (back-compat)');
+  'time: null hi -> fine name');
 
 -- id grid: fine and coarse.
 select is(
-  pgpm._part_name('m', 'id', '1000', '0', '1000')::text,
+  pgpm._part_name('m', 'id', '1000', '0', '1000', 'UTC')::text,
   'm_p' || lpad('0', 19, '0'),
   'id: one-step range -> fine name');
 select is(
-  pgpm._part_name('m', 'id', '1000', '0', '5000')::text,
+  pgpm._part_name('m', 'id', '1000', '0', '5000', 'UTC')::text,
   'm_p' || lpad('0', 19, '0') || '_to_' || lpad('5000', 19, '0'),
   'id: multi-step range -> coarse name');
 

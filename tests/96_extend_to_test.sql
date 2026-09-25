@@ -107,7 +107,7 @@ select cmp_ok(pgpm.extend_to('public.et_time', (now() + interval '10 days')::tex
 
 select is(
   (select count(*)::int from generate_series(
-      pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', pgpm._frontier_native('public.et_time'::regclass))::timestamptz,
+      pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', pgpm._frontier_native('public.et_time'::regclass), 'UTC')::timestamptz,
       date_trunc('day', now() + interval '10 days'),
       interval '1 day'
     ) g

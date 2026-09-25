@@ -54,6 +54,14 @@ is the motivating case -- decoded via a declared `<prefix><fixed-width base-N en
 `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit` below), and a `timestamptz`/`timestamp`/`date` column
 is **time**.
 
+The grid is computed in the **zone of the session that runs the call**, recorded in
+`pgpm.config.partition_tz` and used for every boundary and partition name from then on, whatever zone
+maintenance's session runs in. Month and year boundaries fall at midnight on the 1st in that zone; a
+`timestamp` or `date` control column is read as wall time in it. For UTC-aligned boundaries, run
+`set timezone = 'UTC'` first. The call refuses a session zone that is not a name in `pg_timezone_names`
+(a POSIX rule or a bare abbreviation), and the zone can be changed afterwards only with
+[`set_partition_tz`](#set_partition_tz).
+
 The cutover moves no rows, and runs in **three transactions** so that none of its locks scales with the
 row count: add the monolith's bound `CHECK` as `NOT VALID` (catalog only, instant); commit, which drops
 that statement's `ACCESS EXCLUSIVE`; `VALIDATE` it, the one `O(rows)` read, under `SHARE UPDATE EXCLUSIVE`,
@@ -111,7 +119,8 @@ Parameters:
   retention horizon past the partition taking writes and the first maintenance tick would drop every
   partition. `interval '0'` is allowed and keeps only the partition taking writes.
 - `p_regrain_batch` -- rows per regrain COPY microbatch.
-- `p_anchor` -- the grid origin the boundaries align to.
+- `p_anchor` -- the grid origin the boundaries align to (month and year steps count from its month in
+  the session's zone; day and shorter steps count seconds from the instant).
 - `p_paused` -- register paused (the default); `false` goes live immediately.
 - `p_incoming_fks` -- `'error'` (the default: refuse if any incoming FK exists) or `'preserve'` (drop each
   for the conversion and re-add it against the new parent, which `maintain` does on a later tick, or
@@ -1431,6 +1440,26 @@ one at the swap (see [`regrain_step`](#regrain_step)), which refuses while any o
 the horizon. The change itself is safe; the swap waits until `retain` is set back or the run is
 cancelled with [`regrain_cancel`](#regrain_cancel).
 
+### `set_partition_tz`
+
+```sql
+pgpm.set_partition_tz(p_parent regclass, p_tz text) returns void
+```
+
+Change `config.partition_tz`, the zone the grid is computed in and partition names are rendered in.
+`transmute` records the transmuting session's `TimeZone` there and every later boundary is computed in
+it whatever zone the maintaining session runs in, so this is normally never called. It exists for the
+upgrade case: an install that predates the column has it backfilled to `UTC`, and a table whose grid was
+built from a non-UTC session has to be told which zone that was.
+
+`p_tz` must be a name in `pg_timezone_names` (any casing; the canonical spelling is stored). An `id` grid
+is refused: it has no calendar and never reads the zone. A change is **refused** when the newest
+partition's upper bound is not a grid boundary in the new zone, because `obtain` would then skip every
+candidate that half-overlaps the current tail and create the first one past it, leaving a permanent
+hole. A day-denominated step is the same lattice in every zone, so its zone can always change (only the
+names move); a month or year step can only be moved to the zone the grid was in fact built in. Each
+accepted call writes a `set_partition_tz` row to `pgpm.log` with `old -> new` in `method`.
+
 ## Observability
 
 ### `status`
@@ -1730,6 +1759,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `control_kind` | `text` | `time`, `id`, `uuidv7`, or `text_time` |
 | `partition_step` | `text` | grid width (`1 month` for time/uuidv7/text_time; a bigint for id) |
 | `partition_anchor` | `text` | grid origin |
+| `partition_tz` | `text` | the zone boundaries are computed in and names rendered in: the transmuting session's `TimeZone` (`UTC` for id); change it only with [`set_partition_tz`](#set_partition_tz) |
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7/text_time, bigint count for id; null = keep) |
 | `retain_batch` | `int` | max partitions one `retain()` call attempts, oldest first (null = unbounded) |
@@ -1853,6 +1883,10 @@ is `<rel>_p<lo>_to_<hi>`, both bounds formatted at the step's granularity:
 - time/uuidv7/text_time: `events_p2026_03` (a fine month), `events_p2026_03_to_2026_07` (the monolith)
 - id: `events_p0000000000000010000`, `events_p0000000000000000000_to_0000000000000060000`
 
+Day and coarser labels are rendered in `config.partition_tz`. Hour and minute labels are rendered in UTC,
+because a zone with daylight saving repeats an hour every autumn and two adjacent cells would otherwise
+share a name.
+
 The name is a human-facing label; `pgpm.part` holds the authoritative bounds. The `_to_` form is also
 what keeps `transmute`'s orphan check from mistaking a monolith for a leftover of an interrupted regrain.
 
@@ -1861,7 +1895,7 @@ what keeps `transmute`'s orphan check from mistaking a monolith for a leftover o
 Functions named `pgpm._*` are private and may change without notice. The kind-specific logic lives in a
 small adapter (`_grid_floor`, `_grid_next`, `_encode`, `_decode`, `_frontier_native`, `_part_name`,
 `_native_gt`, `_native_type`), which is where a new partition kind would plug in; the rest (`_transmute`,
-`_create_partition`, `_uuid_to_ts`/`_ts_to_uuid`,
+`_create_partition`, `_uuid_to_ts`/`_ts_to_uuid`, `_time_literal`/`_col_to_native`/`_canonical_tz`,
 `_install_write_block`/`_remove_write_block`/`_enforce_write_blocks`/`_is_write_blocked`,
 `_run_archive_strategy`/`_archive_noop`,
 `_next_archive_chunk`/`_archive_fully_covered`/`_archive_step`) implements the engine. Do not call

@@ -579,6 +579,10 @@ run_perf() {
   # Same pattern for #447: tests/107's two-session swap probe, run here on clean code and by
   # `discriminate` against the mutants that put the 100-pass bound back.
   bash "$(dirname "$0")/bench/regrain_swap_reconcile.sh" "$c" pgpm_perf15                        || rc=1
+  # Same shape for the grid-zone guard (#455): tests/111 through the harness discriminate.sh drives the
+  # grid_session_timezone mutant through, so a harness broken enough to fail against everything is
+  # caught here on clean code rather than read as "the mutant was caught".
+  bash "$(dirname "$0")/bench/grid_timezone.sh" "$c" pgpm_perf17                                || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"
