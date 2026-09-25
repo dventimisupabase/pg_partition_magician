@@ -1003,14 +1003,17 @@ begin
   --
   -- Capture each definition and drop the constraint, which is what unblocks the drop. The recorded
   -- definition names the referenced table BY NAME, and the new parent takes the source's name, so it
-  -- replays verbatim afterwards -- the same property transmute's own preserve path relies on.
+  -- replays verbatim afterwards -- the same property transmute's own preserve path relies on. Captured
+  -- through the core's _fk_definition (#498), which pins the search_path so the name is schema-qualified:
+  -- the row goes to pgpm.dropped_fk, and a re-add that does not succeed below is retried by maintain in
+  -- pg_cron's session, whose search_path is not this one's.
   --
   -- Deliberately NOT re-added here: doing so would leave an incoming FK in place when the plain table is
   -- handed to transmute, which refuses one by default, and asking for 'preserve' would just have transmute
   -- drop it again. The re-add happens after the handoff, through the core's dropped_fk machinery.
   -- The eligibility of these keys was settled in the preflight, before any copy work.
   for k in
-    select c.conrelid::regclass as referencing, c.conname, pg_get_constraintdef(c.oid) as def
+    select c.conrelid::regclass as referencing, c.conname, pgpm._fk_definition(c.oid) as def
       from pg_constraint c
      where c.confrelid = p_hypertable and c.contype = 'f' and c.conrelid <> p_hypertable
        and c.conparentid = 0
