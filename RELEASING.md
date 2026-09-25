@@ -16,7 +16,8 @@ That surface is wider than a list of functions, so it is spelled out:
 - **The supported PostgreSQL majors.** Currently 15, 16, 17 and 18. Dropping one is a MAJOR change.
 - **The version string itself.** `pgpm.version()`, `extension.control`'s `default_version`, and the
   git tag all carry the same value. `tests/84_version_test.sql` asserts the shape; keep the three in
-  step by hand at release time.
+  step by hand at release time. `docs/guide.md`'s database.dev snippet pins it too, and
+  `scripts/check_living_docs.sh` holds that pin to `extension.control`, so a missed bump fails CI.
 
 What is explicitly *not* promised: partition child names, the contents of `pgpm.log` rows beyond
 `action`, anything under `bench/`, and any behaviour reached only by writing to a pgpm table directly
@@ -37,12 +38,14 @@ treated as a blanket exemption.
 
 ## Cutting a release
 
-Two files carry the version and both must move together:
+Three files carry the version and all must move together:
 
 ```bash
-# 1. Bump both, to the same value.
+# 1. Bump all three, to the same value.
 #    pgpm_core/install.sql        the pgpm.version() literal, at the end of the file
 #    pgpm_core/extension.control  default_version
+#    docs/guide.md                the database.dev snippet's version '...' pin; the Living docs
+#                                 lint job holds it to extension.control, so a missed bump fails CI
 #
 # 2. Rename the CHANGELOG heading for the release.
 #    ## [Unreleased]   ->   ## [0.2.0] - 2026-08-20

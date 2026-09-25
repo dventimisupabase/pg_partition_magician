@@ -161,9 +161,12 @@ with the bundle + minified dbdev package + a source tarball (release notes pulle
 [database.dev](https://database.dev). You can also run either workflow manually via
 *workflow_dispatch* with an explicit version.
 
-> **One manual step CI can't do:** on a version bump, bump the pinned `version '…'` in the dbdev
+> **One manual step, which CI enforces:** on a version bump, bump the pinned `version '…'` in the dbdev
 > `create extension` example in [`docs/guide.md`](./docs/guide.md#install). The install page fills it
-> in from the release tag automatically; the docs copy is pinned by hand (dbdev recommends pinning).
+> in from the release tag automatically; the docs copy is pinned by hand (dbdev recommends pinning),
+> and `scripts/check_living_docs.sh` (the `Living docs` lint job) fails while it names any version other
+> than `extension.control`'s `default_version`. It went unbumped through two releases before that check
+> existed.
 
 **One-time setup for publishing** (the publish job is inert until both exist):
 
