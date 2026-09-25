@@ -98,6 +98,12 @@ def stopping_status(m):
     return rows
 
 
+def md_cell(text):
+    """A table cell: escape `_` and `|` so identifiers like _grid_next do not read as emphasis or a column
+    break (pass 2's record failed markdownlint MD037 on exactly that)."""
+    return (text or "").replace("|", "\\|").replace("_", "\\_")
+
+
 def fmt(x, nd=2):
     return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
 
@@ -111,7 +117,9 @@ def record(m, a):
         f"seeds K={m['K']}, recall {fmt(m['recall'])}; claims {m['claims']}; findings {m['findings']}; precision {fmt(m['precision'])}",
         f"findings by tier: T1 {t[1]} T2 {t[2]} T3 {t[3]} T4 {t[4]} T5 {t[5]}",
         f"cost per finding: {fmt(m['cost_per_finding'], 1)}; per Tier 1 finding: {fmt(m['cost_per_t1'], 1)}",
-        f"root causes: {len(m['root_causes'])} behind the findings ({', '.join(m['root_causes']) or 'none recorded'}), closed as a class: to be filled after the fix phase",
+        f"root causes: {len(m['root_causes'])} distinct verifier root-cause statements behind the findings"
+        + (f"; grouped into {a.root_cause_groups} classes below" if a.root_cause_groups else "")
+        + "; closed as a class: to be filled after the fix phase",
         f"known and open (re-found, unfixed from earlier passes): {m['known_open']}",
         f"capture-recapture (T1): {a.capture_recapture}",
         "blind spots (seeds missed, by lens): " + (", ".join(f"{b['id']} {b['what']} ({b['lens']}, T{b['tier']})" for b in m["blind_spots"]) or "none"),
@@ -122,16 +130,22 @@ def record(m, a):
     ]
     for f in sorted(m["finding_rows"], key=lambda r: (r["tier"], r["id"])):
         issue = f"#{f['issue']}" if f["issue"] else ""
-        lines.append(f"| {f['tier']} | {f['id']}: {f['scenario']} | {issue} | |")
+        lines.append(f"| {f['tier']} | {f['id']}: {md_cell(f['scenario'])} | {issue} | |")
     lines += ["", "## Null results (by lens)", "", "(from the finders' null-results files)", "",
               "## Fell in verification", ""]
     lines += [f"- {r['id']}: {r['reason']}" for r in m["fell_rows"]] or ["none"]
     lines += ["", "## Known and open", ""]
     lines += [f"- {r['id']}: #{r['issue']}" for r in m["known_rows"]] or ["none"]
     lines += ["", "## Hypotheses (not counted)", ""]
-    lines += [f"- {r['id']} ({r['finder']}): {r['scenario']}" for r in m["hypothesis_rows"]] or ["none"]
+    lines += [f"- {r['id']} ({r['finder']}): {md_cell(r['scenario'])}" for r in m["hypothesis_rows"]] or ["none"]
     lines += ["", "## Stopping criteria status", "", "This pass's half; the criteria need the previous pass as well.", ""]
     lines += [f"- {name}: {'met' if ok else 'NOT met'}" for name, ok in stopping_status(m)]
+    if getattr(a, "root_causes_file", None):
+        with open(a.root_causes_file) as fh:
+            lines += ["", "## Root causes", "", fh.read().rstrip("\n")]
+    if getattr(a, "notes_file", None):
+        with open(a.notes_file) as fh:
+            lines += ["", "## Coordinator notes", "", fh.read().rstrip("\n")]
     return "\n".join(lines) + "\n"
 
 
@@ -164,10 +178,13 @@ def selftest():
     class A:
         pass_n, date, pinned, release = 2, "2026-10-01", "c5a60df", "0.6.0+"
         budget, lenses, previous_lenses, capture_recapture = "2 x 1h", "time", "none", "not attempted"
+        root_cause_groups, root_causes_file, notes_file = 1, None, None
     rec = record(m, A)
     assert "recall 0.50; claims 5; findings 1; precision 0.40" in rec, rec
     assert "| 1 | F1-02: rows lost | #500 | |" in rec
+    assert md_cell("a _grid_next | b") == "a \\_grid\\_next \\| b"
     assert "S2 untransmute_no_recheck_under_lock (concurrency, T1)" in rec
+    assert "root causes: 1 distinct verifier root-cause statements behind the findings; grouped into 1 classes below" in rec
     assert "- F2-02: #439" in rec and "- F2-03 (F2):" in rec
     print("pass_metrics selftest: PASS")
     return 0
@@ -180,6 +197,9 @@ def main():
     ap.add_argument("--release", default=""); ap.add_argument("--budget", default="")
     ap.add_argument("--budget-units", type=float); ap.add_argument("--lenses", default="")
     ap.add_argument("--previous-lenses", default=""); ap.add_argument("--capture-recapture", default="not attempted")
+    ap.add_argument("--root-causes", dest="root_causes_file", help="markdown file with the coordinator's root-cause grouping, appended as a section")
+    ap.add_argument("--root-cause-groups", type=int, help="number of classes in that grouping, for the summary line")
+    ap.add_argument("--notes", dest="notes_file", help="markdown file appended as 'Coordinator notes'")
     ap.add_argument("--out"); ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
