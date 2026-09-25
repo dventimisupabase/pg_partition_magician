@@ -1242,6 +1242,53 @@ $$;''',
         "what lets one edit put the defect back in the NDJSON and the Parquet path at once.",
         [("  select case when p_kind = 'id' then p_lo else regexp_replace(p_lo, '[^0-9]', '', 'g') end;\n",
           "  select regexp_replace(p_lo, '[^0-9]', '', 'g');\n", 1)],
+    # #498, one mutation per site of the fix, so a catch names which anchor went missing. All three break
+    # bench/dropped_fk_identity.sh: the first two through tests/124's own assertions, the third through
+    # the wrapper's upgrade half, which is the only place a second run of install.sql happens.
+    ),
+    "dropped_fk_definition_session_search_path": (
+        "bench/dropped_fk_identity.sh",
+        "Pre-#498 capture: the cutover records pg_get_constraintdef() as rendered in the TRANSMUTING "
+        "session, which leaves the referenced table unqualified whenever that session's search_path can "
+        "see it. restore_incoming_fks replays the text in a later session with the default search_path, "
+        "so `REFERENCES orders(id)` resolves to whatever `orders` means there: an unrelated public.orders "
+        "(the key comes back against the wrong table, logged restore_incoming_fk) or nothing "
+        "(fail_restore_incoming_fk every tick). tests/124's app.orders/public.orders pair, converted under "
+        "`set search_path = app, public` and restored under the default, is what catches it.",
+        [("      select c.conrelid::regclass as reltbl, c.conname, pgpm._fk_definition(c.oid) as def\n",
+          "      select c.conrelid::regclass as reltbl, c.conname, pg_get_constraintdef(c.oid) as def\n", 1)],
+    ),
+    "dropped_fk_referencer_stays_on_monolith": (
+        "bench/dropped_fk_identity.sh",
+        "Pre-#498 cutover: nothing moves the records in which the converted table is the REFERENCER, so "
+        "they keep naming the oid this rename turns into the monolith child and the restore lands on that "
+        "single partition (relkind 'r', so NOT VALID, logged restore_incoming_fk) while every row the "
+        "referencing table routes to a forward partition escapes the key. One site, two findings: a "
+        "self-referential key (F5-02, conrelid IS p_parent, recorded one statement before the rename) and a "
+        "key another parent preserved against this table before it was converted (F5-07). tests/124 "
+        "inserts an orphan at id 5000, past the monolith, in each and requires the refusal, with the "
+        "parent (conparentid = 0) named as the key's owner. Only the cutover's update is removed; "
+        "untransmute's mirror stays, so the mutant is exactly 'the record does not follow the rename'.",
+        [("  update pgpm.dropped_fk set referencing_table = v_parent where referencing_table = p_parent;\n",
+          "", 1)],
+    ),
+    "dropped_fk_definition_no_backfill": (
+        "bench/dropped_fk_identity.sh",
+        "The install-time rewrite of a legacy record removed: a dropped_fk.definition captured by an "
+        "earlier pgpm keeps its unqualified `REFERENCES parent(` after the upgrade, so the first regrain "
+        "swap or restore to run in pg_cron's session re-adds the key against whatever that name means "
+        "there. Invisible to every pgTAP file (each installs FRESH, so no record predates the install); "
+        "the wrapper's second half forges the legacy text on a real record, re-runs install.sql over the "
+        "database, and requires the qualified spelling and a restore that lands on the recorded parent "
+        "rather than the same-named decoy in public.",
+        [("update pgpm.dropped_fk d\n"
+          "   set definition = replace(d.definition,\n"
+          "                            ' REFERENCES ' || quote_ident(c.relname) || '(',\n"
+          "                            ' REFERENCES ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || '(')\n"
+          "  from pg_class c join pg_namespace n on n.oid = c.relnamespace\n"
+          " where c.oid = d.parent_table\n"
+          "   and position(' REFERENCES ' || quote_ident(c.relname) || '(' in d.definition) > 0;\n",
+          "", 1)],
     ),
 }
 
