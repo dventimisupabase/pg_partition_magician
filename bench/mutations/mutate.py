@@ -1101,6 +1101,25 @@ begin
         "bound and the decision) so the mutant is self-consistent rather than a half-applied defect.",
         [("ceil(cfg.obtain / 2.0)", "cfg.obtain / 2", 2)],
     ),
+    "set_regrain_off_keeps_regrain": (
+        "bench/set_regrain_off_midflight.sh",
+        "Pre-#516 set_regrain: turning auto-regrain off writes regrain_to and nothing else, so the run in "
+        "flight is stranded. maintain dispatches regrain_step only while regrain_to is set, so the run is "
+        "never driven again, and _enforce_regrain_capture keeps capture on the child whose range covers "
+        "config.regrain_cursor, which nothing clears, so it is never swept: the capture trigger, the "
+        "TRUNCATE refusal, the delta and the not-yet-attached copies all stay until regrain_cancel. Removes "
+        "only the regrain_cancel branch, so tests/129's section (A) -- capture gone, cursor null, copies "
+        "dropped, one regrain_cancel row, TRUNCATE accepted -- is what catches it; sections (B) and (C) "
+        "pass on the mutant too, which shows the gating they pin is not what discriminates.",
+        [("""  if p_target_step is null and cfg.regrain_to is not null
+     and (cfg.regrain_cursor is not null
+          or exists (select 1 from pgpm.part where parent_table = p_parent and not attached)
+          or exists (select 1 from pgpm.part p where p.parent_table = p_parent
+                      and pgpm._regrain_capture_active(p_parent, p.child_name))) then
+    perform pgpm.regrain_cancel(p_parent);
+  end if;
+""", "", 1)],
+    ),
     "grid_session_timezone": (
         "bench/grid_timezone.sh",
         "Pre-#455 _grid_next: the calendar step is `p_lo::timestamptz + interval`, evaluated in the "

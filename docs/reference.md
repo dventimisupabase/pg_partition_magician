@@ -977,9 +977,13 @@ copying work already done and nothing else.
 The copies are **dropped, not kept**. Keeping them would let a later regrain resume from copies made before
 the cancel, which were therefore never reconciled.
 
-Abandoning a regrain without calling this (turning auto-regrain off mid-flight, say) is safe: `maintain`
-sweeps orphaned capture each tick and logs `regrain_capture_orphan`. The verb exists so an operator can stop
-one deliberately and get the disk back.
+Turning auto-regrain off with [`set_regrain`](#set_regrain)`(parent, null)` while the run it started is in
+flight abandons that run through this same path, so the two cannot differ: the same teardown, one
+`regrain_cancel` log row. `maintain` also sweeps a capture trigger left on a child whose range the cursor no
+longer covers, logging `regrain_capture_orphan`, but that is a backstop for a cursor cleared by some other
+route, not a way to abandon a run: it drops no copies and clears no delta. To stop a run deliberately and get
+the disk back, or to clear one left half-done with auto-regrain already off (`config.regrain_cursor` set,
+`regrain_to` null), call this.
 
 ### `regrain_history`
 
@@ -1483,6 +1487,14 @@ Two targets are refused at call time rather than left to wedge every tick: a `p_
 names `<rel>_p<label>` would exceed PostgreSQL's 63-byte identifier limit. A finer step has a wider label,
 so a table whose monthly names fit can still be refused a daily target; the message names the offending
 name and says how many bytes to shorten the table name by (see [Partition naming](#partition-naming)).
+
+Turning it **off while the run it started is in flight** abandons that run, exactly as
+[`regrain_cancel`](#regrain_cancel) would: the capture trigger and the `TRUNCATE` refusal come off, the
+not-yet-attached copies are dropped (the transient disk comes back at once), the delta is cleared, the cursor
+is reset, and one `regrain_cancel` row is logged. The source child still holds every row, so only the copy
+work is lost. To keep that work, leave auto-regrain on until [`progress`](#progress) shows the swap, then
+turn it off. A call that finds auto-regrain already off changes nothing, so it never touches an
+operator-driven regrain.
 
 ### `set_obtain`
 

@@ -440,8 +440,8 @@ select pgpm.set_regrain('public.events', '1 month');   -- feather the monolith t
 
 With auto-regrain on, each `maintain` tick advances one budget-sized microbatch of the oldest frozen coarse
 child toward the target step, sized by `config.regrain_batch`. It is off by default
-(`set_regrain(parent, null)` turns it back off) and always safe to enable: it only paces regraining; it
-never starts on a child that is not frozen.
+(`set_regrain(parent, null)` turns it back off, abandoning any run it has in flight as `regrain_cancel`
+would) and always safe to enable: it only paces regraining; it never starts on a child that is not frozen.
 
 `set_regrain` refuses a target step **coarser** than `partition_step`: splitting toward it could only leave
 the history at a grain the grid does not have. Equal-or-finer targets are accepted, and `maintain` only ever

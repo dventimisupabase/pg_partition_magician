@@ -3065,9 +3065,12 @@ end;
 $$;
 
 -- The janitor (#267). Change capture is installed per regrain and normally dies with the source at the
--- swap, but a regrain can be abandoned silently: the operator sets regrain_to to null mid-flight, or drives
--- a manual regrain of child A while auto-regrain is working child B and the two clobber the shared cursor.
--- A left-behind trigger taxes every write to that child and fills a delta nobody reads.
+-- swap, but a regrain can be abandoned silently, leaving a trigger that taxes every write to that child and
+-- fills a delta nobody reads. The two abandonments it was built for are closed at their source now: a
+-- second regrain on the same parent is refused rather than clobbering the shared cursor (#267), and
+-- set_regrain(parent, null) mid-flight cancels the run outright through regrain_cancel (#516) rather than
+-- leaving the cursor set, which this janitor read as "still live" and so never swept. What remains is the
+-- backstop for a cursor cleared by any other route (a hand edit, say).
 --
 -- The child that legitimately carries capture is derivable with no extra state: the attached child whose
 -- range covers regrain_cursor, and none at all when the cursor is null. `hi` is inclusive here because a
@@ -5435,6 +5438,28 @@ begin
   if p_target_step is not null then
     select c.relname into v_rel from pg_class c where c.oid = p_parent;
     perform pgpm._part_name(v_rel, cfg.control_kind, p_target_step, cfg.partition_anchor, null, cfg.partition_tz);
+  end if;
+
+  -- #516: turning auto-regrain OFF abandons the run it had in flight. maintain dispatches regrain_step only
+  -- while regrain_to is set, so once it was null the run was never driven again; and _enforce_regrain_capture
+  -- keeps capture on the child whose range covers regrain_cursor, which nothing cleared, so it was never
+  -- swept either. Left that way, the capture trigger taxed every write into the source and filled a delta
+  -- nobody drained, the not-yet-attached copies stayed on disk, and TRUNCATE of the parent stayed refused as
+  -- "a regrain is in flight", until the operator found regrain_cancel. Abandon it the way the operator's
+  -- own escape does and through the same code, so the two cannot drift: trigger and TRUNCATE guard off
+  -- every child, delta cleared, copies dropped with their part rows, cursor null, one regrain_cancel log
+  -- row. The source still holds every row, so only the copy work is lost; completing the run instead would
+  -- need its target step, which nothing records once regrain_to is gone. Only when this call actually turns
+  -- auto-regrain off: a call that finds it already off changes nothing, so it cannot cancel an
+  -- operator-driven regrain. Before the write below, so a lock failure inside the cancel rolls the whole
+  -- call back and leaves auto-regrain on and the run intact, to be retried. The three tests are the three
+  -- places an in-flight regrain leaves a mark, any one of which is enough to warrant the cleanup.
+  if p_target_step is null and cfg.regrain_to is not null
+     and (cfg.regrain_cursor is not null
+          or exists (select 1 from pgpm.part where parent_table = p_parent and not attached)
+          or exists (select 1 from pgpm.part p where p.parent_table = p_parent
+                      and pgpm._regrain_capture_active(p_parent, p.child_name))) then
+    perform pgpm.regrain_cancel(p_parent);
   end if;
 
   update pgpm.config set regrain_to = p_target_step where parent_table = p_parent;

@@ -306,12 +306,16 @@ on a fixed volume it can be a problem if you regrain a large coarse child in one
 
    The transient space is reclaimed at the swap, so `regrain_eta` is roughly how long until it comes back.
 
-2. If you are disk-bound, stop starting new work and let the current regrain finish (it drops its source at
-   the swap, reclaiming the transient space):
+2. If you are disk-bound, get the transient space back now. Turning auto-regrain off abandons the run in
+   flight as `regrain_cancel` would: the copies are dropped at once, the source child still holds every row,
+   and only the copying already done is lost:
 
    ```sql
-   select pgpm.set_regrain('public.events', null);   -- pause auto-regrain (the in-flight one still completes)
+   select pgpm.set_regrain('public.events', null);   -- off: abandons the in-flight run, copies dropped
    ```
+
+   If you would rather keep that work, leave auto-regrain on until `progress()` shows the swap (the source
+   is dropped there, which reclaims the space), then turn it off before the next coarse child gets far.
 
 3. Regrain **hierarchically** so each step's footprint stays bounded: split the monolith into coarse units
    first (for example per year), then regrain one coarse unit at a time. Each later step only needs ~2x of
