@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`from_hypertable` refuses an integer-time dimension, and a `p_control` that is not the dimension, up
+  front** (#458). The chunk-by-chunk copy bounds each chunk on `range_start`/`range_end` from
+  `timescaledb_information.chunks`, which are ranges of the dimension column and are populated only for a
+  timestamp-typed dimension. Preflight checked only that `p_control` exists, so a `bigint` dimension copied
+  `t >= NULL and t < NULL` (nothing) and the cutover dropped the hypertable before `transmute` refused the
+  column, leaving an empty plain table and no hypertable; and a second time column that is not the
+  dimension migrated to a partitioned table with zero rows and reported success. `from_hypertable_preflight`
+  now requires `p_control` to be the primary dimension (naming the actual dimension when it is not) and the
+  dimension to be `timestamptz`, `timestamp` or `date`, and `from_hypertable_cutover` runs the same two
+  checks in its own right, since a destination left by a copy under an older version reaches the
+  irreversible drop without preflight ever having run. `tests/timescale/db/18` pins both refusals through
+  every entry point, with the hypertable intact by identity afterwards, and passes `timestamp` and `date`
+  dimensions as positive controls. The retention translation's `(config->>'drop_after')::interval`, which
+  would have read an integer policy's `1000` as seconds, is unreachable now that integer dimensions are
+  refused before it, and is left as is.
 - **`transmute` and `set_retain` refuse a negative retain** (#451). Neither `transmute` overload
   checked the sign of `p_retain`, so `p_retain => interval '-1 day'` (or `-1000` on an `id` grid)
   registered a retention horizon in the future, and the first maintenance tick write-blocked and dropped
