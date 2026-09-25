@@ -2016,14 +2016,20 @@ $$;
 -- true iff the write-block trigger is actually installed on this child right now (checked directly
 -- against pg_trigger, not re-derived from the boundary formula) -- shared by _archive_step (issue
 -- #237, only ever archives an already-blocked child) and retire() (issue #238) below.
+--
+-- The schema is matched by OID, never by name (#512). This used to select the parent's nspname and cast
+-- it back with `::regnamespace`, whose input parses its text as an SQL identifier: a schema whose name
+-- needs quoting ("Sales") was downcased, so the lookup raised `schema "sales" does not exist` on every
+-- archive tick (nothing archived, the aged child never retired), or, once a lower-case twin existed,
+-- silently answered for the twin's same-named child. _regrain_capture_active had the same shape.
 create or replace function pgpm._is_write_blocked(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
-declare v_nsp name;
+declare v_nsp_oid oid;
 begin
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select c.relnamespace into v_nsp_oid from pg_class c where c.oid = p_parent;
   return exists (
     select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
-     where t.tgname = 'pgpm_write_block' and c.relname = p_child and c.relnamespace = v_nsp::regnamespace
+     where t.tgname = 'pgpm_write_block' and c.relname = p_child and c.relnamespace = v_nsp_oid
   );
 end;
 $$;
@@ -2688,15 +2694,16 @@ begin
 end;
 $$;
 
--- true iff p_child currently carries the capture trigger
+-- true iff p_child currently carries the capture trigger. Schema matched by OID, not by re-parsing its
+-- name (#512, same defect and fix as _is_write_blocked).
 create or replace function pgpm._regrain_capture_active(p_parent regclass, p_child name)
 returns boolean language plpgsql stable as $$
-declare v_nsp name;
+declare v_nsp_oid oid;
 begin
-  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+  select c.relnamespace into v_nsp_oid from pg_class c where c.oid = p_parent;
   return exists (select 1 from pg_trigger t join pg_class c on c.oid = t.tgrelid
                   where t.tgname = 'pgpm_regrain_capture' and c.relname = p_child
-                    and c.relnamespace = v_nsp::regnamespace);
+                    and c.relnamespace = v_nsp_oid);
 end;
 $$;
 
