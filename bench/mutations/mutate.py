@@ -656,6 +656,29 @@ MUTATIONS = {
           "alter table pgpm.config add column if not exists archive_batch int default 1;\n"
           "alter table pgpm.config add column if not exists mutant_unlisted_col int;\n", 1)],
     ),
+    "upgrade_regrain_capture_backfill_noop": (
+        "bench/upgrade_in_place.sh",
+        "The upgrade adds pgpm.config.regrain_delta_oid and regrain_capture_fn_oid (#496) and populates "
+        "neither: the backfill block that records the derived-name relations of an install that predates "
+        "the anchors is deleted, the `add column if not exists` lines left in place, so the catalog-shape "
+        "assertion stays green and both columns are there, null, for the regrain the operator had in "
+        "flight across the upgrade. Null anchors mean the readers fall back to the parent's current name, "
+        "which is the pre-#496 rename hazard exactly, for precisely the regrain that was running. What "
+        "must FAIL here is the anchor assertion by identity, not the catalog hash.",
+        [("""do $$
+declare r record; v_nsp name; v_delta name; v_fn name;
+begin
+  for r in select parent_table from pgpm.config where regrain_delta_oid is null loop
+    select d.nsp, d.delta, d.fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_derive(r.parent_table) d;
+    if v_nsp is null or to_regclass(format('%I.%I', v_nsp, v_delta)) is null then continue; end if;
+    update pgpm.config
+       set regrain_delta_oid      = to_regclass(format('%I.%I', v_nsp, v_delta))::oid,
+           regrain_capture_fn_oid = to_regprocedure(format('%I.%I()', v_nsp, v_fn))::oid
+     where parent_table = r.parent_table;
+  end loop;
+end $$;
+""", "", 1)],
+    ),
     "upgrade_stale_overloads_kept": (
         "bench/upgrade_from_release.sh",
         "The four `drop function if exists <old signature>` lines issue #441 added are gone again, "
@@ -923,6 +946,57 @@ begin
         "identities, all written under SQL, DMY and read back under ISO, MDY, are what catch it.",
         [("returns text language sql stable set datestyle = 'ISO, MDY' as $$\n  select p_ts::text;\n$$;\n",
           "returns text language sql stable as $$\n  select p_ts::text;\n$$;\n", 1)],
+    ),
+    "regrain_capture_by_name": (
+        "bench/regrain_capture_identity.sh",
+        "Pre-#496 _regrain_capture_names: the delta table and trigger function are resolved from the "
+        "parent's CURRENT relname, the oids pgpm.config recorded at prepare ignored. The trigger the "
+        "prepare tick installed has the delta's name baked in, so after ALTER TABLE ... RENAME of the "
+        "parent mid-regrain it keeps writing ev_pgpm_regrain_delta while the reconcile, the swap gate "
+        "and the swap all look for events_pgpm_regrain_delta, find nothing, count 0 pending and swap: a "
+        "committed UPDATE reverts, a DELETE comes back, an INSERT vanishes. tests/124 section (A) is "
+        "what catches it: the resolver's answer after the rename, the gate's count, and the three rows "
+        "by identity after the swap.",
+        [("  select regrain_delta_oid, regrain_capture_fn_oid into cfg from pgpm.config where parent_table = p_parent;\n"
+          "  if not found then return; end if;\n",
+          "  select regrain_delta_oid, regrain_capture_fn_oid into cfg from pgpm.config where parent_table = p_parent;\n"
+          "  return;\n", 1)],
+    ),
+    "regrain_delta_reused": (
+        "bench/regrain_capture_identity.sh",
+        "Pre-#496 _regrain_capture_install: the per-parent delta is created only when nothing sits under "
+        "its name and merely TRUNCATED otherwise, so it keeps the key columns of the FIRST regrain while "
+        "the trigger function is regenerated from the CURRENT key. Rename a key column between two "
+        "regrains (PK (id, k2) -> (id, k3)) and the prepare tick succeeds, then every INSERT, UPDATE and "
+        "DELETE on the source raises 'column k3 of relation b_pgpm_regrain_delta does not exist' for the "
+        "life of the regrain, where the reference promises committed DML against the source is honoured. "
+        "The identity anchors stay, so only the re-mint is missing: tests/124 section (B)'s column list, "
+        "its 'not the same relation' check and its lives_ok are what catch it.",
+        [("  if exists (select 1 from pg_class where oid = cfg.regrain_delta_oid) then\n"
+          "    execute format('drop table %s', cfg.regrain_delta_oid::regclass::text);\n"
+          "  end if;\n"
+          "  execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);\n",
+          "  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then\n"
+          "  execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);\n", 1),
+         ("  execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);\n"
+          "  v_delta_reg := format('%I.%I', v_nsp, v_delta)::regclass;\n",
+          "  execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);\n"
+          "  end if;\n"
+          "  execute format('truncate %I.%I', v_nsp, v_delta);\n"
+          "  v_delta_reg := format('%I.%I', v_nsp, v_delta)::regclass;\n", 1)],
+    ),
+    "regrain_delta_ungranted": (
+        "bench/regrain_capture_identity.sh",
+        "Pre-#496 grants: the delta is created by whoever runs regrain_step (the scheduling role under "
+        "cron), owned by it and granted to nobody, and the per-tick re-sync is gone too. The capture "
+        "trigger inserts into it with the WRITER's privileges (pgpm has no SECURITY DEFINER anywhere), "
+        "so an application role holding full DML on the parent, and even the parent's own owner, gets "
+        "42501 on every UPDATE, DELETE and INSERT landing in the regraining child for the whole regrain. "
+        "tests/124 section (C)'s owner and has_table_privilege checks and its lives_ok writes as those "
+        "roles are what catch it.",
+        [("  perform pgpm._own_like_parent(p_parent, v_delta_reg);\n"
+          "  perform pgpm._regrain_capture_grant(p_parent, v_delta_reg);\n", "", 1),
+         ("  if v_delta_reg is not null then perform pgpm._regrain_capture_grant(p_parent, v_delta_reg); end if;\n", "", 1)],
     ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",

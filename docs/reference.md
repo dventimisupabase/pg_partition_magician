@@ -883,6 +883,18 @@ consumed early: it stays in the delta for the next pass. If writes outpace it th
 at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
 work is done under the swap's lock.
 
+The delta table and its trigger function live in the parent's schema as `<table>_pgpm_regrain_delta` and
+`<table>_pgpm_regrain_capture()`. They are named from the parent when the prepare tick mints them and found
+by **oid** from then on (`config.regrain_delta_oid`, `config.regrain_capture_fn_oid`), so renaming the parent
+mid-regrain changes nothing: the trigger keeps writing the delta it was given, and the reconcile, the swap
+gate and the swap read that same relation. Every prepare tick drops and re-mints the delta from the key as
+it is then, so a key column renamed between two regrains is picked up rather than tripping every write into
+the source; a relation already holding the name it would mint under, other than the one this parent recorded,
+is refused rather than adopted. The trigger runs with the **writer's** privileges (pgpm has no
+`SECURITY DEFINER`), so the delta is owned like the parent and every role holding `INSERT`, `UPDATE` or
+`DELETE` on the parent is granted `INSERT` on it, re-synced on every tick: a role granted mid-regrain can
+write from the next tick on, and nothing beyond the grants on the parent is needed.
+
 The swap has the same contract. Whatever is captured between that gate and the moment the `DETACH` takes
 its lock is reconciled under the lock until nothing is left, and the source is dropped only once no
 captured change in its range remains; if one does, the swap raises rather than drop it, the whole tick rolls
@@ -1780,6 +1792,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `regrain_max_blocks` | `int` | optional block budget per microbatch (caps wide rows; null = row cap only) |
 | `regrain_to` | `text` | auto-regrain target step (null = off; see `set_regrain`) |
 | `regrain_cursor` | `text` | how far the in-progress regrain has copied (null = not regraining); [`progress`](#progress) reads it as a fraction of the range |
+| `regrain_delta_oid` / `regrain_capture_fn_oid` | `oid` / `oid` | the change-capture delta table and trigger function the last prepare tick minted for this parent, by identity; every reader of the delta resolves them from here, so a rename of the parent mid-regrain is harmless (null until the first regrain; backfilled by an upgrade) |
 | `archive_fn` | `regprocedure` | the pluggable archive strategy (null = `none`); see [Archive strategy contract](#archive-strategy-contract) |
 | `archive_byte_budget` / `archive_probe_sample` | `bigint` / `int` | byte-budget chunking knobs for the built-in chunked archiver (see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |
 | `archive_batch` | `int` | max partitions one `_archive_step` call touches, oldest first (default 1; null = unbounded -- see [Byte-budget chunked archiving](#byte-budget-chunked-archiving)) |

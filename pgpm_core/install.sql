@@ -132,6 +132,14 @@ alter table pgpm.config add column if not exists regrain_to text;
 -- deletes), so the source never shrinks and cannot drive progress the way deletes would; this
 -- cursor is the explicit progress state instead. null = no regrain in flight; reset to null at the swap.
 alter table pgpm.config add column if not exists regrain_cursor text;
+-- regrain change capture's anchors (#496): the oids of the per-parent delta table and of the trigger
+-- function the prepare tick minted, recorded so that every reader of the delta (the reconcile, the swap
+-- gate, the swap, status) resolves the relation the source's trigger actually writes, whatever the parent
+-- is called by then. Null until the parent's first regrain; the relations persist between regrains and
+-- prepare re-mints them, recording the new oids. Backfilled for an older install where
+-- _regrain_capture_derive is defined, below.
+alter table pgpm.config add column if not exists regrain_delta_oid oid;
+alter table pgpm.config add column if not exists regrain_capture_fn_oid oid;
 -- retain() pacing (issue #189): cap how many eligible partitions ONE retain() call will attempt
 -- (write-block, archive-coverage check, drop), so an aged-out backlog spreads across maintenance
 -- ticks (each tick its own transaction via pg_cron) instead of one call carrying the whole backlog
@@ -2423,12 +2431,23 @@ $$;
 -- frontier at all. So capture must be correct however much arrives, not merely for a well-behaved
 -- append-only workload.
 --
--- Shape: the delta table and its trigger function are PER PARENT and persistent (named from the parent,
--- which is stable -- naming from the child would break, since #266's fix renames the source mid-flight);
--- only the trigger on the source child is per regrain. Lifecycle therefore reduces to rows, not
--- relations, and an abandoned regrain leaks a trigger the janitor removes rather than an orphan table.
+-- Shape: the delta table and its trigger function are PER PARENT and persistent; only the trigger on the
+-- source child is per regrain. Lifecycle therefore reduces to rows, not relations, and an abandoned regrain
+-- leaks a trigger the janitor removes rather than an orphan table. They are NAMED from the parent (naming
+-- from the child would break, since #266's fix renames the source mid-flight) but FOUND by identity (#496):
+-- the prepare tick records their oids in pgpm.config and every reader resolves them from there, because the
+-- parent's name is not stable either. An operator's ALTER TABLE ... RENAME mid-regrain used to leave the
+-- trigger writing the delta it was given while the reconcile, the swap gate and the swap all derived a fresh
+-- name from the new relname, found nothing, counted 0 pending and swapped: every change captured since the
+-- copy went with the source. The delta is also RE-MINTED at every prepare rather than reused: its columns are
+-- the key as of that regrain and the trigger function is generated from the key as it is now, so a key
+-- column renamed between two regrains made every write into the source raise for the life of the next one
+-- while the old delta was kept.
 
-create or replace function pgpm._regrain_capture_names(
+-- The names this parent's capture relations are MINTED under: derived from the parent's current relname.
+-- Only _regrain_capture_install creates under these (and the upgrade backfill below reads them); every
+-- other caller goes through _regrain_capture_names, which prefers what pgpm.config recorded.
+create or replace function pgpm._regrain_capture_derive(
   p_parent regclass, out nsp name, out delta name, out fn name
 ) returns record language plpgsql stable as $$
 declare v_rel name;
@@ -2439,6 +2458,51 @@ begin
   fn    := left(v_rel || '_pgpm_regrain_capture', 63)::name;
 end;
 $$;
+
+-- The parent's LIVE capture relations, by identity (#496): the delta and the function whose oids the prepare
+-- tick recorded in pgpm.config, under whatever names they carry now. Falls back to the derived names when
+-- nothing is recorded, which is a parent that has never regrained (its readers then find no relation and
+-- count 0) or a capture minted before the oids were recorded (it sits under the derived name, and a legacy
+-- trigger writes there); and likewise when a recorded relation is gone (dropped by hand), since the derived
+-- name is where the next prepare will mint. The two are resolved independently, so a function dropped by
+-- hand does not lose the delta.
+create or replace function pgpm._regrain_capture_names(
+  p_parent regclass, out nsp name, out delta name, out fn name
+) returns record language plpgsql stable as $$
+declare cfg record; v_nsp name; v_rel name;
+begin
+  select d.nsp, d.delta, d.fn into nsp, delta, fn from pgpm._regrain_capture_derive(p_parent) d;
+  select regrain_delta_oid, regrain_capture_fn_oid into cfg from pgpm.config where parent_table = p_parent;
+  if not found then return; end if;
+  if cfg.regrain_delta_oid is not null then
+    select n.nspname, c.relname into v_nsp, v_rel
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = cfg.regrain_delta_oid;
+    if found then nsp := v_nsp; delta := v_rel; end if;
+  end if;
+  if cfg.regrain_capture_fn_oid is not null then
+    select p.proname into v_rel from pg_proc p
+     where p.oid = cfg.regrain_capture_fn_oid and p.pronamespace = (select oid from pg_namespace where nspname = nsp);
+    if found then fn := v_rel; end if;
+  end if;
+end;
+$$;
+
+-- Upgrade path (#496): an install that predates the two anchor columns found its capture relations by name
+-- alone. Record them now for every parent whose derived-name delta exists, so a regrain in flight across
+-- this upgrade is anchored from here on and a later prepare knows the delta it finds is this parent's own.
+-- Only rows with nothing recorded, so a re-run changes nothing.
+do $$
+declare r record; v_nsp name; v_delta name; v_fn name;
+begin
+  for r in select parent_table from pgpm.config where regrain_delta_oid is null loop
+    select d.nsp, d.delta, d.fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_derive(r.parent_table) d;
+    if v_nsp is null or to_regclass(format('%I.%I', v_nsp, v_delta)) is null then continue; end if;
+    update pgpm.config
+       set regrain_delta_oid      = to_regclass(format('%I.%I', v_nsp, v_delta))::oid,
+           regrain_capture_fn_oid = to_regprocedure(format('%I.%I()', v_nsp, v_fn))::oid
+     where parent_table = r.parent_table;
+  end loop;
+end $$;
 
 -- TRUNCATE is the one write the row trigger cannot see (issue #449). It fires no row trigger, so a truncate
 -- of the source mid-regrain leaves the delta empty, and TRUNCATE parent never reaches the standalone copies
@@ -2463,19 +2527,51 @@ begin
 end;
 $$;
 
--- Install capture for a regrain of p_child: mint the per-parent delta table and trigger function if this
--- parent has never regrained, clear any residue from a previous regrain, and put the trigger on the source
--- child. CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which conflicts with ROW EXCLUSIVE, so in-flight DML
--- blocks the install and DML afterwards sees the trigger: once this commits nothing can have slipped past
--- uncaptured. That lock is why this is its own tick -- sharing a transaction with a copy batch would hold
--- it across the batch instead of for an O(1) statement.
+-- Give the parent's writers INSERT on the delta (#496). The capture trigger inserts into the delta with the
+-- WRITER's privileges: pgpm has no SECURITY DEFINER anywhere, and the delta used to be created by whoever
+-- ran the tick, with no grants, so every non-owner role holding DML on the parent got 42501 on every write
+-- into the regraining child for the life of the regrain. Every grantee of INSERT, UPDATE or DELETE on the
+-- parent, table- or column-level (PUBLIC included), gets INSERT on the delta; the owner's implicit rights
+-- come from _own_like_parent, called beside this. Grants only what is missing, so a steady-state tick
+-- issues no DDL, and regrain_step calls it on every tick so a grant made mid-regrain is honoured from the
+-- next one.
+create or replace function pgpm._regrain_capture_grant(p_parent regclass, p_delta regclass)
+returns void language plpgsql as $$
+declare r record;
+begin
+  for r in
+    select g.grantee
+      from (select a.grantee from pg_class c cross join lateral aclexplode(c.relacl) a
+             where c.oid = p_parent and c.relacl is not null
+               and a.privilege_type in ('INSERT', 'UPDATE', 'DELETE')
+            union
+            select a.grantee from pg_attribute att cross join lateral aclexplode(att.attacl) a
+             where att.attrelid = p_parent and att.attnum > 0 and not att.attisdropped and att.attacl is not null
+               and a.privilege_type in ('INSERT', 'UPDATE')) g
+     where not exists (select 1 from pg_class d cross join lateral aclexplode(d.relacl) b
+                        where d.oid = p_delta and d.relacl is not null
+                          and b.grantee = g.grantee and b.privilege_type = 'INSERT')
+  loop
+    execute format('grant insert on %s to %s', p_delta::text,
+                   case when r.grantee = 0 then 'public' else quote_ident(pg_get_userbyid(r.grantee)) end);
+  end loop;
+end;
+$$;
+
+-- Install capture for a regrain of p_child: mint the per-parent delta table and trigger function (tearing
+-- down what an earlier regrain of this parent left, by the oids pgpm.config recorded) and put the trigger on
+-- the source child. CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which conflicts with ROW EXCLUSIVE, so
+-- in-flight DML blocks the install and DML afterwards sees the trigger: once this commits nothing can have
+-- slipped past uncaptured. That lock is why this is its own tick -- sharing a transaction with a copy batch
+-- would hold it across the batch instead of for an O(1) statement.
 create or replace function pgpm._regrain_capture_install(p_parent regclass, p_child name)
 returns void language plpgsql as $$
 declare
-  v_nsp name; v_delta name; v_fn name; v_keyidx oid; v_keycols_q text; v_newvals_q text; v_oldvals_q text;
-  v_bad_q text;
+  cfg pgpm.config; v_nsp name; v_delta name; v_fn name; v_delta_reg regclass; v_taken regclass; v_taken_fn regprocedure;
+  v_keyidx oid; v_keycols_q text; v_newvals_q text; v_oldvals_q text; v_bad_q text;
 begin
-  select nsp, delta, fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_names(p_parent);
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  select nsp, delta, fn into v_nsp, v_delta, v_fn from pgpm._regrain_capture_derive(p_parent);
 
   select coalesce(
            (select i.indexrelid from pg_index i where i.indrelid = p_parent and i.indisprimary limit 1),
@@ -2509,18 +2605,47 @@ begin
     join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
    where i.indexrelid = v_keyidx;
 
-  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then
-    execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);
-    -- monotonic ordering column so a reconcile pass can batch the oldest captures first: a batch is the
-    -- first N eligible rows by pgpm_seq that ONE snapshot can see, and the pass consumes exactly those rows
-    -- (#497), never "everything at or below a watermark". The value is assigned when the trigger fires,
-    -- inside the writer's transaction, so a row can commit later than rows carrying higher values; a
-    -- pass addresses the delta by the identity of the rows it saw, and a late-committing row waits for
-    -- the next pass. Excluded by name wherever key columns are introspected.
-    execute format('alter table %I.%I add column pgpm_seq bigint generated always as identity', v_nsp, v_delta);
-    execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);
+  -- The names are the parent's current relname plus a suffix, and a relation already under one of them that
+  -- is not the one this parent recorded is somebody else's (#496): refuse rather than adopt it. Before,
+  -- whatever sat under the derived name was taken for the delta and TRUNCATED.
+  v_taken := to_regclass(format('%I.%I', v_nsp, v_delta));
+  if v_taken is not null and v_taken::oid is distinct from cfg.regrain_delta_oid then
+    raise exception 'pg_partition_magician: cannot regrain % -- change capture would mint its delta table as %.%, and that name is held by relation % (oid %), which this parent did not mint. Drop or rename that relation, then re-run.',
+      p_parent, quote_ident(v_nsp), quote_ident(v_delta), v_taken::text, v_taken::oid;
   end if;
-  execute format('truncate %I.%I', v_nsp, v_delta);   -- residue from an earlier regrain is not ours
+  v_taken_fn := to_regprocedure(format('%I.%I()', v_nsp, v_fn));
+  if v_taken_fn is not null and v_taken_fn::oid is distinct from cfg.regrain_capture_fn_oid then
+    raise exception 'pg_partition_magician: cannot regrain % -- change capture would mint its trigger function as %.%(), and that name is held by function % (oid %), which this parent did not mint. Drop or rename that function, then re-run.',
+      p_parent, quote_ident(v_nsp), quote_ident(v_fn), v_taken_fn::text, v_taken_fn::oid;
+  end if;
+
+  -- Tear down the previous regrain's relations, by identity, and mint fresh ones (#496). Fresh, not reused:
+  -- the delta's columns are the key as of THIS regrain and the trigger function below inserts the current
+  -- key's column names, so keeping a delta minted under an earlier key (a key column renamed in between)
+  -- made every write into the source raise for the life of the regrain. Dropping by recorded oid rather than
+  -- by name is what reaches a delta left under an earlier relname of the parent. The function first: nothing
+  -- depends on the delta, and no trigger can reference the function here, since regrain_step has already
+  -- refused a second in-flight regrain on this parent.
+  if exists (select 1 from pg_proc where oid = cfg.regrain_capture_fn_oid) then
+    execute format('drop function %s', cfg.regrain_capture_fn_oid::regprocedure::text);
+  end if;
+  if exists (select 1 from pg_class where oid = cfg.regrain_delta_oid) then
+    execute format('drop table %s', cfg.regrain_delta_oid::regclass::text);
+  end if;
+  execute format('create table %I.%I as select %s from %s with no data', v_nsp, v_delta, v_keycols_q, p_parent::text);
+  -- monotonic ordering column so a reconcile pass can batch the oldest captures first: a batch is the
+  -- first N eligible rows by pgpm_seq that ONE snapshot can see, and the pass consumes exactly those rows
+  -- (#497), never "everything at or below a watermark". The value is assigned when the trigger fires,
+  -- inside the writer's transaction, so a row can commit later than rows carrying higher values; a
+  -- pass addresses the delta by the identity of the rows it saw, and a late-committing row waits for
+  -- the next pass. Excluded by name wherever key columns are introspected.
+  execute format('alter table %I.%I add column pgpm_seq bigint generated always as identity', v_nsp, v_delta);
+  execute format('create index on %I.%I (pgpm_seq)', v_nsp, v_delta);
+  v_delta_reg := format('%I.%I', v_nsp, v_delta)::regclass;
+  -- The trigger runs as the WRITER, so the delta is owned like the parent and every role that can write the
+  -- parent gets INSERT on it (#496; see _regrain_capture_grant).
+  perform pgpm._own_like_parent(p_parent, v_delta_reg);
+  perform pgpm._regrain_capture_grant(p_parent, v_delta_reg);
 
   execute format('create or replace function %I.%I() returns trigger language plpgsql as $pgpm$
     begin
@@ -2553,6 +2678,13 @@ begin
   execute format('create trigger pgpm_regrain_truncate_guard before truncate on %I.%I for each statement execute function pgpm._regrain_truncate_guard()',
                  v_nsp, p_child);
   execute format('alter table %I.%I enable always trigger pgpm_regrain_truncate_guard', v_nsp, p_child);
+  -- Record what was minted, by oid (#496): every reader resolves the delta and the function through
+  -- pgpm.config from here on, so a rename of the parent mid-regrain changes what _regrain_capture_derive
+  -- would say and nothing else.
+  update pgpm.config
+     set regrain_delta_oid      = v_delta_reg::oid,
+         regrain_capture_fn_oid = format('%I.%I()', v_nsp, v_fn)::regprocedure::oid
+   where parent_table = p_parent;
 end;
 $$;
 
@@ -2904,6 +3036,7 @@ declare
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
   v_fk_ids bigint[];
   v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_delta_name name; v_busy name;
+  v_delta_reg regclass;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -3036,6 +3169,11 @@ begin
       values (p_parent, 'regrain_prepare', v_lo, v_hi, v_child_name);
     return 'prepared';
   end if;
+  -- #496: a role granted DML on the parent after the prepare tick gets INSERT on the delta from the next
+  -- tick on, rather than 42501 until the swap. Grants only what is missing, so this is a no-op most ticks.
+  select delta into v_delta_name from pgpm._regrain_capture_names(p_parent);
+  v_delta_reg := to_regclass(format('%I.%I', v_nsp, v_delta_name));
+  if v_delta_reg is not null then perform pgpm._regrain_capture_grant(p_parent, v_delta_reg); end if;
 
   -- retention horizon (matches retain(), issue #91)
   if cfg.retain is not null then
@@ -4726,8 +4864,9 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   v_ncast := pgpm._native_type(cfg.control_kind);
-  -- resolve the regrain change-capture names (#267) NOW, while the parent still exists: they are derived
-  -- from it, and the drop below would leave the lookup with nothing to read.
+  -- resolve the regrain change-capture names (#267) NOW, while the parent and its config row still exist:
+  -- they come from the oids recorded there at prepare (#496), or failing that from the parent's own name,
+  -- and both are gone by the time the drop below runs.
   select delta, fn into v_cdelta, v_cfn from pgpm._regrain_capture_names(p_parent);
 
   -- THE GATE (REDESIGN.md section 13): a clean (metadata-only) reverse needs the original table still
