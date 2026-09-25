@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- **Parquet archives of a `numeric(p,s)` column with `p >= 17` encoded negative values, and positives
+  of 19 or more digits, as different numbers, and every reader agreed on the wrong one (#461).**
+  `archive._pq_plain_decimal` stepped its two's-complement byte loop with `trunc(v / 256)`, and
+  PostgreSQL's numeric `/` rounds its quotient to about 16 significant digits, so once the running
+  value had 17 or more integer digits the rounding carried into every higher byte. Every negative gets
+  there at the 8-byte width `numeric(17,s)` is the first to need (its `2^(8n) + value` step has 20
+  digits), so `numeric(19,4)`, the money shape, was squarely inside it: `-1.5` came back as `5.0536`,
+  `-0.0001` as `0.0255` and the column maximum `999999999999999.9999` as `1000000000000000.0255`, from
+  pyarrow and DuckDB alike. `numeric(16,s)` and narrower, 7 bytes or fewer, were never affected, which
+  is why `scripts/verify_parquet.py`, whose widest DECIMAL fixture was 5 bytes, stayed green. The loop
+  now steps with `div()`/`mod()`, exact at any magnitude, as `pgpm._radix_encode` already did for the
+  same reason.
+
+  **A Parquet file written before this fix from a `numeric(p >= 17)` column that held a negative
+  value, or a positive of 19 or more digits, carries wrong values, and nothing in the file says so:**
+  each wrong value is a valid encoding of some other number (`-0.0001` became the exact bytes of
+  `+0.0255`), so no reader can flag it and the file cannot be repaired from itself. The repair is to
+  re-archive the range from the source rows while they still exist; `pgpm.archive_ledger` lists which
+  ranges went to which keys. A column of that shape that only ever held non-negative values under 19
+  digits was encoded correctly and needs nothing, and NDJSON archives (`archive.to_s3`, which renders
+  rows with `row_to_json`) were never affected. Pinned by `tests/archive/db/11`, which checks the
+  encoder's bytes against a Python-derived two's-complement reference for five values at every width
+  1..16 they fit (the width-8 row is required to be present, since widths 1..7 passed before the fix
+  and pass again against it), and by three new `verify_parquet.py` fixtures (`numeric(19,4)`, `(17,2)`,
+  `(38,10)`, with negatives and near-max values) read back exactly through both readers; all three
+  fail against the previous encoder.
 - **Both pgpm triggers now fire under `session_replication_role = replica`** (#450). The write block
   and the regrain change capture were created in PostgreSQL's default origin-only state, so a session
   running as `replica`, which is what a logical-replication apply worker runs as and what some bulk
