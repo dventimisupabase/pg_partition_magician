@@ -217,6 +217,124 @@ def test_timestamptz(conn):
     print(f"{'PASS' if ok else 'FAIL'}: timestamptz epoch conversion ({len(expected)} rows)")
 
 
+def test_timestamp_naive(conn):
+    # A `timestamp` (without time zone) is a wall clock, not an instant. The writer encodes it as
+    # that wall clock read as if it were UTC and annotates the leaf TIMESTAMP(isAdjustedToUTC=false,
+    # MICROS) beside the legacy TIMESTAMP_MICROS, the pair pyarrow itself writes for a naive
+    # timestamp, so both readers hand back a NAIVE datetime equal to the wall clock, the same value
+    # NDJSON's row_to_json emits (issue #465). It used to go through `::timestamptz`, which reads the
+    # wall clock in the SESSION zone, so two archive sessions in different zones wrote different
+    # instants. The two zones are read back as the witness that they really differed, and the
+    # expected values are written out here rather than fetched from Postgres, so a reader cannot
+    # agree with the writer by sharing its mistake. The timestamptz column beside it stays an
+    # instant: pyarrow types it with a zone, and its values are the instants themselves.
+    make_table(conn, "t_ts_naive", "ts timestamp not null, tstz timestamptz not null", None)
+    rows = [
+        ("2024-01-15 12:00:00", "2024-01-15 18:30:00+00"),   # New York is on EST here (UTC-5)
+        ("2024-07-15 12:00:00", "2024-07-15 18:30:00+00"),   # and on EDT here (UTC-4)
+        ("1970-01-01 00:00:00", "1970-01-01 00:00:00+00"),   # the issue's own repro row
+        ("1900-01-01 00:00:00", "1900-01-01 00:00:00+00"),   # a negative epoch
+    ]
+    for ts, tstz in rows:
+        run(conn, "insert into t_ts_naive (ts, tstz) values (%s, %s)", (ts, tstz))
+    conn.commit()
+    utc = datetime.timezone.utc
+    expected_ts = [
+        datetime.datetime(2024, 1, 15, 12, 0, 0),
+        datetime.datetime(2024, 7, 15, 12, 0, 0),
+        datetime.datetime(1970, 1, 1, 0, 0, 0),
+        datetime.datetime(1900, 1, 1, 0, 0, 0),
+    ]
+    expected_tstz = [
+        datetime.datetime(2024, 1, 15, 18, 30, 0, tzinfo=utc),
+        datetime.datetime(2024, 7, 15, 18, 30, 0, tzinfo=utc),
+        datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=utc),
+        datetime.datetime(1900, 1, 1, 0, 0, 0, tzinfo=utc),
+    ]
+    ok = True
+
+    raws = {}
+    for zone in ("America/New_York", "UTC"):
+        run(conn, "set timezone to %s", (zone,))
+        got = run(conn, "select current_setting('TimeZone')")[0][0]
+        if got != zone:
+            FAILURES.append(f"timestamp naive: witness failed, the session zone is {got!r}, not {zone!r}")
+            ok = False
+        raws[zone] = to_parquet_bytes(conn, "t_ts_naive")
+    run(conn, "reset timezone")
+    conn.commit()
+    if raws["America/New_York"] != raws["UTC"]:
+        FAILURES.append("timestamp naive: the New York and UTC sessions wrote different bytes")
+        ok = False
+
+    # Read the NEW YORK session's file: that is the one the old writer got wrong.
+    raw = raws["America/New_York"]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        arrow_schema = pq.read_table(path).schema
+        parquet_schema = pq.ParquetFile(path).schema
+        leaves = {parquet_schema.column(i).name: parquet_schema.column(i) for i in range(len(parquet_schema))}
+        rel = duckdb.sql(f"select * from '{path}'")
+        duck_types = dict(zip([d[0] for d in rel.description], [str(t) for t in rel.types]))
+        # parquet_schema() reports the SchemaElement's own fields. pyarrow's ColumnSchema does not:
+        # parquet-cpp re-derives converted_type FROM the logical type when one is present, and for
+        # TIMESTAMP(isAdjustedToUTC=false) that derivation is NONE whatever the bytes say, so only
+        # DuckDB can witness that the legacy ConvertedType is physically there beside the new one.
+        raw_leaves = {name: (conv, logi) for name, conv, logi in
+                      duckdb.sql(f"select name, converted_type, logical_type from parquet_schema('{path}')").fetchall()}
+    finally:
+        os.unlink(path)
+    # how the two readers INTERPRET the leaves: ts a naive timestamp, tstz an instant
+    if str(arrow_schema.field("ts").type) != "timestamp[us]":
+        FAILURES.append(f"timestamp naive: pyarrow types ts as {arrow_schema.field('ts').type}, expected timestamp[us] with no zone")
+        ok = False
+    if str(arrow_schema.field("tstz").type) != "timestamp[us, tz=UTC]":
+        FAILURES.append(f"timestamp naive: pyarrow types tstz as {arrow_schema.field('tstz').type}, expected timestamp[us, tz=UTC]")
+        ok = False
+    if "isAdjustedToUTC=false" not in str(leaves["ts"].logical_type):
+        FAILURES.append(f"timestamp naive: pyarrow reads the ts leaf as {leaves['ts'].logical_type}, expected isAdjustedToUTC=false")
+        ok = False
+    if "isAdjustedToUTC=true" not in str(leaves["tstz"].logical_type) or leaves["tstz"].converted_type != "TIMESTAMP_MICROS":
+        FAILURES.append(f"timestamp naive: pyarrow reads the tstz leaf as {leaves['tstz'].logical_type} / {leaves['tstz'].converted_type}, "
+                        "expected the UTC-adjusted TIMESTAMP_MICROS it always had")
+        ok = False
+    if duck_types.get("ts") != "TIMESTAMP":
+        FAILURES.append(f"timestamp naive: duckdb types ts as {duck_types.get('ts')}, expected TIMESTAMP")
+        ok = False
+    # what the leaves physically CARRY: ts both annotations, tstz the legacy one alone
+    ts_conv, ts_logi = raw_leaves["ts"]
+    if ts_conv != "TIMESTAMP_MICROS" or "isAdjustedToUTC=0" not in str(ts_logi) or "MICROS=MicroSeconds()" not in str(ts_logi):
+        FAILURES.append(f"timestamp naive: ts leaf carries converted_type={ts_conv!r} logical_type={ts_logi!r}, "
+                        "expected TIMESTAMP_MICROS beside TIMESTAMP(isAdjustedToUTC=false, MICROS)")
+        ok = False
+    if raw_leaves["tstz"] != ("TIMESTAMP_MICROS", None):
+        FAILURES.append(f"timestamp naive: tstz leaf carries {raw_leaves['tstz']!r}, expected ('TIMESTAMP_MICROS', None), unchanged")
+        ok = False
+
+    arrow_rows, duck_rows = read_with_both_readers(raw)
+    for i, (exp_ts, exp_tstz) in enumerate(zip(expected_ts, expected_tstz)):
+        a_ts, d_ts = arrow_rows[i]["ts"], duck_rows[i]["ts"]
+        if a_ts.tzinfo is not None or a_ts != exp_ts:
+            FAILURES.append(f"timestamp naive: row {i} pyarrow ts={a_ts!r} expected naive {exp_ts!r}")
+            ok = False
+        if d_ts.tzinfo is not None or d_ts != exp_ts:
+            FAILURES.append(f"timestamp naive: row {i} duckdb ts={d_ts!r} expected naive {exp_ts!r}")
+            ok = False
+        a_tstz, d_tstz = arrow_rows[i]["tstz"], duck_rows[i]["tstz"]
+        if a_tstz.tzinfo is None or a_tstz.astimezone(utc) != exp_tstz:
+            FAILURES.append(f"timestamp naive: row {i} pyarrow tstz={a_tstz!r} expected {exp_tstz!r}")
+            ok = False
+        # DuckDB gives a naive UTC wall clock for a converted-type-only TIMESTAMP_MICROS (see test_timestamptz)
+        d_tstz_utc = d_tstz if d_tstz.tzinfo else d_tstz.replace(tzinfo=utc)
+        if d_tstz_utc != exp_tstz:
+            FAILURES.append(f"timestamp naive: row {i} duckdb tstz={d_tstz!r} expected {exp_tstz!r}")
+            ok = False
+    print(f"{'PASS' if ok else 'FAIL'}: timestamp (without time zone) is the wall clock, session-independent, "
+          f"annotated naive ({len(expected_ts)} rows, 2 session zones)")
+
+
 def test_multi_column(conn):
     make_table(conn, "t_multi",
                "id int4 not null, amount float8 not null, active boolean not null, label text not null",
@@ -724,6 +842,7 @@ def main():
         test_bool,
         test_text,
         test_timestamptz,
+        test_timestamp_naive,
         test_multi_column,
         test_empty_table,
         test_single_row,
