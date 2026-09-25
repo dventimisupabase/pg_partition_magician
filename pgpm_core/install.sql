@@ -1699,9 +1699,13 @@ $$;
 -- archive_fn's return shape: how much of a requested [lo, hi) a single call durably archived.
 -- covered_hi is the native-grid value up to which [lo, ...) is now durably archived by THIS call --
 -- may be less than hi, since a real strategy is expected to be resumable (called again next tick to
--- make further bounded progress, not to finish the whole range at once). rows_archived is how many
--- rows this call actually archived; null when nothing was actually archived (the 'none' strategy,
--- or a strategy that made no progress this tick). s3_key/etag are optional identifiers a transport
+-- make further bounded progress, not to finish the whole range at once), but it must be ABOVE lo and
+-- AT MOST hi: _archive_step holds it to that before a ledger row is written from it (issue #454, see
+-- _archive_contract_breach below), since that row is what opens retire()'s drop gate. A strategy that
+-- can make no progress on a call (the object store is unreachable, say) should RAISE rather than
+-- return: maintain() logs a skip_archive deferral and hands it the same chunk next tick. rows_archived
+-- is how many rows this call actually archived; null when nothing was actually archived (the 'none'
+-- strategy, or a range that held no rows). s3_key/etag are optional identifiers a transport
 -- strategy (e.g. pgpm_archive's pgpm.archive_to_s3_ndjson/archive_to_s3_parquet, issue #239) can
 -- report back for the ledger row; null for a strategy with nothing object-store-shaped to name (the
 -- 'none' strategy, pgpm._archive_noop, a user-authored strategy that doesn't use S3). No CREATE OR
@@ -1780,7 +1784,9 @@ $$;
 -- transport strategy (e.g. pgpm_archive's pgpm.archive_to_s3_ndjson/archive_to_s3_parquet), still
 -- null for a strategy with nothing object-store-shaped to name (pgpm._archive_noop, the 'none'
 -- strategy). rows_archived is nullable (unlike the original's not null): the contract explicitly
--- allows a strategy to report no progress on a given call.
+-- allows a call to report no rows archived (a range that held none). hi, though, is never lo itself
+-- and never past the chunk the strategy was handed: _archive_step refuses such a return before it
+-- gets here (issue #454).
 create table if not exists pgpm.archive_ledger (
   parent_table  regclass    not null,
   lo            text        not null,
@@ -1900,13 +1906,51 @@ begin
 end;
 $$;
 
+-- THE STRATEGY'S RETURN IS A CLAIM, NOT A FACT (issue #454). archive_fn is a published extension
+-- point, and the covered_hi it returns is written into pgpm.archive_ledger, which is what
+-- _archive_fully_covered reads as retire()'s drop precondition. Recorded verbatim, a strategy bug that
+-- answers chunk [0, 15) with covered_hi 15000 marks the whole partition covered on the spot and the
+-- next retain() drops it with nothing archived. So hold the return to the promise the call made: a
+-- native value with p_lo < covered_hi <= p_hi. Returns null when it keeps that promise, else the rule
+-- it broke, in words an operator can act on.
+--
+-- Each bound closes a different hole. Above p_hi is the drop-with-nothing-archived defect itself.
+-- The lower bound is STRICT on purpose: covered_hi = p_lo is "no progress", and recorded as a
+-- (lo, lo) ledger row it wedges the ledger for good, because _next_archive_chunk resumes from max(hi)
+-- = lo, hands the strategy the identical chunk, and the insert collides on the ledger's primary key
+-- every tick from then on. Null is refused for the same reason (a null hi is not a watermark). And a
+-- value that is not even a native value is caught here, by a class-22 data_exception on the cast,
+-- rather than left to poison the text hi column and raise out of every later max(hi::numeric) over
+-- the ledger, which maintain() would have reported as a skip_archive deferral, tick after tick, for
+-- what is a permanent strategy bug. A strategy that genuinely cannot make progress on a call should
+-- raise (see pgpm.archive_result's note): that IS the deferral path, and it retries the same chunk.
+create or replace function pgpm._archive_contract_breach(p_kind text, p_lo text, p_hi text, p_covered_hi text)
+returns text language plpgsql immutable as $$
+begin
+  if p_covered_hi is null then
+    return 'covered_hi is null; the contract requires the native value up to which [lo, ...) is now archived';
+  end if;
+  begin
+    if not pgpm._native_gt(p_kind, p_covered_hi, p_lo) then
+      return 'covered_hi must be above lo: a call that covered nothing is not a chunk, and a (lo, lo) ledger row would collide with the next tick''s on the primary key';
+    end if;
+    if pgpm._native_gt(p_kind, p_covered_hi, p_hi) then
+      return 'covered_hi must not exceed hi: the strategy is claiming coverage of a range it was not handed';
+    end if;
+  exception when data_exception then
+    return format('covered_hi is not a %s value (%s)', pgpm._native_type(p_kind), sqlerrm);
+  end;
+  return null;
+end;
+$$;
+
 -- one maintenance tick's worth of chunked archiving: picks up to config.archive_batch (default 1;
 -- null = unlimited, same escape hatch retain_batch already has -- issue #351) attached children
 -- that ALREADY have the write-block trigger installed (checked directly against pg_trigger, not
 -- re-derived from the boundary formula -- this is what keeps archiving from ever running ahead of
 -- write-blocking) and are not yet fully covered, oldest first, and for each picks its next chunk,
--- runs the configured strategy, and records progress. Returns how many chunks were recorded this
--- call. A 'none' strategy (archive_fn null) has nothing to do -- every child is already "covered"
+-- runs the configured strategy, holds its return to the contract (_archive_contract_breach above),
+-- and records progress. Returns how many chunks were recorded this call. A 'none' strategy (archive_fn null) has nothing to do -- every child is already "covered"
 -- per _archive_fully_covered above.
 --
 -- IDENTITY, BEFORE ANY READ OF THE CHILD (issue #421). What this loop selects out of pgpm.part is a
@@ -1920,7 +1964,7 @@ create or replace function pgpm._archive_step(p_parent regclass)
 returns int language plpgsql as $$
 declare
   cfg pgpm.config; v_ncast text; v_nsp name; v_now regclass;
-  r record; v_range record; v_result pgpm.archive_result; v_count int := 0;
+  r record; v_range record; v_result pgpm.archive_result; v_breach text; v_count int := 0;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -1973,6 +2017,24 @@ begin
     if not found then continue; end if;
 
     v_result := pgpm._run_archive_strategy(p_parent, r.child_name, v_range.lo, v_range.hi);
+
+    -- Hold the return to the chunk it was handed (issue #454; the rules are _archive_contract_breach's
+    -- own comment). Same shape as the identity refusal above: `continue`, and no ledger row, so the
+    -- child's coverage stays exactly where it was and retire()'s drop precondition stays shut. Unlike
+    -- that refusal this one IS retryable, and by construction: nothing advanced, so the next tick hands
+    -- the strategy the very same chunk, and a corrected strategy (pgpm.set_archive_fn) resumes from
+    -- where the ledger honestly stands. Until then it logs once per tick, counts in
+    -- status().retain_drop_failures, and at archive_batch's default of 1 holds up this parent's other
+    -- partitions, which is right: the strategy is provably wrong about what it archived.
+    v_breach := pgpm._archive_contract_breach(cfg.control_kind, v_range.lo, v_range.hi, v_result.covered_hi);
+    if v_breach is not null then
+      insert into pgpm.log (parent_table, action, lo, hi, method)
+        values (p_parent, 'fail_archive_contract', v_range.lo, v_range.hi,
+                format('%s returned covered_hi %s for %I.%I chunk [%s, %s): %s; refusing to record it',
+                       cfg.archive_fn::text, coalesce(quote_literal(v_result.covered_hi), 'null'),
+                       v_nsp, r.child_name, v_range.lo, v_range.hi, v_breach));
+      continue;
+    end if;
 
     insert into pgpm.archive_ledger (parent_table, lo, hi, child_name, s3_key, etag, rows_archived)
     values (p_parent, v_range.lo, v_result.covered_hi, r.child_name, v_result.s3_key, v_result.etag, v_result.rows_archived);
@@ -5020,10 +5082,16 @@ begin
     -- `fail_write_block_identity` (issue #429) is the same mismatch one step earlier again, and it
     -- stalls the same chain from the top: a partition that never gets its write block is never an
     -- archive candidate, so it is never covered, so it is never dropped.
+    -- `fail_archive_contract` (issue #454) is the archive step refusing a strategy's return that
+    -- broke the contract (covered_hi null, not above the chunk's lo, past its hi, or not a native
+    -- value), so no ledger row is written and coverage does not advance. Retention is stalled the
+    -- same way, on every tick until the strategy is corrected, which is the one thing that separates
+    -- it from the identity refusals: it clears itself once a correct strategy is handed the same chunk.
     select count(*) into v_drop_fails from pgpm.log
       where parent_table = r.parent_table
         and action in ('fail_retain_drop', 'fail_retain_crossing', 'fail_retain_detach',
-                       'fail_retain_identity', 'fail_archive_identity', 'fail_write_block_identity')
+                       'fail_retain_identity', 'fail_archive_identity', 'fail_write_block_identity',
+                       'fail_archive_contract')
         and id > coalesce(v_last_retain_id, 0);
     -- Partitions whose concurrent detach has been dispatched and not yet completed (issue #268).
     -- Non-zero is normal for a tick or two while cron performs the detach; persistently non-zero with

@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- **The archive step now holds `archive_fn` to its contract (#454).** The `covered_hi` a strategy
+  returned was written into `pgpm.archive_ledger` verbatim, and that ledger is `retire()`'s drop
+  precondition, so a strategy bug that answered chunk `[0, 15)` with `covered_hi = 15000` marked the
+  partition fully covered on the spot and the next `retain()` dropped it with nothing archived.
+  `_archive_step` now checks the returned `covered_hi` against the chunk it handed over: it must be a
+  native grid value with `p_lo < covered_hi <= p_hi`. On a breach (null, at or below `p_lo`, past
+  `p_hi`, or not a native value) no ledger row is written; the step logs the new `fail_archive_contract`
+  action, with the strategy, the chunk, the value returned and the rule it broke in `method`, skips that
+  partition for the tick, and `status().retain_drop_failures` counts it alongside the other `fail_*`
+  actions that stall retention.
+
+  The strict lower bound closes a second defect for free: a strategy returning `covered_hi = p_lo` ("no
+  progress") used to write a `(lo, lo)` ledger row, after which every tick resumed from `max(hi) = lo`,
+  handed the strategy the same chunk, and collided on the ledger's primary key, a permanent wedge that
+  `maintain()` reported as a `skip_archive` deferral. Such a return is now refused before it reaches the
+  ledger. A strategy that genuinely cannot make progress on a call should raise; that is logged as
+  `skip_archive` and retried with the same chunk, which is the deferral path.
+
+  `fail_archive_contract` is a prefixed non-success event per the naming rule, so alerts matching exact
+  action values are unaffected. Unlike the identity refusals it is retryable by construction: nothing
+  advanced, so a corrected strategy (`pgpm.set_archive_fn`) is handed the very same chunk next tick. The
+  built-in `pgpm._archive_noop` and `pgpm_archive`'s two S3 strategies always return the chunk's own
+  `p_hi` and are unaffected. One new internal, `pgpm._archive_contract_breach(kind, lo, hi, covered_hi)`,
+  which returns the rule broken or null; internal, so no promise attaches to it. `tests/115` drives four
+  misbehaving strategies (overshoot, `p_lo`, null, not a number) through the step and a `maintain()`
+  tick, each paired with the strategy's own record of the chunk it was handed, and then a well-behaved
+  one on the same chunk as the control.
 - **Fixed: a primary key that excludes the control column is refused whatever other unique constraints
   the table has** (#445). `transmute` on `events(id PRIMARY KEY, created_at, UNIQUE (tenant, created_at))`
   by `created_at` used to fall through to the unique-constraint reuse: the parent adopted the UNIQUE,

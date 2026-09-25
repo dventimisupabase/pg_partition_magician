@@ -979,6 +979,17 @@ them; a strategy with nothing object-store-shaped to name (`pgpm._archive_noop`,
 strategy) leaves them `null`. This is the contract the byte-budget chunked archiver and the real S3
 upload functions implement.
 
+The core holds a strategy to that promise. Before a ledger row is written from a call's result,
+`covered_hi` must be a native grid value strictly above the `p_lo` the call was handed and no greater
+than its `p_hi`. A return that breaks this (null, at or below `p_lo`, past `p_hi`, or not a native
+value at all) is not recorded: the step logs one `fail_archive_contract` row naming the strategy, the
+chunk, the value returned and the rule it broke, skips that partition for the tick, and counts the
+refusal in `status().retain_drop_failures`; see
+[the archive step's contract check](#the-archive-steps-contract-check). A strategy that cannot make
+progress on a call (the object store is unreachable, say) should **raise** rather than return:
+`maintain()` records that as a `skip_archive` deferral and hands it the same chunk next tick, which
+is the retry path. Returning `p_lo` as `covered_hi` is not.
+
 `pgpm._run_archive_strategy(p_parent, p_child, p_lo, p_hi)` is the dispatch stub: it looks up
 `config.archive_fn` and calls it, or, for a `null` (`none`) strategy, returns `(p_hi, null)` directly
 -- the whole requested range is trivially "already covered" since there was never anything to
@@ -1026,8 +1037,10 @@ byte-budget chunker: never archive a whole large partition as one giant operatio
   attached children that **already have the write-block trigger installed** (checked directly, not
   re-derived from the boundary formula) and are not yet fully covered, it picks up to
   `config.archive_batch` of them, **oldest first**, and for each picks the next chunk, runs
-  `_run_archive_strategy`, and records the result in `pgpm.archive_ledger`. A child without the
-  trigger yet is never touched, however far past the byte budget's reach it sits.
+  `_run_archive_strategy`, checks the returned `covered_hi` against that chunk (see
+  [the archive step's contract check](#the-archive-steps-contract-check)), and records the result in
+  `pgpm.archive_ledger`. A child without the trigger yet is never touched, however far past the byte
+  budget's reach it sits.
 - `config.archive_batch` (default **1**; `null` = unbounded) caps how many *different* partitions
   one `_archive_step` call touches -- the same shape as `retain_batch` (nullable `int`, `null`
   means unlimited, caps attempts not successes), but a different default, and for a reason worth
@@ -1089,6 +1102,37 @@ holds up that parent's other partitions, which is deliberate: pgpm's catalog is 
 about which relation is which, and retention should not march on past that. A null `child_oid` (a
 partition recorded before the column existed, whose name no longer resolved at upgrade time) is
 unanchored and skips the check entirely.
+
+#### The archive step's contract check
+
+`archive_fn`'s return is a claim about the chunk it was handed, and the `pgpm.archive_ledger` row
+written from it is what opens `retire()`'s drop gate. Recorded verbatim, a strategy that answered
+chunk `[0, 15)` with `covered_hi = 15000` marked the whole partition covered on the spot, and the next
+`retain()` dropped it with nothing archived. So before writing the row, `_archive_step` checks the
+returned `covered_hi` against the `[p_lo, p_hi)` it passed: it must be a native grid value with
+`p_lo < covered_hi <= p_hi`.
+
+Each bound closes a different hole. Past `p_hi` is the drop with nothing archived. At or below `p_lo`
+is "no progress", which recorded as a `(lo, lo)` ledger row wedged the ledger for good: the next tick
+resumed from `max(hi) = lo`, handed the strategy the same chunk, and collided on the ledger's primary
+key, every tick from then on. A null `covered_hi` is refused for the same reason (a null `hi` is not a
+watermark). And a value that is not a native value at all is refused here rather than left in the
+text `hi` column, where every later coverage check would have raised, and `maintain()` would have
+reported that as a `skip_archive` deferral, tick after tick, for what is a permanent strategy bug.
+
+On a breach nothing is recorded. The step logs `fail_archive_contract`, with the strategy, the chunk,
+the value it returned and the rule it broke in `method`, skips that partition for the tick, and
+continues with the rest of the batch. Coverage stays exactly where it was, so the drop precondition
+stays shut. It counts in `status().retain_drop_failures`, and at `archive_batch`'s default of `1` it
+also holds up that parent's other partitions, which is right: the strategy is demonstrably wrong
+about what it archived.
+
+Unlike the identity refusals, this one is retryable by construction. Nothing advanced, so the next
+tick hands the strategy the very same chunk; correct the strategy (or point `pgpm.set_archive_fn` at
+a corrected one) and archiving resumes from where the ledger honestly stands. Until then the row
+repeats once per tick. A strategy that genuinely cannot make progress on a call should raise rather
+than return `p_lo`: a raise is logged as `skip_archive` and retried with the same chunk, and says
+what it is.
 
 #### Sizing `archive_byte_budget`: there is no single optimal size
 
@@ -1336,7 +1380,9 @@ One row per managed table. Beyond the static config it surfaces:
   relation whose detach was dispatched), `fail_archive_identity` (the same mismatch found one step
   earlier, by the archive step, so coverage never completes and the drop gate never opens) and
   `fail_write_block_identity` (the same mismatch one step earlier again, so the partition never
-  becomes an archive candidate at all), since all six wedge retention the same way.
+  becomes an archive candidate at all) and `fail_archive_contract` (the archive step refused a
+  strategy's returned `covered_hi` that broke the contract, so coverage does not advance), since all
+  seven wedge retention the same way.
 - `parent_missing` -- the managed relation itself is **gone**: dropped without
   [`untransmute`](#untransmute), leaving the `pgpm.config` row pointing at an oid that no longer
   resolves. Everything else in the row still reports (it comes from pgpm's own catalog), but
@@ -1640,6 +1686,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `fail_restore_incoming_fk` / `fail_validate_incoming_fk` | a preserve-FK re-add failed / a validation was blocked by an orphan |
 | `fail_retain_drop` / `fail_retain_detach` / `fail_retain_crossing` / `fail_detach_reap` | an unexpected `DROP` failure / no `pgpm_detach` job to dispatch the detach to (run `pgpm.schedule()`) / a `NO ACTION`/`RESTRICT` FK blocked the crossing delete / finalizing an abandoned detach failed. In every case the partition is left whole and `method` carries the error |
 | `fail_retain_identity` / `fail_archive_identity` / `fail_write_block_identity` | a partition's name no longer resolves to the relation pgpm recorded for it, so `retire` refused to detach or drop it (see [identity](#what-retire-checks-a-partitions-identity-against)) / the archive step refused to read it (see [the archive step's identity check](#the-archive-steps-identity-check)) / the write-block step refused to put its trigger on it. `method` names the OIDs and, for the first, which anchor disagreed. None clears itself on a later tick |
+| `fail_archive_contract` | the archive step refused what the archive strategy returned: `covered_hi` was null, not above the chunk's `lo`, past its `hi`, or not a native value, so no ledger row was written and coverage did not advance (see [the archive step's contract check](#the-archive-steps-contract-check)). `method` names the strategy, the chunk, the value returned and the rule it broke. Repeats once per tick until the strategy is corrected, and clears itself once it is |
 
 ### `pgpm.dropped_fk`
 
