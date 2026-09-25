@@ -811,15 +811,15 @@ MUTATIONS = {
         [("      -- the first grid boundary past the frontier's own cell, and the top of attached coverage\n"
           "      v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step,\n"
           "                  pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,\n"
-          "                                   pgpm._frontier_native(p_parent)));\n"
+          "                                   pgpm._frontier_native(p_parent), cfg.partition_tz), cfg.partition_tz);\n"
           "      execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',\n"
           "                     pgpm._native_type(cfg.control_kind), p_parent::text) into v_top;\n"
           "      v_ahead := 0;\n"
           "      while v_top is not null and v_ahead < ceil(cfg.obtain / 2.0)\n"
           "            and not pgpm._native_gt(cfg.control_kind,\n"
-          "                  pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell), v_top) loop\n"
+          "                  pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell, cfg.partition_tz), v_top) loop\n"
           "        v_ahead := v_ahead + 1;\n"
-          "        v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell);\n"
+          "        v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step, v_cell, cfg.partition_tz);\n"
           "      end loop;\n",
           "      select count(*) into v_ahead\n"
           "        from pgpm.part p\n"
@@ -827,7 +827,7 @@ MUTATIONS = {
           "         and not pgpm._native_gt(cfg.control_kind,\n"
           "               pgpm._grid_next(cfg.control_kind, cfg.partition_step,\n"
           "                 pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,\n"
-          "                                  pgpm._frontier_native(p_parent))),\n"
+          "                                  pgpm._frontier_native(p_parent), cfg.partition_tz), cfg.partition_tz),\n"
           "               p.lo);\n", 1)],
     ),
     "obtain_headroom_integer_division": (
@@ -839,6 +839,20 @@ MUTATIONS = {
         "leaving the grid unextended while the frontier keeps advancing. Mutates both sites (the walk's "
         "bound and the decision) so the mutant is self-consistent rather than a half-applied defect.",
         [("ceil(cfg.obtain / 2.0)", "cfg.obtain / 2", 2)],
+    ),
+    "grid_session_timezone": (
+        "bench/grid_timezone.sh",
+        "Pre-#455 _grid_next: the calendar step is `p_lo::timestamptz + interval`, evaluated in the "
+        "SESSION's TimeZone, with the zone parameter accepted and ignored. A transmute under "
+        "America/New_York then builds children on the 00:00-04/-05 lattice while pg_cron, under the "
+        "server's UTC, steps the grid on the 00:00+00 lattice: obtain's candidates half-overlap the New "
+        "York children and are skipped, and the first one past the tail is created with a permanent hole "
+        "behind it. Only the month branch is reverted, deliberately: the fixed-seconds branch is left "
+        "absolute so the mutant is exactly 'the zone parameter is not consulted', not 'the day lattice "
+        "is broken again', and a catch is a catch for the right reason. tests/111's month-step pairs "
+        "(computed under two session zones) and its transmute-under-New-York walk are what catch it.",
+        [("      return (((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz)::text;\n",
+          "      return (p_lo::timestamptz + make_interval(months => v_months))::text;\n", 1)],
     ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+- **The partition grid is computed in a recorded zone, never in the caller's session `TimeZone`** (#455).
+  `_grid_floor`, `_grid_next`, `_part_name` and `transmute`'s bound computation evaluated `date_trunc`,
+  `extract`, `+ interval` and `to_char` in whatever zone the calling session had. An operator transmuting
+  under `America/New_York` therefore built children on the `00:00-04/-05` lattice while pg_cron, under
+  the server's UTC, computed `obtain`'s candidates on the `00:00+00` lattice, found each half-overlapping
+  an existing child, skipped it, and created the first one past the New York tail: a permanent hole about
+  `p_obtain` steps out, with nothing logged and a healthy `status()`. Independently, `+ '1 day'` on a
+  `timestamptz` is a calendar day in the session zone (23 or 25 hours across a DST transition) while
+  `_grid_floor`'s fixed-seconds branch is an absolute 86400 s lattice, so any DST-observing session
+  opened a 23-hour hole every autumn on daily and weekly grids.
+
+  `transmute` now records the transmuting session's `TimeZone` in the new `pgpm.config.partition_tz`
+  (`UTC` for `id` grids; the call refuses a session zone that is not a `pg_timezone_names` name), and
+  every adapter call takes that zone as a parameter, so the same table gets the same bounds and names
+  from any session. Day-denominated steps are an absolute number of seconds in `_grid_next` too, so the
+  two functions share one lattice; the price is that in a DST zone a daily boundary drifts an hour against
+  local midnight twice a year (UTC is unaffected). `timestamp` and `date` control columns are read as
+  wall time in `partition_tz` everywhere, and every bound literal pgpm writes carries the wall time in
+  that zone with its offset, so all three column types get the same bounds from any session. Hour and
+  minute partition labels are rendered in UTC: a DST zone's wall clock repeats an hour every autumn, so
+  two adjacent hourly cells would otherwise share a name and `obtain` would skip one.
+
+  **Upgrading in place: check `partition_tz` if any table was transmuted from a non-UTC session.** The
+  column backfills to `UTC`, because nothing in the catalog records which zone an existing grid was built
+  in. If the operator's session was in another zone at `transmute` time, run
+  `select pgpm.set_partition_tz('schema.table', 'That/Zone')` for that table. The new setter validates
+  the name against `pg_timezone_names` and refuses unless the grid's newest bound is on that zone's
+  lattice (a day-denominated grid is on the same lattice in every zone and always accepts). A refusal
+  means maintenance has already extended the grid in UTC: keep `UTC`, and look for an existing hole by
+  walking `pgpm.part` for the table ordered by `lo::timestamptz`, where any row whose `hi` differs from
+  the next row's `lo` marks a range no partition covers and must be created by hand. Installs that only
+  ever transmuted from UTC sessions need no action.
 - **A Parquet file is now written from one snapshot (#462).** `archive._pq_to_parquet` and
   `archive._pq_to_parquet_range` used to run `count(*)` and then one query per column straight
   against the relation. A VOLATILE plpgsql function under READ COMMITTED takes a fresh snapshot per

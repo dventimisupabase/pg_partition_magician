@@ -29,6 +29,7 @@ on:
       - 'bench/mutations/**'
       - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
       - 'tests/107_regrain_swap_reconcile_complete_test.sql'   # the file regrain_swap_reconcile.sh drives
+      - 'tests/111_grid_timezone_test.sql'       # the file grid_timezone.sh drives
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'
@@ -50,6 +51,7 @@ on:
       - 'bench/mutations/**'
       - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
       - 'tests/107_regrain_swap_reconcile_complete_test.sql'   # the file regrain_swap_reconcile.sh drives
+      - 'tests/111_grid_timezone_test.sql'       # the file grid_timezone.sh drives
       - 'test.sh'
       - 'docker-compose.yml'
       - 'Dockerfile'

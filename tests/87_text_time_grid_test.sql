@@ -22,20 +22,20 @@ select is(
 );
 
 select is(
-  pgpm._grid_floor('text_time', '1 month', '2000-01-01 00:00:00+00', timestamptz '2026-03-15 12:00:00+00'::text),
+  pgpm._grid_floor('text_time', '1 month', '2000-01-01 00:00:00+00', timestamptz '2026-03-15 12:00:00+00'::text, 'UTC'),
   timestamptz '2026-03-01 00:00:00+00'::text,
   'grid_floor treats text_time as calendar-aligned, identically to time/uuidv7'
 );
 
 select is(
   pgpm._grid_next('text_time', '1 month',
-    pgpm._grid_floor('text_time', '1 month', '2000-01-01 00:00:00+00', timestamptz '2026-03-15 12:00:00+00'::text)),
+    pgpm._grid_floor('text_time', '1 month', '2000-01-01 00:00:00+00', timestamptz '2026-03-15 12:00:00+00'::text, 'UTC'), 'UTC'),
   timestamptz '2026-04-01 00:00:00+00'::text,
   'grid_next steps text_time forward by one calendar month'
 );
 
 select is(
-  pgpm._part_name('events', 'text_time', '1 month', timestamptz '2026-03-01 00:00:00+00'::text),
+  pgpm._part_name('events', 'text_time', '1 month', timestamptz '2026-03-01 00:00:00+00'::text, null, 'UTC'),
   'events_p2026_03',
   'part_name formats a text_time child the same way as time/uuidv7 (calendar label, not the raw id)'
 );

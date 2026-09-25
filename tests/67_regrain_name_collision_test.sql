@@ -26,8 +26,8 @@ call pgpm.transmute('public.rnc', 'id', 1000);
 insert into public.rnc values (20000, 'frontier');   -- advance the frontier so the monolith freezes
 
 select is(
-  pgpm._part_name('rnc', 'id', '1000', '0', '1000'),
-  pgpm._part_name('rnc', 'id', '100', '0', '100'),
+  pgpm._part_name('rnc', 'id', '1000', '0', '1000', 'UTC'),
+  pgpm._part_name('rnc', 'id', '100', '0', '100', 'UTC'),
   'the collision is real: source and its own first sub-range render the same name on the source grid');
 
 select is((select count(*)::int from public.rnc), 401,

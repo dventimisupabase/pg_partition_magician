@@ -86,6 +86,7 @@ check() { # <label> <actual> <expected>
 # against its own defect. The two preconditions below are what keep a hardcoded list from rotting.
 # In install.sql's own order, so a new backfill line has an obvious place to go.
 DEGRADE_COLS="
+pgpm.config:partition_tz
 pgpm.config:obtain_retry_after
 pgpm.config:text_time_prefix
 pgpm.config:text_time_width

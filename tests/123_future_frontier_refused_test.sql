@@ -77,7 +77,7 @@ select is(
   (select hi::timestamptz from pgpm.part where parent_table = 'public.ev_clean'::regclass
     order by lo::timestamptz limit 1),
   pgpm._grid_next('uuidv7', '1 month',
-    pgpm._grid_floor('uuidv7', '1 month', '2000-01-01 00:00:00+00', now()::text))::timestamptz,
+    pgpm._grid_floor('uuidv7', '1 month', '2000-01-01 00:00:00+00', now()::text, 'UTC'), 'UTC')::timestamptz,
   'uuidv7: without the skewed row the same table converts, hi = first grid boundary above now()');
 
 -- ============================================== (C) ordinary clock skew is accepted
@@ -101,7 +101,7 @@ select is(
     order by lo::timestamptz limit 1),
   pgpm._grid_next('uuidv7', '1 month',
     pgpm._grid_floor('uuidv7', '1 month', '2000-01-01 00:00:00+00',
-      greatest(pgpm._uuid_to_ts((select id from public.ev_minutes order by id desc limit 1)), now())::text))::timestamptz,
+      greatest(pgpm._uuid_to_ts((select id from public.ev_minutes order by id desc limit 1)), now())::text, 'UTC'), 'UTC')::timestamptz,
   'uuidv7: and its hi is the boundary above the frontier, greatest(max, now())');
 
 -- ============================================== (C2) the allowance is one step plus one hour, pinned
@@ -185,7 +185,7 @@ select is(
     order by lo::timestamptz limit 1),
   pgpm._grid_next('text_time', '1 month',
     pgpm._grid_floor('text_time', '1 month', '2000-01-01 00:00:00+00',
-      greatest(pgpm._text_time_to_ts((select id from public.tt_clean order by id desc limit 1), 'c', 8, 36, 'ms'), now())::text))::timestamptz,
+      greatest(pgpm._text_time_to_ts((select id from public.tt_clean order by id desc limit 1), 'c', 8, 36, 'ms'), now())::text, 'UTC'), 'UTC')::timestamptz,
   'text_time: its hi is the boundary above the frontier, greatest(max, now())');
 
 -- check_text_time must not raise when the column's maximum does not even match the declared shape

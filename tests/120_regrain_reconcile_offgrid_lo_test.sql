@@ -52,7 +52,7 @@ select is(
     order by lo::numeric limit 1),
   'rfa_p0000000000000020000_to_0000000000000060000'::name,
   'GUARD: the monolith is [20000, 60000), as this file assumes');
-select is(pgpm._grid_floor('id', '7000', '0', '20000'), '14000',
+select is(pgpm._grid_floor('id', '7000', '0', '20000', 'UTC'), '14000',
   'LIVENESS: 20000 is off the 7000 grid (its grid floor is 14000), so the first sub-range is clamped');
 
 select is(pgpm.regrain_step('public.rfa', 'rfa_p0000000000000020000_to_0000000000000060000', '7000', 500),
@@ -187,13 +187,13 @@ select is(
 -- The clamped first sub-range of a child starting 2024-03-01 on a weekly grid anchored at 2000-01-01 is
 -- [2024-03-01, 2024-03-02), and regrain_step names it from the clamped lo. A name derived from the grid
 -- floor alone is a different child that never exists. This is why the lookup is by range for every kind.
-select is(pgpm._grid_floor('time', '1 week', '2000-01-01 00:00:00+00', '2024-03-01 00:00:00+00')::timestamptz,
+select is(pgpm._grid_floor('time', '1 week', '2000-01-01 00:00:00+00', '2024-03-01 00:00:00+00', 'UTC')::timestamptz,
   '2024-02-24 00:00:00+00'::timestamptz,
   'time: 2024-03-01 is off the weekly grid (its grid floor is 2024-02-24), so the first sub-range is clamped');
-select is(pgpm._part_name('rfh', 'time', '1 week', '2024-03-01 00:00:00+00', '2024-03-02 00:00:00+00'),
+select is(pgpm._part_name('rfh', 'time', '1 week', '2024-03-01 00:00:00+00', '2024-03-02 00:00:00+00', 'UTC'),
   'rfh_p2024_03_01'::name,
   'time: regrain_step names the clamped first sub-range [2024-03-01, 2024-03-02) rfh_p2024_03_01');
-select is(pgpm._part_name('rfh', 'time', '1 week', '2024-02-24 00:00:00+00', '2024-03-02 00:00:00+00'),
+select is(pgpm._part_name('rfh', 'time', '1 week', '2024-02-24 00:00:00+00', '2024-03-02 00:00:00+00', 'UTC'),
   'rfh_p2024_02_24'::name,
   'time: a grid-floor derivation renders rfh_p2024_02_24, a child that never exists: the two disagree');
 

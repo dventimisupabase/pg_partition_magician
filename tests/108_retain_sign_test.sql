@@ -70,7 +70,7 @@ select is((select retain from pgpm.config where parent_table = 'public.rs108t'::
 -- hi > boundary and is never eligible
 select is(
   (select pgpm._retain_boundary(c) from pgpm.config c where c.parent_table = 'public.rs108t'::regclass),
-  pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', now()::text),
+  pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', now()::text, 'UTC'),
   'retain 0 puts the horizon exactly on the frontier partition''s grid floor');
 
 select child_name as t_write from pgpm.part
@@ -122,7 +122,7 @@ select is((select retain from pgpm.config where parent_table = 'public.rs108i'::
 -- Everything with hi <= 2000 is aged; [2000, 3000) itself is not.
 select is(
   (select pgpm._retain_boundary(c) from pgpm.config c where c.parent_table = 'public.rs108i'::regclass),
-  pgpm._grid_floor('id', '1000', '0', pgpm._frontier_native('public.rs108i')),
+  pgpm._grid_floor('id', '1000', '0', pgpm._frontier_native('public.rs108i'), 'UTC'),
   'retain 0 lands the horizon exactly on the frontier partition''s grid floor');
 select is(
   (select pgpm._retain_boundary(c) from pgpm.config c where c.parent_table = 'public.rs108i'::regclass),
@@ -166,7 +166,7 @@ select is((select retain from pgpm.config where parent_table = 'public.rs108t'::
 select ok(
   not pgpm._native_gt('time',
     (select pgpm._retain_boundary(c) from pgpm.config c where c.parent_table = 'public.rs108t'::regclass),
-    pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', now()::text)),
+    pgpm._grid_floor('time', '1 day', '2000-01-01 00:00:00+00', now()::text, 'UTC')),
   'a sub-step retain puts the horizon at or below the frontier partition''s floor, never past it');
 -- and back to zero: the horizon returns to the write partition's floor, which newly drops nothing
 select lives_ok(

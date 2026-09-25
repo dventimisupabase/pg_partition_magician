@@ -33,7 +33,7 @@ select child_name as time_mono from pgpm.part
 
 -- LIVENESS: a forecast is only meaningful if there is a coarse child, and the frontier is inside it.
 select ok(
-  (select pgpm._native_gt('time', hi, pgpm._grid_next('time', '1 day', lo)) from pgpm.part
+  (select pgpm._native_gt('time', hi, pgpm._grid_next('time', '1 day', lo, 'UTC')) from pgpm.part
     where parent_table = 'public.fz_time'::regclass and child_name = :'time_mono'),
   'LIVENESS: the time monolith is coarse (wider than one step), so there is a freeze to forecast');
 select ok(
