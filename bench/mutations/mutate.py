@@ -1162,6 +1162,20 @@ $$;''',
   end loop;
 """, "", 1)],
     ),
+    "archive_encode_no_partition_tz": (
+        "bench/archive_encode_partition_tz.sh",
+        "Pre-#501 transports: archive._encode_upload_ndjson_single and archive._encode_upload_parquet "
+        "call pgpm._encode without config.partition_tz, so its last parameter falls back to its UTC "
+        "default and the chunk's [lo, hi) is rendered as UTC wall time. A timestamptz column reads the "
+        "same instant from either rendering; a naive timestamp column drops the offset and keeps the "
+        "wall clock, so on a grid recorded in another zone the strategy reads the range shifted by "
+        "the zone offset, uploads the wrong hour's rows, and still returns covered_hi = p_hi, which "
+        "opens retire()'s drop gate for rows that were never archived. Four sites, lo and hi in each "
+        "transport: the defect is the missing argument, not either function it is missing from, so "
+        "the mutant removes it from all four.",
+        [("pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz)",
+          "pcfg.text_time_discard_bits, pcfg.text_time_epoch)", 4)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -1178,6 +1192,7 @@ MUTATION_SRC = {
     "archive_from_item_raw_splice": "pgpm_archive/install.sql",
     "archive_order_by_raw_splice": "pgpm_archive/install.sql",
     "parquet_per_column_statements": "pgpm_archive/install.sql",
+    "archive_encode_no_partition_tz": "pgpm_archive/install.sql",
 }
 
 # name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`
