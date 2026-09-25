@@ -549,6 +549,12 @@ run_archive() {
   echo "--- Parquet single-snapshot guard (issue #462) ---"
   bash "$(dirname "$0")/bench/archive_parquet_snapshot.sh" pgpm_test-archive pgpm_pqsnap || fail=1
 
+  # The partition_tz guard (#501) re-runs tests/archive/db/16 for the same reason as the boundary
+  # guard above: it is the harness discriminate.sh drives that file through, and this is the
+  # clean-code half of that pair.
+  echo "--- chunk literals rendered in partition_tz guard (issue #501) ---"
+  bash "$(dirname "$0")/bench/archive_encode_partition_tz.sh" pgpm_test-archive pgpm_enctz || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"

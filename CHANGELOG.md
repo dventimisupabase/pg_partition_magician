@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **The S3 archive transports read a chunk in the grid's zone** (#501).
+  `archive._encode_upload_ndjson_single` and `archive._encode_upload_parquet`, the transports behind
+  `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet`, rendered the chunk's `[lo, hi)` into
+  column literals without `config.partition_tz`, so each literal carried the wall clock in UTC. A
+  `timestamptz` column reads the same instant from any offset and was unaffected. A naive `timestamp`
+  or `date` column drops the offset and compares the wall clock, so on a grid recorded in another
+  zone (`America/New_York`, say) the strategy read the range five hours late: the object held the
+  wrong hour's rows, `rows_archived` counted them, and `covered_hi = p_hi` still declared the chunk
+  archived, so `retire()` could drop a partition whose own rows were never uploaded. Both transports
+  now pass `partition_tz`, as every reader of a chunk in `pgpm_core` already did.
+  `tests/archive/db/16_encode_partition_tz_test.sql` builds the issue's fixture (three rows in one
+  New York hourly child, archived from a UTC session) and reads both objects back from MinIO by row
+  identity; `bench/archive_encode_partition_tz.sh` drives it in the archive track and in
+  `discriminate` against the `archive_encode_no_partition_tz` mutation, which removes the argument
+  from all four sites.
 - **A row trigger's enabled state survives `transmute` and `untransmute`** (#499). Both replayed the
   table's triggers from `pg_get_triggerdef`, which never emits `pg_trigger.tgenabled`, so every replayed
   trigger came back `ENABLE` (origin-only) whatever it had been: a trigger the operator had `DISABLE`d

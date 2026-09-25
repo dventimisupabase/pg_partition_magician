@@ -2283,17 +2283,23 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
+  -- [p_lo, p_hi) as literals of the column's type, rendered in config.partition_tz like every other
+  -- reader of a chunk in pgpm_core (#501). On a timestamptz column any zone's rendering names the same
+  -- instant. On a naive timestamp or date column the literal's offset is dropped and its WALL CLOCK is
+  -- what the predicate compares, so it has to be the wall clock in the zone the grid was recorded in:
+  -- left to pgpm._encode's UTC default, a New York grid had its chunk read five hours late here while
+  -- covered_hi = p_hi still opened retire()'s drop gate for the rows that were never read.
   execute format(
     'select coalesce(string_agg(row_to_json(t)::text, e''\n'' order by t.%I), ''''), count(*)
        from %I.%I t where t.%I >= %L and t.%I < %L',
     pcfg.control_column, v_nsp, v_rel, pcfg.control_column,
     pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
                  pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz),
     pcfg.control_column,
     pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
                  pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                 pcfg.text_time_discard_bits, pcfg.text_time_epoch))
+                 pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz))
     into v_payload, v_rows;
 
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
@@ -2346,12 +2352,13 @@ begin
   select * into pcfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'archive._encode_upload_parquet: % is not managed', p_parent; end if;
 
+  -- in config.partition_tz, for the reason given in _encode_upload_ndjson_single (#501)
   v_lo_lit := pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
                            pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                           pcfg.text_time_discard_bits, pcfg.text_time_epoch);
+                           pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz);
   v_hi_lit := pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
                            pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                           pcfg.text_time_discard_bits, pcfg.text_time_epoch);
+                           pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz);
   -- The file and its row count come out of the same read (#462). rows_archived used to be a count(*)
   -- run after the encode, a statement later and a snapshot apart, so under a concurrent write it
   -- matched neither the file nor the child. The counted encoder reports how many rows the one

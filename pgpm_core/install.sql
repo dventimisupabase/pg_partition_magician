@@ -807,10 +807,11 @@ $$;
 
 -- native grid value -> a literal of the COLUMN type. The text_time_* params are text_time-only (default
 -- null for every other kind, which never reads them) -- see pgpm.config's text_time_* columns. p_tz is
--- read by the `time` kind only, whose literal is rendered in it (_time_literal, #455). It defaults to
--- 'UTC' for the archive module, whose calls predate it: on a timestamptz column any offset rendering is
--- exact, so the default is only wrong for a naive column in a non-UTC zone. Every caller in this file
--- passes config.partition_tz.
+-- read by the `time` kind only, whose literal is rendered in it (_time_literal, #455). Every caller in
+-- this file and in pgpm_archive passes config.partition_tz; the archive transports did not until #501,
+-- and read a naive column's chunk in the wrong hour for it. The 'UTC' default stays only so that a
+-- pgpm_archive older than this parameter still installs and runs: on a timestamptz column any offset
+-- rendering is exact, so it is only wrong for a naive column in a non-UTC zone. Do not lean on it.
 -- the two-argument shape shipped in 0.1.0 and 0.2.0; kept beside this one, a two-argument call is ambiguous (#441)
 drop function if exists pgpm._encode(text, text);
 create or replace function pgpm._encode(p_kind text, p_native text,
