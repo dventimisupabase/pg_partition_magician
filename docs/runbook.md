@@ -477,6 +477,14 @@ re-transmuted, the new conversion would collide with that orphan by name. So `tr
 finds a standalone table matching the parent's child-partition naming (`<rel>_p<digits>`), rather than
 silently adopting stale data. An in-flight child is also tracked in `pgpm.part` with `attached = false`.
 
+Two sibling refusals share this shape. `... already exists as a sequence matching this parent's partition
+naming ...` means a relation that is not a table holds a child-partition name; the message says what kind it
+is, so `drop table` is not the command. `... already exists, and transmute needs that name for the monolith
+...` means a relation holds the coarse name the converted table itself will take (`<rel>_p<lo>_to_<hi>`),
+typically a monolith detached from an earlier conversion of a table by that name. In every case the refusal
+happens before anything is committed: no bound, no claim, the table untouched. Drop or rename the relation
+the message names and retry.
+
 **Steps.**
 
 1. The error names the orphan. Confirm it is a leftover standalone table, not a live attached partition --

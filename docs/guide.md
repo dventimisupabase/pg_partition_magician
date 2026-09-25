@@ -268,7 +268,8 @@ the tradeoff in full.
 conversion waits for a lock. The locks it takes are brief; what this protects you from is the *wait*,
 because a pending `ACCESS EXCLUSIVE` request blocks every lock request behind it, so without a bound one
 long-running query against your table stalls all of it for as long as that query runs. Raise it in a quiet
-window, lower it under heavy traffic. A timeout is safe to retry: re-running `transmute` resumes.
+window, lower it under heavy traffic. A timeout is safe to retry: re-running `transmute` resumes, from the
+same session or a new one.
 
 **If a conversion dies partway, the bound outlives it** and the table goes on refusing those writes.
 `pgpm.transmute_abort('public.events')` drops it and puts the table back exactly as it was; its incoming
@@ -893,6 +894,13 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
 - **Re-transmuting a table fails with an "orphan" error.** An interrupted regrain creates child
   partitions as standalone tables before attaching them; an un-attached child survives a `DROP TABLE
   <parent> CASCADE`. `transmute` detects a leftover and refuses up front; drop the named orphan and retry.
+  The same up-front refusal names any other relation (a sequence, a view) holding a child-partition name,
+  and a relation holding the name the monolith itself will take (`<table>_p<lo>_to_<hi>`), typically a
+  monolith detached from an earlier conversion of a table by that name.
+- **Re-running `transmute` on a table it already converted is refused.** `transmute` converts a table
+  once; the message says the earlier cutover did commit, and `status()` shows the table managed. There is
+  nothing to resume, and the refusal costs nothing. A conversion that failed *before* its cutover, on the
+  other hand, is resumed by a re-run, from the same session or a new one.
 
 ## Caveats and v1 scope
 

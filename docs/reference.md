@@ -176,7 +176,9 @@ Parameters:
   without a bound one long-running query stalls the whole table for as long as it runs. A bad value is
   refused before anything is committed. On timeout, a failure in phase 1 leaves the table untouched, and
   one in the cutover leaves the recorded, resumable state [`transmute_abort`](#transmute_abort) and
-  `maintain_all`'s sweep handle; either way, re-run `transmute` to retry.
+  `maintain_all`'s sweep handle; either way, re-run `transmute` to retry, from the same session or a new
+  one. The claim a failed attempt leaves records your session as its owner, and that session may resume
+  or abort it; only a conversion still running in a *different* live session is refused.
 - `p_force_frontier` -- **uuidv7 and text_time only.** For these kinds the frontier is the newer of the
   column's maximum and `now()`, so one row minted by a client with a wrong clock sets the frontier, and with
   it the monolith's permanent `hi`, as far ahead as that clock was wrong: every row written until then lands
@@ -193,7 +195,13 @@ Parameters:
   [`check_text_time`](#check_text_time), whose `newest_decoded`/`newest_in_future` show the maximum before
   you convert.
 
-Refuses up front (leaving the table untouched) when: a key (primary key or unique constraint) exists but
+Refuses up front (leaving the table untouched) when: the table is already converted (it has a `pgpm.config`
+row: `transmute` converts a table once, and a retry whose earlier cutover did commit has nothing to resume),
+is not a plain table (partitioned, a view, a foreign table), or is a partition, an inheritance child or an
+inheritance parent; a relation of any kind already holds the name the monolith will take
+(`<table>_p<lo>_to_<hi>`, typically a monolith detached from an earlier conversion of a table by that name)
+or a child-partition name (`<table>_p<digits>...`: an orphan from an interrupted regrain, or a sequence or
+view that happens to be named that way); a key (primary key or unique constraint) exists but
 excludes `p_control`, or only a *bare* unique index includes it (promote it to a constraint first); the
 control column is `float`/`double` (imprecise boundaries); a `time`-kind control column
 is not a timestamp/date, a `uuidv7` control is not `uuid`, or a `text_time` control is not `text`/`varchar`;
@@ -258,9 +266,10 @@ pgpm.transmute_abort(p_parent regclass) returns boolean
 
 Abandons a conversion that died between transactions, dropping the `pgpm_monolith_bound` `CHECK` it left
 on the table and clearing its `pgpm.transmute_inflight` row. Returns `false` if there is no in-flight
-conversion to abandon, and raises if one is still running in another session. That is all there is to
-undo: incoming foreign keys are dropped only by the cutover, so a conversion that never got there left
-them in place, and there is nothing for this to re-add.
+conversion to abandon, and raises if one is still running in another session. Your own session's failed
+attempt is always yours to abort: the claim it left records your session as its owner, which is not
+"another session". That is all there is to undo: incoming foreign keys are dropped only by the cutover,
+so a conversion that never got there left them in place, and there is nothing for this to re-add.
 
 It **abandons; it does not resume**. Finishing a half-done conversion of a live table unattended is a
 larger action than pgpm will take on your behalf. To try again, call `transmute` again: it finds the
