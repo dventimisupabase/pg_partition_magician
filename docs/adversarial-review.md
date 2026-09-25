@@ -15,6 +15,7 @@ and `bench/mutations/`.
 - [Seeding](#seeding)
 - [Metrics](#metrics)
 - [Stopping criteria](#stopping-criteria)
+- [Between passes](#between-passes)
 - [Lenses](#lenses)
 - [Pass record](#pass-record)
 - [Pass history](#pass-history)
@@ -99,7 +100,10 @@ nothing; none of the three is filed.
    - fails on both: a **candidate**; the verifier then tries to disprove it (is the behaviour
      documented and intended, is the reproduction exercising a test artifact, does it need a state pgpm
      refuses to enter) and either confirms it as a finding or records why it fell;
-   - fails on neither, or needs the finder's environment: **not reproduced**, dropped.
+   - fails on neither, or needs the finder's environment: **not reproduced**, dropped;
+   - fails on both and matches an issue still open from an earlier pass: **known and open**, recorded
+     against that issue and not counted as a new finding. The verifier alone holds the open-issue list
+     (see [Between passes](#between-passes)).
 7. **Triage.** Tier every finding by the rubric. Group findings that share a root cause and a fix.
 8. **Measure.** Fill in the [metrics](#metrics). Compute precision and seed recall before anyone looks at
    the count of findings, so the count is read in light of them.
@@ -140,6 +144,8 @@ Recorded per pass, in this order, so the count of findings is never read alone.
 | findings | claims that survived verification |
 | precision | findings / claims |
 | findings by tier | Tier 1 through Tier 5 |
+| root causes | distinct root causes behind the findings, and how many the fix phase closed as a class rather than an instance |
+| known and open | re-found findings from earlier passes still unfixed |
 | cost per finding | budget / findings, and budget / Tier 1 findings |
 | null results | slices probed and found sound, by lens |
 | capture-recapture estimate | when two independent hunts run on the same commit: `n1 * n2 / overlap` for Tier 1, minus what was found |
@@ -168,6 +174,39 @@ Stopping does not mean no scrutiny. It means the standing mode changes to:
   fixes is new surface with new interactions.
 
 A pass is also **abandoned early**, and the method revised, if precision drops below 0.5 mid-pass.
+
+## Between passes
+
+A pass has a counterpart, the fix phase, and the next pass stands on it. A pass whose findings were
+not fixed re-finds them, its yield does not fall because nothing changed, and the curve the metrics are
+meant to draw says nothing. The rules that keep the loop honest:
+
+- **Pin on the fixes.** Pass N+1 pins a commit that contains the fixes for every Tier 1 and Tier 2
+  finding of pass N. Lower tiers may be deferred, but each deferred finding stays open as an issue.
+- **Known and open is a class, not a finding.** The verifier, and only the verifier, holds the list of
+  issues still open from earlier passes. A re-found one is classified **known and open** and recorded
+  against its issue. Finders never see the list, so it cannot steer what they look at.
+- **A fix is a guard and a mutation, or it is a patch.** Per `CLAUDE.md`, every fix PR carries a guard
+  that would fail with the defect present and a mutation in `bench/mutations/` that puts the defect
+  back, proven by `./test.sh discriminate`. The guard keeps the fix honest now; the mutation keeps a
+  later refactor from quietly undoing it. Without both, the floor can sink back and the next pass
+  cannot tell a new defect from a resurrected one.
+- **The reproduction is the acceptance test.** A finding is closed when its original reproduction
+  passes against the fixed `main`. That is the verifier's last act for each finding, and it makes the
+  reproduction a regression test rather than a one-off.
+- **Fixed defects become seeds.** Every real defect this codebase produced is the best possible seed
+  for a later pass, because it is quiet in exactly the way its siblings are. After the fix phase, add
+  each fixed defect's mutation to the catalogue if the fix PR did not already.
+- **Judge the fix phase on classes.** Pass 1's 25 issues came from about seven root causes. A fix that
+  removes the cause removes a class; one that patches the symptom leaves siblings for the next pass to
+  find. Record root causes closed alongside findings fixed.
+- **Fixes are new surface.** A batch of fix PRs, and the hand-resolved merge regions between them, is
+  where the next pass's defects concentrate. The floor rises as a ratchet with a small backlash, not
+  monotonically, which is why the fresh-surface lens is mandatory and why a full pass follows any large
+  merge batch. Finding a defect that a fix introduced is the process working.
+
+The loop, in full: pin, hunt, verify, file, fix with guard and mutation, close each finding by its own
+reproduction, merge the batch with a rebase and a fresh CI run per PR, pin again.
 
 ## Lenses
 
@@ -208,6 +247,8 @@ lenses: <list> | previous pass lenses: <list>
 seeds K=<n>, recall <r>; claims <c>; findings <f>; precision <p>
 findings by tier: T1 <n> T2 <n> T3 <n> T4 <n> T5 <n>
 cost per finding: <x>; per Tier 1 finding: <y>
+root causes: <n> behind the findings, <m> closed as a class by the fix phase
+known and open (re-found, unfixed from earlier passes): <n>
 capture-recapture (T1): <estimate or "not attempted">
 blind spots (seeds missed, by lens): <list>
 
