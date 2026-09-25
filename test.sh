@@ -353,10 +353,10 @@ run_observe() {  # pg_flight_recorder observability track: impact_report correla
 # The pgpm_archive track: PG17 + pgsql-http against a real MinIO container standing in for S3.
 # Builds one template database (pgpm_arch_tmpl) carrying the fixtures and both modules, then runs
 # every tests/archive/db/*.sql via pg_prove against its OWN clone of it -- the same one-database-per-file
-# pattern the default matrix uses, for the same reason (the clone loop below states it in full). MinIO
-# has no docker-compose service of its own for the `mc` client, so bucket setup runs as a one-off
-# `docker run` against the network name pinned in docker-compose.yml (pgpm_test_net) rather than a
-# compose-managed service.
+# pattern the default matrix uses, for the same reason (the clone loop below states it in full). Bucket
+# setup is a one-off `docker run` of curlimages/curl against the network name pinned in
+# docker-compose.yml (pgpm_test_net) rather than a compose-managed service: a SigV4-signed PUT, so it
+# needs no MinIO client image at all (issue #436: the `mc` image vanished along with the server's).
 run_archive() {
   local prof="archive" svc="archive" fail=0
   local px=( --profile "$prof" exec -T "$svc" psql -U postgres )
@@ -369,14 +369,38 @@ run_archive() {
   $DC --profile "$prof" up -d
 
   wait_pg "$prof" "$svc" 60
+  # /minio/health/cluster, not /minio/health/live: `live` answers 200 as soon as the process listens,
+  # while `cluster` is MinIO's readiness probe and stays 503 until the server has finished initializing
+  # -- the window in which a PUT gets `XMinioServerNotInitialized`. Loud on timeout: a silent fall-through
+  # here used to surface later as an unexplained pgTAP failure inside a database this script then dropped.
+  local ready=""
   for _ in $(seq 1 60); do
-    docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/live >/dev/null 2>&1 && break
+    if docker run --rm --network "$net" curlimages/curl -sf http://minio:9000/minio/health/cluster >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
   done
-  # quay.io, not Docker Hub: minio/mc hit the same "pull access denied" break as the minio/minio
-  # server image did (docker-compose.yml), for the same reason -- see the comment there.
-  docker run --rm --network "$net" --entrypoint sh quay.io/minio/mc -c \
-    "mc alias set local http://minio:9000 minioadmin minioadmin && mc mb -p local/archive-test-bucket" >/dev/null
+  if [ -z "$ready" ]; then
+    echo "archive track: FAIL -- MinIO never reported ready (/minio/health/cluster) within 60 s"
+    docker logs pgpm_test-archive-minio 2>&1 | tail -20
+    $DC --profile "$prof" down -v; return 1
+  fi
+  # Create the bucket with a SigV4-signed PUT from the same curl image the health wait already uses,
+  # instead of the `mc` client (its image went away with MinIO's server image, issue #436). 200 is
+  # created, 409 is "already exists" from an earlier run; anything else is a real failure. Then READ
+  # the bucket back and require 200: a missing bucket answers 404 here, so this is a witness that the
+  # setup actually happened, not just that the PUT returned.
+  local s3=( docker run --rm --network "$net" curlimages/curl -s -o /dev/null -w '%{http_code}'
+             --aws-sigv4 aws:amz:us-east-1:s3 -u minioadmin:minioadmin )
+  local code
+  code=$("${s3[@]}" -X PUT http://minio:9000/archive-test-bucket) || code="curl exit $?"
+  if [ "$code" != 200 ] && [ "$code" != 409 ]; then
+    echo "archive track: FAIL -- creating the MinIO bucket returned $code"
+    $DC --profile "$prof" down -v; return 1
+  fi
+  code=$("${s3[@]}" http://minio:9000/archive-test-bucket/) || code="curl exit $?"
+  if [ "$code" != 200 ]; then
+    echo "archive track: FAIL -- the MinIO bucket is not readable after creation ($code)"
+    $DC --profile "$prof" down -v; return 1
+  fi
 
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q \
     -c "create extension if not exists http; create extension if not exists pgcrypto; create extension if not exists pgtap;" >/dev/null
@@ -398,8 +422,17 @@ run_archive() {
     local ab adb; ab="$(basename "$af")"; an=$((an + 1)); adb="pgpm_a$an"
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "create database $adb template pgpm_arch_tmpl" >/dev/null
-    $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab" \
-      || fail=1
+    if ! $DC --profile "$prof" exec -T "$svc" sh -c "pg_prove --timer -U postgres -d $adb /repo/tests/archive/db/$ab"; then
+      fail=1
+      # A pgTAP assertion can only say WHAT is missing (a ledger row, a covered range). maintain()'s
+      # per-step handlers swallow the WHY into pgpm.log as skip_*/fail_* rows, and the drop below takes
+      # them with it, so a red run on a runner nobody can log into explains nothing. Print them first.
+      echo "--- $ab: pgpm.log skip_*/fail_* rows in $adb (why maintain()'s steps did nothing) ---"
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select to_char(at, 'HH24:MI:SS.MS') || '  ' || action || '  ' || coalesce(method, '') from pgpm.log where action like 'skip\_%' or action like 'fail\_%' order by at" || true
+      echo "--- $ab: pgpm.part in $adb (attached, write-blocked, archive-covered) and pgpm.archive_ledger ---"
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select parent_table || '.' || child_name || '  [' || lo || ', ' || hi || ')  attached=' || attached || '  write_blocked=' || pgpm._is_write_blocked(parent_table, child_name) || '  covered=' || pgpm._archive_fully_covered(parent_table, child_name) from pgpm.part order by parent_table::text, lo::numeric" || true
+      $DC "${px[@]}" -d "$adb" -v ON_ERROR_STOP=1 -At -c "select 'ledger  ' || parent_table || '  [' || lo || ', ' || hi || ')  ' || child_name || '  key=' || coalesce(s3_key, '<null>') || '  rows=' || coalesce(rows_archived::text, '<null>') from pgpm.archive_ledger order by parent_table::text, lo::numeric" || true
+    fi
     $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists $adb" >/dev/null
   done
   $DC "${px[@]}" -d postgres -v ON_ERROR_STOP=1 -q -c "drop database if exists pgpm_arch_tmpl" >/dev/null

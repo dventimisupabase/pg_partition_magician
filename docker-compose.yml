@@ -71,21 +71,43 @@ services:
   # The archive track: PG17 + pgsql-http (S3 uploads via the http extension) + MinIO standing in
   # for S3. Its own profile, excluded from "all" -- pgsql-http is only needed here, so the default
   # pg15-18 matrix images stay exactly as they were. test.sh's own one-off `docker run --network`
-  # calls (for MinIO bucket setup via the mc client, which has no service of its own) rely on the
-  # network name pinned below rather than guessing Compose's auto-generated one.
+  # calls (the health wait and the SigV4-signed bucket setup, both plain curl) rely on the network
+  # name pinned below rather than guessing Compose's auto-generated one.
   #
-  # Pulled from quay.io, not Docker Hub: minio/minio on Docker Hub now returns "pull access denied,
-  # repository does not exist or may require 'docker login'" for an unauthenticated pull, reproduced
-  # both on GitHub-hosted runners and locally, so it is not a per-runner rate limit. quay.io/minio/minio
-  # is MinIO's own maintained mirror and still pulls anonymously.
+  # Which image, and why it is pinned by digest (issue #436). MinIO stopped publishing public images:
+  # Docker Hub's minio/minio went "pull access denied" on 2026-09-13 (PR #373 moved to quay.io), and on
+  # 2026-09-24 quay.io/minio/minio started answering `unauthorized` too, its API returning 401 for the
+  # repository itself, so no MinIO-published registry serves it anonymously any more. That was verified
+  # at the registry level with an anonymous bearer token, NOT with `docker manifest inspect`, which on
+  # the Mac that found this failed for every image, alpine included. bitnamilegacy/minio is Bitnami's
+  # frozen (2025-08-19, unmaintained by design) build of MinIO 2025.7.23; it pulls anonymously from
+  # Docker Hub, ships linux/amd64 and linux/arm64, and is exactly what a test double wants: an S3 API
+  # that never changes underneath the suite. The digest is the multi-arch index, so the runner and a
+  # Mac get the same bytes, and a deleted image fails the pull loudly instead of a retagged one silently
+  # pulling something else.
+  #
+  # The image's own entrypoint is BYPASSED, and this is load-bearing. Bitnami's setup.sh starts a
+  # TEMPORARY MinIO server, provisions the `mc` client against it, stops it, and only then execs the
+  # real server. Every readiness signal a caller can observe answers 200 on the temporary one too, so
+  # on a slow GitHub runner test.sh's health wait, its bucket setup and tests/archive/db/04 were all
+  # served by the provisioning server, and tests/archive/db/08's first PUT then met the real server
+  # still loading: `HTTP 503 XMinioServerNotInitialized`, twice in a row on #437, invisible from a Mac
+  # where the whole handover takes under a second. Running the `minio` binary directly, as the image's
+  # own uid 1001 against its declared data volume, gives ONE server process whose first 200 is the
+  # only 200 there will be. It also makes the service image-agnostic: any image carrying a `minio`
+  # binary works with this same entrypoint and command, so a future swap is a one-line change here.
+  # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are read by the binary itself, so tests/archive/fixtures.sql's
+  # endpoint and credentials are unchanged. The bucket is created by test.sh with a SigV4-signed curl
+  # PUT rather than the `mc` client, whose image vanished with the server's.
   minio:
     profiles: ["archive"]
-    image: quay.io/minio/minio
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
     container_name: pgpm_test-archive-minio
+    entrypoint: ["minio"]
+    command: ["server", "/bitnami/minio/data", "--address", ":9000"]
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data
 
   archive:
     <<: *pg-base
