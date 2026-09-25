@@ -51,8 +51,9 @@ create table if not exists pgpm.config (
   -- The zone every calendar step is computed in, and every partition name rendered in (#455). Recorded
   -- from the transmuting session's TimeZone, so the grid the operator saw at conversion is the grid for
   -- the life of the table, whatever zone pg_cron's session runs in. A month boundary is midnight on the
-  -- 1st IN THIS ZONE; a naive (timestamp / date) control value is read as wall time IN THIS ZONE.
-  -- 'UTC' for id grids, which have no calendar. Change it with pgpm.set_partition_tz, never by hand.
+  -- 1st IN THIS ZONE. 'UTC' for id grids, which have no calendar, and for a naive (timestamp / date)
+  -- control column, which has no zone: its grid is the column's own wall clock, which is the UTC lattice
+  -- (#504), and set_partition_tz refuses to move it. Change it with pgpm.set_partition_tz, never by hand.
   partition_tz     text        not null default 'UTC',
   obtain          int         not null default 30,
   retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
@@ -795,8 +796,9 @@ returns text language sql stable as $$
 $$;
 
 -- Is the control column NAIVE: timestamp without time zone, or date? Such a value carries no zone of
--- its own, and pgpm reads it as wall time in partition_tz (see _col_to_native). false for every other
--- column type, and for a missing column.
+-- its own, so its grid is the column's own wall clock: partition_tz is 'UTC' for it (#504) and
+-- _col_to_native reads it as wall time in that zone. false for every other column type, and for a
+-- missing column.
 create or replace function pgpm._control_naive(p_parent regclass, p_control name)
 returns boolean language sql stable as $$
   select coalesce((select t.typname in ('timestamp', 'date')
@@ -808,8 +810,9 @@ $$;
 -- Rendered as wall time in p_tz WITH that instant's numeric offset: a timestamptz column reads the
 -- exact instant from the offset; a timestamp or date column ignores the offset (PostgreSQL's documented
 -- rule for zone-carrying input to a zoneless type) and keeps the wall time in p_tz, which is precisely
--- what a naive value means here. So one literal serves `for values from`, the monolith's bound CHECK
--- and every `ctl >= lo and ctl < hi` predicate, from any session, for all three column types.
+-- what a naive value means here (p_tz is 'UTC' for such a column, #504, so that wall time is the
+-- column's own reading of the lattice instant). So one literal serves `for values from`, the monolith's
+-- bound CHECK and every `ctl >= lo and ctl < hi` predicate, from any session, for all three column types.
 create or replace function pgpm._time_literal(p_ts timestamptz, p_tz text)
 returns text language plpgsql immutable as $$
 declare v_wall timestamp; v_off int; v_us text;
@@ -941,7 +944,8 @@ $$;
 -- kind adds (#455). A NAIVE column (timestamp without time zone, date) carries no zone, and its text cast
 -- through ::timestamptz would take the SESSION's zone, so the same stored value would decode to one
 -- instant in an operator's session and another in pg_cron's. It is read as wall time in partition_tz
--- instead, which is exactly what _time_literal writes back. A timestamptz column's text carries its
+-- instead, which is exactly what _time_literal writes back; and partition_tz is 'UTC' for such a column
+-- (#504), so this maps the column's own reading onto the lattice unchanged. A timestamptz column's text carries its
 -- offset and round-trips exactly. Always ::timestamp first: `date at time zone` casts the date to a
 -- timestamptz in the session zone and converts the WRONG way. Per-row SQL (regrain's reconcile) inlines
 -- the same rule as an expression rather than calling this, which does a catalog lookup.
@@ -1212,7 +1216,8 @@ $$;
 -- p_value is in the CONTROL COLUMN's own representation (a uuid literal, a text_time id, a bigint id, a
 -- timestamptz-parseable string) -- decoded the same way pgpm._frontier_native decodes max(control), so a
 -- caller passes exactly what it would have inserted. For a timestamp or date column the value is read
--- as wall time in config.partition_tz, the same rule every other read of that column follows (#455).
+-- as wall time in config.partition_tz, which is 'UTC' for such a column (#504): the same rule every
+-- other read of that column follows (#455).
 --
 -- p_max caps how many NEW partitions this call may create. The check runs BEFORE any DDL: a wildly-off
 -- p_value (a typo, an off-by-a-few-zeros id) is refused loudly and immediately, creating nothing, rather
@@ -3716,18 +3721,6 @@ begin
   if p_retain is not null and not pgpm._retain_nonnegative(p_control_kind, p_retain) then
     raise exception 'pg_partition_magician: p_retain cannot be negative (got %) -- a negative retain puts the retention horizon past the partition taking writes, so the first maintenance tick would drop every partition, that one included; zero keeps only the partition taking writes, null keeps everything', p_retain;
   end if;
-  -- #455: the zone the grid is computed in, for the life of the table. The transmuting session's, so the
-  -- grid the operator sees at conversion is the grid maintenance keeps extending whatever zone pg_cron's
-  -- session runs in; 'UTC' for id, which has no calendar. Only a pg_timezone_names name is recorded (see
-  -- _canonical_tz), and this is checked before anything is committed, so a refusal costs nothing.
-  if p_control_kind = 'id' then
-    v_tz := 'UTC';
-  else
-    v_tz := pgpm._canonical_tz(current_setting('TimeZone'));
-    if v_tz is null then
-      raise exception 'pg_partition_magician: this session''s TimeZone (%) is not a name in pg_timezone_names, and pgpm records the transmuting session''s zone as the one the partition grid is computed in for the life of the table. Set a named zone first (set timezone = ''UTC'' for UTC-aligned boundaries, the usual choice) and re-run.', current_setting('TimeZone');
-    end if;
-  end if;
   -- #309: validate the lock timeout HERE, before anything is committed. set_config raises on a bad value
   -- anyway, but it would do so from inside phase 1 or, worse, phase 3 -- after the O(rows) validation
   -- scan the operator has already waited through. A typo should cost nothing.
@@ -3837,6 +3830,31 @@ begin
     -- the bounds this kind computes route rows to the wrong partition (see _check_text_time_collation).
     -- Not gated by p_force_text_time: that flag overrides a sampling heuristic, and this is arithmetic.
     perform pgpm._check_text_time_collation(p_parent, p_control, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_alphabet);
+  end if;
+
+  -- #455: the zone the grid is computed in, for the life of the table. The transmuting session's, so the
+  -- grid the operator sees at conversion is the grid maintenance keeps extending whatever zone pg_cron's
+  -- session runs in. Only a pg_timezone_names name is recorded (see _canonical_tz), and this is checked
+  -- before anything is committed, so a refusal costs nothing.
+  --
+  -- 'UTC' for an id grid, which has no calendar, and for a NAIVE control column (timestamp without time
+  -- zone, date), which has no zone (#504): its values are wall readings, and the grid is computed on that
+  -- wall clock directly, so a day is [D 00:00, D+1 00:00) in the column's own values, an hour
+  -- [H:00, H+1:00), a month [1st 00:00, next 1st 00:00), and every bound literal is that reading with no
+  -- offset. That is exactly the UTC lattice. Reading the column as wall time in the session's zone
+  -- instead put the absolute day and hour lattices off the column's clock: a New York session rendered
+  -- the 00:00Z day boundary as 20:00 the previous day, which a date column read as the previous DATE, so
+  -- the monolith's CHECK excluded every row dated today and phase 2's VALIDATE failed after phase 1 had
+  -- committed; and the two hourly cells either side of a fall-back rendered to the same naive wall time,
+  -- an empty range CREATE TABLE refused, so the grid could never extend past that hour. set_partition_tz
+  -- refuses to change it for such a column, because the zone also decides how its literals are read.
+  if p_control_kind = 'id' or (p_control_kind = 'time' and v_typname in ('timestamp', 'date')) then
+    v_tz := 'UTC';
+  else
+    v_tz := pgpm._canonical_tz(current_setting('TimeZone'));
+    if v_tz is null then
+      raise exception 'pg_partition_magician: this session''s TimeZone (%) is not a name in pg_timezone_names, and pgpm records the transmuting session''s zone as the one the partition grid is computed in for the life of the table. Set a named zone first (set timezone = ''UTC'' for UTC-aligned boundaries, the usual choice) and re-run.', current_setting('TimeZone');
+    end if;
   end if;
 
   -- Orphaned-child guard (REDESIGN.md): regrain creates each fine child as a standalone table
@@ -4222,10 +4240,11 @@ begin
   end if;
   execute format('select t.%I::text from %s t order by t.%I asc limit 1', p_control, p_parent::text, p_control)
     into v_min_raw;
-  -- #455: a naive (timestamp / date) control value has no zone; read it as wall time in v_tz, the rule
-  -- _col_to_native applies everywhere else, so the monolith's lower bound is the one every later session
-  -- would compute. A timestamptz text already carries its offset. pgpm.config does not exist yet, so
-  -- this is the inline form of that rule, with v_typname already looked up above.
+  -- #455: a naive (timestamp / date) control value has no zone; read it as wall time in v_tz (which is
+  -- 'UTC' for such a column, #504), the rule _col_to_native applies everywhere else, so the monolith's
+  -- lower bound is the one every later session would compute. A timestamptz text already carries its
+  -- offset. pgpm.config does not exist yet, so this is the inline form of that rule, with v_typname
+  -- already looked up above.
   if p_control_kind = 'time' and v_min_raw is not null then
     v_min_raw := case when v_typname in ('timestamp', 'date') then pgpm._ts_text(v_min_raw::timestamp at time zone v_tz)
                       else pgpm._ts_text(v_min_raw::timestamptz) end;
@@ -5496,6 +5515,13 @@ begin
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.control_kind = 'id' then
     raise exception 'pg_partition_magician: % is an id grid, which has no calendar; partition_tz is never consulted for it and stays ''UTC''', p_parent;
+  end if;
+  -- #504: a naive column has no zone either. Its grid is its own wall clock (partition_tz is 'UTC' for
+  -- it, see _transmute), and because the zone also decides how its bound literals are rendered and read,
+  -- a change would put every new partition's catalog bound off by the offset against the existing ones:
+  -- pgpm.part and pg_class disagreeing, and a wall-clock hole in the forward grid that refuses writes.
+  if cfg.control_kind = 'time' and pgpm._control_naive(p_parent, cfg.control_column) then
+    raise exception 'pg_partition_magician: set_partition_tz(%, %) refused -- column % of % is a timestamp or date column, which carries no zone: its grid and its bound literals are the column''s own wall clock (recorded as ''UTC''), and rendering new bounds in another zone would shift them by that zone''s offset against every existing partition', p_parent, p_tz, cfg.control_column, p_parent;
   end if;
   v_tz := pgpm._canonical_tz(p_tz);
   if v_tz is null then

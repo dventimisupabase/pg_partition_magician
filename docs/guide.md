@@ -975,6 +975,8 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   maintenance runs in. Month and year boundaries are midnight on the 1st in that zone; day and shorter
   steps are a fixed number of seconds, so in a zone with daylight saving a daily boundary sits an hour
   off local midnight for part of the year, and their partitions are named by the UTC date (or hour)
-  they start at. A `timestamp` or `date` column is read as wall time in that
-  zone. For UTC boundaries, `set timezone = 'UTC'` before the call; change the zone afterwards only with
-  `pgpm.set_partition_tz`, which refuses a change the grid built so far is not on.
+  they start at. A `timestamp` or `date` column has no zone: its grid is the column's own wall clock
+  (recorded as `UTC`), so its days and hours are whole wall days and hours in the column's values, and
+  its zone cannot be changed. For UTC boundaries on a `timestamptz` column, `set timezone = 'UTC'`
+  before the call; change the zone afterwards only with `pgpm.set_partition_tz`, which refuses a change
+  the grid built so far is not on.

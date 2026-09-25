@@ -1232,6 +1232,27 @@ begin
         [("    v_label_tz := case when v_months > 0 then p_tz else 'UTC' end;\n",
           "    v_label_tz := case when v_months > 0 or v_secs >= 86400 then p_tz else 'UTC' end;\n", 1)],
     ),
+    "naive_column_grid_in_session_zone": (
+        "bench/naive_column_utc_grid.sh",
+        "Pre-#504 _transmute and set_partition_tz: a timestamp or date control column records the "
+        "transmuting SESSION's zone as partition_tz, and set_partition_tz accepts a change for it. The "
+        "column's values are wall readings with no zone, but the fixed-step lattices are absolute seconds "
+        "from the anchor instant, so read in a zone with an offset they no longer sit on the column's own "
+        "clock: under America/New_York the 00:00Z day boundary renders as 20:00 the previous day, which a "
+        "date column reads as the previous DATE, so the monolith's CHECK excludes every row dated today "
+        "and phase 2's VALIDATE fails after phase 1 committed; the hourly cells either side of the autumn "
+        "fall-back render to the same naive wall time and CREATE TABLE refuses the second as an empty "
+        "range; and after an accepted zone change every new bound literal is rendered in a different zone "
+        "from the existing ones. Two sites, because the refusal is half of the fix: without it a table "
+        "correctly recorded as UTC can still be moved off its own clock. tests/126's date-column "
+        "conversion, its hourly cells across the fall-back and its refused set_partition_tz are what catch it.",
+        [("  if p_control_kind = 'id' or (p_control_kind = 'time' and v_typname in ('timestamp', 'date')) then\n    v_tz := 'UTC';\n",
+          "  if p_control_kind = 'id' then\n    v_tz := 'UTC';\n", 1),
+         ("  if cfg.control_kind = 'time' and pgpm._control_naive(p_parent, cfg.control_column) then\n"
+          "    raise exception 'pg_partition_magician: set_partition_tz(%, %) refused -- column % of % is a timestamp or date column, which carries no zone: its grid and its bound literals are the column''s own wall clock (recorded as ''UTC''), and rendering new bounds in another zone would shift them by that zone''s offset against every existing partition', p_parent, p_tz, cfg.control_column, p_parent;\n"
+          "  end if;\n",
+          "", 1)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "

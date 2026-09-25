@@ -308,6 +308,29 @@
   survives the swap; `bench/regrain_reconcile_snapshot.sh` drives it against the
   `regrain_reconcile_delete_by_watermark` mutation, which `./test.sh discriminate` requires it to fail.
 
+- **A `timestamp` or `date` control column's grid is the column's own wall clock, recorded as
+  `partition_tz = 'UTC'`** (#504). pgpm read a naive value as wall time in the transmuting session's
+  zone, computed the grid on the resulting instants and rendered every bound back in that zone with an
+  offset the column then discarded. A calendar step round-trips that way, but the day and hour steps are
+  an absolute lattice of seconds that does not sit on the column's clock in a zone with an offset: under
+  `America/New_York` a `date` column with a day step got a monolith `CHECK` of `d < yesterday's date`
+  (the 00:00Z boundary rendered as 20:00 the previous day), so phase 2's `VALIDATE` failed with a raw
+  `23514` after phase 1 had committed and the `NOT VALID` `CHECK` rejected every row dated today; with an
+  hourly step the two cells either side of the autumn fall-back rendered to the same naive wall time
+  (05:00Z and 06:00Z are both 01:00 in New York), `CREATE TABLE` refused the second as an empty range
+  and the grid could never extend past that hour; and `set_partition_tz` accepted a zone change for such
+  a column, after which new bound literals were rendered in a different zone from the existing ones.
+  Now a naive column's values are taken as what they are, wall readings: a day is `[D 00:00, D+1 00:00)`
+  in the column's values, an hour `[H:00, H+1:00)`, a month `[1st 00:00, next 1st 00:00)`, and every
+  literal is that reading. That is the UTC lattice, so `transmute` records `UTC` for such a column
+  whatever the session's zone (as it does for an `id` grid) and `set_partition_tz` refuses to move it.
+  The write frontier for such a column is `now()` on that same clock, so an application writing local
+  wall time from a zone east of UTC runs ahead of it by its offset, which the forward slack covers on a
+  day or coarser grid and needs `obtain` above the offset in hours on an hourly one. A naive-column
+  table transmuted from a non-UTC session on an unreleased build keeps its recorded zone (its grid is on
+  that lattice). `tests/126` pins the rule, `bench/naive_column_utc_grid.sh` runs it against
+  `naive_column_grid_in_session_zone`, and `tests/111` (d) follows it.
+
 - **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,

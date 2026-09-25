@@ -613,6 +613,8 @@ run_perf() {
     "bench/uuidv7_regrain_archive.sh pgpm_perf34"
     "bench/archive_ledger_identity.sh pgpm_perf35"
     "bench/day_label_utc.sh pgpm_perf36"
+    "bench/day_label_utc.sh pgpm_perf37"
+    "bench/naive_column_utc_grid.sh pgpm_perf21"
   )
   local selected=()
   local n=${#guards[@]} idx
