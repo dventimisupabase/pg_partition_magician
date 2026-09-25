@@ -349,7 +349,7 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    `pgpm.archive_ledger`/`pgpm._archive_fully_covered` for that child directly). A flat `retain_backlog`
    with `retain_drop_failures` actually **climbing** is a real failure: the reason is in the log
    (`fail_retain_drop`, `fail_retain_crossing`, `fail_retain_detach`, `fail_retain_identity`,
-   `fail_archive_identity` or `fail_write_block_identity` rows, `method`).
+   `fail_archive_identity`, `fail_write_block_identity` or `fail_archive_contract` rows, `method`).
 
    **The three `*_identity` actions need no foreign key and no detach, so check for them first.** All
    say the same thing: a partition's name no longer resolves to the relation pgpm recorded for it
@@ -370,6 +370,16 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    parent_table = ... and child_name = ...`. Renaming a partition is safe if you update
    `pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded
    identity stays right.
+
+   **`fail_archive_contract` is the archive step refusing what your archive strategy returned**, not a
+   problem with the partition: `config.archive_fn` answered a chunk with a `covered_hi` that was null,
+   not above the chunk's `lo`, past its `hi`, or not a native value at all, and pgpm declined to record
+   a coverage claim it can see is wrong. `method` names the strategy, the chunk, the value returned and
+   the rule it broke. Nothing was archived and nothing was dropped. Unlike the identity refusals it does
+   clear itself: nothing advanced, so every tick hands the strategy the same chunk again, and once the
+   strategy is fixed (or `pgpm.set_archive_fn` points at a corrected one) archiving resumes from where
+   the ledger stands. A strategy that cannot make progress on a call should raise, which shows as a
+   `skip_archive` deferral, rather than return the chunk's own `lo`.
 
 2. If anything has a foreign key **pointing at** this table, check the two failures specific to that. A
    referenced partition cannot be dropped outright; it is detached first, by a cron job.
