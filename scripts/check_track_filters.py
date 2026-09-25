@@ -386,7 +386,7 @@ def main():
     # nothing about a file the glob matches that the filter does not.
     tracks_by_name = parse_tracks(open("test.sh").read())
     for name, text in sorted(workflows.items()):
-        push, pr, tracks = workflow_info(text)
+        push, pr, tracks, _templated = workflow_info(text)
         filt = pr if pr is not None else push
         if filt is None:
             continue
