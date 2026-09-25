@@ -1509,8 +1509,9 @@ begin
 end;
 $$;
 
--- idempotent: a no-op if the child is already blocked, so a repeat _enforce_write_blocks tick (every
--- maintain() call revisits every attached child) never raises a duplicate-trigger error.
+-- idempotent: on a child that is already blocked it only checks the trigger's enable state (the #450
+-- note below), so a repeat _enforce_write_blocks tick (every maintain() call revisits every attached
+-- child) never raises a duplicate-trigger error.
 --
 -- IDENTITY, BEFORE THE DDL (issue #429). This resolves p_child by NAME and then issues CREATE
 -- TRIGGER against whatever comes back, and _enforce_write_blocks calls it for every attached child
@@ -1550,7 +1551,7 @@ $$;
 -- is forget_missing's business, and retire() already counts it via fail_retain_identity.
 create or replace function pgpm._install_write_block(p_parent regclass, p_child name)
 returns void language plpgsql as $$
-declare v_nsp name; v_child regclass; v_now regclass; r record;
+declare v_nsp name; v_child regclass; v_now regclass; v_enabled "char"; r record;
 begin
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
@@ -1568,12 +1569,25 @@ begin
   end if;
 
   v_child := format('%I.%I', v_nsp, p_child)::regclass;
-  if exists (select 1 from pg_trigger where tgrelid = v_child and tgname = 'pgpm_write_block') then
+  select tgenabled into v_enabled from pg_trigger where tgrelid = v_child and tgname = 'pgpm_write_block';
+  if found then
+    -- The upgrade path for #450. A block installed by an older pgpm is origin-only, and re-running
+    -- install.sql touches no trigger, so the revisit every tick already makes is where it gets fixed:
+    -- one ALTER, once, on the first tick after the upgrade.
+    if v_enabled <> 'A' then
+      execute format('alter table %I.%I enable always trigger pgpm_write_block', v_nsp, p_child);
+    end if;
     return;
   end if;
   execute format(
     'create trigger pgpm_write_block before insert or update or delete on %I.%I'
     || ' for each row execute function pgpm._write_block_raise()', v_nsp, p_child);
+  -- ENABLE ALWAYS (#450). CREATE TRIGGER leaves a trigger origin-only, which a session running as
+  -- session_replication_role = replica (a logical-replication apply worker, a loader silencing triggers)
+  -- skips. That default is for triggers that are replication side effects; this one is retention's
+  -- fence, and a row that gets past it lands in a partition whose archive coverage is already complete
+  -- and is dropped unarchived.
+  execute format('alter table %I.%I enable always trigger pgpm_write_block', v_nsp, p_child);
 end;
 $$;
 
@@ -2077,6 +2091,13 @@ begin
   execute format('drop trigger if exists pgpm_regrain_capture on %I.%I', v_nsp, p_child);
   execute format('create trigger pgpm_regrain_capture after insert or update or delete on %I.%I for each row execute function %I.%I()',
                  v_nsp, p_child, v_nsp, v_fn);
+  -- ENABLE ALWAYS (#450). CREATE TRIGGER leaves a trigger origin-only, which a session running as
+  -- session_replication_role = replica (a logical-replication apply worker, a loader silencing triggers)
+  -- skips. That default is for triggers that are replication side effects; this one is what keeps a
+  -- mid-regrain write from being reverted, lost or resurrected by the swap, and a change it does not see
+  -- is a change the reconcile cannot honour. Re-created per regrain, so a regrain begun after the upgrade
+  -- gets it without a repair step; one already in flight keeps its origin-only trigger until it swaps.
+  execute format('alter table %I.%I enable always trigger pgpm_regrain_capture', v_nsp, p_child);
 end;
 $$;
 

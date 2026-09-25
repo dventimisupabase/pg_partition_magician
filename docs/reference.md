@@ -583,7 +583,8 @@ everything behind it until it clears (the wedge shows as a flat `status().retain
 `retain_drop_failures` stays at zero for that; see [`retire`](#retire).
 
 `retain()` is a loop over [`retire`](#retire): it picks the eligible set and `retire` carries the
-per-partition protocol.
+per-partition protocol. Every eligible partition is write-blocked before it is dropped, and the block
+holds for a session running as `session_replication_role = replica` too (see [`retire`](#retire)).
 
 ### `retire`
 
@@ -596,6 +597,11 @@ external assistant (e.g. an archive-then-drop scanner) -- or several cooperating
 retirement directly. It claims the `pgpm.part` row, ensures the child is write-blocked
 (`pgpm._install_write_block`, idempotent), checks `pgpm._archive_fully_covered`, and only then `DROP`s, deletes the catalog row, and logs `retain_drop`. Returns `true`
 iff this call dropped the partition.
+
+The write block is a trigger on the child, enabled `ALWAYS`, so it fires regardless of
+`session_replication_role`: a logical-replication apply worker, or a loader running as `replica` to
+silence triggers, is refused exactly as an ordinary session is. A block an older pgpm installed in the
+origin-only state is brought up to `ALWAYS` by the first `maintain` tick after `install.sql` is re-run.
 
 `retire` never widens what retention may drop -- a caller only picks **which** eligible partition and
 **when**. It refuses (raises) an unmanaged table, a table with no retention policy (`config.retain` is
@@ -740,7 +746,9 @@ child while it is still empty, so the swap never validates one under its lock.
 Committed DML against the source while a regrain is in flight is honoured. A trigger on the source records
 changed keys into a per-parent delta table, and a reconcile pass treats the **source** as the authority for
 each captured key, so a row inserted, deleted or updated mid-regrain is not lost, resurrected or reverted
-by the swap. The reconcile is bounded by the same budget as the copy and takes the tick when there is work,
+by the swap. The trigger is enabled `ALWAYS`, so DML applied with `session_replication_role = replica` (a
+logical-replication subscriber's apply worker, a loader silencing triggers) is captured like any other.
+The reconcile is bounded by the same budget as the copy and takes the tick when there is work,
 so a burst of DML paces itself rather than landing inside the swap. If writes outpace it the regrain stalls
 at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
 work is done under the swap's lock.
