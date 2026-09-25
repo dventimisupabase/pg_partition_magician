@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- **A Parquet file is now written from one snapshot (#462).** `archive._pq_to_parquet` and
+  `archive._pq_to_parquet_range` used to run `count(*)` and then one query per column straight
+  against the relation. A VOLATILE plpgsql function under READ COMMITTED takes a fresh snapshot per
+  statement, so a row that committed between two column reads was in the later columns and not the
+  earlier ones, and from that column on every value sat one row away from the row it belonged to.
+  The file was well-formed (every column had exactly `count(*)` values), so no reader could tell;
+  the bug hunt read 8000 of 8000 rows with a `tag` belonging to a different row's `id`. Both
+  encoders now materialise the rows once, in their final order, with the new
+  `archive._pq_snapshot` (one statement, one snapshot, into a session temp table dropped as soon
+  as the last column is read), and read every column from that. Bytes are unchanged for an
+  unchanged table: the ordering key is the same, verified byte-for-byte across both entry points,
+  compressed and not. The automatic path's `rows_archived` comes from that same snapshot too, via
+  the new `archive._pq_to_parquet_range_counted(...) -> (p_file, p_num_rows)`; the bytea
+  `archive._pq_to_parquet_range` is now a one-line wrapper over it, so existing callers are
+  unaffected. The comment on `archive.to_s3_parquet` that claimed a single snapshot now describes
+  one, and says plainly that the manual path has no write fence: a row that commits after the
+  snapshot is not in the file, so quiesce the partition first or use the automatic path.
+
+  If you archived Parquet on the **manual** path (`archive.to_s3_parquet`) while the partition was
+  still being written to, files written before this fix may be misaligned across columns in exactly
+  this way, and nothing in the file says so. Re-encode from the source if you still have it, or
+  check a sample of rows against a column you can cross-reference. The automatic path write-blocks a
+  partition before archiving it, so its files were exposed only to a writer that bypassed the
+  fence (`session_replication_role = replica`). New: `tests/archive/db/15`, the two-session race,
+  and `bench/archive_parquet_snapshot.sh`, which reads the racy files back with pyarrow and is
+  required to fail against the `parquet_per_column_statements` mutation.
 - **`text_time` refuses a digit alphabet the control column's collation does not order** (#456). A RANGE
   partition on a `text` column compares under the column's collation, while the bounds `text_time`
   computes are ordered by base-N place value, which is bytewise. Under `en_US`, the default collation of

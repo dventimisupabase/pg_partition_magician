@@ -530,6 +530,12 @@ run_archive() {
   echo "--- encode parameter boundary guard (issue #408) ---"
   bash "$(dirname "$0")/bench/archive_encode_boundary.sh" pgpm_test-archive pgpm_encbound || fail=1
 
+  # The single-snapshot guard (#462) re-runs tests/archive/db/15 for the same reason, and adds the
+  # half that file cannot do from inside the database: pyarrow reading the racy files it produced and
+  # asserting id = tag on every row. Needs the venv the independent-reader step above just built.
+  echo "--- Parquet single-snapshot guard (issue #462) ---"
+  bash "$(dirname "$0")/bench/archive_parquet_snapshot.sh" pgpm_test-archive pgpm_pqsnap || fail=1
+
   $DC --profile "$prof" down -v
   if [ "$fail" -ne 0 ]; then echo "archive track: FAIL"; return 1; fi
   echo "archive track: PASS"
