@@ -124,7 +124,9 @@ def plant(tree, pristine, plan, sealed_path, run=subprocess.run):
             ppath = entry["patch"]
             with open(ppath) as fh:
                 ptext = fh.read()
-            run(["git", "-C", tree, "apply", "--index", os.path.abspath(ppath)], check=True)
+            # working tree only: mutations applied above are unstaged, so `--index` would refuse with
+            # "does not match index"; everything is staged together before the amend below
+            run(["git", "-C", tree, "apply", os.path.abspath(ppath)], check=True)
             files = patch_lines(ptext)
             sealed["seeds"].append({
                 "id": f"S{i}", "kind": "patch", "patch": os.path.basename(ppath),
