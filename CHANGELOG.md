@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **`archive.to_s3_parquet` resolves its child in the parent's schema, and both manual archive functions
+  check the child's identity** (#464). `to_s3_parquet` cast the bare child name to `regclass`, so it
+  resolved through the caller's `search_path`: from a session whose `search_path` did not reach a managed
+  table's schema, the real child was refused with `relation does not exist`, and once any same-named
+  relation existed in `public`, that relation's rows went out under the partition's key with HTTP 200.
+  `to_s3` had the schema right but, like `to_s3_parquet`, never compared what the name resolved to
+  against `pgpm.part.child_oid`. Both now resolve `%I.%I` off the parent's namespace and refuse, with a
+  `pg_partition_magician:` error naming both oids, a relation that has taken a partition's name: the
+  manual-path twin of the automatic path's `fail_archive_identity`. A child that does not exist in the
+  parent's schema fails with a clear message rather than a bare `relation does not exist`; a null
+  `child_oid` is unanchored and skips the comparison, as everywhere else.
 - **`from_hypertable` refuses an integer-time dimension, and a `p_control` that is not the dimension, up
   front** (#458). The chunk-by-chunk copy bounds each chunk on `range_start`/`range_end` from
   `timescaledb_information.chunks`, which are ranges of the dimension column and are populated only for a
