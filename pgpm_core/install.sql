@@ -2216,7 +2216,7 @@ declare
   cfg pgpm.config; v_nsp name;
   v_child_lo text; v_child_hi text; v_lo text;
   v_avg numeric; v_batch int; v_batch_count int; v_probe_hi_col text; v_probe_hi text;
-  v_next_distinct_col text; v_stop text;
+  v_next_distinct_col text; v_stop text; v_unit text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -2276,6 +2276,34 @@ begin
       into v_next_distinct_col;
     v_stop := case when v_next_distinct_col is null then v_child_hi
                    else pgpm._col_to_native(cfg, v_next_distinct_col) end;
+    -- The tie that matters is on the NATIVE grid, not the column (#513). A chunk's bounds are native
+    -- values, and for text_time and uuidv7 the decode truncates to the encoding's unit (a second for
+    -- ObjectId and KSUID, a millisecond for uuidv7, ULID and cuid), so when one unit holds at least a
+    -- chunk's worth of rows (a bulk import minted within one second) the next distinct COLUMN value
+    -- decodes to v_lo itself and v_stop = v_lo. Returning nothing here was permanent: every later tick
+    -- resumed from the same v_lo and stopped there again, with no log row, and the child was never
+    -- covered nor retired. A run of rows at one native value can no more be split than a run at one
+    -- column value (the strategy is handed native bounds, which fall only on unit boundaries), so extend
+    -- past the unit: the chunk ends at the first row minted after v_lo's unit, or at the child's hi if
+    -- there is none, and it exceeds archive_byte_budget by construction, which is the documented price
+    -- of never splitting a tie. The lookup is an index probe on the unit's minimal literal, not a decode
+    -- per row. The identity codecs (time, id) decode distinct values distinctly and cannot get here;
+    -- their unit is their type's own resolution, so the same step would still be right if they did.
+    if not pgpm._native_gt(cfg.control_kind, v_stop, v_lo) then
+      v_unit := case cfg.control_kind
+                  when 'text_time' then case cfg.text_time_unit when 's' then '1 second' else '1 millisecond' end
+                  when 'uuidv7' then '1 millisecond'
+                  when 'time' then '1 microsecond'
+                  else '1' end;
+      execute format('select min(%I)::text from %I.%I t where t.%I >= %L',
+                     cfg.control_column, v_nsp, p_child, cfg.control_column,
+                     pgpm._encode(cfg.control_kind, pgpm._grid_next(cfg.control_kind, v_unit, v_lo, cfg.partition_tz),
+                                  cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
+                                  cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz))
+        into v_next_distinct_col;
+      v_stop := case when v_next_distinct_col is null then v_child_hi
+                     else pgpm._col_to_native(cfg, v_next_distinct_col) end;
+    end if;
   end if;
 
   if not pgpm._native_gt(cfg.control_kind, v_stop, v_lo) then

@@ -1172,9 +1172,14 @@ byte-budget chunker: never archive a whole large partition as one giant operatio
   strategy with nothing object-store-shaped to name (`pgpm._archive_noop`, the `none` strategy).
 - `pgpm._next_archive_chunk(p_parent, p_child)` picks the next chunk **within one child's own
   `[lo, hi)`** -- resuming from wherever that child's ledger coverage left off, extended to the next
-  distinct control value so a run of ties never splits across two chunks. It only ever looks at a
-  child that is already write-blocked, and the block is not lifted while the ledger covers the child
-  (see [`maintain`](#maintain)), so what it archives cannot change underneath it.
+  distinct control value so a run of ties never splits across two chunks. The tie is judged on the
+  native grid: a `text_time` or `uuidv7` column decodes at its encoding's unit (a second for ObjectId
+  and KSUID ids, a millisecond for uuidv7, ULID and cuid), so rows minted within one unit travel in
+  one chunk, and that chunk exceeds `archive_byte_budget` by however much the unit holds. A bulk
+  import that lands a chunk's worth of rows in one second is archived as one oversized chunk, then
+  the picker resumes at its usual size. It only ever looks at a child that is already write-blocked,
+  and the block is not lifted while the ledger covers the child (see [`maintain`](#maintain)), so
+  what it archives cannot change underneath it.
 - `pgpm._archive_fully_covered(p_parent, p_child)` is true once the ledger's recorded ranges for
   that child reach its own `hi` (or the strategy is `none`) -- `retire()`'s archive-coverage drop
   precondition (see [`retire`](#retire)).
@@ -1370,7 +1375,9 @@ the same one config surface the synchronous functions use -- setting `archive_fn
 second, independently configured surface. An `archive_fn` cannot issue `COMMIT`: it is a plain function
 and PL/pgSQL forbids transaction control inside one regardless of call context. It does not need to
 either, since `pgpm._next_archive_chunk` bounds every call to `config.archive_byte_budget` before
-`archive_fn` ever runs.
+`archive_fn` ever runs, with one exception: a run of rows tied at a single native value (one second
+of ObjectId or KSUID ids, one millisecond of uuidv7, ULID or cuid ids) is never split, so a chunk
+that carries such a run is as large as the run.
 
 ## Scheduling
 
