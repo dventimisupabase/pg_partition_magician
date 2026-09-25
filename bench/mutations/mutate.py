@@ -1921,6 +1921,19 @@ $$;''',
              "  v_amz_date     := to_char(now() at time zone 'utc', 'YYYYMMDD\"T\"HH24MISS\"Z\"');\n", 2),
         ],
     ),
+    "to_s3_compress_unread": (
+        "bench/archive_to_s3_compress.sh",
+        "Pre-#520 archive.to_s3: the synchronous NDJSON export never read archive.config.compress. "
+        "With the flag on it uploaded plain NDJSON at <prefix><child>.ndjson, Content-Type "
+        "application/x-ndjson, while pgpm_archive/README.md promised GZIP for either format and "
+        "archive.to_s3_parquet and both archive_fn strategies honoured the flag; a reader pointed at "
+        "the documented <prefix><child>.ndjson.gz found nothing. One site: the function's one read of "
+        "the flag, so the mutant exports exactly as the old function did, at the old key with the old "
+        "type, through both the single-PUT and the multipart path.",
+        [
+            ("  v_gzip := cfg.compress;\n", "  v_gzip := false;\n", 1),
+        ],
+    ),
 }
 
 # name -> source file (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -1944,6 +1957,7 @@ MUTATION_SRC = {
     "archive_encode_no_partition_tz": "pgpm_archive/install.sql",
     "archive_object_key_digits_only": "pgpm_archive/install.sql",
     "sigv4_transaction_start_stamp": "pgpm_archive/install.sql",
+    "to_s3_compress_unread": "pgpm_archive/install.sql",
 }
 
 # name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`

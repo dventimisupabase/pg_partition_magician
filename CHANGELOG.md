@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`archive.to_s3` honours `archive.config.compress`** (#520). The synchronous NDJSON export never
+  read the flag: with it on, it uploaded plain NDJSON at `<prefix><child>.ndjson`, while the module's
+  README promised GZIP for either format and `archive.to_s3_parquet` and both `archive_fn` strategies
+  honoured it, so a reader pointed at the documented `.ndjson.gz` key found nothing. With the flag on
+  it now writes a GZIP stream at `<prefix><child>.ndjson.gz` (Content-Type `application/gzip`), the
+  key the automatic NDJSON strategy already uses, and nothing at the plain key. A large export
+  compresses each `part_bytes` text chunk into a gzip member of its own and accumulates members into
+  a multipart part until the part is full, since S3 and MinIO refuse a non-final part under 5 MiB; the
+  concatenation is one valid gzip file (RFC 1952) and memory stays bounded as before.
+  `tests/archive/db/16_to_s3_compress_test.sql` exports through both the single-PUT and the multipart
+  path and checks the single member's CRC-32 and length against the partition's NDJSON;
+  `bench/archive_to_s3_compress.sh` inflates both objects with Python's gzip and asserts every row by
+  identity, and drives the file against the `to_s3_compress_unread` mutation, which
+  `./test.sh discriminate` requires it to fail.
+
 - **The SigV4 signers stamp `x-amz-date` from the wall clock, not from the transaction start** (#520).
   `archive.s3_signed_request` and `archive.s3_signed_request_bytea` read `now()`, which in PostgreSQL is
   the transaction's start time, so every S3 request a transaction made carried the same stamp, and S3

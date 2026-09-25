@@ -560,7 +560,14 @@ run_archive() {
   echo "--- archive object key identity guard (issue #502) ---"
   bash "$(dirname "$0")/bench/archive_object_key.sh" pgpm_test-archive pgpm_objkey || fail=1
 
-  # The SigV4 wall-clock guard (#520) re-runs tests/archive/db/17 for the same reason as the two
+  # The archive.to_s3 compress guard (#520) re-runs tests/archive/db/16_to_s3_compress for the same
+  # reason, and adds the half that file cannot do from inside the database: Python's gzip inflating the
+  # objects it left in t16.obj and asserting the rows by identity, since this module has no gzip
+  # decoder of its own.
+  echo "--- archive.to_s3 compress guard (issue #520) ---"
+  bash "$(dirname "$0")/bench/archive_to_s3_compress.sh" pgpm_test-archive pgpm_tos3gz || fail=1
+
+  # The SigV4 wall-clock guard (#520) re-runs tests/archive/db/17 for the same reason as the ones
   # above: this is the clean-code half of the pair bench/discriminate.sh completes with the mutant.
   echo "--- SigV4 wall-clock stamp guard (issue #520) ---"
   bash "$(dirname "$0")/bench/archive_sigv4_wall_clock.sh" pgpm_test-archive pgpm_sigv4clock || fail=1

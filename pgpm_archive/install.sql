@@ -2459,12 +2459,14 @@ end;
 $$;
 
 -- Small partitions (one part's worth or less) take a plain single PUT; bigger ones stream
--- through S3 multipart, holding at most one part in memory at a time.
+-- through S3 multipart, holding at most one part in memory at a time. With archive.config.compress
+-- on, the same two paths carry a gzip stream instead of plain NDJSON (the fold inside the loop says
+-- how), at <prefix><child>.ndjson.gz.
 create or replace function archive.to_s3(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare
   cfg archive.config; pcfg pgpm.config; v_ctltype text;
-  v_ctype text := 'application/x-ndjson';
+  v_gzip boolean; v_ctype text; v_body bytea := '';
   v_key_id text; v_secret text; v_nsp name; v_key text;
   v_part_payload text; v_chunk text; v_cursor text; v_cursor_tid tid; v_done boolean := false;
   v_page_rows bigint; v_written bigint := 0; v_expected bigint;
@@ -2487,7 +2489,16 @@ begin
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select a.atttypid::regtype::text into v_ctltype
     from pg_attribute a where a.attrelid = p_parent and a.attname = pcfg.control_column;
-  v_key := cfg.prefix || p_child || '.ndjson';
+  -- The object's form follows archive.config.compress, as it does on every other path this module
+  -- ships (#520): plain NDJSON at <prefix><child>.ndjson or, with the flag on, a GZIP stream at
+  -- <prefix><child>.ndjson.gz, the key the automatic NDJSON strategy already uses for a compressed
+  -- object. The flag is read here, once, and nowhere else in this function.
+  v_gzip := cfg.compress;
+  if v_gzip then
+    v_key := cfg.prefix || p_child || '.ndjson.gz'; v_ctype := 'application/gzip';
+  else
+    v_key := cfg.prefix || p_child || '.ndjson';    v_ctype := 'application/x-ndjson';
+  end if;
 
   -- Conservation baseline: the partition's row count as the export begins. Every page's rows are
   -- summed against it, and the export is refused rather than completed when the two differ (below),
@@ -2533,11 +2544,31 @@ begin
         v_nsp, p_child, v_written, v_expected;
     end if;
 
-    exit parts when v_done and v_part > 0 and v_part_payload = '';
+    -- Fold the text chunk into the outgoing part body. Plain, the body IS the chunk's bytes. Compressed,
+    -- the chunk becomes one gzip member appended to the body, and the body is not sent until it is a
+    -- full part: S3 and MinIO refuse a non-final multipart part under 5 MiB (EntityTooSmall), and a
+    -- compressed chunk is usually far under it. Concatenated members are one valid gzip file (RFC
+    -- 1952 section 2.2), which is how gunzip, zcat, Python's gzip, DuckDB and Hadoop read them, so the
+    -- compressed export keeps the plain one's bound of one text chunk and one part body in memory at
+    -- a time. An empty partition still gets one member (header, an empty block, CRC-32 0, ISIZE 0), so
+    -- the object at the .gz key is always a gzip file a reader can open.
+    if v_gzip then
+      if v_part_payload <> '' or (v_part = 0 and octet_length(v_body) = 0) then
+        v_body := v_body || archive._pq_gzip_compress_dynamic(convert_to(v_part_payload, 'UTF8'));
+      end if;
+    else
+      v_body := convert_to(v_part_payload, 'UTF8');
+    end if;
+    v_part_payload := '';
+    continue parts when v_gzip and not v_done and octet_length(v_body) < cfg.part_bytes;
 
+    exit parts when v_done and v_part > 0 and octet_length(v_body) = 0;
+
+    -- Both bodies go through the bytea signer: the plain one is the same bytes the text signer would
+    -- have hashed and sent, and the compressed one is binary.
     if v_part = 0 and v_done then
-      v_resp := archive.s3_signed_request('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key, '',
-                                         v_ctype, v_part_payload, v_key_id, v_secret);
+      v_resp := archive.s3_signed_request_bytea('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key, '',
+                                                v_ctype, v_body, v_key_id, v_secret);
       if v_resp.status not between 200 and 299 then
         raise exception 'archive.to_s3: PUT of % failed: HTTP % %', p_child, v_resp.status, left(v_resp.content, 200);
       end if;
@@ -2554,9 +2585,9 @@ begin
     end if;
 
     v_part := v_part + 1;
-    v_resp := archive.s3_signed_request('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key,
-                                       'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
-                                       v_ctype, v_part_payload, v_key_id, v_secret);
+    v_resp := archive.s3_signed_request_bytea('PUT', cfg.endpoint, cfg.bucket, cfg.region, v_key,
+                                              'partNumber=' || v_part || '&uploadId=' || archive.s3_url_encode(v_upload_id),
+                                              v_ctype, v_body, v_key_id, v_secret);
     if v_resp.status not between 200 and 299 then
       raise exception 'archive.to_s3: part % of % failed: HTTP % %', v_part, p_child, v_resp.status, left(v_resp.content, 200);
     end if;
@@ -2565,7 +2596,7 @@ begin
       if lower(h.field) = 'etag' then v_etag := h.value; end if;
     end loop;
     v_parts_xml := v_parts_xml || format('<Part><PartNumber>%s</PartNumber><ETag>%s</ETag></Part>', v_part, v_etag);
-    v_part_payload := '';
+    v_body := '';
     exit parts when v_done;
   end loop;
 
