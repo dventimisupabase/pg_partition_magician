@@ -1060,6 +1060,27 @@ $$;''',
             1,
         )],
     ),
+    "parquet_per_column_statements": (
+        "bench/archive_parquet_snapshot.sh",
+        "Pre-#462 read: archive._pq_snapshot materialises nothing. Its temp TABLE becomes a temp VIEW "
+        "over the live relation and its row count a separate count(*), so every per-column query "
+        "archive._pq_encode_column_data runs afterwards goes back to the relation itself under a READ "
+        "COMMITTED snapshot of its own (one per column, plus one for the count), which is exactly the "
+        "N+1 snapshots the encoders used to take. A row committing between two column reads is then "
+        "in the later columns and not the earlier ones, and from that column on every value belongs "
+        "to the row next door, in a file every reader accepts. Five sites, all in the snapshot's "
+        "lifecycle: the create, the count, and the three drops (the guarded one before the create, "
+        "and one at the end of each encoder), so the mutant runs to completion rather than erroring "
+        "on `drop table` of a view, which would fail the guard for the wrong reason.",
+        [
+            ("    'create temp table archive_pq_snapshot on commit drop as\n",
+             "    'create temp view archive_pq_snapshot as\n", 1),
+            ("  get diagnostics v_num_rows = row_count;\n",
+             "  execute 'select count(*) from pg_temp.archive_pq_snapshot' into v_num_rows;\n", 1),
+            ("  drop table pg_temp.archive_pq_snapshot;\n",
+             "  drop view pg_temp.archive_pq_snapshot;\n", 3),
+        ],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -1075,6 +1096,7 @@ MUTATION_SRC = {
     "archive_deflate_six_arrays": "pgpm_archive/install.sql",
     "archive_from_item_raw_splice": "pgpm_archive/install.sql",
     "archive_order_by_raw_splice": "pgpm_archive/install.sql",
+    "parquet_per_column_statements": "pgpm_archive/install.sql",
 }
 
 # name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`

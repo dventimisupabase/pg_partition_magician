@@ -1718,14 +1718,17 @@ $$;
 -- tests/archive/db/10_encode_boundary_test.sql drives a statement terminator through every one of
 -- these parameters and pins the signature against exactly that regression.
 --
--- p_order_by defaults to {ctid} (this function's original, whole-relation ordering,
--- unchanged byte-for-byte); archive._pq_to_parquet_range (below) passes an explicit
--- '(control column, key columns)' order-by instead, since ctid is not comparable once a
--- read spans more than one child's heap. quote_ident('ctid') is `ctid` -- a system column needs no
--- special case here. Both call sites guarantee p_order_by is a strict total
--- order with no ties: ctid is unique per live row, and the range variant requires a primary
--- key/predicate-free unique constraint specifically so the control column can be tiebroken (see
--- the exception archive._pq_to_parquet_range raises when one is missing). That matters below,
+-- p_order_by defaults to {ctid}, the whole-relation ordering this function was written for and the
+-- one bench/archive_encode_memory.sh still drives it with directly. Since #462 neither encoder points
+-- it at the source relation at all: archive._pq_snapshot (below) materialises the rows once, in the
+-- order the encoder wants -- ctid for the whole-relation entry point, '(control column, key
+-- columns)' for the range one, since ctid is not comparable once a read spans more than one child's
+-- heap -- and numbers them, and both encoders then pass {archive_pq_ord} over that table.
+-- quote_ident('ctid') is `ctid` -- a system column needs no special case here. Every caller
+-- guarantees p_order_by is a strict total order with no ties: ctid is unique per live row, the range
+-- variant requires a primary key/predicate-free unique constraint specifically so the control column
+-- can be tiebroken (see the exception archive._pq_to_parquet_range_counted raises when one is
+-- missing), and a row_number() ordinal is unique by construction. That matters below,
 -- where is_present and values_payload are two SEPARATE aggregate calls sharing the same ORDER BY
 -- text rather than one shared array: with no ties, there is only one valid row ordering for
 -- p_order_by, so the two sorts can't land on different sequences relative to each other. This one
@@ -1862,13 +1865,88 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- The read: one statement, one snapshot (issue #462)
+-- ---------------------------------------------------------------------------
+
+-- archive._pq_snapshot: materialises the rows an encoder is about to write, in their final row
+-- order, into the session temp table pg_temp.archive_pq_snapshot, in ONE statement, and returns how
+-- many rows that statement saw. Every column the encoder reads from the table afterwards therefore
+-- has exactly that many rows, in exactly that order, whatever else commits meanwhile.
+--
+-- WHY. archive._pq_encode_column_data runs one query per column, and a VOLATILE plpgsql function
+-- under READ COMMITTED takes a fresh snapshot for every statement it runs. Pointed straight at the
+-- relation, N columns were N snapshots, plus one more for the count(*) that sized the page headers.
+-- A row committing between two of those reads was in the later columns and not the earlier ones,
+-- and from that column on every value sat one row away from the row it belonged to. The file was
+-- well-formed (every column had exactly count(*) values), so no reader could tell: the hunt read
+-- 8000 of 8000 rows with a tag belonging to a different row's id. Reading from a table only this
+-- session can see, filled by one statement, gives every column the same rows in the same order no
+-- matter how many statements it takes to encode them. It does so without a lock that would block
+-- writers for the length of the encode, and without REPEATABLE READ, which a function cannot switch
+-- to mid-transaction (SET TRANSACTION is legal only before the transaction's first query).
+--
+-- archive_pq_ord is the row's position under p_order_by, computed once here so the per-column reads
+-- sort a bigint instead of re-sorting the key. Under a strict total order (which every caller
+-- guarantees: see archive._pq_encode_column_data's own contract) a row's position is fixed, so
+-- `order by archive_pq_ord` reproduces p_order_by exactly and the file's bytes do not change:
+-- verified byte-for-byte against the pre-#462 encoder, both entry points, compressed and not. The
+-- ordinal has to be a column of its own because ctid, the whole-relation encoder's order, does not
+-- survive a copy (the temp table has ctids of its own), and a fresh heap's insertion order is not a
+-- documented property to lean on.
+--
+-- MEMORY. This is not another copy of the data in process memory: a temp table lives in temp_buffers
+-- and spills to the backend's temp files, so the encoder's peak RSS is still set by the one column it
+-- is encoding plus the compressed body it has built so far (the shape bench/archive_*_memory.sh pin
+-- for #366/#368/#370), not by the width of the row. It is one more copy ON DISK for the life of the
+-- call, and one sort (the row_number) in place of N sorts of the key over the source. The encoders
+-- drop it as soon as the last column is read; ON COMMIT DROP covers an encoder that raises first,
+-- and the guarded drop below covers the next call in the same transaction after such a raise.
+-- pg_temp is the only schema the name can resolve in, so it can never drop anything but this
+-- session's own.
+--
+-- Nothing here carries SQL (#408): the relation arrives as p_schema/p_table and the range as
+-- p_control/p_lo/p_hi (both go to archive._pq_from_item), the column list and the ordering as
+-- name[], quote_ident'd element by element.
+create or replace function archive._pq_snapshot(
+  p_schema name, p_table name, p_cols name[], p_order_by name[],
+  p_control name default null, p_lo text default null, p_hi text default null
+) returns bigint
+language plpgsql as $$
+declare
+  v_from_q text; v_cols_q text; v_order_q text; v_num_rows bigint;
+begin
+  if 'archive_pq_ord' = any (p_cols) then
+    raise exception 'archive._pq_snapshot: %.% has a column named archive_pq_ord, the name the Parquet encoder reserves for its row ordinal; rename it to archive the table as Parquet', p_schema, p_table;
+  end if;
+  select string_agg(quote_ident(c), ', ' order by ord) into v_cols_q
+    from unnest(p_cols) with ordinality as t(c, ord);
+  select string_agg(quote_ident(c), ', ' order by ord) into v_order_q
+    from unnest(p_order_by) with ordinality as t(c, ord);
+  if v_cols_q is null or v_order_q is null then
+    raise exception 'archive._pq_snapshot: p_cols and p_order_by must both be non-empty';
+  end if;
+  v_from_q := archive._pq_from_item(p_schema, p_table, p_control, p_lo, p_hi);
+
+  if to_regclass('pg_temp.archive_pq_snapshot') is not null then
+    drop table pg_temp.archive_pq_snapshot;
+  end if;
+  execute format(
+    'create temp table archive_pq_snapshot on commit drop as
+       select %s, row_number() over (order by %s) as archive_pq_ord from %s',
+    v_cols_q, v_order_q, v_from_q);
+  get diagnostics v_num_rows = row_count;
+  return v_num_rows;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------
 
 create or replace function archive._pq_to_parquet(p_relation regclass, p_compress boolean default true) returns bytea
 language plpgsql as $$
 declare
-  v_schema name; v_table name; v_from_q text;
+  v_schema name; v_table name;
   v_col record;
   v_col_names text[] := '{}';
   v_col_pgtypes text[] := '{}';
@@ -1895,7 +1973,6 @@ begin
   select n.nspname, c.relname into v_schema, v_table
     from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where c.oid = p_relation;
-  v_from_q := archive._pq_from_item(v_schema, v_table);
 
   for v_col in
     select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
@@ -1952,15 +2029,21 @@ begin
     raise exception 'archive._pq_to_parquet: relation % has no supported columns', p_relation;
   end if;
 
-  execute format('select count(*) from %s', v_from_q) into v_num_rows;
+  -- ONE statement, ONE snapshot (#462): every column below is read from this materialisation, so a
+  -- write that commits while the columns are being encoded is in all of them or in none, and the
+  -- row count that sizes the page headers and the footer is the count of rows the file holds, not
+  -- a count(*) that saw a snapshot of its own. ctid order, as this entry point has always written a
+  -- single heap; archive._pq_snapshot numbers the rows in that order once.
+  v_num_rows := archive._pq_snapshot(v_schema, v_table, v_col_names::name[], array['ctid']::name[]);
 
   v_body := v_magic;
   for i in 1..v_ncols loop
     -- named notation, and not just for length: it is what makes the absence of a SQL-carrying
     -- argument legible at the call site, which is the whole point of #408's signature.
     v_data := archive._pq_encode_column_data(
-      p_schema => v_schema, p_table => v_table,
+      p_schema => 'pg_temp', p_table => 'archive_pq_snapshot',
       p_col => v_col_names[i], p_pgtype => v_col_pgtypes[i], p_nullable => v_col_nullable[i],
+      p_order_by => array['archive_pq_ord']::name[],
       p_decimal_scale => v_col_scale[i], p_decimal_bytes => v_col_typelen[i]);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
@@ -1988,6 +2071,7 @@ begin
   v_schema_list := array_prepend(archive._pq_build_schema_root(v_ncols), v_schema_elements);
   v_footer := archive._pq_build_file_metadata(v_schema_list, v_num_rows, array[v_row_group]);
 
+  drop table pg_temp.archive_pq_snapshot;
   return v_body || v_footer || archive._pq_reverse_bytes(int4send(length(v_footer))) || v_magic;
 end;
 $$;
@@ -1999,15 +2083,27 @@ $$;
 -- the gate.
 -- ---------------------------------------------------------------------------
 
--- archive._pq_to_parquet_range: reads [p_lo, p_hi) of p_control off p_parent (typically a
--- partitioned parent), relying on Postgres's own partition pruning. p_lo/p_hi are literals
--- already typed for p_control's actual column type -- e.g. for a uuidv7-kind control column,
--- translate a pgpm native-grid (timestamptz) value via pgpm._encode first, the same way
--- pgpm.regrain_step builds its own v_lo_lit/v_hi_lit before using them.
-create or replace function archive._pq_to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default true) returns bytea
+-- archive._pq_to_parquet_range_counted: reads [p_lo, p_hi) of p_control off p_parent (typically a
+-- partitioned parent), relying on Postgres's own partition pruning, and returns the file (p_file)
+-- together with the number of rows it holds (p_num_rows), both from the one snapshot
+-- archive._pq_snapshot took. p_lo/p_hi are literals already typed for p_control's actual column
+-- type -- e.g. for a uuidv7-kind control column, translate a pgpm native-grid (timestamptz) value
+-- via pgpm._encode first, the same way pgpm.regrain_step builds its own v_lo_lit/v_hi_lit before
+-- using them.
+--
+-- Two names for one encode, on purpose. archive._encode_upload_parquet needs the row count for the
+-- ledger's rows_archived and used to get it from a count(*) of its own, a statement later and a
+-- snapshot apart from the file, so under a concurrent write it matched neither the file nor the
+-- child (#462); it calls this. archive._pq_to_parquet_range (below) keeps its bytea signature for
+-- every caller that only wants the file (scripts/verify_parquet_range.py, the bench/ memory guards)
+-- and is a one-line wrapper over this, so there is exactly one encoder. Exceptions raised here are
+-- worded under the wrapper's name, which is the name callers know.
+create or replace function archive._pq_to_parquet_range_counted(
+  p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean,
+  out p_file bytea, out p_num_rows bigint)
 language plpgsql as $$
 declare
-  v_schema name; v_table name; v_from_q text; v_order_cols name[]; v_key_cols name[];
+  v_schema name; v_table name; v_order_cols name[]; v_key_cols name[];
   v_col record;
   v_col_names text[] := '{}';
   v_col_pgtypes text[] := '{}';
@@ -2043,8 +2139,6 @@ begin
   -- the ordering travels as column NAMES, not as a joined SQL fragment: the encoder quote_ident's
   -- each one itself (#408). The control column leads, the key columns tiebreak it.
   v_order_cols := array[p_control] || v_key_cols;
-
-  v_from_q := archive._pq_from_item(v_schema, v_table, p_control, p_lo, p_hi);
 
   for v_col in
     select a.attname, a.attnotnull, t.typname, t.typtype, t.typcategory, t.typelem, a.atttypmod
@@ -2101,16 +2195,19 @@ begin
     raise exception 'archive._pq_to_parquet_range: relation % has no supported columns', p_parent;
   end if;
 
-  execute format('select count(*) from %s', v_from_q) into v_num_rows;
+  -- ONE statement, ONE snapshot (#462), in this encoder's own order: the control column leading and
+  -- the key columns tiebreaking it (v_order_cols). The range predicate is applied here, once; the
+  -- per-column reads below see only the materialised rows, so they need neither the range nor the
+  -- key, just the ordinal.
+  v_num_rows := archive._pq_snapshot(v_schema, v_table, v_col_names::name[], v_order_cols, p_control, p_lo, p_hi);
 
   v_body := v_magic;
   for i in 1..v_ncols loop
     v_data := archive._pq_encode_column_data(
-      p_schema => v_schema, p_table => v_table,
+      p_schema => 'pg_temp', p_table => 'archive_pq_snapshot',
       p_col => v_col_names[i], p_pgtype => v_col_pgtypes[i], p_nullable => v_col_nullable[i],
-      p_order_by => v_order_cols,
-      p_decimal_scale => v_col_scale[i], p_decimal_bytes => v_col_typelen[i],
-      p_control => p_control, p_lo => p_lo, p_hi => p_hi);
+      p_order_by => array['archive_pq_ord']::name[],
+      p_decimal_scale => v_col_scale[i], p_decimal_bytes => v_col_typelen[i]);
     if p_compress then
       v_page_bytes := archive._pq_gzip_compress_dynamic(v_data);
       v_page_header := archive._pq_build_page_header(v_num_rows::int4, length(v_data), length(v_page_bytes));
@@ -2137,8 +2234,17 @@ begin
   v_schema_list := array_prepend(archive._pq_build_schema_root(v_ncols), v_schema_elements);
   v_footer := archive._pq_build_file_metadata(v_schema_list, v_num_rows, array[v_row_group]);
 
-  return v_body || v_footer || archive._pq_reverse_bytes(int4send(length(v_footer))) || v_magic;
+  drop table pg_temp.archive_pq_snapshot;
+  p_file := v_body || v_footer || archive._pq_reverse_bytes(int4send(length(v_footer))) || v_magic;
+  p_num_rows := v_num_rows;
 end;
+$$;
+
+-- The bytea entry point every existing caller uses: the same encode, minus the count. One select,
+-- so there is nothing in it to drift from the encoder above.
+create or replace function archive._pq_to_parquet_range(p_parent regclass, p_control name, p_lo text, p_hi text, p_compress boolean default true) returns bytea
+language sql as $$
+  select c.p_file from archive._pq_to_parquet_range_counted(p_parent, p_control, p_lo, p_hi, p_compress) c;
 $$;
 
 -- pgpm_archive's old range-picking, drop-gating, and self-driving-retire-sweep apparatus
@@ -2231,36 +2337,27 @@ create or replace function archive._encode_upload_parquet(p_parent regclass, p_l
 returns table(s3_key text, etag text, rows_archived bigint)
 language plpgsql as $$
 declare
-  cfg archive.config; pcfg pgpm.config; v_nsp name; v_rel name;
-  v_payload bytea; v_key text; v_key_id text; v_secret text;
+  cfg archive.config; pcfg pgpm.config;
+  v_payload bytea; v_key text; v_key_id text; v_secret text; v_lo_lit text; v_hi_lit text;
   v_resp http_response; h http_header; v_etag text; v_rows bigint;
 begin
   select * into cfg from archive.config where parent_table = p_parent;
   if not found then raise exception 'archive._encode_upload_parquet: % has no archive.config row', p_parent; end if;
   select * into pcfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'archive._encode_upload_parquet: % is not managed', p_parent; end if;
-  select n.nspname, c.relname into v_nsp, v_rel
-    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  v_payload := archive._pq_to_parquet_range(
-    p_parent, pcfg.control_column,
-    pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
-                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
-    pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
-                 pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                 pcfg.text_time_discard_bits, pcfg.text_time_epoch),
-    p_compress);
-  execute format('select count(*) from %I.%I where %I >= %L and %I < %L',
-                  v_nsp, v_rel, pcfg.control_column,
-                  pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
-                               pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                               pcfg.text_time_discard_bits, pcfg.text_time_epoch),
-                  pcfg.control_column,
-                  pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
-                               pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
-                               pcfg.text_time_discard_bits, pcfg.text_time_epoch))
-    into v_rows;
+  v_lo_lit := pgpm._encode(pcfg.control_kind, p_lo, pcfg.text_time_prefix, pcfg.text_time_width,
+                           pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                           pcfg.text_time_discard_bits, pcfg.text_time_epoch);
+  v_hi_lit := pgpm._encode(pcfg.control_kind, p_hi, pcfg.text_time_prefix, pcfg.text_time_width,
+                           pcfg.text_time_radix, pcfg.text_time_unit, pcfg.text_time_alphabet,
+                           pcfg.text_time_discard_bits, pcfg.text_time_epoch);
+  -- The file and its row count come out of the same read (#462). rows_archived used to be a count(*)
+  -- run after the encode, a statement later and a snapshot apart, so under a concurrent write it
+  -- matched neither the file nor the child. The counted encoder reports how many rows the one
+  -- snapshot it encoded held, which is what the ledger row is meant to record.
+  select c.p_file, c.p_num_rows into v_payload, v_rows
+    from archive._pq_to_parquet_range_counted(p_parent, pcfg.control_column, v_lo_lit, v_hi_lit, p_compress) c;
 
   select decrypted_secret into v_key_id from vault.decrypted_secrets where name = cfg.vault_key_id;
   select decrypted_secret into v_secret from vault.decrypted_secrets where name = cfg.vault_secret;
@@ -2465,11 +2562,15 @@ exception when others then
 end;
 $$;
 
--- The Parquet hook: single PUT, same shape and ceiling as archive.to_s3's basic (non-multipart)
--- variant -- archive._pq_to_parquet reads every column via array_agg() with no COMMIT in between
--- (each column's array must come from the same snapshot as every other column's, or concurrent
--- writes between column reads could misalign rows across columns), so this holds the vacuum
--- horizon for the whole read+upload, structurally, not as an oversight.
+-- The Parquet function: single PUT, same shape and ceiling as archive.to_s3's basic (non-multipart)
+-- variant. archive._pq_to_parquet materialises every column in ONE statement (archive._pq_snapshot,
+-- #462) and encodes from that, so a write that commits mid-encode is either wholly in the file or
+-- wholly out of it, never in some columns and not others. Snapshot and encode run inside this one
+-- transaction, so the vacuum horizon is held for the whole read+upload, structurally, not as an
+-- oversight. What this function does NOT have is a write fence: unlike the archive_fn path, whose
+-- child is pgpm_write_block'ed before it is archived, nothing here stops a writer, so a row that
+-- commits after the snapshot is simply not in the file. Quiesce the partition first, or use the
+-- automatic path (README).
 create or replace function archive.to_s3_parquet(p_parent regclass, p_child name, p_lo text, p_hi text)
 returns void language plpgsql as $$
 declare

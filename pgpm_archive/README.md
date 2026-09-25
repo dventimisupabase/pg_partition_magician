@@ -114,6 +114,16 @@ the budget past a few MiB with compression on.
   the budget and never exactly equal to it. See
   [Byte-budget chunked archiving](../docs/reference.md#byte-budget-chunked-archiving) for the row
   math and the compression cost that scales with it.
+- **Concurrent writes**: a Parquet file is written from one snapshot. The encoder reads every column
+  from a single materialisation taken in one statement, so a row that commits while the file is
+  being built is either wholly in it or wholly out of it, never in some columns and not others, and
+  the `rows_archived` the automatic path records is the row count of that same snapshot. What
+  decides whether such a row is in or out is the write fence, and only the automatic path has one:
+  `pgpm.maintain()` write-blocks a partition before archiving it, so nothing can commit into it
+  mid-encode. The manual `archive.to_s3_parquet` (and `archive.to_s3`) has no fence at all: a row
+  that commits after the snapshot is simply not in the file, and the drop you run afterwards takes
+  it with the partition. Quiesce the partition first (a `pgpm_write_block`-style trigger, or stop the
+  writer), or use the automatic path.
 - **On Supabase**: Storage enforces the project's upload size limit (default 50MB) on the S3
   protocol too, and `statement_timeout` is 2 minutes -- both apply to a single manual call. The
   automatic path's chunking keeps each upload well under both.

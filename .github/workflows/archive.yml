@@ -5,16 +5,17 @@ name: Archive track
 # and MinIO standing in for S3, neither of which the default pg15-18 matrix images carry.
 # Path-filtered so it runs only when the module, its tests, its memory guards, or the harness change.
 #
-# bench/archive_*.sh covers the four guards run_archive runs after the pgTAP suite and the
-# independent-reader step: the three memory-bound guards (#366, #368, #370) and the encode boundary
-# guard (#408). All four were missing, so a PR that changed one of them on its own ran no archive
-# job at all. Their MUTATION side was still covered, by perf.yml's `discriminate` step, which drives
-# the archive mutations against this same container -- and that is precisely the half-coverage this
-# repo keeps mistaking for coverage, since the clean-code run is explicitly the other half of that
-# pair (see run_archive's own comment on the boundary guard).
+# bench/archive_*.sh covers the five guards run_archive runs after the pgTAP suite and the
+# independent-reader step: the three memory-bound guards (#366, #368, #370), the encode boundary
+# guard (#408) and the single-snapshot guard (#462). The first four were once all missing, so a PR
+# that changed one of them on its own ran no archive job at all. Their MUTATION side was still
+# covered, by perf.yml's `discriminate` step, which drives the archive mutations against this same
+# container -- and that is precisely the half-coverage this repo keeps mistaking for coverage, since
+# the clean-code run is explicitly the other half of that pair (see run_archive's own comment on the
+# boundary guard).
 #
-# A glob rather than four names, and unlike lockview.yml's list this one is a real shape: every
-# guard the archive track runs is a bench/archive_*.sh, all four of them, with nothing else in
+# A glob rather than five names, and unlike lockview.yml's list this one is a real shape: every
+# guard the archive track runs is a bench/archive_*.sh, all five of them, with nothing else in
 # bench/ matching. It does rest on that naming convention holding for the next one. If a future
 # archive guard is named something else, add it here BY NAME rather than widening this to
 # bench/*.sh, which would start the whole MinIO-and-pyarrow track on every unrelated bench edit.
