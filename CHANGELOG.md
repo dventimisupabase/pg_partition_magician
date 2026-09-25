@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+- **A uuidv7 table can be regrained, archived and retired again: nothing reads its control column
+  with `max()` or `min()` any more** (#507). PostgreSQL has no `max(uuid)` or `min(uuid)` aggregate
+  before 18, and three reads of a uuidv7 table's newest or next control value used exactly those.
+  `regrain_step`'s copy resumed from `max(<control>)` over the fine child, so every regrain of a
+  uuidv7 monolith raised `42883 function max(uuid) does not exist` on its first copy batch:
+  `regrain()` and `regrain_history()` died synchronously, and once `set_regrain` had armed
+  auto-regrain every maintenance tick prepared the monolith, failed the copy and logged `skip_regrain`,
+  forever, so a uuidv7 history could never be split. `_next_archive_chunk` sized a chunk with
+  `max(<control>)` over the byte-budget window and extended it past ties with `min(<control>)`, so on a
+  uuidv7 table with an `archive_fn` every tick's archive step raised the same way, was logged as
+  `skip_archive`, wrote no ledger row, and `retain()` never dropped the aged partition. All three
+  now read the value with `ORDER BY ... LIMIT 1`, the shape `_frontier_native` has used for uuid
+  since #325. `tests/125_uuidv7_regrain_archive_test.sql` regrains a frozen uuidv7 monolith both
+  synchronously and through `maintain` ticks, then archives and retires the aged month through a
+  400-byte budget so the tie extension is reached, asserting the exact rows, partitions, ledger range
+  and `retain_drop` involved; `bench/uuidv7_regrain_archive.sh` runs that file against the three
+  mutations `regrain_copy_watermark_max_uuid`, `archive_chunk_boundary_max_uuid` and
+  `archive_chunk_tie_min_uuid`, one per site, so `./test.sh discriminate` proves each site is
+  exercised on its own.
 - **`transmute` refuses up front a table it cannot convert and a name it cannot take, and a failed attempt
   can be retried or aborted from the session that owns it (#509).** Three conditions the cutover was
   always going to trip on were checked nowhere before it, so phases 1 and 2 first committed a validated,
