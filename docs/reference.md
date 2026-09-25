@@ -1852,9 +1852,9 @@ Preserve-managed incoming FKs and their lifecycle.
 |---|---|---|
 | `id` | `bigint` | identity |
 | `parent_table` | `regclass` | the referenced parent |
-| `referencing_table` | `regclass` | the table holding the FK |
+| `referencing_table` | `regclass` | the table holding the FK. Follows the table through pgpm's own renames: a self-referential key names the new parent, and a later `transmute` (or `untransmute`) of the referencing table moves the anchor onto its new parent (or restored table), never onto a monolith partition |
 | `constraint_name` | `name` | the FK name |
-| `definition` | `text` | the captured FK definition (already names the new parent) |
+| `definition` | `text` | the captured FK definition. Names the new parent schema-qualified, so it replays against the same table from any session's `search_path` (`maintain` replays it from pg_cron's) |
 | `restored_at` | `timestamptz` | null = dropped (RI off); set = re-added |
 | `validated_at` | `timestamptz` | set = fully validated; null with `restored_at` set = re-added `NOT VALID` (orphans pending) |
 | `dropped_at` | `timestamptz` | when the FK was captured and dropped |

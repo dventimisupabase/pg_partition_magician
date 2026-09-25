@@ -1245,6 +1245,7 @@ $$;''',
     # #498, one mutation per site of the fix, so a catch names which anchor went missing. All three break
     # bench/dropped_fk_identity.sh: the first two through tests/124's own assertions, the third through
     # the wrapper's upgrade half, which is the only place a second run of install.sql happens.
+    ),
     "dropped_fk_definition_session_search_path": (
         "bench/dropped_fk_identity.sh",
         "Pre-#498 capture: the cutover records pg_get_constraintdef() as rendered in the TRANSMUTING "

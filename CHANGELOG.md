@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+- **`pgpm.dropped_fk` records anchor a preserved incoming key by identity, from any session** (#498).
+  The cutover recorded `pg_get_constraintdef()` as rendered in the transmuting session, which leaves the
+  referenced table unqualified whenever that session's `search_path` can see it, and `restore_incoming_fks`
+  replayed the text in pg_cron's session, so `REFERENCES orders(id)` resolved to whatever `orders` meant
+  there: an unrelated `public.orders` (the key came back against the wrong table, logged
+  `restore_incoming_fk`) or nothing (`fail_restore_incoming_fk` every tick). And `referencing_table` was
+  the referencing table's oid as of the capture: for a self-referential key that is the very oid the
+  cutover renames into the monolith child, and for any key it is the oid a later `transmute` of the
+  referencing table renames the same way, so the restore re-added the key on that one partition and every
+  row routed to a forward partition escaped it, while the log said restored. Now the definition is captured
+  through `pgpm._fk_definition`, which pins `search_path` to `pg_catalog` so the referenced table is
+  always schema-qualified (the hypertable module's capture uses it too); the cutover moves every record in
+  which the converted table is the referencer onto its new parent, in the rename's own transaction, and
+  `untransmute` moves them back onto the restored table; and re-running `install.sql` rewrites a record an
+  earlier pgpm captured unqualified. Records an earlier pgpm anchored on a monolith partition are not
+  rewritten: their key may physically live on that partition, and moving the record without the key would
+  break `suspend_incoming_fks`. `tests/124_dropped_fk_identity_test.sql` (the issue's three reproductions
+  plus both `untransmute` round trips), `bench/dropped_fk_identity.sh` (the same file against an arbitrary
+  install, plus the upgrade rewrite), and three mutations in `bench/mutations/mutate.py`.
 - **Native bounds are stored in ISO 8601 form whatever the writing session's `DateStyle`** (#500). Every
   native time value pgpm stores (`pgpm.part.lo`/`hi`, `pgpm.log.lo`/`hi`, `config.partition_anchor`,
   `transmute_inflight.lo`/`hi`, the archive ledger's bounds) is text, and it was rendered with a bare
