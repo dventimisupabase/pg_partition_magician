@@ -182,6 +182,10 @@ cannot make progress yet.
    - `regrain=reconciling:N` tick after tick, with `regrain_delta_pending` not falling, means writes into
      the coarse child are outpacing the reconcile and the swap is correctly refusing to start. The table
      is consistent and reads are unaffected; raise `regrain_batch` or wait for the write burst to pass.
+   - A `skip_regrain` row whose `method` reads `captured change(s) in [...] are still pending after the
+     swap's residual reconcile` is the swap refusing to drop the source with changes unapplied. The tick
+     rolled back whole, the source is still attached, and the next tick reconciles the backlog before
+     swapping; nothing is lost. It should not recur, and one that does is worth reporting.
 
 4. If disk is the constraint, see [Disk is filling during a regrain](#disk-is-filling-during-a-regrain).
 

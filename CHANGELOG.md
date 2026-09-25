@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **regrain's swap now reconciles every captured change before it drops the source (#447).** After
+  the `DETACH`, the swap drained the change-capture delta for at most 100 passes of
+  `greatest(batch, 1000)` keys and then attached, dropped and truncated unconditionally; nothing checked
+  that the loop had stopped because the delta was empty. The pre-swap gate bounds only what had committed
+  before it ran: a writer already holding a row in the source keeps the `DETACH` waiting, and everything
+  it commits during that wait lands in the delta after the gate. Under `maintain` the `DETACH`'s 200 ms
+  `lock_timeout` keeps that window small; a hand-driven `regrain_step` has none, and a history purge
+  committing during the wait was exactly the shape that overflowed. Reproduced: 150,051 committed rows,
+  49,851 of them gone after a clean `swapped:30`, no error anywhere.
+
+  The loop now runs until the reconcile finds nothing (the `DETACH`'s lock is what makes that finite),
+  and before the `DROP` the swap asserts that no captured change in `[lo, hi)` remains, raising a
+  `pg_partition_magician: internal error` otherwise so the whole swap rolls back with the source still
+  attached; under `maintain` that surfaces as a `skip_regrain` row and the next tick reconciles the
+  backlog before swapping. New internal `pgpm._regrain_delta_count(parent, lo, hi)`, the range-scoped
+  count that check uses (range-scoped because a cross-partition `UPDATE`'s new key can sit outside the
+  child being split). Guarded by `tests/107`, a two-session probe in which a writer commits 120,002
+  captured changes after seeing the swap's ungranted `ACCESS EXCLUSIVE`, and by
+  `bench/regrain_swap_reconcile.sh`, which drives that file against two mutants: the pre-fix bound put
+  back (the file fails on identity, after a swap that reported success) and the bound with the new
+  check left in (the file fails on the swap tick, which now raises), so the check is proven live rather
+  than assumed.
 - **`archive.to_s3` no longer drops rows that tie on the control column at a page boundary** (#463).
   The synchronous NDJSON export read the partition `fetch_rows` at a time and resumed each page from
   the previous page's `max(control)`. The control column need not be unique, so when a run of equal

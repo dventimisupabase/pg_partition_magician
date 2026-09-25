@@ -514,6 +514,9 @@ run_perf() {
   # through, and a harness only ever pointed at mutants would be green in `discriminate` even if it
   # were broken enough to fail against everything. This is the clean-code half of that pair.
   bash "$(dirname "$0")/bench/retire_detach_substitution.sh" "$c" pgpm_perf14                   || rc=1
+  # Same pattern for #447: tests/107's two-session swap probe, run here on clean code and by
+  # `discriminate` against the mutants that put the 100-pass bound back.
+  bash "$(dirname "$0")/bench/regrain_swap_reconcile.sh" "$c" pgpm_perf15                        || rc=1
   $DC --profile "$prof" down -v
   if [ "$rc" -ne 0 ]; then echo "perf track: FAIL"; return 1; fi
   echo "perf track: PASS"
