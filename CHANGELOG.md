@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **`pgpm_archive`'s object key keeps the sign (and decimal point) of an `id` kind's lo** (#502). Both
+  transports, `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet`, named the uploaded object
+  after the digits of the chunk's lo, `regexp_replace(p_lo, '[^0-9]', '', 'g')`, so chunk lo `-10000`
+  and chunk lo `10000` of one table shared one key: a single `maintain()` tick uploaded the second over
+  the first, both ledger rows recorded the shared key as archived, and `retire()` would have dropped the
+  `[-10000, 0)` partition with its rows gone from the store. On a `numeric` control the same projection
+  folded `10.5` onto `105`. The stem now comes from `archive._object_stem(kind, lo)`, which keeps the
+  `id` kind's numeric text whole (`<prefix><parent>_-10000.ndjson`) and leaves the digits-only shape of
+  every time-based kind, and so every existing key, untouched; a non-negative integer lo produces the
+  same key as before. `tests/archive/db/16_archive_object_key_identity_test.sql` drives both transports
+  on the issue's fixture and reads each object back by identity; `bench/archive_object_key.sh` runs it
+  in the archive track and under `discriminate` against the `archive_object_key_digits_only` mutation,
+  which puts the digits-only stem back.
 - **`pgpm.set_archive_fn` refuses a strategy that does not return `pgpm.archive_result`** (#517). The
   `regprocedure` cast resolves a name and an argument list and never looks at the return type, and nothing
   else did, so a strategy declared `returns text` was accepted, against the reference's promise that

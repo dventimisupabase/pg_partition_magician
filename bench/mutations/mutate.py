@@ -1217,6 +1217,18 @@ $$;''',
         [("pcfg.text_time_discard_bits, pcfg.text_time_epoch, pcfg.partition_tz)",
           "pcfg.text_time_discard_bits, pcfg.text_time_epoch)", 4)],
     ),
+    "archive_object_key_digits_only": (
+        "bench/archive_object_key.sh",
+        "Pre-#502 object key: archive._object_stem projects EVERY native lo onto its digits, "
+        "regexp_replace(p_lo, '[^0-9]', '', 'g'), the id kind included, so the sign (and on a numeric "
+        "control the decimal point) is gone from the key and chunk lo -10000 and chunk lo 10000 of one "
+        "table upload to the same object: the second PUT of a tick overwrites the first while both "
+        "ledger rows record the shared key as archived, and retire() drops the first partition with its "
+        "rows gone from the store. One site: both transports take the stem from the helper, which is "
+        "what lets one edit put the defect back in the NDJSON and the Parquet path at once.",
+        [("  select case when p_kind = 'id' then p_lo else regexp_replace(p_lo, '[^0-9]', '', 'g') end;\n",
+          "  select regexp_replace(p_lo, '[^0-9]', '', 'g');\n", 1)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
@@ -1234,6 +1246,7 @@ MUTATION_SRC = {
     "archive_order_by_raw_splice": "pgpm_archive/install.sql",
     "parquet_per_column_statements": "pgpm_archive/install.sql",
     "archive_encode_no_partition_tz": "pgpm_archive/install.sql",
+    "archive_object_key_digits_only": "pgpm_archive/install.sql",
 }
 
 # name -> the CI track whose job runs it; anything not listed here belongs to the default `perf`
