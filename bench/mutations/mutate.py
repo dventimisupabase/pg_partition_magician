@@ -1233,6 +1233,19 @@ begin
           "      end if;\n",
           "", 1)],
     ),
+    "transmute_resume_session_zone": (
+        "bench/transmute_resume_zone.sh",
+        "Pre-#506 _transmute: a resume reuses the claim's bound but ignores the zone recorded with it and "
+        "registers config.partition_tz from the RESUMING session. The bound sits on the claiming session's "
+        "lattice, so the monolith is on one lattice and every later grid computation on another: obtain's "
+        "first candidates half-overlap the monolith and are skipped, a hole one whole step wide is left "
+        "right past its hi (writes there fail with no partition found), and set_partition_tz refuses the "
+        "repair. The column and the recording stay; only the adoption on resume is removed, so the mutant "
+        "is exactly 'the recorded zone is not consulted'. tests/128's resume from a UTC session of a New "
+        "York claim is what catches it: partition_tz reads UTC, the monolith's hi is not a UTC boundary, "
+        "and obtain leaves the hole.",
+        [("  if v_resumed then\n    v_tz := coalesce(v_claim_tz, v_tz);\n  end if;\n", "", 1)],
+    ),
     "part_name_day_label_in_zone": (
         "bench/day_label_utc.sh",
         "Pre-#503 _part_name: a day or week label is the wall DATE of the cell's start in partition_tz, "

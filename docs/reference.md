@@ -281,9 +281,9 @@ attempt is always yours to abort: the claim it left records your session as its 
 so a conversion that never got there left them in place, and there is nothing for this to re-add.
 
 It **abandons; it does not resume**. Finishing a half-done conversion of a live table unattended is a
-larger action than pgpm will take on your behalf. To try again, call `transmute` again: it finds the
-recorded row and reuses the bound already on the table rather than recomputing one against a frontier that
-has since moved.
+larger action than pgpm will take on your behalf. To try again, call `transmute` again, from a session in
+any zone: it finds the recorded row and reuses the bound already on the table, and the zone that bound was
+computed in, rather than recomputing one against a frontier that has since moved.
 
 You mostly will not need to call this. Every `maintain_all` tick sweeps for abandoned conversions and
 undoes them, and it decides "abandoned" from whether the session that claimed the conversion is still
@@ -1947,6 +1947,7 @@ carries a `pgpm_monolith_bound` `CHECK` and is refusing writes outside `[lo, hi)
 | `nsp` / `rel` | `name` | its schema and name as of the conversion's start, so the bound can still be dropped by name after the rename |
 | `control_kind` | `text` | `time`, `id`, `uuidv7` or `text_time` |
 | `lo` / `hi` | `text` | the native bounds the `CHECK` is enforcing; a retry reuses these rather than recomputing |
+| `partition_tz` | `text` | the zone `lo` and `hi` were computed in; a retry adopts it along with them, whatever zone its own session runs in (null on a row written before the column existed, which a retry reads as "keep this session's zone") |
 | `started_at` | `timestamptz` | when the conversion added the bound |
 
 ### `pgpm.archive_ledger`

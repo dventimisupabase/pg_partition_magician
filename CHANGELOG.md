@@ -345,6 +345,20 @@
   `bench/month_step_dst_gap.sh` runs it against `grid_next_month_unsnapped`, and the existing
   `grid_session_timezone` mutation is re-anchored on the rewritten line.
 
+- **A resumed `transmute` keeps the zone its bound was computed in** (#506). Phase 1 computes the
+  monolith's bound in the transmuting session's zone and records it in `pgpm.transmute_inflight` so a
+  re-run after a failure between the phases resumes on it, but the claim did not record the zone. A
+  resume from a session in another zone reused the bound and then registered `config.partition_tz`
+  from its own session, so the monolith sat on one lattice and every later grid computation on another:
+  `obtain`'s first candidates half-overlapped the monolith and were skipped, a hole one whole step wide
+  was left right past its `hi` (writes there failed with "no partition of relation found for row"), and
+  `set_partition_tz` refused to repair it. `pgpm.transmute_inflight` now carries `partition_tz`, the
+  claim records it, a resume adopts it along with the bound, and the `transmute_resume` log row names
+  the zone it reused. A claim recorded before the column existed carries null there and a resume keeps
+  the session's zone, as before. `tests/128` resumes a New York claim from a UTC session and checks the
+  monolith's bound is a boundary in the recorded zone and the first forward child starts exactly at it;
+  `bench/transmute_resume_zone.sh` runs it against `transmute_resume_session_zone`.
+
 - **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,

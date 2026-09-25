@@ -298,6 +298,10 @@ create table if not exists pgpm.transmute_inflight (
   control_kind  text        not null,
   lo            text        not null,
   hi            text        not null,
+  -- #506: the zone lo and hi were computed in (the claiming session's, #455). A resume reuses the bound,
+  -- so it has to reuse this too, whatever zone the resuming session runs in; null on a claim recorded
+  -- before the column existed, which a resume reads as "keep this session's zone", the old behaviour.
+  partition_tz  text,
   started_at    timestamptz not null default now(),
   owner_pid           int,
   owner_backend_start timestamptz
@@ -307,6 +311,7 @@ create table if not exists pgpm.transmute_inflight (
 -- becoming permanently stuck behind a liveness check it has no data for.
 alter table pgpm.transmute_inflight add column if not exists owner_pid int;
 alter table pgpm.transmute_inflight add column if not exists owner_backend_start timestamptz;
+alter table pgpm.transmute_inflight add column if not exists partition_tz text;
 
 -- Is the session that claimed a conversion still alive? (#405)
 --
@@ -3707,6 +3712,7 @@ declare
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_monolith name; v_monreg regclass;
   v_tz text;   -- #455: the zone the grid is computed in, recorded in config.partition_tz
+  v_claim_tz text;   -- #506: the zone recorded with the claim, which a resume adopts along with the bound
   v_frontier_native text; v_min_raw text; v_max_raw text; v_min_native text; v_lo_native text; v_hi_native text;
   v_max_ts timestamptz; v_skew_limit timestamptz;   -- #457: the decoded data maximum and how far ahead of now() it may sit
   -- #277: everything CREATE TABLE ... LIKE does NOT carry, captured before the rename and replayed onto
@@ -4378,9 +4384,9 @@ begin
   -- failed attempt: resuming it is exactly what a take-over does. Matched on both columns, the identity
   -- we are about to record; a recycled pid with an older backend_start fails the match and is caught by
   -- the first arm instead, because its owner is dead.
-  insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi,
+  insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi, partition_tz,
                                        owner_pid, owner_backend_start)
-  values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native,
+  values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native, v_tz,
           pg_backend_pid(), (select backend_start from pg_stat_activity where pid = pg_backend_pid()))
       on conflict (parent_table) do update
          set owner_pid           = excluded.owner_pid,
@@ -4388,7 +4394,7 @@ begin
        where not pgpm._session_alive(transmute_inflight.owner_pid, transmute_inflight.owner_backend_start)
           or (transmute_inflight.owner_pid = excluded.owner_pid
               and transmute_inflight.owner_backend_start = excluded.owner_backend_start)
-  returning lo, hi, (xmax <> 0) into v_lo_native, v_hi_native, v_resumed;
+  returning lo, hi, partition_tz, (xmax <> 0) into v_lo_native, v_hi_native, v_claim_tz, v_resumed;
 
   if not found then
     raise exception 'pg_partition_magician: a transmute of % is already in progress in another session', p_parent;
@@ -4398,6 +4404,16 @@ begin
   -- than recomputing one -- the frontier has moved on since, but no row can have landed outside the recorded
   -- range, because the CHECK was rejecting exactly those the whole time. xmax is 0 on an insert and the
   -- updating xid on an update, which is what distinguishes the two here.
+  --
+  -- And reuse the ZONE that bound was computed in (#506). The bound sits on the claiming session's lattice
+  -- (#455); registering THIS session's zone instead put the monolith on one lattice and every later grid
+  -- computation on another, so obtain's first candidates half-overlapped the monolith and were skipped, a
+  -- hole one whole step wide was left right past its hi (writes there failed), and set_partition_tz
+  -- refused the repair because the grid built past the hole was on the wrong lattice for the original
+  -- zone. A claim recorded before the column existed carries null and keeps this session's zone.
+  if v_resumed then
+    v_tz := coalesce(v_claim_tz, v_tz);
+  end if;
   v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native, v_tz);
 
   -- #509: the cutover RENAMEs the table to this name, so the name has to be free, and nothing before this
@@ -4766,7 +4782,8 @@ begin
   -- looking the table up by name would never see it (#275).
   if v_resumed then
     insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reused the recorded bound');
+      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native,
+              'reused the recorded bound' || case when v_claim_tz is null then '' else ', computed in ' || v_claim_tz end);
   end if;
 
   -- record the original table, now the bounded MONOLITH coarse child, as an attached partition

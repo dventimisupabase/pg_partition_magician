@@ -616,6 +616,7 @@ run_perf() {
     "bench/day_label_utc.sh pgpm_perf37"
     "bench/naive_column_utc_grid.sh pgpm_perf21"
     "bench/month_step_dst_gap.sh pgpm_perf22"
+    "bench/transmute_resume_zone.sh pgpm_perf23"
   )
   local selected=()
   local n=${#guards[@]} idx
