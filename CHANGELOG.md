@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **PRs land through a merge queue.** Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
+  `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
+  PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,
+  the new `Lint summary` and `Perf summary`) instead of eight job names. The perf workflow drops its
+  path filter, because a required check that did not run blocks a PR from being queued; sharded, it
+  is about as long as one pgTAP matrix job. Before this, `main`'s "branch must be up to date" rule
+  made every merge a rebase plus a full CI run per PR, about 30 minutes each, serialised.
+
 - **The perf CI job is sharded across runners.** One job that ran every bench guard and then every
   discriminating mutation took 27 minutes and was the critical path of every PR's CI (the pgTAP matrix
   takes 6). `./test.sh perf --shard=I/N` and `./test.sh discriminate --shard=I/N` (also

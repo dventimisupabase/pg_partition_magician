@@ -65,6 +65,9 @@ name: Lock-view capture guard
 # eBPF workflow states its own environmental assumption, so losing it is legible in the job that
 # needs it instead of in a shared file neither job names.
 on:
+  # The merge queue builds main plus the queued PRs and runs this on that tree, so a queued
+  # change is tested exactly as it will land. merge_group has no paths filter by design.
+  merge_group:
   push:
     branches: [ main ]
     paths:

@@ -20,6 +20,9 @@ name: Archive track
 # archive guard is named something else, add it here BY NAME rather than widening this to
 # bench/*.sh, which would start the whole MinIO-and-pyarrow track on every unrelated bench edit.
 on:
+  # The merge queue builds main plus the queued PRs and runs this on that tree, so a queued
+  # change is tested exactly as it will land. merge_group has no paths filter by design.
+  merge_group:
   push:
     branches: [ main ]
     paths:
