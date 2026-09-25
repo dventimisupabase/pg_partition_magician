@@ -265,9 +265,10 @@ long scan is never mistaken for a dead one. Re-running `transmute` resumes from 
 than recomputing one.
 
 The one hard requirement is that the **control column be `NOT NULL`** (a partition key cannot be null, and
-`transmute` never scans to enforce it). A key is *not* required: if the table has a **primary key** or a
-**unique constraint** that includes the control column, `transmute` reuses it in place (the parent adopts
-the monolith's existing index, no rebuild); if it has neither, the table is partitioned **keyless** and no
+`transmute` never scans to enforce it). A key is *not* required: if the table's **primary key** includes
+the control column, `transmute` reuses it in place (the parent adopts the monolith's existing index, no
+rebuild); if it has no primary key and a **unique constraint** includes the control column, that is reused
+the same way; if it has neither, the table is partitioned **keyless** and no
 key is synthesized (faithful to a keyless source, e.g. a plain hypertable). Postgres only requires a
 partitioned key to *include* the partition key, not lead it, so a single-column key qualifies, and so does
 a composite one that contains it (e.g. `(tenant_id, id)` partitioned by `id`, or `UNIQUE (device_id, ts)`
@@ -275,9 +276,13 @@ partitioned by `ts`). A few shapes are still refused with a clear error rather t
 key:
 
 - **A nullable control column**: run `ALTER TABLE ... ALTER COLUMN <control> SET NOT NULL` first.
-- **A key that *excludes* the control column** (the classic `events(id PRIMARY KEY, created_at)` wanting
-  time partitioning): make the control column part of the key first, or widen it with `CREATE UNIQUE INDEX
-  CONCURRENTLY` then `ALTER TABLE ... ADD PRIMARY KEY USING INDEX`.
+- **A primary key that *excludes* the control column** (the classic `events(id PRIMARY KEY, created_at)`
+  wanting time partitioning): make the control column part of the key first, or widen it with `CREATE
+  UNIQUE INDEX CONCURRENTLY` then `ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>`.
+  This holds even when a unique constraint that does include the control column sits beside it:
+  `transmute` will not adopt that one and leave the primary key behind on the monolith, where it would
+  enforce nothing for rows written to newer partitions. The error names the primary key constraint and
+  the control column.
 - **Only a *bare* unique index** (not a constraint) covers the control column: `ADD UNIQUE` would rebuild
   it, so promote it metadata-only first with `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`.
 

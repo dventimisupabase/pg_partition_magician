@@ -90,10 +90,14 @@ same way).
 Parameters:
 
 - `p_control` -- the partition-key column. It **must be `NOT NULL`** (a partition key cannot be null;
-  `pgpm` never scans to enforce it). A key is not required: if a **primary key or unique constraint**
-  includes the control column, `pgpm` reuses it in place and never rewrites it; otherwise the table is
-  partitioned **keyless** (no key synthesized). A key that *excludes* the control column is refused (no
-  rewrite), as is a *bare* unique index (promote it to a constraint first). Column **order** within the key
+  `pgpm` never scans to enforce it). A key is not required: if the **primary key** includes the control
+  column, `pgpm` reuses it in place and never rewrites it; if there is no primary key and a **unique
+  constraint** includes the control column, that is reused instead; if there is neither, the table is
+  partitioned **keyless** (no key synthesized). A **primary key that *excludes* the control column is
+  refused** (no rewrite), whatever other unique constraints the table has: it could not be carried onto
+  the parent, and `pgpm` will not adopt a different key and leave it behind on the monolith, where it
+  would enforce nothing for new rows. The error names the constraint and the control column. A *bare*
+  unique index is refused too (promote it to a constraint first). Column **order** within the key
   is free: PostgreSQL requires only that the key *contain* the partition key, and `pgpm` reads the key for
   identity, never for ordering. Choose it for your own reads (see
   [the guide](guide.md#the-cutover-moves-no-rows)). Note: `regrain` is unavailable
