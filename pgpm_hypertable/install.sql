@@ -10,16 +10,19 @@
 -- plain table under the original name, then hand to transmute -- version- and
 -- catalog-agnostic, which is what the deprecated Apache builds need. The copy is
 -- online (source serves traffic, committed per chunk); only the cutover takes a
--- brief lock. Scope: a single time/RANGE dimension; append-only catch-up at
+-- brief lock. Scope: a single time/RANGE dimension on a timestamptz, timestamp or
+-- date column, migrated ON that column (p_control must be the dimension; see
+-- _from_hypertable_check_dimension for why); append-only catch-up at
 -- cutover. The control column's key is whatever transmute reuses -- a PRIMARY KEY
 -- or UNIQUE constraint that includes it, or keyless if it has neither (the common
 -- hypertable shape). Identity columns are preserved (re-established before the
 -- handoff, since CREATE TABLE LIKE does not carry identity), generated columns are
 -- preserved (the copy omits them from its column list and they recompute on
 -- insert), and CHECK constraints, defaults, and NOT NULL are carried onto the
--- partitioned parent by transmute. Refused up front: continuous aggregates and
--- space partitioning (>1 dimension); transmute also refuses a nullable control
--- column, a key that excludes it, or a bare unique index.
+-- partitioned parent by transmute. Refused up front: continuous aggregates, space
+-- partitioning (>1 dimension), an integer-time dimension, and a p_control that is
+-- not the dimension column; transmute also refuses a nullable control column, a
+-- key that excludes it, or a bare unique index.
 --
 -- Catch-up has two modes. By default the cutover catches up append-only: rows
 -- whose control column is past the copy watermark. That is enough for time-series
@@ -81,6 +84,42 @@ begin
   return make_interval(secs => (v_bytes / (v_mibps * 1048576.0))::double precision);
 end $$;
 
+-- _from_hypertable_check_dimension: the two facts the chunk-by-chunk copy silently depends on (issue #458).
+-- The copy bounds each chunk with `<p_control> >= range_start and < range_end` read from
+-- timescaledb_information.chunks. Those are ranges OF THE DIMENSION COLUMN, and they are populated only for a
+-- timestamp-typed dimension: an integer dimension's bounds live in range_start_integer and range_start is
+-- NULL for every chunk. So the predicate partitions the table exactly when p_control IS the time dimension
+-- AND the dimension is timestamptz/timestamp/date. Anything else copies a strict subset of the rows, or
+-- nothing at all (`t >= NULL and t < NULL`), and the cutover then drops the hypertable and reports success
+-- over an empty table: no error, no log row. Preflight used to check only that the column exists.
+--
+-- Factored out of the preflight so the cutover can run it in its own right. The cutover is the irreversible
+-- step and required only that a destination exist, which a copy run under an older version (or a table made
+-- by hand) satisfies without the copy phase ever having refused. dimension_number = 1 rather than
+-- dimension_type = 'Time': Timescale allows a second range dimension, and then 'Time' names two rows while
+-- the primary is always number 1 (preflight refuses >1 dimensions anyway). Internal, so no promise attaches.
+create or replace function pgpm._from_hypertable_check_dimension(p_hypertable regclass, p_control name)
+returns void language plpgsql as $$
+declare v_nsp name; v_rel name; v_dim_col name; v_dim_type regtype;
+begin
+  select n.nspname, c.relname into v_nsp, v_rel
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
+  select column_name, column_type into v_dim_col, v_dim_type
+    from timescaledb_information.dimensions
+   where hypertable_schema = v_nsp and hypertable_name = v_rel and dimension_number = 1;
+  if v_dim_col is null then
+    raise exception 'pg_partition_magician: % is not a hypertable', p_hypertable;
+  end if;
+  if v_dim_col <> p_control then
+    raise exception 'pg_partition_magician: cannot migrate hypertable % on column % -- its time dimension is %. The online copy is bounded chunk by chunk on the dimension''s chunk ranges, so it conserves rows only when p_control is the dimension column; on any other column rows would be silently lost. Pass p_control => %.',
+      p_hypertable, p_control, v_dim_col, quote_ident(v_dim_col);
+  end if;
+  if v_dim_type not in ('timestamptz'::regtype, 'timestamp'::regtype, 'date'::regtype) then
+    raise exception 'pg_partition_magician: cannot migrate hypertable % -- its time dimension % is %: integer-time hypertables are not supported by from_hypertable; only timestamptz, timestamp and date dimensions are. An integer dimension''s chunk ranges live in range_start_integer, which the chunk-by-chunk copy does not read, so the copy would move nothing, and the handoff to transmute is by time interval.',
+      p_hypertable, v_dim_col, v_dim_type;
+  end if;
+end $$;
+
 -- from_hypertable_preflight: the refusal checks, factored out so they are callable on their own (a
 -- dry-run gate) and unit-testable inside a transaction. Raises a pgpm-prefixed error on any blocker;
 -- returns normally when the hypertable is migratable by this version (with a NOTICE estimating the disk).
@@ -126,6 +165,12 @@ begin
   if v_ctl_attnum is null then
     raise exception 'pg_partition_magician: column % not found on %', p_control, p_hypertable;
   end if;
+
+  -- (3b) ...and it must BE the time dimension, and that dimension must be a timestamp type (issue #458).
+  -- Existence is not enough: a second time column passes (3) and migrates to zero rows, because the copy is
+  -- bounded on the DIMENSION's chunk ranges; an integer dimension passes (3) and copies nothing, because its
+  -- ranges are not in the column the copy reads. See _from_hypertable_check_dimension.
+  perform pgpm._from_hypertable_check_dimension(p_hypertable, p_control);
 
   -- (4) an outgoing FK the source never validated (issue #264). The migration carries outgoing FKs by
   -- replaying each definition verbatim on the private destination and then VALIDATEing it, so a NOT VALID
@@ -614,6 +659,12 @@ begin
   select n.nspname, c.relname into v_nsp, v_rel
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_hypertable;
   v_dest := v_rel || '_pgpm_dest';
+  -- The dimension facts the copy depended on are re-checked HERE, in the irreversible phase (issue #458).
+  -- This procedure used to require only that a destination exist, and a destination left by a copy that
+  -- ran under an older version, or made by hand, reaches the DROP below without preflight ever having run.
+  -- Only the two dimension checks, not the whole preflight: its disk and time NOTICEs describe a copy that
+  -- has already happened, and its foreign-key eligibility was settled before that copy did any work.
+  perform pgpm._from_hypertable_check_dimension(p_hypertable, p_control);
   -- Keep the OID this check resolved, not just the fact that something answered (#422). The swap
   -- below renames this relation INTO the source's name, so it is the half of the swap that ends with
   -- a relation BECOMING the production table -- and between here and there the destination is

@@ -261,8 +261,11 @@ level (a plain `CALL`, never inside a surrounding transaction or an atomic block
 
 Scope and caveats:
 
-- A single time/`RANGE` dimension. **Continuous aggregates** and **space partitioning** (more than one
-  dimension) are refused up front.
+- A single time/`RANGE` dimension on a `timestamptz`, `timestamp` or `date` column, migrated on that column:
+  `p_control` must be the dimension column, because the copy is bounded on the dimension's chunk ranges and
+  on any other column it would silently lose rows. **Continuous aggregates**, **space partitioning** (more
+  than one dimension), **integer-time** dimensions and a `p_control` other than the dimension are refused up
+  front.
 - The control column's key is whatever `transmute` reuses: a primary key or unique constraint that includes
   it, else **keyless** (the common hypertable shape, since `create_hypertable` makes the time column
   `NOT NULL` but adds no key). Identity columns, generated columns, `CHECK` constraints, defaults, and
@@ -298,7 +301,7 @@ pgpm.from_hypertable(
 The one-shot driver: runs `from_hypertable_copy` then `from_hypertable_cutover` back to back. Use it when the
 migration does not need to interleave application writes between the phases. `p_interval` and the
 `p_obtain`/`p_retain`/`p_anchor`/`p_paused` parameters pass straight through to `transmute`; `p_drain_batch` is this module's own
-to `transmute` (see there); `p_control` is the time column; `p_track_changes` and `p_predrain` are described
+to `transmute` (see there); `p_control` is the time dimension column; `p_track_changes` and `p_predrain` are described
 under `from_hypertable_copy` and `from_hypertable_cutover`. When `p_retain` is left `null`, the source's
 `drop_chunks` policy interval (if any) is carried in.
 
@@ -448,10 +451,16 @@ The refusal gate, factored out so you can dry-run it inside a transaction. Raise
 normally otherwise. **Refuses** when: the `timescaledb` extension is absent; `p_hypertable` is not a
 hypertable; it has one or more **continuous aggregates** (no native-partition equivalent, and dropping them is
 data-destructive); it has more than one **dimension** (space partitioning); the `p_control` column does not
-exist; an **outgoing** foreign key is `NOT VALID`; or an **incoming** foreign key references anything other
-than the key pgpm will reuse. On success it raises a `NOTICE` estimating the transient extra disk the migration needs (see
-`from_hypertable_disk_estimate`) and a rough copy-time ETA (see `from_hypertable_time_estimate`). Both
-`from_hypertable_copy` and `from_hypertable` call it first.
+exist; `p_control` is **not the time dimension** column (the copy is bounded chunk by chunk on the dimension's
+ranges, so on any other column it would silently lose rows; the message names the actual dimension); the
+dimension is **integer-time** (`smallint`, `integer` or `bigint`: only `timestamptz`, `timestamp` and `date`
+dimensions are supported, because an integer dimension's chunk ranges are not in the column the copy reads,
+so it would copy nothing); an **outgoing** foreign key is `NOT VALID`; or an **incoming** foreign key
+references anything other than the key pgpm will reuse. On success it raises a `NOTICE` estimating the
+transient extra disk the migration needs (see `from_hypertable_disk_estimate`) and a rough copy-time ETA (see
+`from_hypertable_time_estimate`). Both `from_hypertable_copy` and `from_hypertable` call it first, and
+`from_hypertable_cutover` repeats the two dimension checks in its own right, since a destination left by an
+earlier copy is enough to reach the cutover's drop without preflight having run.
 
 #### Foreign keys
 
