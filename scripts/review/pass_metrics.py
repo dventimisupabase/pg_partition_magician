@@ -98,6 +98,12 @@ def stopping_status(m):
     return rows
 
 
+def md_cell(text):
+    """A table cell: escape `_` and `|` so identifiers like _grid_next do not read as emphasis or a column
+    break (pass 2's record failed markdownlint MD037 on exactly that)."""
+    return (text or "").replace("|", "\\|").replace("_", "\\_")
+
+
 def fmt(x, nd=2):
     return "n/a" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
 
@@ -124,14 +130,14 @@ def record(m, a):
     ]
     for f in sorted(m["finding_rows"], key=lambda r: (r["tier"], r["id"])):
         issue = f"#{f['issue']}" if f["issue"] else ""
-        lines.append(f"| {f['tier']} | {f['id']}: {f['scenario']} | {issue} | |")
+        lines.append(f"| {f['tier']} | {f['id']}: {md_cell(f['scenario'])} | {issue} | |")
     lines += ["", "## Null results (by lens)", "", "(from the finders' null-results files)", "",
               "## Fell in verification", ""]
     lines += [f"- {r['id']}: {r['reason']}" for r in m["fell_rows"]] or ["none"]
     lines += ["", "## Known and open", ""]
     lines += [f"- {r['id']}: #{r['issue']}" for r in m["known_rows"]] or ["none"]
     lines += ["", "## Hypotheses (not counted)", ""]
-    lines += [f"- {r['id']} ({r['finder']}): {r['scenario']}" for r in m["hypothesis_rows"]] or ["none"]
+    lines += [f"- {r['id']} ({r['finder']}): {md_cell(r['scenario'])}" for r in m["hypothesis_rows"]] or ["none"]
     lines += ["", "## Stopping criteria status", "", "This pass's half; the criteria need the previous pass as well.", ""]
     lines += [f"- {name}: {'met' if ok else 'NOT met'}" for name, ok in stopping_status(m)]
     if getattr(a, "root_causes_file", None):
@@ -176,6 +182,7 @@ def selftest():
     rec = record(m, A)
     assert "recall 0.50; claims 5; findings 1; precision 0.40" in rec, rec
     assert "| 1 | F1-02: rows lost | #500 | |" in rec
+    assert md_cell("a _grid_next | b") == "a \\_grid\\_next \\| b"
     assert "S2 untransmute_no_recheck_under_lock (concurrency, T1)" in rec
     assert "root causes: 1 distinct verifier root-cause statements behind the findings; grouped into 1 classes below" in rec
     assert "- F2-02: #439" in rec and "- F2-03 (F2):" in rec
