@@ -297,6 +297,90 @@ TRANSMUTE_MONOLITH_NAME_RE = re.compile(
     r"      v_nsp, v_monolith, v_lo_native, v_hi_native;\n  end if;\n",
     re.DOTALL,
 )
+# The three places #511 made pgpm.archive_ledger follow the partition rather than a stale name, each
+# held here whole (comment and code) so the mutant reads as code that never had the rule, not as a
+# comment describing a statement that is no longer there. One constant per mechanism, because the
+# guard has a direct assertion for each and a refactor that drops one should be named for it.
+ARCHIVE_LEDGER_ORPHAN_SWEEP = """  -- COVERAGE UNDER A NAME NO LONGER TRACKED IS DISCARDED (issue #511). The ledger is keyed
+  -- (parent_table, lo) and matched to its partition by child_name, so coverage is attached to a
+  -- NAME, and a name can stop meaning what it meant without the ledger hearing about it: an operator
+  -- renames a partly archived partition and updates pgpm.part.child_name (the procedure the guide
+  -- used to document, and nothing else), or a pgpm older than this fix regrained a partly archived
+  -- child and dropped the source with its chunks still recorded. Either way the rows now sit under a
+  -- name that is not a tracked partition of this parent, over a range that a tracked partition
+  -- holds, and that partition's own first chunk starts at the same lo: the INSERT below collides on
+  -- archive_ledger_pkey, this whole step raises, maintain() logs skip_archive, and at archive_batch's
+  -- default of 1 nothing of this parent is archived or retired again. A wedge that never clears.
+  --
+  -- Discarding is the only honest resolution, for the reason #452 gives: a watermark describes a
+  -- partition's contents only because the write block has been on THAT relation since the first
+  -- chunk, and nothing guarded the relationship between these rows and the partition that now holds
+  -- the range. Adopting them would let a row written between the change and the block be dropped
+  -- unarchived; the partition archives again from its own lo instead. Rows under an untracked name
+  -- that overlap NO tracked partition are left alone: retire() leaves each dropped partition's
+  -- chunks in place as the record of where its rows went, and those never collide with anything.
+  -- Per name rather than per row, so one relation's coverage is discarded whole and the log says
+  -- which relation it was; same action as the #452 discard, because it is the same statement about
+  -- the ledger ("this coverage cannot be vouched for"), with `method` saying why.
+  --
+  -- Where pgpm itself changes a name or replaces a partition it keeps the ledger consistent in the
+  -- same transaction (regrain_step's transitional rename carries the rows, its swap retires the
+  -- source's), so on a current install this finds only what an operator or an older pgpm left.
+  for r in execute format(
+    'select l.child_name, count(*) as chunks, min(l.lo::%1$s)::text as lo, max(l.hi::%1$s)::text as hi
+       from pgpm.archive_ledger l
+      where l.parent_table = %2$L::regclass
+        and l.child_name is not null
+        and not exists (select 1 from pgpm.part p
+                         where p.parent_table = l.parent_table and p.child_name = l.child_name)
+        and exists (select 1 from pgpm.part t
+                     where t.parent_table = l.parent_table
+                       and l.lo::%1$s < t.hi::%1$s and l.hi::%1$s > t.lo::%1$s)
+      group by l.child_name',
+    v_ncast, p_parent::text)
+  loop
+    delete from pgpm.archive_ledger where parent_table = p_parent and child_name = r.child_name;
+    insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+      values (p_parent, 'archive_coverage_reset', r.lo, r.hi, r.chunks,
+              format('%s archived chunk(s) were recorded for %I.%I, which is no longer a tracked partition of %s, over a range a tracked partition now holds; nothing guarded that coverage across the change, so it is discarded and the partition holding the range archives from its own lo',
+                     r.chunks, v_nsp, r.child_name, p_parent::text));
+  end loop;
+
+"""
+
+REGRAIN_SWAP_LEDGER_RETIRE = """  -- The source's archive coverage goes with it (#511). A partly archived child can be regrained
+  -- (#278), and its chunks sit in pgpm.archive_ledger keyed (parent_table, lo) under its name. Left
+  -- there, they describe a relation that no longer exists, and the first fine child starts at the
+  -- same lo, so its first chunk's INSERT collides on the primary key: _archive_step raises every tick
+  -- and nothing of this parent is archived or retired again. Retire them here, in the swap's own
+  -- transaction, rather than leave them for _archive_step's orphan discard: the first fine child of a
+  -- #266-renamed source takes the source's OLD bare name, so a row left under that name is not an
+  -- orphan the discard can see but a chunk recorded for a different relation sitting under a live
+  -- partition's name, with only _enforce_write_blocks' no-block reset (#452) between it and being
+  -- adopted as that partition's watermark. The ledger should not lean on a backstop for a state the
+  -- swap can simply not leave behind. The fine children hold every row and archive from their own lo
+  -- under their own blocks; the objects the source's chunks already wrote stay in the archive,
+  -- unreferenced.
+  delete from pgpm.archive_ledger where parent_table = p_parent and child_name = v_child_name;
+  get diagnostics v_rec = row_count;
+  if v_rec > 0 then
+    insert into pgpm.log (parent_table, action, lo, hi, rows, method)
+      values (p_parent, 'archive_coverage_reset', v_lo, v_hi, v_rec,
+              format('%s archived chunk(s) were recorded for %I.%I, which this regrain replaced with %s fine partition(s) and dropped; discarded, and each fine partition archives from its own lo',
+                     v_rec, v_nsp, v_child_name, v_made));
+  end if;
+"""
+
+REGRAIN_RENAME_LEDGER_CARRY = """    -- ...and its archive coverage with it (#511). pgpm.archive_ledger matches chunks to their partition
+    -- by child_name, so rows left under the old name are coverage nothing tracks: _archive_step's
+    -- orphan discard would throw them away on the next tick and re-export the prefix, and the old bare
+    -- name is exactly what the first fine sub-range is about to be called, so after the swap they
+    -- would sit under a live partition's name as a watermark recorded for a different relation, with
+    -- only the #452 no-block reset between them and adoption. Same relation, same transaction, block
+    -- untouched, so carrying the rows keeps every #452 invariant.
+    update pgpm.archive_ledger set child_name = v_src_name
+     where parent_table = p_parent and child_name = v_child_name;
+"""
 
 MUTATIONS = {
     "transmute_no_commits": (
@@ -1592,6 +1676,35 @@ $$;''',
           "                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col, cfg.control_column)\n",
           "    execute format('select min(%I)::text from %I.%I t where t.%I > %L',\n"
           "                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col)\n", 1)],
+    ),
+    "archive_ledger_no_orphan_sweep": (
+        "bench/archive_ledger_identity.sh",
+        "Pre-#511 _archive_step: coverage recorded under a child_name that is no longer a tracked "
+        "partition of the parent is left in the ledger. The ledger is keyed (parent_table, lo), so the "
+        "partition that now holds that range collides on archive_ledger_pkey with its own first chunk, "
+        "the step raises, maintain logs skip_archive every tick, and at archive_batch 1 nothing of the "
+        "parent is archived or retired again. tests/125 case B (a partly archived partition renamed with "
+        "pgpm.part.child_name updated and nothing else, the procedure the guide used to document) is what "
+        "catches it.",
+        [(ARCHIVE_LEDGER_ORPHAN_SWEEP, "", 1)],
+    ),
+    "regrain_swap_keeps_source_ledger": (
+        "bench/archive_ledger_identity.sh",
+        "Pre-#511 regrain swap: the source's pgpm.part row is deleted and the source dropped, but its "
+        "pgpm.archive_ledger chunks stay recorded under its name. The tick's own orphan discard then clears "
+        "them, so the run still completes; what names this mutant is tests/125 case A asserting, BEFORE any "
+        "maintenance tick, that nothing is left under the source's name and that the swap logged one "
+        "archive_coverage_reset for it, and case D asserting the same for a #266-renamed source.",
+        [(REGRAIN_SWAP_LEDGER_RETIRE, "", 1)],
+    ),
+    "regrain_rename_orphans_ledger": (
+        "bench/archive_ledger_identity.sh",
+        "Pre-#511 #266 transitional rename: pgpm.part.child_name is updated to the source's on-target-grid "
+        "name, pgpm.archive_ledger.child_name is not, so a partly archived source's coverage is left under "
+        "a name nothing tracks (and, once the swap frees it, the first fine child's name). tests/125 case D "
+        "asserts right after the preparing step that the chunk is recorded under the new name and nothing "
+        "under the old.",
+        [(REGRAIN_RENAME_LEDGER_CARRY, "", 1)],
     ),
 }
 

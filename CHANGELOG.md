@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+- **Archive coverage follows the partition, not a stale name** (#511). `pgpm.archive_ledger` is keyed
+  `(parent_table, lo)` and matches chunks to their partition by `child_name`, and two things changed
+  what a name meant without touching it. `regrain`'s swap dropped a partly archived source (allowed since
+  #278) and deleted its `pgpm.part` row but left its chunks recorded under its name, so the first fine
+  child's first chunk, at the same `lo`, collided on `archive_ledger_pkey`: `_archive_step` raised out of
+  every tick (`skip_archive`, `duplicate key`), and no partition of that parent was archived or retired
+  again. The documented rename procedure (update `pgpm.part.child_name` "and nothing else") orphaned a
+  partly archived partition's chunks the same way, so archiving restarted from `lo` under the new name
+  and collided with the old name's row, every tick, for good. Both were wedges that never cleared.
+
+  `_archive_step` now discards coverage recorded under a `child_name` that is no longer a tracked
+  partition of the parent when it overlaps a range a tracked partition holds, logged once per name as
+  `archive_coverage_reset`, and the live partition archives from its own `lo` (nothing guarded that
+  coverage across the change, the same reasoning as #452; chunks of retired partitions overlap nothing
+  and are left as the record of where their rows went). Where pgpm itself changes a name or replaces a
+  partition it keeps the ledger consistent in the same transaction: the swap retires the source's chunks
+  with its `pgpm.part` row, and the #266 transitional rename carries them to the new name (the old bare
+  name is what the first fine child is then called, so a row left there would sit under a live name with
+  only #452's no-block reset between it and adoption). The guide and runbook now document the rename as
+  updating `pgpm.part.child_name` and `pgpm.archive_ledger.child_name` together, which keeps coverage
+  attached and resumes archiving from the watermark instead of exporting the prefix twice; the old
+  procedure no longer wedges, it re-exports. `tests/125_archive_ledger_identity_test.sql` pins all four
+  paths by which ids were handed under which name; `bench/archive_ledger_identity.sh` runs it against the
+  mutants `archive_ledger_no_orphan_sweep`, `regrain_swap_keeps_source_ledger` and
+  `regrain_rename_orphans_ledger`, one per mechanism, and each must fail it.
 - **A uuidv7 table can be regrained, archived and retired again: nothing reads its control column
   with `max()` or `min()` any more** (#507). PostgreSQL has no `max(uuid)` or `min(uuid)` aggregate
   before 18, and three reads of a uuidv7 table's newest or next control value used exactly those.

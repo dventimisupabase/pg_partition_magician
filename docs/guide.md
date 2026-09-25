@@ -638,9 +638,27 @@ every step that would act on the name checks it first: you get `fail_write_block
 `fail_archive_identity` or `fail_retain_identity` in the log, depending on how far the partition got,
 and a partition that stays put rather than a wrong object in your bucket and a drop authorised by it.
 All three stay wedged until you sort the name out. If you do need to rename one, update
-`pgpm.part.child_name` in the same transaction and nothing else: a rename does not change an oid, so
-the recorded identity is still right afterwards. That is exactly what `regrain`'s own transitional
-rename does.
+`pgpm.part.child_name` and `pgpm.archive_ledger.child_name` in the same transaction: a rename does
+not change an oid, so the recorded identity is still right afterwards, and the ledger matches a
+partition's archived chunks by name, so carrying the name keeps its coverage attached and archiving
+resumes from where it left off. That is exactly what `regrain`'s own transitional rename does.
+
+```sql
+begin;
+alter table public.events_p2026_03 rename to events_2026_03_history;
+update pgpm.part          set child_name = 'events_2026_03_history'
+ where parent_table = 'public.events'::regclass and child_name = 'events_p2026_03';
+update pgpm.archive_ledger set child_name = 'events_2026_03_history'
+ where parent_table = 'public.events'::regclass and child_name = 'events_p2026_03';
+commit;
+```
+
+If the ledger is left behind (the procedure as this guide used to document it), pgpm does not wedge on
+it:
+the next archive tick finds coverage under a name that is no longer a tracked partition, over a
+range the renamed partition holds, discards it (logged once as `archive_coverage_reset`, with the
+old name in `method`) and archives the partition again from its `lo`. Nothing is lost either way;
+the difference is whether the chunks already exported are exported a second time.
 
 `status().retain_backlog` tracks partitions still waiting on their turn to drop; it falling tick over
 tick is normal draining (either a paced backlog or archiving still catching up), while flat with

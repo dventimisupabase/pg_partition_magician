@@ -845,8 +845,9 @@ flight. Let it finish, or stop it with [`regrain_cancel`](#regrain_cancel), then
 A child whose range is exactly one grid step wide carries the plain `_p<lo>` name, which is also what its
 own first fine sub-range would be called. Regrain renames such a child to its explicit-range form
 (`_p<lo>_to_<hi>`) before splitting it, logged as `regrain_rename`, so the sub-range names are free. The
-rename is metadata-only, the child is dropped at the swap anyway, and `pgpm.part` is updated with it, so
-the only visible effect is the transitional name. Anything driving a regrain across ticks by hand should
+rename is metadata-only, the child is dropped at the swap anyway, and `pgpm.part` and
+`pgpm.archive_ledger` are updated with it (a partly archived source keeps its coverage under the new
+name), so the only visible effect is the transitional name. Anything driving a regrain across ticks by hand should
 re-read the child name from `pgpm.part` rather than assuming it; `regrain`, `regrain_history` and
 auto-regrain all do.
 
@@ -873,7 +874,13 @@ swap, since `retain` would drop those rows unconditionally the moment they becam
 partition until archiving has fully covered it, so discarding it would destroy exactly the rows that gate
 is protecting. Once materialized, the ordinary pipeline applies: `maintain` write-blocks it,
 archives it, and `retire` drops it once covered. The cost is copying rows that are about to be dropped,
-which is paid only on tables that archive. The
+which is paid only on tables that archive. A source that was itself **partly archived** when the regrain
+ran (its write block on, some chunks in `pgpm.archive_ledger`) has those chunks retired by the swap along
+with its `pgpm.part` row, logged as `archive_coverage_reset` with the source's name: the ledger is keyed
+`(parent_table, lo)`, so left in place they would collide with the first fine child's own first chunk,
+and they describe a relation that no longer exists. The fine children hold every row and archive from
+their own `lo` under their own blocks; the objects the source's chunks already wrote stay in the archive,
+unreferenced by the ledger. The
 source stays whole and **attached** until that swap, so a read of the parent is never short.
 
 The skip is decided once, as the cursor passes the sub-range, and the swap **re-checks it** against the
@@ -1169,7 +1176,14 @@ byte-budget chunker: never archive a whole large partition as one giant operatio
   `_run_archive_strategy`, checks the returned `covered_hi` against that chunk (see
   [the archive step's contract check](#the-archive-steps-contract-check)), and records the result in
   `pgpm.archive_ledger`. A child without the trigger yet is never touched, however far past the byte
-  budget's reach it sits.
+  budget's reach it sits. Before picking candidates it discards coverage recorded under a `child_name`
+  that is no longer a tracked partition of the parent when that coverage overlaps a range a tracked
+  partition holds (a partition renamed without carrying the ledger, or a source an older `regrain`
+  dropped without retiring its chunks): the ledger is keyed `(parent_table, lo)`, so such rows would collide with the live
+  partition's own first chunk, and nothing guarded them across the change, so they cannot stand in for
+  it. Logged once per name as `archive_coverage_reset`; the live partition archives from its own `lo`.
+  Rows under an untracked name that overlap no tracked partition are left where they are: `retire()`
+  leaves every dropped partition's chunks in the ledger as the record of where its rows went.
 - `config.archive_batch` (default **1**; `null` = unbounded) caps how many *different* partitions
   one `_archive_step` call touches -- the same shape as `retain_batch` (nullable `int`, `null`
   means unlimited, caps attempts not successes), but a different default, and for a reason worth
@@ -1883,7 +1897,7 @@ having to enumerate them, and no failure can hide inside a prefix match on a suc
 | `drop_incoming_fk` / `suspend_incoming_fk` / `restore_incoming_fk` / `validate_incoming_fk` | preserve-FK lifecycle events |
 | `from_hypertable_carry_fk` | (`pgpm_hypertable` only) an outgoing FK re-added onto the migrated destination during `from_hypertable_copy` |
 | `forget_missing` | `forget_missing()` cleared a parent's registration because its relation no longer exists; `rows` carries how many partition rows were cleared with it |
-| `archive_coverage_reset` | `pgpm.archive_ledger` rows for a partition were found with no write block on it and discarded, since coverage nothing has been guarding cannot be trusted; `rows` carries how many chunks. Archiving starts over from the partition's `lo` once it is blocked again (see [`maintain`](#maintain)) |
+| `archive_coverage_reset` | `pgpm.archive_ledger` rows were discarded because the coverage they record cannot be vouched for; `rows` carries how many chunks and `method` says why. Three causes: the partition they were recorded for has no write block on it (coverage nothing has been guarding, see [`maintain`](#maintain)); they were recorded under a `child_name` that is no longer a tracked partition of the parent, over a range a tracked partition now holds (a partition renamed without carrying the ledger, see [the archive step](#byte-budget-chunked-archiving)); or a `regrain` swap dropped a partly archived source, whose chunks go with it (see [`regrain`](#regrain)). In every case the partition holding the range archives again from its own `lo` |
 | `warn_obtain_unscheduled` | logged at most once per `maintain_all` sweep, with a null `parent_table`, when the `pgpm` cron job exists but `pgpm_obtain` doesn't -- obtain is silently not running |
 | `skip_obtain` / `skip_retain` / `skip_regrain` / `skip_regrain_capture` / `skip_archive` / `skip_write_block` / `skip_restore_fk` / `skip_validate_fk` | a step deferred (lock race or transient error; `method` carries the reason) |
 | `skip_write_block_lift` | a partition retention no longer reaches kept its write block, because `pgpm.archive_ledger` already covers it and that coverage is only true while nothing can write to it. Logged once per partition, on the first tick that would otherwise have lifted the block; `method` says how to make the partition writable again (see [`maintain`](#maintain)) |
