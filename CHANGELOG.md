@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **`transmute` and `set_retain` refuse a negative retain** (#451). Neither `transmute` overload
+  checked the sign of `p_retain`, so `p_retain => interval '-1 day'` (or `-1000` on an `id` grid)
+  registered a retention horizon in the future, and the first maintenance tick write-blocked and dropped
+  every partition, the one taking writes included; the next insert failed with `no partition of
+  relation ... found for row`. Both overloads now raise before anything is committed, and `set_retain`
+  refuses a negative value unconditionally: before, only its would-drop guard stood in the way, and that
+  guard compares boundaries, so a value that grid-floored to the current boundary (retain 0 to -400 at a
+  frontier of 2501, step 1000) went through and armed a later tick. Zero is unchanged and legitimate: its
+  horizon is the write partition's own floor, so it keeps that partition and ages everything behind it.
+  As defence in depth for a `config.retain` edited by hand, `_retain_boundary` and `regrain_step` refuse
+  to compute a horizon from a negative value: a tick against such a row logs `skip_write_block` and
+  `skip_retain` (and `skip_regrain`, when auto-regrain reaches it) carrying the message and drops
+  nothing, `status()` stays up with `retain_backlog` null for that table, and `set_retain` can still
+  repair it. A positive retain shorter than one `partition_step` is unaffected. New internal
+  `pgpm._retain_nonnegative(kind, retain)`; internal, so no promise attaches to it.
 - **`untransmute` decides its one-way door under the lock that acts on it (#443).** It refuses when any
   row lives outside the original monolith, and that refusal was decided once, under `ACCESS SHARE`, by a
   check that cannot see another session's uncommitted insert; the detach and drop that acted on the

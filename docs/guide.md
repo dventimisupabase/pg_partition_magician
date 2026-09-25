@@ -498,7 +498,10 @@ clear error until PGFR is installed. See the
 
 Set a policy at transmute time (`p_retain`) or later with `pgpm.set_retain(p_parent, p_retain)`, and
 maintenance drops partitions past it. Retain is an interval for `time`/`uuidv7`/`text_time` and a count
-of intervals for `id`. `null` keeps everything.
+of ids for `id` (it is subtracted from the frontier, the highest id written). It must not be negative: a
+negative value is refused by both, because it puts the horizon past the partition taking writes and the
+next maintenance tick would drop every partition. Zero keeps only the partition taking writes; `null`
+keeps everything.
 
 ```sql
 select pgpm.set_retain('public.events', '90 days');

@@ -573,6 +573,20 @@ begin
 end;
 $$;
 
+-- is a retain value non-negative on its kind's scale (#451)? A count of ids for id, an interval for
+-- everything else: the same split _retain_boundary makes. A negative value is never a valid retention
+-- policy: it puts the horizon PAST the partition taking writes, so every partition is drop-eligible at once
+-- and the first tick takes the table offline. Zero is legitimate: its horizon is the write partition's own
+-- floor, so it keeps exactly that partition and ages everything behind it (tests/63 relies on it). Null is
+-- null here (no policy); callers decide what that means for them.
+create or replace function pgpm._retain_nonnegative(p_kind text, p_retain text)
+returns boolean language plpgsql immutable as $$
+begin
+  if p_kind = 'id' then return p_retain::numeric >= 0;
+  else return p_retain::interval >= interval '0'; end if;
+end;
+$$;
+
 -- where x sits between lo and hi on the native grid, as a fraction: (x - lo) / (hi - lo). The one place
 -- pgpm subtracts native values rather than comparing them; progress() uses it to turn config.regrain_cursor
 -- into an exact fraction of the coarse child's RANGE (issue #343). null for an empty range (hi <= lo), so
@@ -981,6 +995,17 @@ create or replace function pgpm._retain_boundary(cfg pgpm.config)
 returns text language plpgsql as $$
 begin
   if cfg.retain is null then return null; end if;
+  -- #451: defence in depth for a config.retain that never went through transmute or set_retain (a hand
+  -- edit; both refuse this up front). A negative value puts the horizon past the partition taking writes,
+  -- which makes every attached partition drop-eligible at once, and "everything is aged" is never a valid
+  -- state for a live table, so no horizon is produced at all. (Zero is fine: its horizon is the write
+  -- partition's own floor, which keeps that partition and ages the rest.) Inside a maintenance tick this
+  -- surfaces as skip_write_block and skip_retain rows carrying this message, and the table keeps every
+  -- partition it has; status() catches it and reports retain_backlog as null for the table; set_retain
+  -- compares the old value as null so the repair is not blocked by the thing it repairs.
+  if not pgpm._retain_nonnegative(cfg.control_kind, cfg.retain) then
+    raise exception 'pg_partition_magician: config.retain % on % is negative -- refusing to compute a retention horizon past the partition taking writes, which would make every partition drop-eligible, that one included; repair it with pgpm.set_retain', cfg.retain, cfg.parent_table;
+  end if;
   if cfg.control_kind = 'id' then
     return pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
                             (pgpm._frontier_native(cfg.parent_table)::numeric - cfg.retain::numeric)::text);
@@ -2512,6 +2537,12 @@ begin
 
   -- retention horizon (matches retain(), issue #91)
   if cfg.retain is not null then
+    -- #451: the refusal _retain_boundary makes, restated here because this is the one other place the horizon
+    -- is computed. Against a negative retain every sub-range is "aged", and an aged sub-range is skipped and
+    -- its rows DISCARDED with the coarse source at the swap, never copied: the whole child, gone.
+    if not pgpm._retain_nonnegative(cfg.control_kind, cfg.retain) then
+      raise exception 'pg_partition_magician: config.retain % on % is negative -- refusing to regrain against a retention horizon past the partition taking writes, which would discard every sub-range as aged; repair it with pgpm.set_retain', cfg.retain, p_parent;
+    end if;
     if cfg.control_kind = 'id'
       then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
                                   (v_frontier::numeric - cfg.retain::numeric)::text);
@@ -2854,6 +2885,16 @@ begin
   end if;
   if p_incoming_fks not in ('error', 'drop', 'preserve') then
     raise exception 'pg_partition_magician: p_incoming_fks must be ''error'', ''drop'', or ''preserve'' (got %)', p_incoming_fks;
+  end if;
+  -- #451: retain cannot be negative. Nothing checked its sign, so `p_retain => interval '-1 day'` (a typo
+  -- away from the intended value) registered a horizon in the FUTURE, and the first maintenance tick
+  -- write-blocked and dropped every partition, the one taking writes included; the next insert failed with
+  -- `no partition of relation ... found for row`. Refused HERE, before anything is committed, for the same
+  -- reason the lock-timeout check below is: a typo should cost nothing. Zero is allowed: it keeps only the
+  -- partition taking writes. set_retain applies the same rule, and _retain_boundary refuses a value that
+  -- reached config by any other route (a hand edit).
+  if p_retain is not null and not pgpm._retain_nonnegative(p_control_kind, p_retain) then
+    raise exception 'pg_partition_magician: p_retain cannot be negative (got %) -- a negative retain puts the retention horizon past the partition taking writes, so the first maintenance tick would drop every partition, that one included; zero keeps only the partition taking writes, null keeps everything', p_retain;
   end if;
   -- #309: validate the lock timeout HERE, before anything is committed. set_config raises on a bad value
   -- anyway, but it would do so from inside phase 1 or, worse, phase 3 -- after the O(rows) validation
@@ -4181,9 +4222,21 @@ begin
         raise exception 'pg_partition_magician: p_retain must be a valid interval for control_kind % (got %): %', cfg.control_kind, p_retain, sqlerrm;
       end;
     end if;
+    -- #451: unconditional, whatever the current value and whatever is attached. The would-drop guard below
+    -- compares BOUNDARIES, so a negative value whose boundary grid-floors to the same place as the current
+    -- one (retain 0 -> -400 at a frontier of 2501, step 1000: both floor to 2000) sailed through it, and the
+    -- horizon then jumped past the partition taking writes as soon as the frontier moved. Zero is allowed:
+    -- it keeps only the partition taking writes.
+    if not pgpm._retain_nonnegative(cfg.control_kind, p_retain) then
+      raise exception 'pg_partition_magician: p_retain cannot be negative (got %) -- a negative retain puts the retention horizon past the partition taking writes, so the next maintenance tick would drop every partition, that one included; zero keeps only the partition taking writes, null keeps everything', p_retain;
+    end if;
   end if;
 
-  v_old_boundary := pgpm._retain_boundary(cfg);
+  -- #451: a config.retain written by hand to a negative value has no honest horizon (_retain_boundary
+  -- refuses it, and every tick since has kept everything), so it is compared as null here: the repair is
+  -- held to the same arm-from-null rule as any other bounded value, rather than blocked by the bad value.
+  v_old_boundary := case when cfg.retain is not null and not pgpm._retain_nonnegative(cfg.control_kind, cfg.retain)
+                         then null else pgpm._retain_boundary(cfg) end;
   cfg.retain := p_retain;
   v_new_boundary := pgpm._retain_boundary(cfg);
 
@@ -4936,7 +4989,14 @@ begin
     -- read as "nothing is eligible" -- a claim status() cannot make. This is also the one branch that
     -- would raise, via _retain_boundary -> _frontier_native, so skipping it is what keeps status() alive.
     v_retain_backlog := case when v_missing then null else 0 end;
-    v_retain_boundary := case when v_missing then null else pgpm._retain_boundary(r) end;
+    -- #451: _retain_boundary refuses a hand-edited negative retain (see there). status() is what an
+    -- operator reads to find that out, so it stays alive and reports the backlog as null for that table,
+    -- the same no-honest-answer null as the dead-parent case; pgpm.log carries the reason.
+    begin
+      v_retain_boundary := case when v_missing then null else pgpm._retain_boundary(r) end;
+    exception when others then
+      v_retain_boundary := null; v_retain_backlog := null;
+    end;
     if v_retain_boundary is not null then
       execute format(
         'select count(*) from pgpm.part where parent_table = %L::regclass and attached and hi::%s <= %L::%s',
