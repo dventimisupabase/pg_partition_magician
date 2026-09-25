@@ -12,50 +12,16 @@ name: Perf guard
 # It asserts scan COUNTERS, not wall-clock, so there are no timing thresholds to flake on a shared runner:
 # the expected value is exactly zero.
 on:
+  # The merge queue builds main plus the queued PRs and runs this on that tree, so a queued
+  # change is tested exactly as it will land. merge_group has no paths filter by design.
+  merge_group:
+  # No paths filter: the merge queue requires this workflow's summary on every PR, and a required
+  # check that did not run blocks the PR from being queued. Sharded, the whole workflow is about as
+  # long as one pgTAP matrix job, so running it on every PR costs runner minutes, not wall-clock.
   push:
     branches: [ main ]
-    paths:
-      - 'pgpm_core/install.sql'
-      # Matched by SHAPE, not enumerated. Every guard this job runs -- through `./test.sh perf` and
-      # through the `discriminate` step that drives the archive guards too -- is a bench/*.sh, and an
-      # enumerated list silently stops covering the next one added. It already had: four guards the
-      # perf track runs (transmute_cutover_order, upgrade_in_place, frontier_drought,
-      # regrain_outgoing_fk_lock) sat outside the list, so changing one of them on its own ran no
-      # perf job at all. Found while fixing #417, which is the same defect one level down -- a
-      # hand-maintained list of what to check, drifting behind what exists, with nothing reporting it.
-      # This sweeps in a few bench scripts the job does not run; a job that runs when it need not is
-      # cheap, and one that quietly does not run is what this repo keeps paying for.
-      - 'bench/*.sh'
-      - 'bench/mutations/**'
-      - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
-      - 'tests/107_regrain_swap_reconcile_complete_test.sql'   # the file regrain_swap_reconcile.sh drives
-      - 'tests/111_grid_timezone_test.sql'       # the file grid_timezone.sh drives
-      - 'test.sh'
-      - 'docker-compose.yml'
-      - 'Dockerfile'
-      - '.github/workflows/perf.yml'
   pull_request:
     branches: [ main ]
-    paths:
-      - 'pgpm_core/install.sql'
-      # Matched by SHAPE, not enumerated. Every guard this job runs -- through `./test.sh perf` and
-      # through the `discriminate` step that drives the archive guards too -- is a bench/*.sh, and an
-      # enumerated list silently stops covering the next one added. It already had: four guards the
-      # perf track runs (transmute_cutover_order, upgrade_in_place, frontier_drought,
-      # regrain_outgoing_fk_lock) sat outside the list, so changing one of them on its own ran no
-      # perf job at all. Found while fixing #417, which is the same defect one level down -- a
-      # hand-maintained list of what to check, drifting behind what exists, with nothing reporting it.
-      # This sweeps in a few bench scripts the job does not run; a job that runs when it need not is
-      # cheap, and one that quietly does not run is what this repo keeps paying for.
-      - 'bench/*.sh'
-      - 'bench/mutations/**'
-      - 'tests/77_retain_incoming_fk_test.sql'   # the file retire_detach_substitution.sh drives
-      - 'tests/107_regrain_swap_reconcile_complete_test.sql'   # the file regrain_swap_reconcile.sh drives
-      - 'tests/111_grid_timezone_test.sql'       # the file grid_timezone.sh drives
-      - 'test.sh'
-      - 'docker-compose.yml'
-      - 'Dockerfile'
-      - '.github/workflows/perf.yml'
   workflow_dispatch:
 
 # Sharded across runners. One job that ran every guard and then every mutation took 27 minutes and was
@@ -99,3 +65,15 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Prove the guards discriminate, shard ${{ matrix.shard }}
         run: ./test.sh discriminate --shard=${{ matrix.shard }}
+
+  # One stable name for the merge queue and branch protection to require, whatever the shard count.
+  summary:
+    name: Perf summary
+    runs-on: ubuntu-latest
+    needs: [perf, discriminate]
+    if: always()
+    steps:
+      - run: |
+          [ "${{ needs.perf.result }}" = "success" ] || { echo "a perf shard failed"; exit 1; }
+          [ "${{ needs.discriminate.result }}" = "success" ] || { echo "a discriminate shard failed"; exit 1; }
+          echo "Every guard passed on correct code and failed against its own defect."

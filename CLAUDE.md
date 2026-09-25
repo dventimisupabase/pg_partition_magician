@@ -88,8 +88,8 @@ to end and only the PR's archive job caught it.
 
 CI runs a `Markdown` job (`.github/workflows/lint.yml`,
 `DavidAnson/markdownlint-cli2-action@v16`) over `**/*.md` using the rules in
-`.markdownlint.json`. `main` is unprotected, so a red Markdown check does not block a
-merge: it just sits there unnoticed. Lint locally before pushing any doc change and keep
+`.markdownlint.json`. `Markdown` is one of the checks `main` requires through the merge queue, so a
+red one blocks the merge; lint locally first rather than discovering it in the queue.
 the check green.
 
 - **Match CI's linter version.** The action pins markdownlint **v0.34.0**. Run
@@ -114,6 +114,16 @@ the check green.
   creates, and a missing entry shows up as a confident failure in a file CI cannot see.
 - **`-` or `+` at the start of a wrapped line** reads as a stray list item (MD004/MD032).
   Reword instead of introducing an em dash (house style: no em dashes anywhere).
+
+## PRs land through the merge queue
+
+`main` requires three summary checks (`Test Summary`, `Lint summary`, `Perf summary`), resolved review
+threads, and an up-to-date branch. The merge queue satisfies the last one: `gh pr merge --squash`
+enqueues the PR, GitHub builds `main` plus the queued PRs, runs every workflow on that exact tree
+(`merge_group` has no path filter, so the perf, archive and eBPF tracks all run there whatever the PR
+touched), and merges only if it is green. Do not rebase-and-rerun by hand to keep a batch honest; the
+queue does it once per group. A PR whose own checks are red or whose threads are unresolved cannot be
+queued, and a group that turns red is split and retried automatically.
 
 ## An unresolved review thread blocks a merge invisibly
 

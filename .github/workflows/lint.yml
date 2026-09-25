@@ -1,6 +1,9 @@
 name: Lint
 
 on:
+  # The merge queue builds main plus the queued PRs and runs this on that tree, so a queued
+  # change is tested exactly as it will land. merge_group has no paths filter by design.
+  merge_group:
   push:
     branches: [ main ]
   pull_request:
@@ -141,3 +144,22 @@ jobs:
               print "dollar-quote check passed"
             }
           ' pgpm_core/install.sql
+
+  # One stable name for the merge queue and branch protection to require.
+  summary:
+    name: Lint summary
+    runs-on: ubuntu-latest
+    needs: [markdown-lint, living-docs, quoted-splices, minifier, track-filters, review-tooling-selftest, shellcheck, lock-view-selftest, sql-syntax]
+    if: always()
+    steps:
+      - run: |
+          [ "${{ needs.markdown-lint.result }}" = "success" ] || { echo "markdown-lint failed"; exit 1; }
+          [ "${{ needs.living-docs.result }}" = "success" ] || { echo "living-docs failed"; exit 1; }
+          [ "${{ needs.quoted-splices.result }}" = "success" ] || { echo "quoted-splices failed"; exit 1; }
+          [ "${{ needs.minifier.result }}" = "success" ] || { echo "minifier failed"; exit 1; }
+          [ "${{ needs.track-filters.result }}" = "success" ] || { echo "track-filters failed"; exit 1; }
+          [ "${{ needs.review-tooling-selftest.result }}" = "success" ] || { echo "review-tooling-selftest failed"; exit 1; }
+          [ "${{ needs.shellcheck.result }}" = "success" ] || { echo "shellcheck failed"; exit 1; }
+          [ "${{ needs.lock-view-selftest.result }}" = "success" ] || { echo "lock-view-selftest failed"; exit 1; }
+          [ "${{ needs.sql-syntax.result }}" = "success" ] || { echo "sql-syntax failed"; exit 1; }
+          echo "Every lint job passed."
