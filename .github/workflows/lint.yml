@@ -29,8 +29,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # scripts/check_living_docs.sh holds the living docs to the code: no removed identifier, no link
+      # to a frozen artifact, no issue number in an operator doc, no version literal other than the one
+      # extension.control installs, and no pgpm.log action that nothing writes. Its --selftest runs
+      # FIRST and re-breaks a scratch copy of the docs four ways, requiring the version and log-action
+      # checks to fail against each, so a check that has stopped seeing the docs fails here rather
+      # than reporting a clean sweep of nothing. No dependencies beyond python3 for the re-break edits.
       - name: Living documentation must be true, and must not cite frozen artifacts
-        run: bash scripts/check_living_docs.sh
+        run: |
+          bash scripts/check_living_docs.sh --selftest
+          bash scripts/check_living_docs.sh
 
   quoted-splices:
     name: Quoted splices
