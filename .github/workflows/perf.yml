@@ -68,26 +68,34 @@ on:
 # `./test.sh perf` and `./test.sh discriminate` with no --shard still run everything, which is what
 # `./test.sh ci` does locally.
 jobs:
+  # The track names below are written literally, not as a matrix variable: scripts/check_track_filters.py
+  # finds a workflow's tracks by reading `./test.sh <track>` out of its run steps, and a templated track
+  # makes the whole workflow invisible to that check (it happened while writing this file).
   perf:
-    name: ${{ matrix.track }} ${{ matrix.shard }} / PG17
+    name: data-coupled lock and work guards ${{ matrix.shard }} / PG17
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # data-coupled lock and work guards on correct code
-          - { track: perf, shard: 1/3 }
-          - { track: perf, shard: 2/3 }
-          - { track: perf, shard: 3/3 }
-          # Every guard is green on correct code. That alone does not show any of them would notice a
-          # regression, and this repo has repeatedly produced guards that pass while observing nothing.
-          # These rebuild install.sql with each defect put back and require the matching guard to FAIL.
-          - { track: discriminate, shard: 1/4 }
-          - { track: discriminate, shard: 2/4 }
-          - { track: discriminate, shard: 3/4 }
-          - { track: discriminate, shard: 4/4 }
+        shard: ['1/3', '2/3', '3/3']
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Run ${{ matrix.track }} shard ${{ matrix.shard }}
-        run: ./test.sh ${{ matrix.track }} --shard=${{ matrix.shard }}
+      - name: Run the perf track, shard ${{ matrix.shard }}
+        run: ./test.sh perf --shard=${{ matrix.shard }}
+
+  # Every guard is green on correct code. That alone does not show any of them would notice a
+  # regression, and this repo has repeatedly produced guards that pass while observing nothing. These
+  # rebuild install.sql with each defect put back and require the matching guard to FAIL.
+  discriminate:
+    name: guards discriminate ${{ matrix.shard }} / PG17
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/4', '2/4', '3/4', '4/4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Prove the guards discriminate, shard ${{ matrix.shard }}
+        run: ./test.sh discriminate --shard=${{ matrix.shard }}
