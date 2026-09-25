@@ -2,7 +2,7 @@
 
 A task-oriented guide to converting a live PostgreSQL table to native `RANGE` partitioning and running
 it. For the full function and catalog reference see [reference.md](reference.md); for a visual overview
-see the [explainer](https://dventimisupabase.github.io/pg_partition_magician/).
+see the [explainer](https://neptunestation-com.github.io/pg_partition_magician/).
 
 ## Contents
 

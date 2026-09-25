@@ -7,7 +7,7 @@ other docs:
 - the [README](../README.md) is the front door;
 - the [user guide](guide.md) explains the *concepts* and how to use pgpm;
 - the [reference](reference.md) documents *every* function and catalog object;
-- the [explainer](https://dventimisupabase.github.io/pg_partition_magician/) is the visual overview;
+- the [explainer](https://neptunestation-com.github.io/pg_partition_magician/) is the visual overview;
 - **this runbook** is what you reach for at 2am, when you do not want to reconstruct a procedure from bits
   scattered across the others.
 
