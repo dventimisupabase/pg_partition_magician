@@ -3078,12 +3078,16 @@ begin
   -- columns include the control column, so the parent (step 8) adopts the monolith's kept index in place,
   -- no drop, no O(rows) rebuild. Postgres only requires a partitioned table's PK/unique key to INCLUDE
   -- the partition key (column order is irrelevant). Preference: the PRIMARY KEY when it includes the
-  -- control column (ADD PRIMARY KEY adopts the child PK index), else a UNIQUE CONSTRAINT that includes it
-  -- (ADD UNIQUE adopts the child unique-constraint index). A *bare* unique index is deliberately NOT
-  -- usable -- ADD UNIQUE would REBUILD it rather than adopt it -- so it is refused with the one metadata-
-  -- only promotion the operator runs first. The reused key makes the control column NOT NULL (a PK
-  -- guarantees it; for a unique constraint we require it, checked not scanned), so the per-column SET NOT
-  -- NULL below stays a metadata no-op. Several shapes are refused up front (before the rename, table left
+  -- control column (ADD PRIMARY KEY adopts the child PK index), else, when the table has NO primary key,
+  -- a UNIQUE CONSTRAINT that includes it (ADD UNIQUE adopts the child unique-constraint index). A primary
+  -- key that EXCLUDES the control column is refused outright, whatever unique constraints sit beside it
+  -- (#445): it cannot be carried onto a partitioned parent, and adopting a different key in its place
+  -- would leave it confined to the monolith, enforcing nothing for any row written to a forward
+  -- partition, with no error or log row to say so. A *bare* unique index is deliberately NOT usable --
+  -- ADD UNIQUE would REBUILD it rather than adopt it -- so it is refused with the one metadata-only
+  -- promotion the operator runs first. The reused key makes the control column NOT NULL (a PK guarantees
+  -- it; for a unique constraint we require it, checked not scanned), so the per-column SET NOT NULL
+  -- below stays a metadata no-op. Several shapes are refused up front (before the rename, table left
   -- untouched) rather than partitioned on a weak key.
   select a.attnum into v_ctl_attnum
     from pg_attribute a where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
@@ -3091,8 +3095,17 @@ begin
   if v_oldpk is not null and (p_control::text = any(v_oldpk)) then
     v_pkcols := v_oldpk;   -- reuse the existing PK verbatim (it already includes the partition key)
     v_add_pk := true;
+  elsif v_oldpk is not null then
+    -- A PRIMARY KEY that excludes the control column: refuse before any UNIQUE constraint is considered
+    -- (#445). This used to fall through to the unique-constraint branch below, so a PK on (id) beside a
+    -- UNIQUE on (tenant, created_at) transmuted on created_at with the parent adopting the UNIQUE and the
+    -- PK left on the monolith; every forward partition then accepted duplicate ids silently. The message
+    -- names the constraint and the control column, and prescribes the widening the docs describe. Adding
+    -- a unique constraint is deliberately NOT offered as a remedy: it is exactly the shape this refuses.
+    raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite keys, and the primary key % (%) does not include %. A primary key cannot be carried onto a partitioned table unless it includes the partition key, whatever other unique constraints the table has, so make % part of the primary key first, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen it via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE % DROP CONSTRAINT %, ADD PRIMARY KEY USING INDEX <idx>.',
+      p_parent, p_control, v_pkname, array_to_string(v_oldpk, ', '), p_control, p_control, p_parent::text, v_pkname;
   else
-    -- no usable PK: look for a UNIQUE CONSTRAINT whose key includes the control column and is neither
+    -- no PK at all: look for a UNIQUE CONSTRAINT whose key includes the control column and is neither
     -- partial nor on an expression (the same shape pgpm can enforce on a partitioned table).
     select con.conname, con.conindid, array_agg(a.attname::text order by k.ord)
       into v_reuse_conname, v_reuse_idx, v_uq_cols
@@ -3125,11 +3138,9 @@ begin
       if v_bare_uq is not null then
         raise exception 'pg_partition_magician: cannot transmute % on % -- the unique index % includes the control column but is a bare index, not a constraint, so pgpm cannot adopt it without an O(rows) rebuild. Promote it to a constraint first: ALTER TABLE % ADD CONSTRAINT %_key UNIQUE USING INDEX %; then re-run transmute. (pgpm reuses a primary key or a unique constraint, never a bare index, to keep the conversion metadata-only.)',
           p_parent, p_control, v_bare_uq, p_parent::text, v_bare_uq, v_bare_uq;
-      elsif v_oldpk is not null then
-        raise exception 'pg_partition_magician: cannot partition % on % -- pgpm does not rewrite keys, and the primary key (%) does not include %, nor does any unique constraint. Make % part of the primary key or add a unique constraint that includes it, then re-run transmute: the simplest modern data model is a single-column time-ordered key (bigint/Snowflake, UUIDv7, or ULID); to retrofit an existing key, widen it via CREATE UNIQUE INDEX CONCURRENTLY on the new columns, then ALTER TABLE ... DROP CONSTRAINT <pk>, ADD PRIMARY KEY USING INDEX <idx>.',
-          p_parent, p_control, array_to_string(v_oldpk, ', '), p_control, p_control;
       else
-        -- truly keyless: no key to reuse. pgpm still partitions it -- the parent gets no primary key or
+        -- truly keyless (a PK that excludes the control column was refused above, so v_oldpk is null
+        -- here): no key to reuse. pgpm still partitions it -- the parent gets no primary key or
         -- unique constraint, faithful to a keyless source (e.g. a plain hypertable un-hypertabled by
         -- from_hypertable). The one requirement is that the control column be NOT NULL: a partition key
         -- cannot be null, and pgpm never scans to enforce it, so a nullable control column is refused.

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **Fixed: a primary key that excludes the control column is refused whatever other unique constraints
+  the table has** (#445). `transmute` on `events(id PRIMARY KEY, created_at, UNIQUE (tenant, created_at))`
+  by `created_at` used to fall through to the unique-constraint reuse: the parent adopted the UNIQUE,
+  `events_pkey` stayed on the monolith, and every forward partition accepted duplicate `id`s with no
+  error, notice or log row. The docs said the shape was refused; it was refused only when there was
+  nothing else to adopt. It is now refused up front, before any COMMIT, with a message naming the primary
+  key constraint and the control column and prescribing the widening (`CREATE UNIQUE INDEX CONCURRENTLY`,
+  then `DROP CONSTRAINT ..., ADD PRIMARY KEY USING INDEX ...`); adding a unique constraint is no longer
+  offered as a remedy, since it is exactly the shape being refused. Unchanged: a table with no primary
+  key and a unique constraint that includes the control column still reuses that constraint, and a
+  primary key that includes it is still reused in place. Pinned by `tests/113`.
 - **`uninstall.sql` now removes regrain's change capture from your schema** (#442). The per-parent delta
   table, its trigger function and the `pgpm_regrain_capture` row trigger live in the parent's schema, not
   in `pgpm`, so `drop schema pgpm cascade` never reached them: after an uninstall during a regrain the
