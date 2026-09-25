@@ -88,8 +88,8 @@ to end and only the PR's archive job caught it.
 
 CI runs a `Markdown` job (`.github/workflows/lint.yml`,
 `DavidAnson/markdownlint-cli2-action@v16`) over `**/*.md` using the rules in
-`.markdownlint.json`. `Markdown` is one of the checks `main` requires through the merge queue, so a
-red one blocks the merge; lint locally first rather than discovering it in the queue.
+`.markdownlint.json`. `Markdown` feeds the `Lint summary` check `main` requires, so a red one keeps
+the PR out of the merge queue; lint locally first.
 the check green.
 
 - **Match CI's linter version.** The action pins markdownlint **v0.34.0**. Run
@@ -115,15 +115,16 @@ the check green.
 - **`-` or `+` at the start of a wrapped line** reads as a stray list item (MD004/MD032).
   Reword instead of introducing an em dash (house style: no em dashes anywhere).
 
-## PRs land through the merge queue
+## How PRs land
 
 `main` requires three summary checks (`Test Summary`, `Lint summary`, `Perf summary`), resolved review
-threads, and an up-to-date branch. The merge queue satisfies the last one: `gh pr merge --squash`
-enqueues the PR, GitHub builds `main` plus the queued PRs, runs every workflow on that exact tree
-(`merge_group` has no path filter, so the perf, archive and eBPF tracks all run there whatever the PR
-touched), and merges only if it is green. Do not rebase-and-rerun by hand to keep a batch honest; the
-queue does it once per group. A PR whose own checks are red or whose threads are unresolved cannot be
-queued, and a group that turns red is split and retried automatically.
+threads, and an up-to-date branch, and a ruleset puts a **merge queue** in front of it. `gh pr merge
+--squash` therefore enqueues rather than merges: GitHub builds `main` plus the queued PRs, runs every
+workflow on that exact tree (`merge_group` has no path filter, so the perf, archive and eBPF tracks all
+run there whatever the PR touched), and merges the group only if it is green, splitting and retrying a
+red one. Do not rebase-and-rerun a batch by hand; the queue does it once per group. A PR whose own
+checks are red or whose threads are unresolved cannot be queued. The queue needs an organization-owned
+repository, which is one reason this one lives under `neptunestation-com`.
 
 ## An unresolved review thread blocks a merge invisibly
 
@@ -133,7 +134,7 @@ an unresolved `chatgpt-codex-connector` review thread. Those threads do not appe
 `gh pr checks`, so query them directly:
 
 ```bash
-gh api graphql -f query='{repository(owner:"dventimisupabase",name:"pg_partition_magician"){
+gh api graphql -f query='{repository(owner:"neptunestation-com",name:"pg_partition_magician"){
   pullRequest(number:NNN){reviewThreads(first:50){pageInfo{hasNextPage}
   nodes{isResolved path comments(first:1){nodes{databaseId body}}}}}}}'
 ```

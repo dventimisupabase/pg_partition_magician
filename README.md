@@ -1,8 +1,8 @@
 # pg_partition_magician
 
-**[→ Explainer &amp; install page](https://dventimisupabase.github.io/pg_partition_magician/)**
+**[→ Explainer &amp; install page](https://neptunestation-com.github.io/pg_partition_magician/)**
 
-[![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://dventimisupabase.github.io/pg_partition_magician/)
+[![pg_partition_magician: partition a live Postgres table online](docs/screenshot.png)](https://neptunestation-com.github.io/pg_partition_magician/)
 
 Online RANGE partitioning for PostgreSQL, in **pure SQL**. No compiled extension, no superuser: install it
 by running one file. The only runtime dependency is **pg_cron**, and only to run the background job.
@@ -63,7 +63,7 @@ psql "$DATABASE_URL" -f pgpm_core/install.sql
 Re-running that file over an existing install is the supported upgrade path. `select pgpm.version()`
 reports what is installed, and `pgpm.installed` records one row per install.sql run.
 
-The [install page](https://dventimisupabase.github.io/pg_partition_magician/install.html) has dashboard
+The [install page](https://neptunestation-com.github.io/pg_partition_magician/install.html) has dashboard
 copy-paste bundles and the registry command; the [guide](docs/guide.md#install) covers all three channels
 and uninstall. `pg_cron` must be enabled for scheduled maintenance.
 
@@ -170,7 +170,7 @@ for manual, one-off archiving instead of the automatic `archive_fn` path.
 - **[Reference](docs/reference.md)**: every function and catalog object.
 - **[Runbook](docs/runbook.md)**: symptom-driven operational procedures.
 - **[Adversarial review](docs/adversarial-review.md)**: how pgpm is hunted for defects, and when to stop.
-- **[Explainer](https://dventimisupabase.github.io/pg_partition_magician/)**: the visual overview.
+- **[Explainer](https://neptunestation-com.github.io/pg_partition_magician/)**: the visual overview.
 - **[Releasing](RELEASING.md)**: what a version number covers, and how a release is cut.
 - **[Security policy](SECURITY.md)**: how to report a vulnerability, and what is in scope.
 

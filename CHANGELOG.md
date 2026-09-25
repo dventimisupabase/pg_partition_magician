@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- **PRs land through a merge queue.** Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
+- **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued
   PRs as one tree before merging, and `main` requires three stable summary checks (`Test Summary`,
   the new `Lint summary` and `Perf summary`) instead of eight job names. The perf workflow drops its
