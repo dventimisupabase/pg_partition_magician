@@ -753,6 +753,16 @@ so a burst of DML paces itself rather than landing inside the swap. If writes ou
 at `reconciling:N` rather than swapping: the source stays attached, reads are unaffected, and no unbounded
 work is done under the swap's lock.
 
+The swap has the same contract. Whatever is captured between that gate and the moment the `DETACH` takes
+its lock is reconciled under the lock until nothing is left, and the source is dropped only once no
+captured change in its range remains; if one does, the swap raises rather than drop it, the whole tick rolls
+back, the source stays attached with capture still installed, and the next tick reconciles the backlog and
+swaps. That residual can be large: a writer that already holds a row in the source keeps the `DETACH`
+waiting for as long as its transaction stays open, and everything it commits in that time lands after the
+gate. Under `maintain` the `DETACH` gives up after 200 ms (a `skip_regrain` row, retried next tick), which
+keeps the residual small; a hand-driven `regrain_step` waits without a timeout, so a large purge committing
+during that wait is reconciled under the lock in full.
+
 The first tick installs the capture and copies nothing, so budget one tick more than the microbatch count.
 
 ### `regrain_cancel`

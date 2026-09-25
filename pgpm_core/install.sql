@@ -2125,6 +2125,27 @@ begin
 end;
 $$;
 
+-- ...and how many of them lie in [p_lo, p_hi): the swap's pre-drop check (#447). Range-scoped, unlike the
+-- gate's count above, because a cross-partition UPDATE's NEW key can sit outside the child being split
+-- (see _regrain_delta_purge), and that key is not this swap's to apply. Compared in ENCODED space
+-- against _encode'd boundaries, as the purge and the reconcile do, so the control column's own type
+-- does the comparing.
+create or replace function pgpm._regrain_delta_count(p_parent regclass, p_lo text, p_hi text)
+returns bigint language plpgsql stable as $$
+declare cfg pgpm.config; v_nsp name; v_delta name; v_n bigint;
+begin
+  select * into cfg from pgpm.config where parent_table = p_parent;
+  select nsp, delta into v_nsp, v_delta from pgpm._regrain_capture_names(p_parent);
+  if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return 0; end if;
+  execute format('select count(*) from %I.%I where %3$s >= %4$L and %3$s < %5$L',
+                 v_nsp, v_delta, quote_ident(cfg.control_column),
+                 pgpm._encode(cfg.control_kind, p_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch),
+                 pgpm._encode(cfg.control_kind, p_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch))
+    into v_n;
+  return v_n;
+end;
+$$;
+
 -- Discard captured keys whose control has left this child's range: a cross-partition UPDATE moved the row
 -- out, and its OLD-key entry (still in range) already covers the removal here. Such an entry can never
 -- apply AND can never become eligible, so leaving it forever would wedge the swap gate, which counts every
@@ -2355,7 +2376,7 @@ declare
   v_cursor text; v_grid_lo text; v_sub_lo text; v_sub_hi text; v_sub_name name;
   v_lo_lit text; v_hi_lit text; v_moved bigint := 0; v_aged boolean; v_made int := 0; v_fk int := 0; r record;
   v_fk_ids bigint[];
-  v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_i int; v_delta_name name; v_busy name;
+  v_child_name name; v_src_name name; v_rec int; v_delta_n bigint; v_delta_name name; v_busy name;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -2669,12 +2690,27 @@ begin
    where parent_table = p_parent and restored_at is not null;
   v_fk := pgpm.suspend_incoming_fks(p_parent, true);
   execute format('alter table %s detach partition %s', p_parent::text, v_child::text);
-  -- #267: the correctness backstop. The DETACH above holds ACCESS EXCLUSIVE on the source, so no further
-  -- writes can arrive and this terminates. The cursor is at hi, so every captured key is now eligible.
-  -- Bounded by the gate; the loop only covers what landed between the gate and the DETACH.
-  for v_i in 1 .. 100 loop
+  -- #267: the correctness backstop. The cursor is at hi, so every captured key is now eligible, and the
+  -- DETACH above holds ACCESS EXCLUSIVE on the source, so no further writes can arrive: the delta is
+  -- finite from here and every pass consumes at least one key, which is what makes this loop terminate.
+  -- It runs until the reconcile finds nothing, NOT for a fixed number of passes (#447). The gate bounds
+  -- only what had committed before it ran; a writer already holding a row in the source keeps the DETACH
+  -- waiting, and everything it commits during that wait lands in the delta after the gate. The earlier
+  -- `for v_i in 1 .. 100` bound dropped everything past 100 * greatest(batch, 1000) such keys with the
+  -- source, silently: measured, 49,851 committed rows gone after a clean `swapped:30`.
+  loop
     exit when pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_hi, greatest(v_batch, 1000)) = 0;
   end loop;
+  -- ...and prove it before the DROP. The source is the authority for every captured key, so dropping it
+  -- with one still pending is data loss with no error anywhere. Raising here rolls the swap back whole,
+  -- which is its documented atomicity: the source stays attached, the captured keys stay in the delta,
+  -- and the next tick reconciles them and swaps. Scoped to [lo, hi), for the reason given on the
+  -- three-argument _regrain_delta_count.
+  v_delta_n := pgpm._regrain_delta_count(p_parent, v_lo, v_hi);
+  if v_delta_n > 0 then
+    raise exception 'pg_partition_magician: internal error regraining % -- % captured change(s) in [%, %) are still pending after the swap''s residual reconcile; refusing to drop the source with changes unapplied. The swap rolls back whole: the source stays attached and the next tick reconciles the backlog before swapping.',
+      v_child_name, v_delta_n, v_lo, v_hi;
+  end if;
   for r in execute format(
     'select child_name, lo, hi from pgpm.part where parent_table = %L::regclass and not attached and lo::%s >= %L::%s and hi::%s <= %L::%s order by lo::%s',
     p_parent::text, v_ncast, v_lo, v_ncast, v_ncast, v_hi, v_ncast, v_ncast)

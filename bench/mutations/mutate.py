@@ -113,6 +113,26 @@ RESTORE_INLINE = """    if v_readded and not v_is_part then
     end if;
     -- The VALIDATE deliberately does NOT happen here (#265)."""
 
+# regrain_step's swap-time residual reconcile (#447): the loop as fixed, the pre-#447 bounded form, and
+# the pre-drop check that follows the loop. Constants because two mutations share the loop swap and only
+# one of them removes the check; the difference between them is the point.
+REGRAIN_SWAP_DRAIN_LOOP = """  loop
+    exit when pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_hi, greatest(v_batch, 1000)) = 0;
+  end loop;
+"""
+
+REGRAIN_SWAP_DRAIN_LOOP_BOUNDED = """  for v_i in 1 .. 100 loop
+    exit when pgpm._regrain_reconcile(p_parent, v_child_name, v_lo, v_hi, v_step, v_hi, greatest(v_batch, 1000)) = 0;
+  end loop;
+"""
+
+REGRAIN_SWAP_PENDING_CHECK = """  v_delta_n := pgpm._regrain_delta_count(p_parent, v_lo, v_hi);
+  if v_delta_n > 0 then
+    raise exception 'pg_partition_magician: internal error regraining % -- % captured change(s) in [%, %) are still pending after the swap''s residual reconcile; refusing to drop the source with changes unapplied. The swap rolls back whole: the source stays attached and the next tick reconciles the backlog before swapping.',
+      v_child_name, v_delta_n, v_lo, v_hi;
+  end if;
+"""
+
 # name -> (guard it must break, why this is the right defect, [(find, replace, expected_count)])
 # #344's hoist: the new parent's CREATE TABLE ... PARTITION BY RANGE, identity, owner, grants,
 # RLS, policies and comments, moved to run BEFORE either rename so none of it adds to the outage.
@@ -622,6 +642,30 @@ MUTATIONS = {
              "                                  case when p_control_kind = 'id' then p_anchor else now()::text end);\n",
              1),
         ],
+    ),
+    "regrain_swap_reconcile_bounded": (
+        "bench/regrain_swap_reconcile.sh",
+        "Pre-#447 regrain_step swap, exactly: after the DETACH the residual reconcile runs for at most "
+        "100 passes of greatest(batch, 1000) keys, and the ATTACH loop, `drop table <source>` and "
+        "`truncate <delta>` follow unconditionally, with nothing checking that the loop stopped because "
+        "the delta was empty. The gate before the DETACH bounds only what had committed before it ran; a "
+        "writer already holding a row in the source keeps the DETACH waiting and everything it commits "
+        "during that wait lands in the delta after the gate, so past 100 * batch keys the rest went with "
+        "the source, silently. tests/107 fails against this on its identity assertions after a swap that "
+        "reported `swapped:10`: 20,001 late rows missing and one deleted row resurrected.",
+        [(REGRAIN_SWAP_DRAIN_LOOP, REGRAIN_SWAP_DRAIN_LOOP_BOUNDED, 1),
+         (REGRAIN_SWAP_PENDING_CHECK, "", 1)],
+    ),
+    "regrain_swap_reconcile_bounded_checked": (
+        "bench/regrain_swap_reconcile.sh",
+        "The 100-pass bound put back with the #447 pre-drop check left in place. Not a shape that ever "
+        "shipped; it exists to prove the check is LIVE, which nothing else can: on correct code the loop "
+        "runs until the delta is empty, so the check can never fire and a typo in its raise would only "
+        "ever be found the day it was needed. Against this mutant tests/107 fails on the swap tick "
+        "itself, which raises instead of dropping the source; against the pure pre-#447 mutant above it "
+        "fails on the identity assertions after a swap that succeeded. The two failures being different "
+        "is what tells the two layers apart.",
+        [(REGRAIN_SWAP_DRAIN_LOOP, REGRAIN_SWAP_DRAIN_LOOP_BOUNDED, 1)],
     ),
     "regrain_no_outgoing_fk": (
         "bench/regrain_outgoing_fk_lock.sh",
