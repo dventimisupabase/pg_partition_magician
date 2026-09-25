@@ -602,6 +602,7 @@ run_perf() {
     "bench/set_archive_fn_return_type.sh pgpm_perf24"
     "bench/cutover_trigger_state.sh pgpm_perf20"
     "bench/datestyle_bounds.sh pgpm_perf25"
+    "bench/dropped_fk_identity.sh pgpm_perf26"
   )
   local selected=()
   local n=${#guards[@]} idx
