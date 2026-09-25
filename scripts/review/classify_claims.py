@@ -29,6 +29,8 @@ Classification, from the two runs:
   candidate       fails on both: a real defect until the verifier disproves it.
   not_reproduced  fails on neither: dropped.
   inverted        fails on the pristine commit only. Should not happen; look at the reproduction.
+  invalid_repro   the reproduction's own LIVENESS/GUARD/fixture checks failed on the review tree, so it
+                  never reached the defect and proves nothing; back to the finder.
   not_run         the tree could not be installed in the claim's container (an environment problem, not
                   the claim's): fix the environment or the claim's "container" and re-run.
 
@@ -48,6 +50,23 @@ import sys
 # arrives as " not ok 3 - ..."; anchoring at column 0 missed every pgTAP failure in pass 2's first run
 # (18 claims read as not_reproduced). Leading whitespace is allowed; a `#` comment still is not.
 NOT_OK = re.compile(r"^\s*not ok\b", re.M)
+# A pgTAP failure whose description starts with LIVENESS, GUARD or fixture is the reproduction's own
+# setup check failing, not the defect: the run did not reach the defect and proves nothing either way.
+# Pass 2: five candidates "failed" on the pristine tree only this way, and each verifier had to rebuild
+# the setup by hand before it could rule.
+NOT_OK_LINE = re.compile(r"^\s*not ok\s+\d+\s*-\s*(.*)$", re.M)
+LIVENESS = re.compile(r"^(LIVENESS|GUARD|fixture|setup|precondition)\b", re.I)
+
+
+def failure_kind(stdout, returncode):
+    """'defect' when a non-liveness assertion failed or psql errored; 'liveness' when every failed
+    assertion was a liveness/guard/fixture check; None when nothing failed."""
+    descs = NOT_OK_LINE.findall(stdout)
+    if returncode != 0:
+        return "defect"
+    if not descs:
+        return None
+    return "liveness" if all(LIVENESS.match(d.strip()) for d in descs) else "defect"
 
 
 def load_claims(claims_dir, only=None, finders=None):
@@ -112,7 +131,10 @@ class Harness:
                 with open(repro) as fh:
                     r = self.psql(container, db, ["-f", "-"], stdin=fh.read(), check=False)
                 out = r.stdout + r.stderr
-                fails = r.returncode != 0 or bool(NOT_OK.search(r.stdout))
+                kind = failure_kind(r.stdout, r.returncode)
+                fails = kind == "defect"
+                if kind == "liveness":
+                    return {"fails": False, "liveness_failed": True, "exit": r.returncode, "tail": out[-1500:]}
             else:
                 env = {**os.environ,
                        "PSQL": f"docker exec -i {container} psql -U postgres -d {db} -v ON_ERROR_STOP=1",
@@ -129,6 +151,10 @@ class Harness:
 def classify(review, pristine):
     if review.get("fails") is None or pristine.get("fails") is None:
         return "not_run"
+    if review.get("liveness_failed"):
+        return "invalid_repro"        # its own setup check failed on the review tree: proves nothing
+    if review["fails"] and pristine.get("liveness_failed"):
+        return "candidate"            # flagged below: the pristine run never reached the defect
     if review["fails"] and not pristine["fails"]:
         return "seed_hit"
     if review["fails"] and pristine["fails"]:
@@ -214,6 +240,9 @@ def run_all(claims, review_tree, pristine_tree, seeds, runner, isolator=None):
         pr = runner(pristine_tree, c, "p")
         cls = classify(rv, pr)
         rec.update({"review": rv, "pristine": pr, "class": cls})
+        if cls == "candidate" and pr.get("liveness_failed"):
+            rec["note"] = ("the pristine run failed only its liveness/guard checks, so it never reached the "
+                           "defect; the verifier must rebuild the setup before ruling")
         if cls == "seed_hit":
             resolve_seed(rec, c, seeds, isolator, runner)
         out.append(rec)
@@ -250,9 +279,12 @@ def summary(results):
     for r in results:
         counts[r["class"]] = counts.get(r["class"], 0) + 1
     lines = ["class           n", "--------------  --"]
-    for k in ("candidate", "seed_hit", "not_reproduced", "inverted", "not_run", "hypothesis"):
+    for k in ("candidate", "seed_hit", "not_reproduced", "inverted", "invalid_repro", "not_run", "hypothesis"):
         if k in counts:
             lines.append(f"{k:<15} {counts[k]:>2}")
+    for r in results:
+        if r["class"] == "candidate" and r.get("note"):
+            lines.append(f"  {r['id']}: pristine liveness failed (verifier must rebuild the setup)")
     for r in results:
         if r["class"] == "not_run":
             lines.append(f"  {r['id']}: {(r.get('review') or {}).get('error') or (r.get('pristine') or {}).get('error')}")
@@ -268,6 +300,12 @@ def selftest():
     assert classify(F, P) == "seed_hit" and classify(F, F) == "candidate"
     assert classify(P, P) == "not_reproduced" and classify(P, F) == "inverted"
     assert classify({"fails": None, "error": "install failed"}, P) == "not_run"
+    assert classify({"fails": False, "liveness_failed": True}, P) == "invalid_repro"
+    assert classify(F, {"fails": False, "liveness_failed": True}) == "candidate"
+    # liveness-only failures are not a detected defect; a mixed set is
+    assert failure_kind(" not ok 1 - LIVENESS: the tick ran\n ok 2 - rows\n", 0) == "liveness"
+    assert failure_kind(" not ok 1 - LIVENESS: x\n not ok 2 - rows lost\n", 0) == "defect"
+    assert failure_kind(" ok 1 - fine\n", 0) is None and failure_kind("", 3) == "defect"
     # `not ok` in TAP output is a failure even when psql exits 0
     assert NOT_OK.search("ok 1\nnot ok 2 - x\n") and not NOT_OK.search("ok 1\n# not ok in a comment\n")
     assert NOT_OK.search("        is        \n------------------\n not ok 9 - late key present +\n")   # psql's aligned rows
