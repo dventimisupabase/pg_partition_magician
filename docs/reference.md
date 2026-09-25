@@ -133,6 +133,11 @@ Parameters:
   convention, valid for `p_tt_radix` up to 36; a radix above that, or a different character set
   entirely (ULID's Crockford base32 skips I/L/O/U; KSUID's base62 is digits then uppercase then
   lowercase), requires spelling the alphabet out explicitly. Its length must equal `p_tt_radix`.
+  A mixed-case alphabet (KSUID's) needs the control column on a bytewise collation (`collate "C"`):
+  RANGE bounds on a `text` column compare under the column's collation, and `en_US` sorts `a` before `P`
+  where base62 puts it after. `transmute` refuses otherwise, naming the collation and the first
+  misordered digit pair; see [`check_text_time`](#check_text_time) and the
+  [guide](guide.md#pick-the-kind).
 - `p_tt_discard_bits` -- **text_time only**, default `0`. After decoding the whole
   `p_tt_prefix`-plus-`p_tt_width`-characters field as one number, discard this many of its low-order
   bits before treating what remains as the time count. `0` (the default) means the decoded field *is*
@@ -184,8 +189,10 @@ is not a timestamp/date, a `uuidv7` control is not `uuid`, or a `text_time` cont
 a `uuid` control samples as overwhelmingly random (UUIDv4) and `p_force_uuidv7` is not set; a `text_time`
 control is missing any of `p_tt_prefix`/`p_tt_width`/`p_tt_radix`/`p_tt_unit`, has a `p_tt_radix` outside
 2-36 with no `p_tt_alphabet` supplied, a `p_tt_alphabet` whose length does not match `p_tt_radix` or that
-repeats a character, a non-positive `p_tt_width`, a negative `p_tt_discard_bits`, or samples as not
-matching the declared shape and `p_force_text_time` is not set; a `uuidv7` or `text_time` control's newest
+repeats a character, a non-positive `p_tt_width`, a negative `p_tt_discard_bits`, an alphabet the control
+column's collation does not order the way base-`p_tt_radix` place value does (KSUID's base62 on an
+`en_US` column; put the column on `collate "C"`, which `p_force_text_time` does not override), or
+samples as not matching the declared shape and `p_force_text_time` is not set; a `uuidv7` or `text_time` control's newest
 value decodes to more than one partition step plus one hour past `now()` and `p_force_frontier` is not set
 (a future-dated row would pin the monolith's permanent `hi` there); a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
@@ -1588,6 +1595,14 @@ A heuristic, not a proof; this is the check `transmute` runs to gate the text_ti
 match the declared shape reports `null` rather than raising. Rows to delete or correct before a refused
 `transmute` are the ones sorting above
 `pgpm._ts_to_text_time(now() + <step> + interval '1 hour', <prefix>, <width>, <radix>, <unit>, ...)`.
+
+Refuses, with the same message `transmute` gives, when the control column's collation does not order the
+declared alphabet the way base-`p_radix` place value does (a mixed-case alphabet such as KSUID's base62
+on an `en_US` column). That is not a heuristic and no fraction is reported: RANGE bounds on a `text`
+column compare under the column's collation, so any such column would route rows to the wrong
+partition. The message names the collation (the effective database locale when the column is on the
+default), the first misordered digit pair and the remedy, `alter table ... alter column ... type text
+collate "C"`.
 
 ### `check_time_monotonic`
 

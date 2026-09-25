@@ -186,7 +186,8 @@ call pgpm.transmute('public.events', 'id', interval '1 month',
   p_tt_alphabet => '0123456789ABCDEFGHJKMNPQRSTVWXYZ');
 
 -- KSUID: no prefix, all 27 base62 digits (it encodes its whole 160-bit payload as one number, not
--- just the timestamp), seconds, a custom epoch, and discard the low 128 bits to keep only the top 32
+-- just the timestamp), seconds, a custom epoch, and discard the low 128 bits to keep only the top 32.
+-- The column must be COLLATE "C" (see below): base62 is mixed-case, and en_US does not order it.
 call pgpm.transmute('public.events', 'id', interval '1 month',
   p_tt_prefix => '', p_tt_width => 27, p_tt_radix => 62, p_tt_unit => 's',
   p_tt_alphabet => '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
@@ -203,6 +204,19 @@ appeared, and ULID/KSUID's alphabets are not the plain `0-9a-z` convention `text
 If your id is shaped like one of these but isn't quite the same (a fork, a different version), sample
 it with [`check_text_time`](reference.md#check_text_time) against your best-guess parameters before
 trusting the result -- the same way you would for any other `text_time` column.
+
+**A mixed-case alphabet needs a `COLLATE "C"` column.** A RANGE partition on a `text` column compares
+under the column's collation, and the bounds `text_time` computes are ordered by base-N place value,
+which is bytewise. Under a locale collation such as `en_US` (the default for most databases) case is a
+tertiary weight, so `a` sorts before `P` while base62 puts `a` = 36 above `P` = 25: random-payload
+KSUIDs do not sort in timestamp order, and the KSUID recipe above fails at VALIDATE with
+`check constraint "pgpm_monolith_bound" ... is violated by some row` (or, on a small table that happens
+to pass, routes rows to the wrong month, where retention drops them early). `transmute` and
+`check_text_time` compare the alphabet under the control column's collation before touching anything
+and refuse, naming the collation and the first misordered digit pair. The fix is a bytewise collation on
+the column: `alter table public.events alter column id type text collate "C"` (this rewrites the
+table), or declare the column `text collate "C"` when creating it. cuid, ULID-as-text and ObjectId use
+single-case alphabets, which every locale orders the way bytes do, so they need nothing.
 
 `transmute` commits between its phases, so it has to be called at the **top level**, never inside a
 surrounding transaction. That rules out running it from a schema-migration tool that wraps each migration

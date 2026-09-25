@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **`text_time` refuses a digit alphabet the control column's collation does not order** (#456). A RANGE
+  partition on a `text` column compares under the column's collation, while the bounds `text_time`
+  computes are ordered by base-N place value, which is bytewise. Under `en_US`, the default collation of
+  most databases, case is a tertiary weight, so `a` sorts before `P` where base62 puts `a` = 36 above
+  `P` = 25: random-payload KSUIDs do not sort in timestamp order (13% of 2,085 sorted outside their own
+  month), the guide's exact KSUID recipe failed at VALIDATE with `check constraint "pgpm_monolith_bound"
+  ... is violated by some row`, and a small table that happened to pass routed rows to the wrong month,
+  where retention would drop them early. `transmute` (before anything is touched, and not overridable by
+  `p_force_text_time`, which covers a sampling heuristic, not arithmetic) and `check_text_time` (as a
+  refusal, not a plausible fraction) now compare the alphabet's adjacent digits under the column's
+  collation at the declared width and refuse, naming the collation (the effective database locale when
+  the column is on `"default"`), the first misordered digit pair and the remedy,
+  `alter table ... alter column ... type text collate "C"`. The comparison is of width-long strings, not
+  single characters: a multi-level collation can order two characters at the case level and let a later
+  position override it (`'a' < 'A'` yet `'aZ' > 'Ab'` under `en_US`), and the string form fails exactly
+  when two digits are not separated at the primary level. cuid, ULID-as-text and ObjectId are
+  single-case and unaffected, verified rather than assumed by `tests/122`'s random-payload ULID on an
+  `en_US` column. `tests/91`'s KSUID fixture moves to a `collate "C"` column, which the guide's recipe now
+  says it must be; its payload-zero values are the month bounds themselves, so it could never have
+  caught this. New internal `pgpm._check_text_time_collation`.
 - **`_detach_reap` no longer finalizes a live concurrent detach** (#453). It finalized every partition
   flagged pending detach under a managed parent, with no check that the session running the detach was
   gone. A concurrent detach spends its whole wait phase in exactly that state, for as long as the longest
