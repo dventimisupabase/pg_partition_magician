@@ -24,6 +24,14 @@
 #      the DROP list). This asserts the conditions for the defect were present before looking for it.
 #   2. The pgpm catalog after the upgrade is IDENTICAL to a fresh install of the same code: every
 #      column of every table and view, with its type. This is the assertion the mutation breaks.
+#      And, separately and BY NAME, every routine in schema pgpm: name, identity arguments, kind and
+#      result type. `create or replace` across a changed argument list creates a second overload
+#      rather than replacing the first (issue #441), and when the new argument has a default the old
+#      call shape matches both and fails with "is not unique". This origin, a degraded FRESH install,
+#      can never carry an old signature to leave behind, so this comparison cannot catch a missed drop
+#      line here; bench/upgrade_from_release.sh upgrades a real released artifact for that. It is
+#      still made here so that any routine-level drift an upgrade does leave is a named difference in
+#      this guard's output rather than something folded silently into the column hash.
 #   3. A backfilled column's VALUE, where restoring the column empty is not good enough (issue #421).
 #      pgpm.part.child_oid is what the archive step checks a candidate's name against, and a null one
 #      reads as unanchored -- so an upgrade that recreated the column and populated nothing would
@@ -113,6 +121,15 @@ N_DEGRADE=$(echo "$DEGRADE_COLS" | grep -c ':')
 CATALOG_SQL="select md5(string_agg(table_name||'.'||column_name||':'||data_type, ',' order by table_name, column_name))
              from information_schema.columns where table_schema = 'pgpm'"
 
+# Every routine in schema pgpm, one line each: name, identity arguments, kind (f/p) and result type. Kept
+# as a LIST rather than a hash so a difference is reported by name (a stale overload reads as
+# `schedule(p_every text) f bigint`, only after upgrade). prokind is "char", which `||` will not take
+# without the cast; the cast is not decoration, an uncast version of this query errors and returns
+# nothing, and nothing-equals-nothing is a pass.
+ROUTINES_SQL="select proname||'('||pg_get_function_identity_arguments(oid)||') '||prokind::text||' '||coalesce(pg_get_function_result(oid), '')
+              from pg_proc where pronamespace = 'pgpm'::regnamespace"
+routines() { q "$1" "$ROUTINES_SQL" | LC_ALL=C sort; }
+
 # ---------------------------------------------------------------------------- fresh oracle
 docker exec "$C" psql -U postgres -q -c "drop database if exists $FRESH" >/dev/null 2>&1
 docker exec "$C" psql -U postgres -q -c "create database $FRESH" >/dev/null 2>&1
@@ -120,6 +137,12 @@ if ! install_into "$FRESH" >/tmp/up_fresh.log 2>&1; then
   echo "FAIL  the fresh oracle install did not complete"; sed 's/^/      /' /tmp/up_fresh.log; exit 1
 fi
 ORACLE=$(q "$FRESH" "$CATALOG_SQL")
+routines "$FRESH" > /tmp/up_fresh_routines.txt
+# The routine oracle must have read SOMETHING, or the identity comparison below is empty-equals-empty.
+N_ROUTINES=$(grep -c . /tmp/up_fresh_routines.txt)
+if [ "$N_ROUTINES" -lt 1 ]; then
+  echo "FAIL  the fresh oracle lists no routines at all: the routine comparison would compare nothing"; exit 1
+fi
 
 # PRECONDITION: every column this guard intends to drop must exist in a fresh install. If the product
 # drops one for real, this list is stale and the guard is quietly testing less than it claims. Fail
@@ -223,6 +246,18 @@ if ! install_into "$DB" >/tmp/up_upgrade.log 2>&1; then
 fi
 
 check "the pgpm catalog matches a fresh install exactly" "$(q "$DB" "$CATALOG_SQL")" "$ORACLE"
+
+# ASSERTION 2, the routine half (#441). Named differences, not a hash: `only after upgrade` is what a
+# stale overload looks like, `only in fresh` what a routine the upgrade failed to create looks like.
+routines "$DB" > /tmp/up_routines.txt
+if cmp -s /tmp/up_fresh_routines.txt /tmp/up_routines.txt; then
+  printf 'PASS  %-58s %s\n' "the pgpm routines match a fresh install exactly" "$N_ROUTINES routines"
+else
+  printf 'FAIL  %-58s\n' "the pgpm routines differ from a fresh install"
+  comm -23 /tmp/up_fresh_routines.txt /tmp/up_routines.txt | sed 's/^/      only in fresh:      /'
+  comm -13 /tmp/up_fresh_routines.txt /tmp/up_routines.txt | sed 's/^/      only after upgrade: /'
+  fail=1
+fi
 
 # ASSERTION 3 (#421). Reported as anchored/total so "0 rows examined" cannot read as success: the
 # expectation is built from the children this fixture actually had before the degrade, not from the

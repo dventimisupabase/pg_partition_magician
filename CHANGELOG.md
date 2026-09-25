@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **Fixed: upgrading from 0.4.0 or older left two ambiguous overloads behind** (#441). `create or
+  replace` across a changed argument list does not replace the old function; it adds a second overload
+  beside it, and four signature changes were missing their `drop function if exists` lines:
+  `restore_incoming_fks(regclass)` and `schedule(text)` (the shapes 0.2.0 through 0.4.0 shipped) and the
+  two-argument `_encode`/`_decode` (0.1.0 and 0.2.0). **An install upgraded from 0.4.0 or older to
+  0.5.0 or 0.6.0 has the first two today**, and the upgrade reported success: `select pgpm.schedule()`
+  fails with `function pgpm.schedule() is not unique`, and every `maintain` tick logs a
+  `skip_restore_fk` row with `method = 'function pgpm.restore_incoming_fks(regclass) is not unique'`,
+  so a preserve-managed incoming FK is never restored and `p_status` carries `restore_fk_deferred` for
+  good. **Re-running `install.sql` with this fix removes the stale overloads**: the fix is itself the
+  remedy for an install already upgraded, and the next tick restores the FK. Verified from every tag
+  0.2.0 through 0.5.0: the routine catalog after the upgrade is identical to a fresh install's. (0.1.0,
+  the pre-transmute `adopt` release, additionally leaves its seven `adopt`-era routines behind; those
+  are removed names rather than overloads, nothing calls them, and they are out of scope here.) New
+  guard `bench/upgrade_from_release.sh` upgrades a real released artifact, v0.2.0's `install.sql`
+  fetched from the tag, and requires routine identity with a fresh install, `schedule()` resolving, and
+  one tick restoring the FK; `bench/upgrade_in_place.sh` now compares routines by name as well.
+  Mutation: `upgrade_stale_overloads_kept`.
 - **The archive step now holds `archive_fn` to its contract (#454).** The `covered_hi` a strategy
   returned was written into `pgpm.archive_ledger` verbatim, and that ledger is `retire()`'s drop
   precondition, so a strategy bug that answered chunk `[0, 15)` with `covered_hi = 15000` marked the

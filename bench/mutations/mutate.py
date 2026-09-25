@@ -656,6 +656,29 @@ MUTATIONS = {
           "alter table pgpm.config add column if not exists archive_batch int default 1;\n"
           "alter table pgpm.config add column if not exists mutant_unlisted_col int;\n", 1)],
     ),
+    "upgrade_stale_overloads_kept": (
+        "bench/upgrade_from_release.sh",
+        "The four `drop function if exists <old signature>` lines issue #441 added are gone again, "
+        "which is install.sql exactly as 0.5.0 and 0.6.0 shipped it. `create or replace` across a "
+        "changed argument list does not replace anything: it creates a SECOND overload beside the "
+        "first, so an upgrade from 0.2.0, 0.3.0 or 0.4.0 keeps pgpm.schedule(text) beside "
+        "pgpm.schedule(text, text) and pgpm.restore_incoming_fks(regclass) beside the p_ids form. The "
+        "new parameter's default makes the old call shape match BOTH, so `select pgpm.schedule()` "
+        "fails with 'is not unique', and so does the restore_incoming_fks(p_parent) call maintain() "
+        "makes every tick -- inside a handler, so it lands as one routine-looking skip_restore_fk row "
+        "per tick and a preserve-managed FK is never restored. A fresh install is untouched (there is "
+        "nothing to drop), so the whole pgTAP suite stays green, and bench/upgrade_in_place.sh has no "
+        "stale signature to find either: its origin is a degraded FRESH install. Only a real released "
+        "origin shows it, which is what upgrade_from_release.sh installs. What must FAIL here is the "
+        "routine-identity assertion, by name, and then schedule() and the tick behind it. One entry "
+        "per line, so a stale pattern names the line that moved.",
+        [
+            ("drop function if exists pgpm.restore_incoming_fks(regclass);\n", "", 1),
+            ("drop function if exists pgpm.schedule(text);\n", "", 1),
+            ("drop function if exists pgpm._encode(text, text);\n", "", 1),
+            ("drop function if exists pgpm._decode(text, text);\n", "", 1),
+        ],
+    ),
     "frontier_data_only": (
         "bench/frontier_drought.sh",
         "Pre-#325: uuidv7's (and, since the text_time control kind, text_time's) forward frontier was "
