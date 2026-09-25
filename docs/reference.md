@@ -101,7 +101,10 @@ Parameters:
 - `p_interval` -- the grid width (`interval '1 day'`, `'1 month'`, `'1 year'`, ...). Cast a bare literal:
   `interval '1 month'` (it disambiguates from the `bigint` overload).
 - `p_obtain` -- how many partitions to keep ahead of the frontier.
-- `p_retain` -- drop partitions older than this `interval`; `null` keeps everything.
+- `p_retain` -- drop partitions older than this `interval`; `null` keeps everything. Must not be
+  negative: a negative interval is refused before anything is committed, because it would put the
+  retention horizon past the partition taking writes and the first maintenance tick would drop every
+  partition. `interval '0'` is allowed and keeps only the partition taking writes.
 - `p_regrain_batch` -- rows per regrain COPY microbatch.
 - `p_anchor` -- the grid origin the boundaries align to.
 - `p_paused` -- register paused (the default); `false` goes live immediately.
@@ -192,7 +195,8 @@ pgpm.transmute(
 
 The **id** overload, for `int`/`bigint`/`numeric` keys (including Snowflake-style ids). Also a
 `PROCEDURE`. Identical to the time overload except the grid width is a `bigint` `p_step`, `p_retain` is a
-`bigint` count of ids, and `p_anchor` is a `bigint`. There is no `p_force_uuidv7`.
+`bigint` count of ids (not negative, as for the time overload: a negative count is refused up front, and
+`0` keeps only the partition taking writes), and `p_anchor` is a `bigint`. There is no `p_force_uuidv7`.
 
 ```sql
 call pgpm.transmute('public.events', 'id', 10000000, p_obtain => 2);
@@ -1229,7 +1233,10 @@ pgpm.set_retain(p_parent regclass, p_retain text default null) returns void
 
 Change `config.retain`, the retention horizon `retain()` drops partitions past (`null` = keep forever).
 `p_retain` is validated against `control_kind` the same way `transmute` does: `numeric` for `id`, an
-interval for `time`/`uuidv7`/`text_time`.
+interval for `time`/`uuidv7`/`text_time`, and, like `transmute`, it must not be negative. A negative
+value is refused outright, whatever the current value: it puts the horizon past the partition taking
+writes, and the guard below compares boundaries, so on its own it cannot see a value that grid-floors to
+the current boundary. `'0'` is allowed and keeps only the partition taking writes.
 
 `retain` is the destructive knob -- it decides what gets `DROP`ped -- so `set_retain` **refuses**,
 rather than warns, whenever the new value would make the very next `retain()` tick drop a partition
