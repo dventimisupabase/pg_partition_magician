@@ -704,7 +704,7 @@ MUTATIONS = {
              "  -- one maintenance tick, drought or not. `id` is untouched below -- it has no clock, so its frontier\n"
              "  -- can only be where the data actually put it.\n"
              "  if cfg.control_kind in ('uuidv7', 'text_time') then\n"
-             "    return greatest(v_decoded::timestamptz, now())::text;\n"
+             "    return pgpm._ts_text(greatest(v_decoded::timestamptz, now()));\n"
              "  end if;\n"
              "  return v_decoded;\n"
              "end;\n",
@@ -712,7 +712,7 @@ MUTATIONS = {
              "                       cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);\n"
              "end;\n", 1),
             ("    if v_max_raw is null then\n"
-             "      v_frontier_native := case when p_control_kind = 'id' then p_anchor else now()::text end;\n"
+             "      v_frontier_native := case when p_control_kind = 'id' then p_anchor else pgpm._ts_text(now()) end;\n"
              "    elsif p_control_kind in ('uuidv7', 'text_time') then\n"
              "      -- #325: mirrors _frontier_native's greatest(decoded, now()) here too. pgpm.config does not exist\n"
              "      -- yet (see the note above), so this cannot just call the shared function -- and fixing only that\n"
@@ -721,12 +721,12 @@ MUTATIONS = {
              "      -- Confirmed the hard way while building text_time support: adding the kind to _frontier_native\n"
              "      -- but not here reproduces exactly that gap (an unfixed [2025-07,2025-10) monolith with the next\n"
              "      -- partition not starting until 2026-08 -- ten covered months missing entirely).\n"
-             "      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now())::text;\n"
+             "      v_frontier_native := pgpm._ts_text(greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now()));\n"
              "    else\n"
              "      v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);\n"
              "    end if;\n",
              "    v_frontier_native := coalesce(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),\n"
-             "                                  case when p_control_kind = 'id' then p_anchor else now()::text end);\n",
+             "                                  case when p_control_kind = 'id' then p_anchor else pgpm._ts_text(now()) end);\n",
              1),
         ],
     ),
@@ -868,8 +868,8 @@ begin
           "      v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step,\n"
           "                  pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,\n"
           "                                   pgpm._frontier_native(p_parent), cfg.partition_tz), cfg.partition_tz);\n"
-          "      execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',\n"
-          "                     pgpm._native_type(cfg.control_kind), p_parent::text) into v_top;\n"
+          "      execute format('select %s from pgpm.part where parent_table = %L::regclass and attached',\n"
+          "                     pgpm._max_hi_native(cfg.control_kind), p_parent::text) into v_top;\n"
           "      v_ahead := 0;\n"
           "      while v_top is not null and v_ahead < ceil(cfg.obtain / 2.0)\n"
           "            and not pgpm._native_gt(cfg.control_kind,\n"
@@ -907,8 +907,22 @@ begin
         "absolute so the mutant is exactly 'the zone parameter is not consulted', not 'the day lattice "
         "is broken again', and a catch is a catch for the right reason. tests/111's month-step pairs "
         "(computed under two session zones) and its transmute-under-New-York walk are what catch it.",
-        [("      return (((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz)::text;\n",
-          "      return (p_lo::timestamptz + make_interval(months => v_months))::text;\n", 1)],
+        [("      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);\n",
+          "      return pgpm._ts_text(p_lo::timestamptz + make_interval(months => v_months));\n", 1)],
+    ),
+    "datestyle_session_render": (
+        "bench/datestyle_bounds.sh",
+        "Pre-#500 rendering of a native timestamptz as text: _ts_text loses its DateStyle pin and renders "
+        "in the SESSION's DateStyle again, which is what every bare timestamptz::text did before it "
+        "existed. A transmute from a 'SQL, DMY' session then stores 1 October 2026 as "
+        "'01/10/2026 00:00:00 UTC' in pgpm.part.lo/hi, pgpm.log and config.partition_anchor, and a "
+        "maintain tick on the default 'ISO, MDY' reads it back as 10 January: the monolith's hi falls "
+        "below the retention horizon and retain() drops the live write partition, today's rows "
+        "included. One site, because the fix is one function: every render goes through it, so removing "
+        "the pin puts the defect back everywhere at once. tests/124's render, adapter and stored-bound "
+        "identities, all written under SQL, DMY and read back under ISO, MDY, are what catch it.",
+        [("returns text language sql stable set datestyle = 'ISO, MDY' as $$\n  select p_ts::text;\n$$;\n",
+          "returns text language sql stable as $$\n  select p_ts::text;\n$$;\n", 1)],
     ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",

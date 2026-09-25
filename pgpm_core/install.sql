@@ -651,6 +651,41 @@ begin
 end;
 $$;
 
+-- A native timestamptz as TEXT, rendered the same way from every session (#500). Every native time value
+-- pgpm stores (pgpm.part.lo/hi, pgpm.log.lo/hi, config.partition_anchor, transmute_inflight.lo/hi, the
+-- archive ledger's bounds) is text written by one session and read back with ::timestamptz by another:
+-- the operator's transmute writes, pg_cron's maintain reads. A bare ::text renders in the WRITING
+-- session's DateStyle, and under 'SQL, DMY' 1 October 2026 is '01/10/2026 00:00:00 UTC', which a session
+-- on the default 'ISO, MDY' reads back as 10 January. Every bound then meant a different instant to
+-- maintenance than it meant to the operator, and retain() dropped a monolith whose real hi was next
+-- month, today's rows included. ISO 8601 output ('2026-10-01 00:00:00+00') is the one form the parser
+-- reads identically under every DateStyle, so the SET clause pins it for the duration of this call and
+-- this call only. Parses are deliberately NOT pinned: a caller's own parse (now()::text handed straight
+-- back to _grid_floor, a control value read in the caller's session) still honours the caller's setting,
+-- which is what lets session-rendered text go INTO the adapter and canonical text come OUT of it.
+--
+-- Every site where a timestamptz becomes native text goes through here (the four dynamic max(hi) reads
+-- over pgpm.part and pgpm.archive_ledger through _max_hi_native below); a bare `::text` on such a value
+-- IS the defect. Pinned to ISO only, not to a zone: the offset carried in the text makes the instant
+-- exact whatever zone rendered it. bench/mutations/mutate.py's datestyle_session_render removes the
+-- clause to put the defect back.
+create or replace function pgpm._ts_text(p_ts timestamptz)
+returns text language sql stable set datestyle = 'ISO, MDY' as $$
+  select p_ts::text;
+$$;
+
+-- The SQL for "the greatest hi among the rows a query selects, as canonical native text" (#500): the
+-- dynamic counterpart of _ts_text for the four max(hi) reads over pgpm.part and pgpm.archive_ledger,
+-- whose native type is only known at run time. Cast BEFORE max() so the comparison is numeric or
+-- temporal, never lexicographic ('91' > '1000'), and render the time kinds through _ts_text so what
+-- comes back (and, in _next_archive_chunk, goes on to be stored as the next chunk's lo) is canonical
+-- whichever session runs the read. Spliced with %s: a fixed expression over the column hi, with no
+-- identifier in it that could need quoting.
+create or replace function pgpm._max_hi_native(p_kind text)
+returns text language sql immutable as $$
+  select case when p_kind = 'id' then 'max(hi::numeric)::text' else 'pgpm._ts_text(max(hi::timestamptz))' end;
+$$;
+
 -- is a retain value non-negative on its kind's scale (#451)? A count of ids for id, an interval for
 -- everything else: the same split _retain_boundary makes. A negative value is never a valid retention
 -- policy: it puts the horizon PAST the partition taking writes, so every partition is drop-eligible at once
@@ -767,12 +802,12 @@ begin
       k := ((extract(year from ts_wall) - extract(year from anc_wall)) * 12
           + (extract(month from ts_wall) - extract(month from anc_wall)))::bigint;
       k := (floor(k::numeric / v_months) * v_months)::bigint;
-      return ((date_trunc('month', anc_wall) + make_interval(months => k::int)) at time zone p_tz)::text;
+      return pgpm._ts_text((date_trunc('month', anc_wall) + make_interval(months => k::int)) at time zone p_tz);
     else
       -- fixed step: an absolute lattice of v_secs from the anchor instant. Zone-free by construction,
       -- and _grid_next's fixed branch adds the same v_secs, so the two can never disagree.
       k := floor(extract(epoch from (ts - anc)) / v_secs)::bigint;
-      return (anc + make_interval(secs => k * v_secs))::text;
+      return pgpm._ts_text(anc + make_interval(secs => k * v_secs));
     end if;
   elsif p_kind = 'id' then
     return (floor((p_native::numeric - p_anchor::numeric) / p_step::numeric) * p_step::numeric + p_anchor::numeric)::text;
@@ -791,7 +826,7 @@ begin
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     if v_months > 0 then
       -- calendar step, on the wall clock in p_tz: the same arithmetic _grid_floor's month branch does
-      return (((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz)::text;
+      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);
     end if;
     -- Fixed step: an absolute number of seconds, NOT `+ p_step::interval`. On a timestamptz, `+ '1 day'`
     -- is a calendar day in the session zone (23 or 25 hours across a DST transition) while _grid_floor's
@@ -799,7 +834,7 @@ begin
     -- in the grid: each lattice candidate half-overlapped a chain child and was skipped. So a "day" step
     -- is 86400 seconds here, a "week" 604800, and in a DST-observing partition_tz a daily boundary drifts
     -- an hour against local midnight twice a year. That is the price of a contiguous grid; UTC pays nothing.
-    return (p_lo::timestamptz + make_interval(secs => extract(epoch from p_step::interval)))::text;
+    return pgpm._ts_text(p_lo::timestamptz + make_interval(secs => extract(epoch from p_step::interval)));
   elsif p_kind = 'id' then return (p_lo::numeric + p_step::numeric)::text;
   else raise exception 'pg_partition_magician: unknown control_kind %', p_kind; end if;
 end;
@@ -842,10 +877,10 @@ create or replace function pgpm._decode(p_kind text, p_colvalue text,
 returns text language plpgsql immutable as $$
 begin
   if p_colvalue is null then return null; end if;
-  if p_kind = 'uuidv7' then return pgpm._uuid_to_ts(p_colvalue::uuid)::text;
+  if p_kind = 'uuidv7' then return pgpm._ts_text(pgpm._uuid_to_ts(p_colvalue::uuid));
   elsif p_kind = 'text_time' then
-    return pgpm._text_time_to_ts(p_colvalue, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit,
-                                  p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::text;
+    return pgpm._ts_text(pgpm._text_time_to_ts(p_colvalue, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit,
+                                               p_tt_alphabet, p_tt_discard_bits, p_tt_epoch));
   else return p_colvalue; end if;
 end;
 $$;
@@ -864,9 +899,9 @@ begin
   if p_raw is null then return null; end if;
   if p_cfg.control_kind = 'time' then
     if pgpm._control_naive(p_cfg.parent_table, p_cfg.control_column) then
-      return (p_raw::timestamp at time zone p_cfg.partition_tz)::text;
+      return pgpm._ts_text(p_raw::timestamp at time zone p_cfg.partition_tz);
     end if;
-    return p_raw::timestamptz::text;
+    return pgpm._ts_text(p_raw::timestamptz);
   end if;
   return pgpm._decode(p_cfg.control_kind, p_raw,
                       p_cfg.text_time_prefix, p_cfg.text_time_width, p_cfg.text_time_radix, p_cfg.text_time_unit,
@@ -939,13 +974,13 @@ begin
     raise exception 'pg_partition_magician: managed table with oid % no longer exists (dropped without pgpm.untransmute); run pgpm.forget_missing() to clear its pgpm state', p_parent::oid;
   end if;
   select * into cfg from pgpm.config where parent_table = p_parent;
-  if cfg.control_kind = 'time' then return now()::text; end if;
+  if cfg.control_kind = 'time' then return pgpm._ts_text(now()); end if;
   -- ORDER BY ... LIMIT 1 (not max()) so it works for uuid too; uses the index.
   -- Qualify with an alias so ORDER BY binds to the (typed) column, not the ::text projection.
   execute format('select t.%I::text from %s t order by t.%I desc limit 1',
                  cfg.control_column, p_parent::text, cfg.control_column) into v_max;
   if v_max is null then
-    return case when cfg.control_kind = 'id' then cfg.partition_anchor else now()::text end;
+    return case when cfg.control_kind = 'id' then cfg.partition_anchor else pgpm._ts_text(now()) end;
   end if;
   v_decoded := pgpm._decode(cfg.control_kind, v_max,
                              cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch);
@@ -958,7 +993,7 @@ begin
   -- one maintenance tick, drought or not. `id` is untouched below -- it has no clock, so its frontier
   -- can only be where the data actually put it.
   if cfg.control_kind in ('uuidv7', 'text_time') then
-    return greatest(v_decoded::timestamptz, now())::text;
+    return pgpm._ts_text(greatest(v_decoded::timestamptz, now()));
   end if;
   return v_decoded;
 end;
@@ -1213,7 +1248,7 @@ begin
     -- `- interval '1 month'` or `- '1 day'` is calendar arithmetic in the SESSION's zone, so two sessions
     -- could put the horizon on different sides of a grid boundary
     return pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                            (((now() at time zone cfg.partition_tz) - cfg.retain::interval) at time zone cfg.partition_tz)::text,
+                            pgpm._ts_text(((now() at time zone cfg.partition_tz) - cfg.retain::interval) at time zone cfg.partition_tz),
                             cfg.partition_tz);
   end if;
 end;
@@ -2079,7 +2114,7 @@ create or replace function pgpm._next_archive_chunk(p_parent regclass, p_child n
 returns table(lo text, hi text)
 language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_ncast text;
+  cfg pgpm.config; v_nsp name;
   v_child_lo text; v_child_hi text; v_lo text;
   v_avg numeric; v_batch int; v_batch_count int; v_probe_hi_col text; v_probe_hi text;
   v_next_distinct_col text; v_stop text;
@@ -2087,8 +2122,6 @@ begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
-  v_ncast := pgpm._native_type(cfg.control_kind);
-
   select p.lo, p.hi into v_child_lo, v_child_hi from pgpm.part p
    where p.parent_table = p_parent and p.child_name = p_child;
   if not found then raise exception 'pg_partition_magician: %.% is not a tracked partition', p_parent, p_child; end if;
@@ -2096,8 +2129,8 @@ begin
   -- hi is stored as text; a plain max() would compare lexicographically ('91' > '1000'), not
   -- numerically/temporally -- cast to the native type first, the same fix archive._file_watermark
   -- already needed for this exact reason.
-  execute format('select max(hi::%s)::text from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
-                 v_ncast, p_parent::text, p_child)
+  execute format('select %s from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
+                 pgpm._max_hi_native(cfg.control_kind), p_parent::text, p_child)
     into v_lo;
   v_lo := coalesce(v_lo, v_child_lo);
 
@@ -2159,7 +2192,7 @@ $$;
 -- the strategy.
 create or replace function pgpm._archive_fully_covered(p_parent regclass, p_child name)
 returns boolean language plpgsql as $$
-declare cfg pgpm.config; v_ncast text; v_child_hi text; v_watermark text;
+declare cfg pgpm.config; v_child_hi text; v_watermark text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
@@ -2170,9 +2203,8 @@ begin
 
   -- hi is text; cast to the native type before max()'ing, same reasoning (and the same fix) as
   -- _next_archive_chunk above -- a plain max() would compare lexicographically.
-  v_ncast := pgpm._native_type(cfg.control_kind);
-  execute format('select max(hi::%s)::text from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
-                 v_ncast, p_parent::text, p_child)
+  execute format('select %s from pgpm.archive_ledger where parent_table = %L::regclass and child_name = %L',
+                 pgpm._max_hi_native(cfg.control_kind), p_parent::text, p_child)
     into v_watermark;
 
   return v_watermark is not null and not pgpm._native_gt(cfg.control_kind, v_child_hi, v_watermark);
@@ -2988,7 +3020,7 @@ begin
       then v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
                                   (v_frontier::numeric - cfg.retain::numeric)::text, cfg.partition_tz);
       else v_retain_boundary := pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
-                                  (((now() at time zone cfg.partition_tz) - cfg.retain::interval) at time zone cfg.partition_tz)::text,
+                                  pgpm._ts_text(((now() at time zone cfg.partition_tz) - cfg.retain::interval) at time zone cfg.partition_tz),
                                   cfg.partition_tz);   -- on the wall clock in partition_tz, as _retain_boundary (#455)
     end if;
   end if;
@@ -3825,12 +3857,12 @@ begin
   -- and min(control), computed directly:
   -- pgpm.config does not exist yet, so _frontier_native (which reads config) cannot be used here.
   if p_control_kind = 'time' then
-    v_frontier_native := now()::text;
+    v_frontier_native := pgpm._ts_text(now());
   else
     execute format('select t.%I::text from %s t order by t.%I desc limit 1', p_control, p_parent::text, p_control)
       into v_max_raw;
     if v_max_raw is null then
-      v_frontier_native := case when p_control_kind = 'id' then p_anchor else now()::text end;
+      v_frontier_native := case when p_control_kind = 'id' then p_anchor else pgpm._ts_text(now()) end;
     elsif p_control_kind in ('uuidv7', 'text_time') then
       -- #325: mirrors _frontier_native's greatest(decoded, now()) here too. pgpm.config does not exist
       -- yet (see the note above), so this cannot just call the shared function -- and fixing only that
@@ -3839,7 +3871,7 @@ begin
       -- Confirmed the hard way while building text_time support: adding the kind to _frontier_native
       -- but not here reproduces exactly that gap (an unfixed [2025-07,2025-10) monolith with the next
       -- partition not starting until 2026-08 -- ten covered months missing entirely).
-      v_frontier_native := greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now())::text;
+      v_frontier_native := pgpm._ts_text(greatest(pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch)::timestamptz, now()));
     else
       v_frontier_native := pgpm._decode(p_control_kind, v_max_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch);
     end if;
@@ -3851,8 +3883,8 @@ begin
   -- would compute. A timestamptz text already carries its offset. pgpm.config does not exist yet, so
   -- this is the inline form of that rule, with v_typname already looked up above.
   if p_control_kind = 'time' and v_min_raw is not null then
-    v_min_raw := case when v_typname in ('timestamp', 'date') then (v_min_raw::timestamp at time zone v_tz)::text
-                      else v_min_raw::timestamptz::text end;
+    v_min_raw := case when v_typname in ('timestamp', 'date') then pgpm._ts_text(v_min_raw::timestamp at time zone v_tz)
+                      else pgpm._ts_text(v_min_raw::timestamptz) end;
   end if;
   v_min_native := coalesce(pgpm._decode(p_control_kind, v_min_raw, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch),
                            pgpm._grid_floor(p_control_kind, p_step, p_anchor, v_frontier_native, v_tz));
@@ -3912,12 +3944,12 @@ begin
       if not p_force_frontier then
         raise exception 'pg_partition_magician: % cannot be partitioned on a % grid using %: its newest value % decodes to %, which is % ahead of now() (%). A time-ordered id dated that far ahead is almost always a client with a wrong clock, and because the frontier is the newer of the data and the clock, that one value would fix the monolith''s permanent upper bound at % instead of %: every row written until then lands in the monolith, which cannot be regrained, and nothing behind it can be dropped, until the clock actually gets there. Delete or correct the rows whose % sorts above % (the value encoding now() + one step + one hour, the most a maximum may lead the clock by) and re-run, or re-run with p_force_frontier => true to accept that bound.',
           p_parent, p_control_kind, quote_ident(p_control), v_max_raw, v_max_ts, justify_interval(date_trunc('second', v_max_ts - now())), now(),
-          v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, now()::text, v_tz), v_tz),
+          v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, pgpm._ts_text(now()), v_tz), v_tz),
           quote_ident(p_control), pgpm._encode(p_control_kind, v_skew_limit::text, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_tt_alphabet, p_tt_discard_bits, p_tt_epoch, v_tz);
       end if;
       raise notice 'pg_partition_magician: the newest % value % in % decodes to %, % ahead of now(); p_force_frontier accepted it, so the monolith''s permanent upper bound is % rather than %. Rows written until then land in the monolith, and it cannot be regrained until the clock passes that bound.',
         quote_ident(p_control), v_max_raw, p_parent, v_max_ts, justify_interval(date_trunc('second', v_max_ts - now())),
-        v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, now()::text, v_tz), v_tz);
+        v_hi_native, pgpm._grid_next(p_control_kind, p_step, pgpm._grid_floor(p_control_kind, p_step, p_anchor, pgpm._ts_text(now()), v_tz), v_tz);
     end if;
   end if;
 
@@ -4406,7 +4438,7 @@ begin
     from pg_attribute a join pg_type t on t.oid = a.atttypid
    where a.attrelid = p_parent and a.attname = p_control and not a.attisdropped;
   call pgpm._transmute(p_parent, p_control, coalesce(v_kind, 'time'),
-    p_interval::text, p_anchor::text, p_obtain,
+    p_interval::text, pgpm._ts_text(p_anchor), p_obtain,
     p_retain::text, p_regrain_batch, p_paused, p_incoming_fks, p_force_uuidv7,
     p_bound_headroom, p_lock_timeout,
     p_tt_prefix, p_tt_width, p_tt_radix, p_tt_unit, p_force_text_time,
@@ -5005,7 +5037,7 @@ begin
   if v_tz is null then
     raise exception 'pg_partition_magician: % is not a time zone name in pg_timezone_names', p_tz;
   end if;
-  select max(hi::timestamptz)::text into v_top from pgpm.part where parent_table = p_parent and attached;
+  select pgpm._ts_text(max(hi::timestamptz)) into v_top from pgpm.part where parent_table = p_parent and attached;
   if v_top is not null
      and pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, v_top, v_tz)::timestamptz
          <> v_top::timestamptz then
@@ -5371,8 +5403,8 @@ begin
       v_cell := pgpm._grid_next(cfg.control_kind, cfg.partition_step,
                   pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor,
                                    pgpm._frontier_native(p_parent), cfg.partition_tz), cfg.partition_tz);
-      execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
-                     pgpm._native_type(cfg.control_kind), p_parent::text) into v_top;
+      execute format('select %s from pgpm.part where parent_table = %L::regclass and attached',
+                     pgpm._max_hi_native(cfg.control_kind), p_parent::text) into v_top;
       v_ahead := 0;
       while v_top is not null and v_ahead < ceil(cfg.obtain / 2.0)
             and not pgpm._native_gt(cfg.control_kind,
@@ -5761,8 +5793,8 @@ begin
                             and pgpm._native_gt(r.control_kind, hi, pgpm._grid_next(r.control_kind, r.partition_step, lo, r.partition_tz))),
            count(*) filter (where not attached)
       into v_np, v_coarse, v_inflight from pgpm.part where parent_table = r.parent_table;
-    execute format('select max(hi::%s)::text from pgpm.part where parent_table = %L::regclass and attached',
-                   pgpm._native_type(r.control_kind), r.parent_table::text) into v_new;
+    execute format('select %s from pgpm.part where parent_table = %L::regclass and attached',
+                   pgpm._max_hi_native(r.control_kind), r.parent_table::text) into v_new;
     -- preserve-managed incoming FK state: dropped (RI off) vs re-added-but-not-validated (orphan-blocked)
     select count(*) filter (where restored_at is null),
            count(*) filter (where restored_at is not null and validated_at is null)

@@ -1768,7 +1768,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `control_column` | `name` | the partition-key column |
 | `control_kind` | `text` | `time`, `id`, `uuidv7`, or `text_time` |
 | `partition_step` | `text` | grid width (`1 month` for time/uuidv7/text_time; a bigint for id) |
-| `partition_anchor` | `text` | grid origin |
+| `partition_anchor` | `text` | grid origin, a native value in the same form as `pgpm.part`'s bounds |
 | `partition_tz` | `text` | the zone boundaries are computed in and names rendered in: the transmuting session's `TimeZone` (`UTC` for id); change it only with [`set_partition_tz`](#set_partition_tz) |
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7/text_time, bigint count for id; null = keep) |
@@ -1788,7 +1788,10 @@ One row per managed table (`parent_table` is the primary key). Columns:
 
 ### `pgpm.part`
 
-The registry of managed partitions. `lo`/`hi` are native-grid values as text.
+The registry of managed partitions. `lo`/`hi` are native-grid values as text: for the time kinds
+(`time`, `uuidv7`, `text_time`) ISO 8601 with the offset (`2026-10-01 00:00:00+00`), rendered that way
+whatever `DateStyle` the writing session had, so a bound reads back as the same instant from any
+session; for `id`, the number.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -1806,7 +1809,8 @@ only; an in-flight child may transiently sit inside a still-attached coarse chil
 
 ### `pgpm.log`
 
-An append-only audit trail. `lo`/`hi` are native bounds, `method` a free-text detail, `rows` a count.
+An append-only audit trail. `lo`/`hi` are native bounds in the same form as `pgpm.part`'s, `method` a
+free-text detail, `rows` a count.
 
 **Non-success events are prefixed, never suffixed.** A step that was deferred logs `skip_<mechanism>`
 and one that failed logs `fail_<mechanism>`, so no non-success action is ever a prefix-extension of the

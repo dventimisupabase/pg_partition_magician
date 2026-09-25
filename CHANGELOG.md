@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Native bounds are stored in ISO 8601 form whatever the writing session's `DateStyle`** (#500). Every
+  native time value pgpm stores (`pgpm.part.lo`/`hi`, `pgpm.log.lo`/`hi`, `config.partition_anchor`,
+  `transmute_inflight.lo`/`hi`, the archive ledger's bounds) is text, and it was rendered with a bare
+  `timestamptz::text`, which follows the writing session's `DateStyle`. A `transmute` run from a session
+  on `SQL, DMY` stored 1 October 2026 as `01/10/2026 00:00:00 UTC`; the pg_cron session, on the default
+  `ISO, MDY`, read that back as 10 January, so the monolith's real upper bound (next month) sat below the
+  retention horizon and `retain()` dropped the live write partition, rows written that day included.
+  Every render now goes through `pgpm._ts_text`, which pins `DateStyle` to ISO for the duration of the
+  call, so a stored bound reads as the same instant from any session; parses are unchanged and still
+  honour the caller's session. Bounds a pre-fix install wrote from a non-ISO session keep their old form
+  and read correctly only under the `DateStyle` that wrote them, exactly as before. Guarded by
+  `tests/124_datestyle_independent_bounds_test.sql` (the issue's reproduction, with the stored text and
+  the instant an `ISO, MDY` session reads it back as asserted by identity), which
+  `bench/datestyle_bounds.sh` runs against its mutation (`datestyle_session_render`) under
+  `./test.sh discriminate`.
 - **`pgpm_archive`'s object key keeps the sign (and decimal point) of an `id` kind's lo** (#502). Both
   transports, `pgpm.archive_to_s3_ndjson` and `pgpm.archive_to_s3_parquet`, named the uploaded object
   after the digits of the chunk's lo, `regexp_replace(p_lo, '[^0-9]', '', 'g')`, so chunk lo `-10000`
