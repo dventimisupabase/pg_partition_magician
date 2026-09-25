@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **The perf CI job is sharded across runners.** One job that ran every bench guard and then every
+  discriminating mutation took 27 minutes and was the critical path of every PR's CI (the pgTAP matrix
+  takes 6). `./test.sh perf --shard=I/N` and `./test.sh discriminate --shard=I/N` (also
+  `bench/discriminate.sh --shard=I/N`) run the I-th of N interleaved slices of the same lists, chosen by
+  index, so every guard and every mutation runs in exactly one of `.github/workflows/perf.yml`'s seven
+  matrix jobs and no guard's environment changes: each still gets its own runner, container and
+  database. A slice that would select nothing fails instead of passing vacuously, and `--list` prints a
+  slice without touching Docker, which is how the partition was checked. Without `--shard` both tracks
+  still run everything, as `./test.sh ci` does.
+
 - **The partition grid is computed in a recorded zone, never in the caller's session `TimeZone`** (#455).
   `_grid_floor`, `_grid_next`, `_part_name` and `transmute`'s bound computation evaluated `date_trunc`,
   `extract`, `+ interval` and `to_char` in whatever zone the calling session had. An operator transmuting

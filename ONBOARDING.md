@@ -26,7 +26,7 @@ psql, or other tooling needed on the host.
                     # NOT in the default matrix
 ./test.sh archive   # the pgpm_archive track: PG17 + pgsql-http against a MinIO stand-in
                     # for S3, its own image, NOT in the default matrix
-./test.sh perf      # the data-coupled lock and work guards under bench/ (PG17)
+./test.sh perf      # the data-coupled lock and work guards under bench/ (PG17); CI runs it as --shard=I/N slices
 ./test.sh discriminate  # prove each perf guard FAILS against its bench/mutations/ defect
 ./test.sh ci        # EVERY track CI runs, each as its own child run (use before pushing)
 ```
