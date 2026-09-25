@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **A row trigger's enabled state survives `transmute` and `untransmute`** (#499). Both replayed the
+  table's triggers from `pg_get_triggerdef`, which never emits `pg_trigger.tgenabled`, so every replayed
+  trigger came back `ENABLE` (origin-only) whatever it had been: a trigger the operator had `DISABLE`d
+  fired again on the very next write and silently rewrote what was stored, an `ENABLE ALWAYS` one stopped
+  firing under `session_replication_role = replica` and an `ENABLE REPLICA` one started firing for
+  ordinary sessions, with nothing refused or logged. Each site now captures the trigger's name and state
+  alongside its definition and re-applies every non-default state after the verbatim replay: at the new
+  parent, where `ENABLE`/`DISABLE TRIGGER` recurses to the clone on every partition and a clone minted
+  for a later partition inherits it, and at the restored table. `tests/124_cutover_trigger_tgenabled_test.sql`
+  carries one trigger per state through the cutover and the reversal and asserts by which rows carry
+  which value; `bench/cutover_trigger_state.sh` drives the same file for `./test.sh discriminate`, where
+  the `transmute_trigger_state_dropped` and `untransmute_trigger_state_dropped` mutations each put one
+  site's defect back.
 - **A regrain reconcile pass consumes from the delta exactly the captured rows it applied, never
   "everything at or below a watermark"** (#497). `_regrain_reconcile` read its batch watermark, its list
   of touched fine children, each child's delete and reinsert, and its final `delete from <delta> where

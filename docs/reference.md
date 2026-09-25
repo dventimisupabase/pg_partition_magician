@@ -77,7 +77,9 @@ the top), and a conversion that dies between transactions leaves the `CHECK` beh
 
 The new parent also takes over everything `CREATE TABLE ... LIKE` does not carry: the **owner**, table and
 **column-level grants**, **row level security** (both `ENABLE` and `FORCE`), every **policy**, table and
-column **comments**, and **row triggers**. All of it is captured before the rename and re-applied inside
+column **comments**, and **row triggers**, each in the enabled state it had (`DISABLE`, `ENABLE ALWAYS`
+and `ENABLE REPLICA` are kept, on the parent and on the clone every partition receives). All of it is
+captured before the rename and re-applied inside
 the same transaction as the cutover, so the parent is never reachable without its policies. Partitions
 minted later, by `obtain` or a regrain, are given the parent's owner too rather than being
 owned by whichever role runs maintenance.
@@ -275,7 +277,8 @@ pgpm.untransmute(p_parent regclass) returns regclass
 Reverses a `transmute`, returning the restored ordinary table. It is a **clean, metadata-only reverse
 while the monolith is still intact and holds the whole table**: it detaches the monolith, drops the
 childless parent (cascading any empty forward partitions), renames the monolith
-back, restores identity and any preserved incoming FKs, and clears `pgpm` state. The monolith is the
+back, restores identity, the row triggers (each in the enabled state the parent had) and any preserved
+incoming FKs, and clears `pgpm` state. The monolith is the
 attached partition with the smallest `lo`.
 
 It is a **one-way door** once any row lives outside the monolith's range -- a forward partition after the
