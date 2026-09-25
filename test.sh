@@ -587,6 +587,7 @@ run_perf() {
     "bench/retire_detach_substitution.sh pgpm_perf14"
     "bench/regrain_swap_reconcile.sh pgpm_perf15"
     "bench/grid_timezone.sh pgpm_perf17"
+    "bench/regrain_reconcile_snapshot.sh pgpm_perf19"
   )
   local selected=()
   local n=${#guards[@]} idx
