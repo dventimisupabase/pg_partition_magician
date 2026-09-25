@@ -2379,12 +2379,12 @@ create or replace function pgpm._regrain_reconcile(
   p_parent regclass, p_child name, p_lo text, p_hi text, p_step text, p_cursor text, p_batch int
 ) returns int language plpgsql as $$
 declare
-  cfg pgpm.config; v_nsp name; v_rel name; v_delta name; v_ncast text; v_keycols_q text; v_dkey_q text;
+  cfg pgpm.config; v_nsp name; v_delta name; v_ncast text; v_keycols_q text; v_dkey_q text;
   v_skey_q text; v_cols_q text; v_wm bigint; v_elig text; v_ctl_q text; v_sub_name name; v_n int := 0; r record;
-  v_lo_lit text; v_hi_lit text; v_cur_lit text;
+  v_lo_lit text; v_hi_lit text; v_cur_lit text; v_sub_lo text; v_sub_hi text; v_boundary text;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
-  select n.nspname, c.relname into v_nsp, v_rel
+  select n.nspname into v_nsp
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
   select delta into v_delta from pgpm._regrain_capture_names(p_parent);
   if to_regclass(format('%I.%I', v_nsp, v_delta)) is null then return 0; end if;
@@ -2438,13 +2438,42 @@ begin
     cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch,
     v_nsp, v_delta, v_wm, v_elig)
   loop
-    v_sub_name := pgpm._part_name(v_rel, cfg.control_kind, p_step, r.sub_lo,
-                                  pgpm._grid_next(cfg.control_kind, p_step, r.sub_lo));
-    -- No fine child means the sub-range was skipped as aged (regrain_aged): it is never materialized and
-    -- its rows go with the source, so there is nothing to reconcile into. Counted, not silent.
-    if to_regclass(format('%I.%I', v_nsp, v_sub_name)) is null then
-      insert into pgpm.log (parent_table, action, lo, hi, method)
-        values (p_parent, 'regrain_reconcile_aged', r.sub_lo, null, v_sub_name);
+    -- #446: find the fine child by RANGE in pgpm.part, never by re-rendering its name. regrain_step
+    -- clamps the first sub-range to the coarse child's own lo when that lo is off the target grid (a
+    -- weekly target on a monthly monolith; a 7000 target on a child starting at 20000) and names the
+    -- child from the clamped value, so a name rendered from grid_floor(ctl) alone ([14000, 21000) ->
+    -- _p14000) belongs to a child that never existed. This loop used to take "no such relation" for
+    -- "skipped as aged", log it, and delete the captured keys anyway; the swap then dropped the source
+    -- with them, so every UPDATE in that sub-range reverted, every DELETE came back and every INSERT
+    -- vanished. pgpm.part holds the authoritative bounds (the name is a label, see _part_name), so ask
+    -- it which child of this regrain contains the sub-range. The probe point is the sub-range's lo as
+    -- regrain_step clamps it, which every eligible key in this group lies at or above; the source itself
+    -- contains that point too and is excluded by name.
+    v_sub_lo := case when pgpm._native_gt(cfg.control_kind, p_lo, r.sub_lo) then p_lo else r.sub_lo end;
+    v_sub_hi := pgpm._grid_next(cfg.control_kind, p_step, r.sub_lo);
+    if pgpm._native_gt(cfg.control_kind, v_sub_hi, p_hi) then v_sub_hi := p_hi; end if;
+    select child_name into v_sub_name from pgpm.part
+     where parent_table = p_parent and child_name <> p_child
+       and not pgpm._native_gt(cfg.control_kind, p_lo, lo)        -- p_lo <= lo: a child of this regrain,
+       and not pgpm._native_gt(cfg.control_kind, hi, p_hi)        -- hi <= p_hi   attached or not
+       and not pgpm._native_gt(cfg.control_kind, lo, v_sub_lo)    -- lo <= sub_lo: it contains the probe
+       and pgpm._native_gt(cfg.control_kind, hi, v_sub_lo);       -- sub_lo < hi
+    if v_sub_name is null then
+      -- No fine child. The one legitimate reason is that regrain_step skipped the sub-range as aged
+      -- (regrain_aged): it is never materialized and its rows go with the source, so there is nothing to
+      -- reconcile into and the captured keys are discarded. Counted, not silent. That is decided by the
+      -- retention horizon, exactly as regrain_step decided it, and NOT by a relation's absence: a missing
+      -- child for a sub-range that is not below the horizon is captured DML with nowhere to land, and
+      -- discarding it is the loss above under another name. Refuse instead, so the tick fails loudly
+      -- (maintain logs it as skip_regrain) and the delta keeps the keys. The horizon is read only on this
+      -- path, and it only ever moves up, so a sub-range aged when regrain_step skipped it is still aged here.
+      v_boundary := pgpm._retain_boundary(cfg);
+      if v_boundary is null or pgpm._native_gt(cfg.control_kind, v_sub_hi, v_boundary) then
+        raise exception 'pg_partition_magician: internal error reconciling % -- captured changes in sub-range [%, %) have no fine child to land in, and the range is not below the retention horizon (%); refusing rather than discarding them.',
+          p_child, v_sub_lo, v_sub_hi, coalesce(v_boundary, 'no retention policy');
+      end if;
+      insert into pgpm.log (parent_table, action, lo, hi)
+        values (p_parent, 'regrain_reconcile_aged', v_sub_lo, v_sub_hi);
       continue;
     end if;
     execute format(

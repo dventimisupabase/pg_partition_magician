@@ -840,6 +840,14 @@ regrain is in flight on it` before anything is truncated, including from a sessi
 `session_replication_role = replica`. Cancel the regrain with `regrain_cancel` first, or truncate after the
 swap.
 
+The reconcile finds each captured key's fine child by its recorded **range** in `pgpm.part`, not by name,
+so a first sub-range that was clamped to the coarse child's own `lo` (a weekly target on a monthly monolith,
+whose `lo` is not on the weekly grid) is reconciled into the child that actually exists. A captured key
+whose sub-range has **no** fine child is discarded, and logged `regrain_reconcile_aged`, only when that
+sub-range lies below the retention horizon, which is the one case in which no child was ever made. In any
+other case the tick fails rather than discarding the change, and the key stays in the delta; under
+`maintain` that surfaces as a `skip_regrain` row carrying the error.
+
 The first tick installs the capture and copies nothing, so budget one tick more than the microbatch count.
 
 ### `regrain_cancel`

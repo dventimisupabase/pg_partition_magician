@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+- **Fix: `regrain_step`'s reconcile no longer discards captured changes in a clamped first sub-range**
+  (#446). When a coarse child's `lo` is off the target grid (a weekly `regrain_to` on a monthly monolith,
+  which `set_regrain` accepts; a `7000` target on a child starting at `20000`), `regrain_step` clamps the
+  first sub-range to that `lo` and names the fine child from it, but the reconcile re-derived the sub-range
+  from the grid floor with no clamp, looked for a child that never existed, took its absence for "skipped
+  as aged", logged `regrain_reconcile_aged` and deleted the captured keys. The swap then dropped the source
+  with them: every UPDATE in that sub-range reverted, every DELETE came back, every INSERT vanished. The
+  reconcile now locates the fine child by range containment in `pgpm.part` (the name is a label; the
+  recorded bounds are authoritative), and a sub-range with no fine child is treated as aged only when it
+  is below the retention horizon, the same test `regrain_step` applied when it skipped it. Otherwise the
+  tick raises and the delta keeps the keys, which `maintain` surfaces as `skip_regrain`. The
+  `regrain_reconcile_aged` row now carries the sub-range's `lo` and `hi` in place of a rendered name.
+  Pinned by `tests/120`: the issue's fixture with one UPDATE, one DELETE and one INSERT inside the clamped
+  sub-range, asserted by identity in the fine child before the swap and through the parent after it, with
+  the aged path kept, the not-aged raise, and the monthly-to-weekly name disagreement on the time grid.
 - **A write block is no longer lifted from a partition `pgpm.archive_ledger` covers** (#452). Coverage is
   a watermark, and it describes the partition's contents only while the write block has been on it since
   the first chunk. Eligibility regresses, though: an `id` table's frontier is `max(control)`, so deleting
