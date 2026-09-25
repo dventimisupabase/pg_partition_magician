@@ -2253,7 +2253,8 @@ declare
   cfg archive.config; pcfg pgpm.config; v_ctltype text;
   v_ctype text := 'application/x-ndjson';
   v_key_id text; v_secret text; v_nsp name; v_key text;
-  v_part_payload text; v_chunk text; v_cursor text; v_done boolean := false;
+  v_part_payload text; v_chunk text; v_cursor text; v_cursor_tid tid; v_done boolean := false;
+  v_page_rows bigint; v_written bigint := 0; v_expected bigint;
   v_upload_id text; v_part int := 0; v_etag text; v_parts_xml text := '';
   v_resp http_response; h http_header;
 begin
@@ -2273,22 +2274,49 @@ begin
     from pg_attribute a where a.attrelid = p_parent and a.attname = pcfg.control_column;
   v_key := cfg.prefix || p_child || '.ndjson';
 
+  -- Conservation baseline: the partition's row count as the export begins. Every page's rows are
+  -- summed against it, and the export is refused rather than completed when the two differ (below),
+  -- so a paging defect or a concurrent writer surfaces as an error, never as a 200 with rows missing.
+  execute format('select count(*) from %I.%I', v_nsp, p_child) into v_expected;
+
   v_part_payload := '';
-  v_cursor := null;
+  v_cursor := null; v_cursor_tid := null;
   <<parts>>
   loop
     while not v_done and octet_length(v_part_payload) < cfg.part_bytes loop
+      -- Page by the TOTAL order (control, ctid), never by the control column alone. The control column
+      -- need not be unique, and a cursor set to a page's max(control) lands ON a run of equal values
+      -- when the page boundary falls inside one; the next page's `> cursor` then skips the rest of the
+      -- run (issue #463). ctid breaks the tie and is stable for the whole export because nothing here
+      -- moves tuples: the automatic path exports a write-blocked child, and this synchronous path
+      -- leaves quiescence to the caller (a concurrent UPDATE or VACUUM FULL cannot lose rows silently
+      -- either, it trips the conservation check below). The planner derives the `control >= cursor`
+      -- index condition from the row comparison itself, so an index on the control column still
+      -- drives each page.
       execute format(
-        'select coalesce(string_agg(j, e''\n'' order by k), ''''), (array_agg(k order by k desc))[1]::text
-           from (select row_to_json(t)::text as j, t.%I as k from %I.%I t
-                  where $1 is null or t.%I > $1::%s
-                  order by t.%I limit $2) s',
+        'select coalesce(string_agg(j, e''\n'' order by k, c), ''''),
+                (array_agg(k order by k desc, c desc))[1]::text,
+                (array_agg(c order by k desc, c desc))[1],
+                count(*)
+           from (select row_to_json(t)::text as j, t.%I as k, t.ctid as c from %I.%I t
+                  where $1 is null or (t.%I, t.ctid) > ($1::%s, $2)
+                  order by t.%I, t.ctid limit $3) s',
         pcfg.control_column, v_nsp, p_child, pcfg.control_column, v_ctltype, pcfg.control_column)
-        into v_chunk, v_cursor using v_cursor, cfg.fetch_rows;
-      if v_chunk = '' then v_done := true;
-      else v_part_payload := v_part_payload || v_chunk || e'\n';
+        into v_chunk, v_cursor, v_cursor_tid, v_page_rows using v_cursor, v_cursor_tid, cfg.fetch_rows;
+      if v_page_rows = 0 then v_done := true;
+      else
+        v_written := v_written + v_page_rows;
+        v_part_payload := v_part_payload || v_chunk || e'\n';
       end if;
     end loop;
+
+    -- The last page has been read: everything past this point only uploads. Refuse here, before the
+    -- single PUT or the final part, so a short export never becomes a complete object; the handler
+    -- below aborts an in-flight multipart upload on the way out.
+    if v_done and v_written <> v_expected then
+      raise exception 'pg_partition_magician: archive.to_s3 of %.% paged % rows but the partition held % when the export began; refusing to write an incomplete object',
+        v_nsp, p_child, v_written, v_expected;
+    end if;
 
     exit parts when v_done and v_part > 0 and v_part_payload = '';
 
