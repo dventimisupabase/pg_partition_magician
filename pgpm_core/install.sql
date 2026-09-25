@@ -337,6 +337,21 @@ returns boolean language sql stable as $$
                     and (backend_start = p_backend_start or backend_start is null));
 $$;
 
+-- A pg_class relkind as an English noun, for a refusal that names the relation standing in the way of a
+-- name transmute needs (#509). "already exists as a standalone table ... drop table it" is wrong advice
+-- when the thing in the way is a sequence or a view, so the message says what it actually found.
+create or replace function pgpm._relkind_noun(p_relkind "char")
+returns text language sql immutable as $$
+  select case p_relkind
+           when 'r' then 'table'            when 'p' then 'partitioned table'
+           when 'v' then 'view'             when 'm' then 'materialized view'
+           when 'f' then 'foreign table'    when 'S' then 'sequence'
+           when 'i' then 'index'            when 'I' then 'partitioned index'
+           when 'c' then 'composite type'   when 't' then 'TOAST table'
+           else 'relation of kind ' || p_relkind::text
+         end;
+$$;
+
 -- The audit trail. NAMING RULE for `action`: non-success events are PREFIXED, never suffixed --
 -- `skip_<mechanism>` for a deferral, `fail_<mechanism>` for a failure. So no non-success action is ever
 -- a prefix-extension of the success it corresponds to, and both query styles are safe: `action =
@@ -3567,7 +3582,7 @@ create or replace procedure pgpm._transmute(
 )
 language plpgsql as $$
 declare
-  v_nsp name; v_rel name; v_default name; v_staging name; v_parent regclass;
+  v_nsp name; v_rel name; v_relkind "char"; v_default name; v_staging name; v_parent regclass;
   v_resumed boolean := false;
   v_typname text; v_oldpk text[]; v_pkcols text[]; v_idcols name[]; v_pkname name; v_col name;
   v_idkinds text[];   -- #308: 'a' (ALWAYS) or 'd' (BY DEFAULT) per v_idcols entry, same order
@@ -3636,8 +3651,37 @@ begin
     raise exception 'pg_partition_magician: p_lock_timeout must be a valid lock_timeout value (got %): %', p_lock_timeout, sqlerrm;
   end;
 
-  select n.nspname, c.relname into v_nsp, v_rel
+  select n.nspname, c.relname, c.relkind into v_nsp, v_rel, v_relkind
     from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
+
+  -- #509: transmute converts an ORDINARY table, once. Nothing checked either, and every shape refused here
+  -- was discovered by the cutover instead, AFTER phases 1 and 2 had committed a validated, write-rejecting
+  -- pgpm_monolith_bound CHECK and the claim. The worst case was a re-run against an already converted
+  -- table, which is the documented remedy after any failure and what a client that lost its connection
+  -- after the cutover committed will do: phase 1 added the bound to the live PARTITIONED parent, where it
+  -- propagates to every partition including the forward ones taking writes; phase 2 validated it; the
+  -- cutover then failed on the monolith's name, and the bound stayed, rejecting every write past the
+  -- ORIGINAL monolith's hi, i.e. every current write, until an abort or the sweep. With the frontier past
+  -- the monolith it instead succeeded and nested the whole table under a second parent. The other shapes
+  -- fail the cutover's ATTACH ("is already a partition", "cannot attach inheritance parent") the same way.
+  -- All four cost nothing to refuse here, before anything is committed.
+  if exists (select 1 from pgpm.config where parent_table = p_parent) then
+    raise exception 'pg_partition_magician: % is already converted and managed by pgpm (it has a pgpm.config row), so there is nothing to convert or resume: transmute converts a table once. If this is a retry after an error, the earlier run''s cutover did commit; see pgpm.status(). A re-run would have added a second write-rejecting pgpm_monolith_bound CHECK to the live partitioned parent.',
+      p_parent;
+  end if;
+  if v_relkind <> 'r' then
+    raise exception 'pg_partition_magician: % is a %, not a plain table. transmute converts an ordinary table only: neither partitioned nor a member of an inheritance tree.',
+      p_parent, pgpm._relkind_noun(v_relkind);
+  end if;
+  if exists (select 1 from pg_inherits where inhrelid = p_parent) then
+    raise exception 'pg_partition_magician: % is already a partition of % (or an inheritance child of it). transmute converts a standalone table only: its cutover attaches the table to a new parent, and a table can be attached to one parent at a time. Convert the parent instead, or detach % first.',
+      p_parent, (select string_agg(inhparent::regclass::text, ', ') from pg_inherits where inhrelid = p_parent), p_parent;
+  end if;
+  if exists (select 1 from pg_inherits where inhparent = p_parent) then
+    raise exception 'pg_partition_magician: % has inheritance children (%). transmute converts a standalone table only: its cutover attaches the table to a new parent, and PostgreSQL refuses to attach an inheritance parent as a partition.',
+      p_parent, (select string_agg(inhrelid::regclass::text, ', ' order by inhrelid) from pg_inherits where inhparent = p_parent);
+  end if;
+
   v_default := (v_rel || '_default')::name;
   -- #510: the staging name is held to the same rule as every partition name (see _part_name): never
   -- truncated. The cast to name below silently cuts it to 63 bytes, and at a 61-character table name the
@@ -3710,12 +3754,21 @@ begin
   -- Refuse up front -- any standalone (un-attached) table in this schema whose name matches this
   -- parent's child-partition naming (<rel>_p<digits...>) is an orphan. starts_with handles the
   -- (un-escaped) rel prefix; the regex only constrains the data-independent suffix.
-  declare v_orphan name;
+  --
+  -- Any relkind, not tables only (#509): a sequence, view or index holding a child's name occupies that
+  -- name just the same, and the relkind filter this once had let it through to obtain, which skips any
+  -- candidate whose name is taken (`continue when to_regclass(...) is not null`, its way of recognising
+  -- a partition it already made). The conversion then COMPLETED with no forward partition and nothing
+  -- logged: the first write past hi failed with "no partition of relation ... found for row", and every
+  -- later tick skipped the name again. Only a table can be a regrain orphan, so only a table gets that
+  -- diagnosis; anything else is named for what it is. The monolith's own coarse name is a different
+  -- shape (<rel>_p<lo>_to_<hi>) and is checked separately, just before phase 1, once the bound that
+  -- determines it is final.
+  declare v_orphan name; v_orphan_kind "char";
   begin
-    select c.relname into v_orphan
+    select c.relname, c.relkind into v_orphan, v_orphan_kind
       from pg_class c
      where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)
-       and c.relkind = 'r'
        and starts_with(c.relname, v_rel || '_p')
        and case when p_control_kind = 'id'
                 then substr(c.relname, length(v_rel) + 3) ~ '^[0-9]{19}$'
@@ -3723,9 +3776,12 @@ begin
            end
        and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid)
      limit 1;
-    if v_orphan is not null then
+    if v_orphan is not null and v_orphan_kind = 'r' then
       raise exception 'pg_partition_magician: %.% already exists as a standalone table matching this parent''s partition naming -- most likely an orphan left by an interrupted regrain. Drop it (drop table %.%) and retry transmute.',
         v_nsp, v_orphan, quote_ident(v_nsp), quote_ident(v_orphan);
+    elsif v_orphan is not null then
+      raise exception 'pg_partition_magician: %.% already exists as a % matching this parent''s partition naming, and the conversion would collide with it when it creates that partition. Drop or rename it and retry transmute.',
+        v_nsp, v_orphan, pgpm._relkind_noun(v_orphan_kind);
     end if;
   end;
 
@@ -4183,10 +4239,20 @@ begin
     v_hi_native := pgpm._grid_next(p_control_kind, p_step, v_hi_native, v_tz);
   end loop;
 
-  -- One atomic take-or-take-over. `do update` fires only when the recorded owner is gone, so the statement
-  -- returns a row exactly when the claim is ours and nothing at all when a live conversion already holds it.
-  -- It deliberately leaves lo/hi untouched, which is what makes RETURNING hand back the ORIGINAL bound on a
-  -- take-over rather than the candidates passed in above.
+  -- One atomic take-or-take-over. `do update` fires only when the recorded owner is gone, OR is this very
+  -- session, so the statement returns a row exactly when the claim is ours and nothing at all when a live
+  -- conversion in another session holds it. It deliberately leaves lo/hi untouched, which is what makes
+  -- RETURNING hand back the ORIGINAL bound on a take-over rather than the candidates passed in above.
+  --
+  -- The second arm is #509. A cutover failure (a lock_timeout in phase 3, say) leaves the claim owned by
+  -- the operator's still-connected session, which _session_alive correctly reads as alive, so with the
+  -- first arm alone the documented remedy, "re-run transmute: it resumes from the recorded bound", was
+  -- refused as "already in progress in another session" to the very session that owned it, and the
+  -- write-rejecting bound stayed until that session disconnected, which no document said. A session runs
+  -- one thing at a time, so a claim recorded by THIS backend can only be this backend's own earlier,
+  -- failed attempt: resuming it is exactly what a take-over does. Matched on both columns, the identity
+  -- we are about to record; a recycled pid with an older backend_start fails the match and is caught by
+  -- the first arm instead, because its owner is dead.
   insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi,
                                        owner_pid, owner_backend_start)
   values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native,
@@ -4195,6 +4261,8 @@ begin
          set owner_pid           = excluded.owner_pid,
              owner_backend_start = excluded.owner_backend_start
        where not pgpm._session_alive(transmute_inflight.owner_pid, transmute_inflight.owner_backend_start)
+          or (transmute_inflight.owner_pid = excluded.owner_pid
+              and transmute_inflight.owner_backend_start = excluded.owner_backend_start)
   returning lo, hi, (xmax <> 0) into v_lo_native, v_hi_native, v_resumed;
 
   if not found then
@@ -4206,6 +4274,20 @@ begin
   -- range, because the CHECK was rejecting exactly those the whole time. xmax is 0 on an insert and the
   -- updating xid on an update, which is what distinguishes the two here.
   v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native, v_tz);
+
+  -- #509: the cutover RENAMEs the table to this name, so the name has to be free, and nothing before this
+  -- checked it. The orphan guard above matches CHILD names (<rel>_p<digits>...), and the monolith's coarse
+  -- <rel>_p<lo>_to_<hi> matches neither of its regexes, so a relation already holding it (a monolith
+  -- detached from an earlier conversion of a table by this name, or one that outlived a DROP) surfaced as
+  -- a raw 42P07 from inside the cutover, after phases 1 and 2 had committed the validated bound and the
+  -- claim, where reference.md promises the collision is refused up front with the table untouched.
+  -- Checked HERE rather than beside the other name guards because the name depends on the bound, and the
+  -- bound is only final once the claim has decided fresh-vs-resume and headroom has been applied. This is
+  -- still the first transaction: nothing is committed, and the raise rolls the claim row back with it.
+  if to_regclass(format('%I.%I', v_nsp, v_monolith)) is not null then
+    raise exception 'pg_partition_magician: %.% already exists, and transmute needs that name for the monolith (the partition the converted table becomes, covering [%, %)). Most likely a leftover from an earlier conversion of a table by this name. Drop or rename it and retry transmute.',
+      v_nsp, v_monolith, v_lo_native, v_hi_native;
+  end if;
 
   -- #309: bound the wait for the ADD's ACCESS EXCLUSIVE. Re-applied per phase rather than set once,
   -- because `set local` does not survive a COMMIT -- the same caution maintain() records at its own
@@ -4692,7 +4774,15 @@ begin
   -- #405: the claim's recorded session decides this, not an advisory lock anyone could have taken. When that
   -- lock gated the abort, a squatter holding it left the operator with no way to clear a bound at all --
   -- this path and the reaper both refused, for the same wrong reason.
-  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then
+  --
+  -- #509: and "alive" alone is not "running in another session". After a cutover failure the claim's owner
+  -- is the operator's own still-connected session, so this refused the operator's abort of their own failed
+  -- attempt, the other documented remedy, for as long as they stayed connected. A session runs one thing at
+  -- a time, so a claim this backend recorded cannot be a conversion still running: pid alone is enough
+  -- here, because a recycled pid belongs to a dead owner, which _session_alive already rules out. The
+  -- reaper keeps the plain liveness test on purpose: an operator whose session is still open keeps the
+  -- right to retry, and a maintain_all run by hand from that session must not undo their bound.
+  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) and r.owner_pid <> pg_backend_pid() then
     raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is still running in another session', p_parent;
   end if;
   execute format('alter table %I.%I drop constraint if exists pgpm_monolith_bound', r.nsp, r.rel);

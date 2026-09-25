@@ -280,6 +280,24 @@ MAINTAIN_NO_COMMITS_EDITS = [
      "    call pgpm.maintain(r.parent_table, v_status);\n", 1),
 ]
 
+# transmute's two #509 precondition blocks. Each is one contiguous block anchored on its opening comment
+# AND its closing raise, so a rewrite of anything between them fails the count instead of quietly yielding
+# a clean copy. The shape block is the four refusals (pgpm.config row, relkind, partition or inheritance
+# child, inheritance parent) between the nsp/rel lookup and `v_default :=`; the name block is the
+# to_regclass check on the monolith's own name, just after the claim has made the bound final.
+TRANSMUTE_SHAPE_PRECONDITION_RE = re.compile(
+    r"  -- #509: transmute converts an ORDINARY table, once\..*?"
+    r"refuses to attach an inheritance parent as a partition\.',\n"
+    r"      p_parent, \(select string_agg\(inhrelid::regclass::text, ', ' order by inhrelid\) "
+    r"from pg_inherits where inhparent = p_parent\);\n  end if;\n\n",
+    re.DOTALL,
+)
+TRANSMUTE_MONOLITH_NAME_RE = re.compile(
+    r"  -- #509: the cutover RENAMEs the table to this name.*?"
+    r"      v_nsp, v_monolith, v_lo_native, v_hi_native;\n  end if;\n",
+    re.DOTALL,
+)
+
 MUTATIONS = {
     "transmute_no_commits": (
         "bench/transmute_lock.sh",
@@ -304,7 +322,7 @@ MUTATIONS = {
              "r.parent_table::oid::text, 0)) then\n"
              "      continue;   -- still running; leave it alone\n"
              "    end if;\n", 1),
-            ("  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) then\n"
+            ("  if pgpm._session_alive(r.owner_pid, r.owner_backend_start) and r.owner_pid <> pg_backend_pid() then\n"
              "    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is "
              "still running in another session', p_parent;\n"
              "  end if;\n",
@@ -313,6 +331,51 @@ MUTATIONS = {
              "    raise exception 'pg_partition_magician: cannot abort the transmute of % -- it is "
              "still running in another session', p_parent;\n"
              "  end if;\n", 1),
+        ],
+    ),
+    "transmute_no_shape_precondition": (
+        "bench/transmute_preconditions.sh",
+        "Pre-#509 _transmute: no check that p_parent is an unconverted plain table (relkind 'r', no "
+        "pgpm.config row, no pg_inherits row as child or parent). Re-run on an already converted table, "
+        "the documented remedy after any failure, phase 1 adds pgpm_monolith_bound NOT VALID to the live "
+        "PARTITIONED parent (propagating to the forward partitions taking writes), phase 2 validates it, "
+        "and the cutover fails on the monolith's name, leaving the bound rejecting every write past the "
+        "original monolith's hi. tests/125 part A: the refusal's own message, no bound anywhere in the "
+        "family, one config row, and a write past the monolith still landing in the forward partition.",
+        [(TRANSMUTE_SHAPE_PRECONDITION_RE, "", 1)],
+    ),
+    "transmute_names_unchecked": (
+        "bench/transmute_preconditions.sh",
+        "Pre-#509 name guards: the monolith's own coarse name <rel>_p<lo>_to_<hi> is checked nowhere "
+        "before the cutover's RENAME, so a standalone table holding it gets through phases 1 and 2 (bound "
+        "committed and validated, claim taken) and fails the cutover with a raw 42P07, where reference.md "
+        "promises an up-front refusal with the table untouched; and the orphan guard matches relkind 'r' "
+        "only, so a sequence holding a CHILD's name is skipped by it and then by obtain itself, and that "
+        "conversion completes with no forward partition and nothing logged. tests/125 part B: the "
+        "refusal's own message naming the relation, no bound, no claim, the table still plain, and the "
+        "same call converting once the squatter is gone.",
+        [
+            (TRANSMUTE_MONOLITH_NAME_RE, "", 1),
+            ("     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)\n"
+             "       and starts_with(c.relname, v_rel || '_p')\n",
+             "     where c.relnamespace = (select n.oid from pg_namespace n where n.nspname = v_nsp)\n"
+             "       and c.relkind = 'r'\n"
+             "       and starts_with(c.relname, v_rel || '_p')\n", 1),
+        ],
+    ),
+    "transmute_claim_refuses_own_session": (
+        "bench/transmute_preconditions.sh",
+        "Pre-#509 claim protocol: the take-over predicate is `not _session_alive(owner)` alone, and "
+        "transmute_abort refuses whenever the owner is alive. After a cutover failure the owner is the "
+        "operator's own still-connected session, so the documented re-run is refused as 'already in "
+        "progress in another session', so is the abort, and the write-rejecting bound stays until that "
+        "session disconnects. tests/125 part C drives the failure, the retry and the abort through ONE "
+        "dblink backend, and pins that a different live session is still refused both ways.",
+        [
+            ("          or (transmute_inflight.owner_pid = excluded.owner_pid\n"
+             "              and transmute_inflight.owner_backend_start = excluded.owner_backend_start)\n",
+             "", 1),
+            (" and r.owner_pid <> pg_backend_pid() then\n", " then\n", 1),
         ],
     ),
     "maintain_no_commits": (
