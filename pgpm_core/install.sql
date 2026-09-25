@@ -4851,9 +4851,12 @@ $$;
 -- inside the monolith's [lo, hi), untransmute exploits that: detach the monolith (it is a complete
 -- standalone table again the instant it detaches, because transmute never drops its PK), drop the
 -- parent and its empty forward partitions, rename the monolith back, and undo the few things transmute
--- changed on it (identity moved to the parent, triggers, preserved incoming FKs). It is a one-way door
--- the moment any row lives outside the monolith: once the frontier crosses its upper bound, live writes
--- route into forward partitions, and a regrain splits the monolith itself -- untransmute then refuses.
+-- changed on it (identity moved to the parent, triggers, preserved incoming FKs) and the few things
+-- maintenance may have put on it since (retention's write block, an in-flight regrain's change capture,
+-- #508). It is a one-way door the moment any row lives outside the monolith: once the frontier crosses its
+-- upper bound, live writes route into forward partitions, and a regrain's swap replaces the monolith with
+-- its fine children -- untransmute then refuses. A regrain that has not swapped yet is abandoned instead,
+-- as regrain_cancel would abandon it: the monolith still holds every row, so the reverse loses nothing.
 -- Returns the restored table.
 --
 -- Fidelity notes: an identity column comes back in the form it had, ALWAYS or BY DEFAULT (#308), and the
@@ -4914,7 +4917,7 @@ begin
   v_gate_q := format('select exists (select 1 from %s where %I >= %L or %I < %L)',
                  p_parent::text, cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz),
                  cfg.control_column, pgpm._encode(cfg.control_kind, v_mon_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz));
-  v_door := format('pg_partition_magician: cannot untransmute %s -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or regraining begins.',
+  v_door := format('pg_partition_magician: cannot untransmute %s -- rows now live outside the original monolith (a forward partition past B, a backdated stray, or a regraining has split it), so a metadata-only reverse would lose data. This is a one-way door once the frontier crosses B or a regrain has split the monolith.',
                    p_parent::text);
   execute v_gate_q into v_outside;
   if v_outside then
@@ -4980,6 +4983,40 @@ begin
   execute v_gate_q into v_outside;
   if v_outside then
     raise exception '%', v_door;
+  end if;
+
+  -- Strip what MAINTENANCE put on the monolith before handing it back (#508). The trigger capture above
+  -- reads the PARENT's pg_trigger, and DETACH strips only the clones of the parent's triggers; pgpm's own
+  -- triggers sit on the CHILD, so without this the restored table carried them out of pgpm's reach:
+  -- config and part are gone by the end of this call, so no tick could ever lift them. Here, under the
+  -- lock and after the gate, because both helpers resolve names through p_parent, which the DROP below
+  -- takes away. Two live on the monolith:
+  --
+  -- pgpm_write_block, retention's fence (_install_write_block). A monolith retention has reached but not
+  -- dropped carries it, whether archiving was deferred (skip_archive) or the frontier regressed and the
+  -- ledger's coverage kept the block (#452, skip_write_block_lift); left on, ENABLE ALWAYS, the restored
+  -- table rejected every INSERT, UPDATE and DELETE with "past its retention boundary". Lifting it here is
+  -- safe: the block exists to keep archive coverage truthful for the DROP retire() would do, and there is
+  -- no retire() after this. Any ledger rows stay, as retire()'s do, and a later transmute that mints a
+  -- child of the same name finds coverage without its block and discards it (archive_coverage_reset).
+  -- _remove_write_block resolves by name and is drop-if-exists, so on a never-blocked monolith it is a no-op.
+  perform pgpm._remove_write_block(p_parent, v_mon);
+
+  -- pgpm_regrain_capture and pgpm_regrain_truncate_guard, an in-flight regrain's apparatus (#267, #449).
+  -- Before its swap the monolith still holds every row and the fine copies are unreconciled duplicates,
+  -- so the door is open and a metadata-only reverse loses nothing; but the capture trigger depends on the
+  -- per-parent function this call drops at the end, so left on it turned the reverse into "cannot drop
+  -- function ... because other objects depend on it", rolled back whole, and the copies are standalone
+  -- relations the parent's DROP never reaches. Abandon the regrain the way the operator's own escape does
+  -- and through the same code, so the two cannot drift: regrain_cancel takes the trigger and the guard off
+  -- every child, truncates the delta, drops the copies with their part rows, clears the cursor and logs
+  -- regrain_cancel once. Only when one is in flight, so a reverse of a never-regrained table logs nothing
+  -- it did not do. The three tests are the three places an in-flight regrain leaves a mark, any one of
+  -- which is enough to warrant the cleanup.
+  if exists (select 1 from pgpm.config where parent_table = p_parent and regrain_cursor is not null)
+     or exists (select 1 from pgpm.part where parent_table = p_parent and not attached)
+     or pgpm._regrain_capture_active(p_parent, v_mon) then
+    perform pgpm.regrain_cancel(p_parent);
   end if;
 
   -- detach the MONOLITH (the original table, holding everything; PK + secondary indexes intact), then
