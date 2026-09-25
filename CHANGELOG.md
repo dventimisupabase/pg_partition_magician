@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **`archive.to_s3` no longer drops rows that tie on the control column at a page boundary** (#463).
+  The synchronous NDJSON export read the partition `fetch_rows` at a time and resumed each page from
+  the previous page's `max(control)`. The control column need not be unique, so when a run of equal
+  values straddled a page boundary the cursor landed on the tied value and the next page's `> cursor`
+  skipped the rest of the run: 30 rows at one timestamp with a 10-row page came out as 10, with HTTP
+  200 and no error, on the path the README offers for archiving before a manual drop. Paging is now
+  by the total order `(control, ctid)`, so a page boundary can fall anywhere in a tie run and lose
+  nothing. The export also counts what it pages against the partition's row count when it began and
+  **refuses to write the object** on a mismatch (`pg_partition_magician: archive.to_s3 of ... paged N
+  rows but the partition held M ...`), aborting an in-flight multipart upload, rather than reporting
+  success; with the fix in place that check trips only when something wrote to the partition during
+  the export, which is the operator's cue that the partition was not quiescent. Pinned by
+  `tests/archive/db/12`, whose witness proves the first page ends inside the tie run and whose
+  assertions name the previously lost rows by identity.
 - **Parquet archives of a `numeric(p,s)` column with `p >= 17` encoded negative values, and positives
   of 19 or more digits, as different numbers, and every reader agreed on the wrong one (#461).**
   `archive._pq_plain_decimal` stepped its two's-complement byte loop with `trunc(v / 256)`, and

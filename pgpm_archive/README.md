@@ -49,6 +49,13 @@ select archive.to_s3('public.events', 'events_p2024_01', '2024-01-01', '2024-02-
 select pgpm.retire('public.events', 'events_p2024_01');
 ```
 
+`archive.to_s3` reads the partition in pages and, before writing the object, checks that the rows it
+paged equal the partition's row count when the export began. On a mismatch it raises
+`pg_partition_magician: archive.to_s3 of ... paged N rows but the partition held M ...` and writes
+nothing (an in-flight multipart upload is aborted), so an object that does land is complete. The
+only thing that trips it is a write to the partition during the export: run it against a partition
+nothing is still writing to, then drop.
+
 See the [reference](../docs/reference.md#archive-strategy-contract) for the full `archive_fn`
 contract and the [guide](../docs/guide.md#archiving-before-a-drop) for the operator's view.
 
