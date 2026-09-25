@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **`untransmute` decides its one-way door under the lock that acts on it (#443).** It refuses when any
+  row lives outside the original monolith, and that refusal was decided once, under `ACCESS SHARE`, by a
+  check that cannot see another session's uncommitted insert; the detach and drop that acted on the
+  answer took their `ACCESS EXCLUSIVE` later. A writer whose insert into a forward partition was
+  uncommitted at the check and committed before that lock was granted had its row dropped with the
+  parent, and `pgpm.log` recorded the `untransmute` as a success. The check now runs again under an
+  explicit `lock table ... in access exclusive mode`, taken one statement before the detach would have
+  taken the same lock, so the exclusive window opens where it always did and grows by one probe of
+  partitions that are empty whenever it passes; the unlocked check stays as the cheap refusal that blocks
+  no writer when the door is already shut. The wait is bounded by the caller's `lock_timeout` and a
+  refusal rolls the whole call back. Because the second answer is only worth something if its snapshot
+  postdates the lock, `untransmute` now also refuses to run under `REPEATABLE READ` or `SERIALIZABLE`,
+  whose snapshot predates the call. Guarded by `bench/untransmute_race.sh` (a writer parked on an
+  uncommitted forward-partition insert, `untransmute` witnessed waiting on `AccessExclusiveLock` while
+  that xid is still open, then released) with the mutation `untransmute_no_recheck_under_lock`, and by
+  `tests/109`, which runs the same race through `dblink` in the version matrix.
 - **regrain's swap now reconciles every captured change before it drops the source (#447).** After
   the `DETACH`, the swap drained the change-capture delta for at most 100 passes of
   `greatest(batch, 1000)` keys and then attached, dropped and truncated unconditionally; nothing checked

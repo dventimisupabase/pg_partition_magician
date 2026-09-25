@@ -509,6 +509,7 @@ run_perf() {
   bash "$(dirname "$0")/bench/regrain_outgoing_fk_lock.sh" "$c" pgpm_perf10                    || rc=1
   bash "$(dirname "$0")/bench/obtain_backoff_headroom.sh" "$c" pgpm_perf12                     || rc=1
   bash "$(dirname "$0")/bench/transmute_claim_squat.sh" "$c" pgpm_perf13                       || rc=1
+  bash "$(dirname "$0")/bench/untransmute_race.sh" "$c" pgpm_perf16                            || rc=1
   # The detach-substitution guard (#407) re-runs a pgTAP file the matrix ALREADY runs, which looks
   # redundant and is not: what runs here is the harness bench/discriminate.sh drives that file
   # through, and a harness only ever pointed at mutants would be green in `discriminate` even if it
