@@ -126,7 +126,7 @@ On a managed Postgres with `pg_tle`, it can also be installed as a Trusted Langu
 
 ```sql
 select dbdev.install('dventimisupabase@pg_partition_magician');
-create extension "dventimisupabase@pg_partition_magician" version '0.4.0' cascade;
+create extension "dventimisupabase@pg_partition_magician" version '0.6.0' cascade;
 ```
 
 You also need `pg_cron` enabled to run scheduled maintenance.

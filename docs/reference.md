@@ -586,7 +586,8 @@ An **outgoing** key (the migrated table referencing another table) is replayed v
 during `from_hypertable_copy` as `NOT VALID`, validated there in its own transaction, and re-added at the new
 parent after the handoff. Validating on the copy keeps the `O(rows)` scan off the cutover's lock, and because
 the copy becomes the monolith child with an already-validated key, the parent-level add is metadata-only.
-Logged `from_hypertable_carry_fk` and `from_hypertable_adopt_fk`.
+Logged `from_hypertable_carry_fk`, once per key, by the copy; the parent-level re-add is a step of the
+`transmute` the handoff runs, and writes no log row of its own.
 
 An **incoming** key (another table referencing the migrated one) is captured and dropped in the cutover,
 since the source hypertable cannot be dropped while one points at it, then re-added against the new parent

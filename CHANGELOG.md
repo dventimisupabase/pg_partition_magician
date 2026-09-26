@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **The guide's database.dev snippet names the version this tree installs, and the reference names only
+  log actions pgpm writes** (#521). `docs/guide.md`'s `create extension ... version '0.4.0'` sat two
+  releases behind `extension.control`'s `0.6.0`, because RELEASING.md's list of files to bump at release
+  time did not include it, so an operator following the guide installed a release this file lists fixes
+  for. And `docs/reference.md`'s Foreign keys section promised `from_hypertable_adopt_fk` beside
+  `from_hypertable_carry_fk` after the cutover's adopt step, its only writer, was removed (transmute's
+  parent-level re-add logs nothing), so an alert on that action, part of the log-action contract
+  RELEASING.md spells out, could never fire. The pin is `0.6.0`, the sentence names
+  `from_hypertable_carry_fk` alone, and RELEASING.md and ONBOARDING.md list the pin as the third file a
+  release bumps. `scripts/check_living_docs.sh` gained two checks that keep both true: every
+  `version 'X.Y.Z'` literal in a living document must equal `extension.control`'s `default_version`, and
+  every `pgpm.log.action` the operator docs name (the reference's vocabulary table and every "logged
+  `x`" sentence) must be a literal some `install.sql` writes, failing loudly when the vocabulary table
+  cannot be found rather than passing on nothing. Its new `--selftest`, which the `Living docs` lint job
+  now runs first, re-breaks a scratch copy four ways (the stale pin, the phantom action in prose and as a
+  table row, the vocabulary heading moved) and requires each check to fail against its re-break.
+
 - **Turning auto-regrain off mid-flight abandons the run it started, instead of stranding it** (#516).
   `set_regrain(parent, null)` wrote `regrain_to` and nothing else. `maintain` dispatches `regrain_step` only
   while `regrain_to` is set, so the run in flight was never driven again, and the capture janitor keeps
