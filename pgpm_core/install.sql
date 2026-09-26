@@ -5333,7 +5333,10 @@ drop function if exists pgpm.maintain(regclass);
 -- CAUTION for anyone adding a step: `set local` dies at COMMIT. lock_timeout is therefore re-applied
 -- after every boundary below, and a new step placed after a COMMIT without re-applying it silently runs
 -- with the session default -- which for obtain means waiting indefinitely for a lock it is designed to
--- fail fast on.
+-- fail fast on. This has happened once already (#514): the retain boundary went without its re-apply,
+-- and auto-regrain's swap DETACH waited on a writer with no timeout while every read of the parent
+-- queued behind it. bench/maintain_regrain_lock_timeout.sh guards that boundary; a new one needs the
+-- same pairing.
 create or replace procedure pgpm.maintain(p_parent regclass, inout p_status text default null)
 language plpgsql as $$
 declare
@@ -5400,7 +5403,15 @@ begin
   -- BOUNDARY (#279). retain DROPs partitions, which takes ACCESS EXCLUSIVE on the parent. Also releases
   -- the FOR UPDATE SKIP LOCKED claim retain holds on each pgpm.part row it worked, which would otherwise
   -- be held against other retirement actors for the rest of the tick.
+  --
+  -- #514: this was the one boundary that did NOT re-apply lock_timeout, so the auto-regrain block below
+  -- ran under the session default (0: wait forever). Its swap's DETACH takes ACCESS EXCLUSIVE on the
+  -- parent, so a writer holding one row in the source kept that request queued for its whole
+  -- transaction, every read of the parent queued behind the request, and the tick swapped when the
+  -- writer let go instead of logging skip_regrain and retrying, which is what docs/reference.md promises.
+  -- bench/maintain_regrain_lock_timeout.sh holds the line below in place.
   commit;
+  perform set_config('lock_timeout', '200ms', true);   -- #514: the auto-regrain below is a step too
 
   -- Adaptive feathering, the drain step, and the FK suspension that guarded it are all gone (#288).
   -- They existed to pace and protect the evacuation of the DEFAULT partition; with a complete forward

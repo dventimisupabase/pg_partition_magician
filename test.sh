@@ -604,6 +604,7 @@ run_perf() {
     "bench/datestyle_bounds.sh pgpm_perf25"
     "bench/dropped_fk_identity.sh pgpm_perf26"
     "bench/regrain_capture_identity.sh pgpm_perf27"
+    "bench/maintain_regrain_lock_timeout.sh pgpm_perf28"
   )
   local selected=()
   local n=${#guards[@]} idx

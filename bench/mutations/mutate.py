@@ -345,6 +345,20 @@ MUTATIONS = {
         "its own is unverified no matter how well its twin is covered.",
         MAINTAIN_NO_COMMITS_EDITS,
     ),
+    "maintain_no_lock_timeout_after_retain": (
+        "bench/maintain_regrain_lock_timeout.sh",
+        "Pre-#514 maintain: the retain boundary's COMMIT is not followed by the set_config that puts "
+        "lock_timeout back, so the auto-regrain block after it runs under the session default (0: wait "
+        "forever). Its swap's DETACH takes ACCESS EXCLUSIVE on the parent; a writer holding one row in "
+        "the source keeps that request queued for its whole transaction, every read of the parent "
+        "queues behind the request, and the tick swaps when the writer lets go instead of logging "
+        "skip_regrain and retrying. Removes only that one line: the other four boundaries keep their "
+        "re-apply, so the mutant is the shipped procedure exactly and nothing else about the tick "
+        "moves. Anchored on the line's own #514 marker, which is what makes it unique among the "
+        "identical re-applies after the write-block and archive boundaries.",
+        [("  perform set_config('lock_timeout', '200ms', true);   -- #514: the auto-regrain below is a step too\n",
+          "", 1)],
+    ),
     "restore_fk_inline_validate": (
         "bench/restore_fk_lock.sh",
         "Pre-#265 restore_incoming_fks: the VALIDATE runs inline, in the same transaction as the ADD, so "
