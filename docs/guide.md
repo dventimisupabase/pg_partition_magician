@@ -562,7 +562,9 @@ brief lock) when nothing references the table. Two consequences in the monolith 
 - **Retention over un-regrained coarse history is all-or-nothing.** A coarse monolith *spanning* the
   horizon is not dropped, because it still holds within-horizon data, so its aged span is not reclaimed
   for as long as it straddles. The monolith is **not exempt** from retention, though: it is an ordinary
-  child partition, and once its whole range is past the horizon it drops like any other, in one step.
+  child partition, and once its whole range is past the horizon it drops like any other, in one step,
+  cancelling any regrain still splitting it (its copies are reclaimed; retention has already taken
+  everything that regrain would have produced).
   Since its upper bound `B` sits just above the frontier at conversion, that happens roughly one retention
   period after you convert, and reclaims the whole history at once.
   What regraining changes is the *granularity*: split into fine children, each drops on its own schedule,

@@ -403,6 +403,25 @@ ARCHIVE_CHUNK_TIES_BLOCK = """    if not pgpm._native_gt(cfg.control_kind, v_sto
     end if;
 """
 
+# retire()'s reclamation of the regrain whose source it drops (#519), whole (comment and code), so the
+# first mutant reads as code that never had it. The second keeps a comment of its own, because what it
+# puts in place is a plausible "simplification" a refactor might make, and the mutant should read as
+# one: the operator verb, parent-wide, where the scoped helper was.
+RETIRE_REGRAIN_RECLAIM = """    -- THE REGRAIN THIS DROP WOULD ORPHAN GOES WITH IT (issue #519). If this partition is the source of
+    -- an in-flight regrain, its fine copies, its captured changes and config.regrain_cursor would
+    -- outlive it with nothing left to reclaim them: auto-regrain answers 'none' once no coarse child
+    -- remains, and the janitor only tears down capture the cursor does not cover. _regrain_reclaim
+    -- takes exactly that regrain's state and no other's (see there for why reclaiming beats refusing,
+    -- and why it is not regrain_cancel). In the drop's own subtransaction, ahead of the DROP, so a lock
+    -- lost on a copy leaves the source whole and this retirement retried next tick, and so the cancel
+    -- is recorded before the drop it makes room for.
+    perform pgpm._regrain_reclaim(p_parent, p_child, r.lo, r.hi);
+"""
+
+RETIRE_REGRAIN_CANCEL_WHOLE_PARENT = """    -- the source of an in-flight regrain is being dropped: cancel the regrain
+    perform pgpm.regrain_cancel(p_parent);
+"""
+
 MUTATIONS = {
     "transmute_no_commits": (
         "bench/transmute_lock.sh",
@@ -1851,6 +1870,26 @@ $$;''',
         "chunks, the burst whole in the second) and its retire assertions are what catch it, through "
         "bench/archive_chunk_ties.sh.",
         [(ARCHIVE_CHUNK_TIES_BLOCK, "", 1)],
+    ),
+    "retire_drops_regrain_source": (
+        "bench/retire_regrain_source.sh",
+        "Pre-#519 retire(): the coarse source of an in-flight regrain is dropped once archiving covers it, "
+        "and the regrain's fine copies (not-attached pgpm.part rows and their standalone tables, still "
+        "holding the rows retention just dropped), its captured changes and config.regrain_cursor are left "
+        "behind with no tick able to reclaim them: auto-regrain answers 'none' with no coarse child left and "
+        "the janitor only tears down capture the cursor does not cover. tests/129 cases A (the scheduled "
+        "path) and B (retire by hand, with a captured change pending) are what catch it.",
+        [(RETIRE_REGRAIN_RECLAIM, "", 1)],
+    ),
+    "retire_cancels_whole_parent_regrain": (
+        "bench/retire_regrain_source.sh",
+        "The scoped _regrain_reclaim replaced by pgpm.regrain_cancel(p_parent), the operator verb: a superset "
+        "that also tears capture off every other child, drops every not-attached copy of the parent and "
+        "clears a cursor that belongs to a regrain of a DIFFERENT child, so retiring any covered partition "
+        "cancels whatever regrain is in flight on the same parent. Cases A and B still pass (the cancel "
+        "covers them); tests/129 case C, which retires a neighbour while the monolith's regrain is in "
+        "flight and then finishes that regrain, is what names this mutant.",
+        [(RETIRE_REGRAIN_RECLAIM, RETIRE_REGRAIN_CANCEL_WHOLE_PARENT, 1)],
     ),
 }
 

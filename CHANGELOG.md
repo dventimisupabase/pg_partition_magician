@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **Retention dropping the coarse source of an in-flight regrain reclaims that regrain instead of
+  orphaning it** (#519). With auto-regrain, an `archive_fn` and `retain` all on, the archive step and the
+  regrain worked the same wholly-aged coarse child at once, and when archiving covered it first `retire()`
+  dropped it and left everything the regrain had built behind: not-attached `pgpm.part` rows that no
+  partition covered, standalone fine copies still holding the rows retention had just dropped,
+  `config.regrain_cursor` pointing into a range that no longer existed, and no tick able to reclaim any of
+  it (auto-regrain answered `none`, the capture sweep only tears down what the cursor does not cover). No
+  rows were lost, the source had been archived, but the documented pipeline was not kept and the
+  leftovers held disk and misreported `status().inflight_partitions` for good. `retire()` now calls a new
+  `pgpm._regrain_reclaim` in the drop's own subtransaction, ahead of the `DROP`: it discards the copies
+  inside the dropped range, the captured changes when this child carries the capture trigger, and the
+  cursor when it is unambiguously this child's, and logs one `regrain_cancel` row whose `method` names
+  `retire`. Scoped to the source, not the parent, so a regrain in flight on another child is untouched
+  and a refusal reclaims nothing; reclaimed rather than refused because `set_regrain(parent, null)`
+  leaves cursor and capture in place, so a `retire` that waited for the regrain would wait forever. The
+  `retain`, `retire`, `regrain_step`, `regrain_cancel` and `pgpm.log` entries in `docs/reference.md` and
+  the retention bullet in `docs/guide.md` describe it. `tests/129_retire_regrain_source_test.sql`
+  reproduces the scheduled path, the hand-driven path with a captured change pending, and the neighbour
+  case, asserting by identity which copies existed at the drop and that none survives it;
+  `bench/retire_regrain_source.sh` drives it against the `retire_drops_regrain_source` and
+  `retire_cancels_whole_parent_regrain` mutations, which `./test.sh discriminate` requires it to fail.
 - **A substituted partition name no longer discards the real partition's archive coverage** (#518).
   `_enforce_write_blocks` decided "coverage found without its block" by name,
   `_is_write_blocked(child_name)`, at the top of its loop body, before the identity check
