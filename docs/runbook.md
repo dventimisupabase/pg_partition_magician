@@ -392,8 +392,12 @@ failure blocks that one partition on purpose (`retain_drop_failures` climbing in
    took it, then either put the intended relation back under that name or clear the stale bookkeeping
    with `pgpm.forget_missing()` (if the parent itself is gone) or `delete from pgpm.part where
    parent_table = ... and child_name = ...`. Renaming a partition is safe if you update
-   `pgpm.part.child_name` in the same transaction: a rename does not change an oid, so the recorded
-   identity stays right.
+   `pgpm.part.child_name` and `pgpm.archive_ledger.child_name` in the same transaction: a rename does
+   not change an oid, so the recorded identity stays right, and the ledger matches archived chunks to
+   their partition by name, so carrying it keeps the coverage attached (the guide has the three
+   statements). Leaving the ledger behind does not wedge anything: the next archive tick discards the
+   coverage left under the old name (logged once as `archive_coverage_reset`) and archives the
+   partition again from its `lo`.
 
    **`fail_archive_contract` is the archive step refusing what your archive strategy returned**, not a
    problem with the partition: `config.archive_fn` answered a chunk with a `covered_hi` that was null,
