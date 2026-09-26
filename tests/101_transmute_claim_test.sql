@@ -9,6 +9,7 @@
 -- pins is the part that is expressible in one session: the claim's own state machine, and the liveness
 -- predicate the recovery paths read.
 create extension if not exists pgtap;
+create extension if not exists dblink;
 
 select plan(10);
 
@@ -48,17 +49,23 @@ call pgpm.transmute('public.cl0', 'id', 100::bigint, p_paused => true);
 select is((select count(*)::int from pgpm.transmute_inflight where parent_table = 'public.cl0'::regclass),
           0, 'a completed conversion releases its claim by deleting the row');
 
--- A claim whose owner is alive refuses a second conversion. Built by hand rather than by racing two real
--- transmutes, which one session cannot do: the row plus a live owner IS the state a running conversion
--- presents, and it is exactly what _transmute's ON CONFLICT ... WHERE NOT _session_alive(...) consults.
+-- A claim whose owner is ANOTHER live session refuses a second conversion. Built by hand rather than by
+-- racing two real transmutes, which one session cannot do: the row plus a live owner IS the state a
+-- running conversion presents, and it is exactly what _transmute's ON CONFLICT ... WHERE consults. The
+-- owner is a real second backend, held open through dblink, and deliberately NOT this session: since
+-- #509 a claim recorded by the calling session itself is that session's own earlier, failed attempt,
+-- which it may resume or abort (tests/125), so a claim owned by pg_backend_pid() no longer stands in for
+-- a conversion running elsewhere.
 create table public.cl1 (id bigint primary key);
+select dblink_connect('other', 'dbname=' || current_database());
 insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi,
                                      owner_pid, owner_backend_start)
-values ('public.cl1'::regclass, 'public', 'cl1', 'id', '0', '100',
-        pg_backend_pid(), (select backend_start from pg_stat_activity where pid = pg_backend_pid()));
+select 'public.cl1'::regclass, 'public', 'cl1', 'id', '0', '100', t.pid, t.started
+  from dblink('other', 'select pid, backend_start from pg_stat_activity where pid = pg_backend_pid()')
+       as t(pid int, started timestamptz);
 
-select ok(pgpm._session_alive(owner_pid, owner_backend_start),
-          'the constructed claim really does have a live owner (witness for the refusals below)')
+select ok(pgpm._session_alive(owner_pid, owner_backend_start) and owner_pid <> pg_backend_pid(),
+          'the constructed claim really does have a live owner, and it is not this session (witness for the refusals below)')
   from pgpm.transmute_inflight where parent_table = 'public.cl1'::regclass;
 
 select throws_ok(
@@ -78,6 +85,7 @@ select throws_ok(
 -- THE DISCRIMINATOR. Same row, same table, owner cleared to stand in for a session that died mid-run: the
 -- reaper must now undo it. Without this the four assertions above are all satisfied by a reaper that never
 -- reaps anything at all.
+select dblink_disconnect('other');
 update pgpm.transmute_inflight set owner_pid = null, owner_backend_start = null
  where parent_table = 'public.cl1'::regclass;
 select is(pgpm._transmute_reap(), 1, 'the reaper DOES undo the same claim once its owner is gone');

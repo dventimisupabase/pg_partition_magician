@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+- **`transmute` refuses up front a table it cannot convert and a name it cannot take, and a failed attempt
+  can be retried or aborted from the session that owns it (#509).** Three conditions the cutover was
+  always going to trip on were checked nowhere before it, so phases 1 and 2 first committed a validated,
+  write-rejecting `pgpm_monolith_bound` and the `transmute_inflight` claim, and the failure surfaced as a
+  raw error from inside the cutover, on a table the docs promised an up-front refusal would leave
+  untouched. Re-running `transmute` on an already converted table (the documented remedy after any
+  failure, and what a client that lost its connection after the cutover committed will do) added the
+  bound to the live partitioned parent, where it propagated to the forward partitions and rejected every
+  write past the original monolith's `hi`, i.e. every current write; with the frontier already past the
+  monolith it instead succeeded and nested the whole table under a second parent, with two `pgpm.config`
+  rows. A relation already holding the monolith's own coarse name `<table>_p<lo>_to_<hi>`, which neither
+  orphan-guard regex matches, failed the cutover's `RENAME` with `42P07`, bound and claim left behind; a
+  sequence, view or index holding a child-partition name was skipped by the guard's `relkind = 'r'`
+  filter and then by `obtain` itself, so that conversion completed with no forward partition and nothing
+  logged, and the first write past `hi` failed with `no partition of relation ... found for row`. And
+  after a cutover failure (a `lock_timeout` in phase 3) the
+  claim's owner was the operator's still-connected session, which the take-over predicate and
+  `transmute_abort` both read as "another session", so the documented retry and the documented abort were
+  refused until that session disconnected, which no document said. `transmute` now refuses, before
+  anything is committed, a table with a `pgpm.config` row, one whose relkind is not a plain table, and a
+  partition, inheritance child or inheritance parent; checks the monolith's own name once the claim has
+  made the bound final; and runs the orphan guard over every relation kind, naming what it found (new
+  helper `_relkind_noun`). A claim recorded by the calling session itself is that session's own earlier,
+  failed attempt: `transmute` resumes it and `transmute_abort` clears it, while a different live session
+  is still refused both ways and the reaper's plain liveness test is unchanged, so a `maintain_all` run by
+  hand from the owning session still leaves the bound alone. `tests/125_transmute_preconditions_test.sql`
+  pins all of it, driving the failing conversions through dblink so a late failure really commits and its
+  damage is observable; `bench/transmute_preconditions.sh` runs that file against the three mutations
+  `transmute_no_shape_precondition`, `transmute_names_unchecked` and
+  `transmute_claim_refuses_own_session`. `tests/101`'s "another session" claim is now owned by a real
+  second backend rather than the test's own, which the fix would otherwise have let through.
+
 - **`untransmute` hands back the monolith with none of pgpm's own apparatus left on it** (#508). It
   captured and replayed the parent's row triggers, and `DETACH` strips their clones, but the triggers
   maintenance puts directly on the monolith child were never touched. A monolith retention had reached
