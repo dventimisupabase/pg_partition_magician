@@ -5068,8 +5068,9 @@ drop function if exists pgpm.feathering_validation(regclass, interval, interval)
 -- bigint step as text for id) turns it on: each maintenance tick feathers the oldest frozen coarse child
 -- one budget-sized microbatch toward that granularity. null turns it off (regrain stays operator-driven via
 -- regrain()/regrain_history()). This only PACES regraining across ticks; regrain_step enforces its own
--- preconditions (frozen, default-clear), so enabling it is always safe -- PROVIDED p_target_step is no
--- coarser than partition_step (issue #341, see the guard below).
+-- preconditions (frozen, default-clear), so enabling it is always safe: a target coarser than
+-- partition_step is refused (issue #341, see the guard below), and maintain() only ever selects a child
+-- the target subdivides (#515), so no target can wedge it.
 create or replace function pgpm.set_regrain(p_parent regclass, p_target_step text default null)
 returns void language plpgsql as $$
 declare
@@ -5078,15 +5079,25 @@ begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
 
-  -- #341: a p_target_step COARSER than partition_step makes progress once, then wedges forever.
-  -- maintain()'s auto-regrain candidate query calls a child "coarse" whenever it is wider than one
-  -- partition_step, but regrain_step's own 'nosubdiv' guard refuses to split a child already at (or
-  -- narrower than) p_target_step. Once a coarse child is split down to a regrain_to wider than
-  -- partition_step, it is still "coarse" by the candidate query's definition, so every later tick
-  -- reselects that same unsplittable child and makes no further progress -- silently, forever.
-  -- Reject it here instead, at call time. Equal-or-finer stays allowed, matching every existing call
-  -- site. partition_anchor is on-grid for ANY step (grid_floor(anchor, step, anchor) = anchor), so
-  -- it is a safe shared point to compare the two steps' widths without a specific child row.
+  -- #341: a p_target_step COARSER than partition_step is refused at call time. maintain()'s auto-regrain
+  -- candidate query calls a child "coarse" whenever it is wider than one partition_step, and regrain_step's
+  -- own 'nosubdiv' guard refuses to split a child already at (or narrower than) p_target_step, so a
+  -- coarser target could only ever split each coarse child down to cells that are still "coarse" and
+  -- never subdividable: the history left at the wrong grain, for good. Equal-or-finer stays allowed,
+  -- matching every existing call site. partition_anchor is on-grid for ANY step (grid_floor(anchor, step,
+  -- anchor) = anchor), so it is a shared point at which to compare the two steps' widths without a child
+  -- row.
+  --
+  -- That comparison is exact for two calendar steps or two fixed ones, and only approximate across kinds
+  -- (#515): a fixed target on a calendar grid, or the reverse, is compared against the ONE cell that
+  -- starts at the anchor, so '30 days' on a '1 month' grid passes here (narrower than a 31-day January)
+  -- although a 30-day cell that starts in February is wider than the calendar month from there. That
+  -- used to wedge auto-regrain: such a cell was the oldest "coarse" candidate on every tick and
+  -- 'nosubdiv' in regrain_step. It cannot any more: maintain() selects only a child the target
+  -- subdivides, so the cells a target cannot split are left alone (and stay counted in
+  -- status().coarse_partitions). Refusing them here exactly would need the shortest and the longest cell
+  -- of a calendar step in partition_tz, DST included; the selection rule closes the wedge for every
+  -- target, so this guard stays the loud refusal of the unambiguous case.
   if p_target_step is not null and pgpm._native_gt(
        cfg.control_kind,
        pgpm._grid_next(cfg.control_kind, p_target_step, cfg.partition_anchor, cfg.partition_tz),
@@ -5425,15 +5436,28 @@ begin
   -- grid there is nothing to evacuate. What remains of a tick is obtain, archive, retain, regrain and the
   -- FK restore -- none of which is paced by row volume.
 
-  -- Auto-regrain target: the oldest FROZEN coarse child (if auto-regrain is on). A coarse child (hi > one
-  -- step past lo) is frozen once its whole range is at/below the current grid floor (no live write still
-  -- lands in it). Found here so the auto-regrain block below can use it.
+  -- Auto-regrain target: the oldest FROZEN coarse child that the target step SUBDIVIDES (if auto-regrain
+  -- is on). A coarse child (hi > one step past lo) is frozen once its whole range is at/below the current
+  -- grid floor (no live write still lands in it). Found here so the auto-regrain block below can use it.
+  --
+  -- "The target subdivides it" (hi > one regrain_to past lo) is regrain_step's own 'nosubdiv' precondition,
+  -- verbatim, and it is REQUIRED here rather than assumed (#515). Assumed, it held only while regrain_to
+  -- was no wider than partition_step at every lo, which set_regrain's #341 guard checks once, at the
+  -- anchor: exact for two calendar steps or two fixed ones, not across kinds. '30 days' on a '1 month'
+  -- grid is narrower than the anchor's 31-day January and was accepted, yet a 30-day cell that starts in
+  -- February is wider than the calendar month from there. Once the first coarse child had been split into
+  -- such cells, that one was "coarse" here and 'nosubdiv' in regrain_step, so it was the oldest candidate
+  -- on every later tick, forever, and the coarse children behind it were never reached. With the second
+  -- predicate here a child the target cannot split is skipped, not reselected: it stays as it is, and
+  -- stays counted in status().coarse_partitions. progress().coarse_frozen mirrors this test.
   if cfg.regrain_to is not null then
     execute format(
       'select child_name from pgpm.part p where p.parent_table = %L::regclass and p.attached'
       || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo, %L))'
+      || ' and pgpm._native_gt(%L, p.hi, pgpm._grid_next(%L, %L, p.lo, %L))'   -- #515: the target subdivides it
       || ' and not pgpm._native_gt(%L, p.hi, %L) order by p.lo::%s asc limit 1',
       p_parent::text, cfg.control_kind, cfg.control_kind, cfg.partition_step, cfg.partition_tz,
+      cfg.control_kind, cfg.control_kind, cfg.regrain_to, cfg.partition_tz,
       cfg.control_kind,
       pgpm._grid_floor(cfg.control_kind, cfg.partition_step, cfg.partition_anchor, pgpm._frontier_native(p_parent), cfg.partition_tz),
       pgpm._native_type(cfg.control_kind))
@@ -6183,12 +6207,17 @@ begin
         end if;
       end if;
 
-      -- coarse children already frozen: whole range at/below the current grid floor, which is exactly
-      -- maintain()'s auto-regrain candidate test
+      -- coarse children already frozen: whole range at/below the current grid floor, and (with auto-regrain
+      -- on) ones its target subdivides, which together is exactly maintain()'s auto-regrain candidate test
+      -- (#515). With regrain_to null the second clause repeats the first, so every frozen coarse child
+      -- counts, as before. A frozen coarse child a set regrain_to cannot split is not counted here, because
+      -- it is not going to be worked; it stays in status().coarse_partitions, which counts by the grid's
+      -- step alone.
       v_floor := pgpm._grid_floor(r.control_kind, r.partition_step, r.partition_anchor, v_frontier, r.partition_tz);
       select count(*) into coarse_frozen from pgpm.part p
        where p.parent_table = r.parent_table and p.attached
          and pgpm._native_gt(r.control_kind, p.hi, pgpm._grid_next(r.control_kind, r.partition_step, p.lo, r.partition_tz))
+         and pgpm._native_gt(r.control_kind, p.hi, pgpm._grid_next(r.control_kind, coalesce(r.regrain_to, r.partition_step), p.lo, r.partition_tz))
          and not pgpm._native_gt(r.control_kind, p.hi, v_floor);
 
       regrain_delta_pending := pgpm._regrain_delta_count(r.parent_table);

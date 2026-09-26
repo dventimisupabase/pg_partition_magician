@@ -1419,7 +1419,11 @@ pgpm.set_regrain(p_parent regclass, p_target_step text default null) returns voi
 Turn auto-regrain on or off. A non-null `p_target_step` (an interval as text for time/uuidv7/text_time, a `bigint`
 step as text for id) lets each `maintain` tick feather the oldest frozen coarse child one microbatch
 toward that granularity; `null` turns it off (regrain stays operator-driven). Enabling it is always safe:
-`regrain_step` enforces its own preconditions, so an un-meetable tick simply retries.
+`regrain_step` enforces its own preconditions, so an un-meetable tick simply retries, and `maintain` selects
+only a frozen coarse child the target subdivides, so a child the target cannot split (a 30-day cell that
+starts in February, on a monthly grid) is left alone rather than retried forever; it stays counted in
+`status().coarse_partitions`. A `p_target_step` coarser than `partition_step` (compared at
+`partition_anchor`) is refused.
 
 ### `set_obtain`
 
@@ -1569,8 +1573,10 @@ produced, not what you meant them to.
   `max(control)`, pgpm keeps no history of it, and a rate to divide by would be a guess. Read
   `freeze_margin` instead.
 - `coarse_frozen` -- coarse partitions whose whole range is already behind the frontier: frozen, and
-  eligible for regrain. `coarse_frozen > 0` beside a null `regrain_to` is a history that is not going to
-  split by itself.
+  eligible for regrain; with `regrain_to` set, only those the target subdivides, which is exactly what
+  `maintain` will select. `coarse_frozen > 0` beside a null `regrain_to` is a history that is not going to
+  split by itself. `coarse_frozen = 0` beside `coarse_partitions > 0` and a set `regrain_to` is coarse
+  history that is either not frozen yet (see `freeze_in`) or that the target cannot split.
 
 **How far along is the regrain, and when does it finish?** Populated while a regrain is in flight
 (`config.regrain_cursor` set, and one child carrying change capture); null otherwise.

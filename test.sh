@@ -606,6 +606,7 @@ run_perf() {
     "bench/regrain_capture_identity.sh pgpm_perf27"
     "bench/maintain_regrain_lock_timeout.sh pgpm_perf28"
     "bench/quoted_schema.sh pgpm_perf29"
+    "bench/regrain_candidate_subdivides.sh pgpm_perf30"
   )
   local selected=()
   local n=${#guards[@]} idx

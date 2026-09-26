@@ -440,11 +440,17 @@ child toward the target step, sized by `config.regrain_batch`. It is off by defa
 (`set_regrain(parent, null)` turns it back off) and always safe to enable: it only paces regraining; it
 never starts on a child that is not frozen.
 
-`set_regrain` refuses a target step **coarser** than `partition_step`: that combination makes progress once
-and then wedges auto-regrain forever, with no error, since the resulting child is still "coarse" by the
-candidate query's definition but no longer subdividable toward the (coarser) target. Equal-or-finer targets
-are unrestricted. For a genuinely hierarchical split (monolith to yearly to monthly, to bound transient
-disk), drive it by hand with `pgpm.regrain()`/`regrain_history()` instead -- those stay fully general.
+`set_regrain` refuses a target step **coarser** than `partition_step`: splitting toward it could only leave
+the history at a grain the grid does not have. Equal-or-finer targets are accepted, and `maintain` only ever
+selects a frozen coarse child that the target actually **subdivides**, so no target can wedge auto-regrain:
+a child the target cannot split is left as it is and the next coarse child is worked instead. The comparison
+behind the refusal is made at `partition_anchor`, which is exact between two calendar steps or two fixed
+ones but not across kinds: `'30 days'` on a `'1 month'` grid is accepted (narrower than the anchor's
+January) although a 30-day cell that starts in February is wider than the calendar month from there. Such
+cells stay counted in `status().coarse_partitions` for good, so on a calendar grid prefer a calendar target
+(`'1 month'` on a monthly grid) or a fixed one no wider than the grid's shortest cell (28 days for a monthly
+grid). For a genuinely hierarchical split (monolith to yearly to monthly, to bound transient disk), drive it
+by hand with `pgpm.regrain()`/`regrain_history()` instead -- those stay fully general.
 
 Regrain **copies**; it never deletes from the source. The coarse child stays whole and attached until one
 atomic swap detaches it, attaches the fine children, and drops it. So a regrain -- the
