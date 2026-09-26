@@ -2020,25 +2020,46 @@ $$;
 -- and the trigger second, on purpose: a chunk is only ever recorded after the transaction that
 -- installed its trigger committed, so a read that finds coverage and then finds no trigger has found
 -- a trigger that left AFTER the coverage was recorded, never one that has simply not landed yet.
+--
+-- AND THE DISCARD IS ANCHORED TO IDENTITY (issue #518). "Without its block" was decided by NAME,
+-- _is_write_blocked(child_name), while the #429 identity check sat further down the loop body inside
+-- _install_write_block. A relation squatting on a partition's name has no trigger, so the tick read
+-- the REAL partition's coverage as unguarded and deleted its ledger rows, in the same tick that then
+-- refused to write-block the squatter as fail_write_block_identity. The rows described a relation
+-- that was still attached, still blocked and unchanged; only the name had moved. So each child's
+-- name is resolved against pgpm.part.child_oid before anything the loop decides by that name, with
+-- exactly _install_write_block's predicate (a null anchor compares as nothing; a name resolving to
+-- nothing stays on the skip_write_block path, for the reasons given above that function), and a
+-- substituted name suppresses the discard: the identity refusal, logged by _install_write_block when
+-- the child is eligible, is then the whole of what the tick does for that child. The predicate is
+-- computed here rather than by anchoring _is_write_blocked, which _archive_step and retire() share
+-- and each follow with an identity refusal of their own one step later, and because the remove arm
+-- below must keep resolving by name: _remove_write_block is deliberately unanchored (#429), so that
+-- an upgraded pgpm can lift a trigger an older one left on whatever held the name.
 create or replace function pgpm._enforce_write_blocks(p_parent regclass)
 returns void language plpgsql as $$
 declare
   cfg pgpm.config; v_boundary text; v_nsp name; r record; v_eligible boolean; v_chunks bigint;
+  v_now regclass; v_substituted boolean;
 begin
   select * into cfg from pgpm.config where parent_table = p_parent;
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   v_boundary := pgpm._retain_boundary(cfg);
   select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;
 
-  for r in select child_name, lo, hi from pgpm.part where parent_table = p_parent and attached
+  for r in select child_name, lo, hi, child_oid from pgpm.part where parent_table = p_parent and attached
     order by hi asc
   loop
     begin
       v_eligible := v_boundary is not null and not pgpm._native_gt(cfg.control_kind, r.hi, v_boundary);
 
+      -- identity first (#518): does the name still mean the relation pgpm recorded?
+      v_now := to_regclass(format('%I.%I', v_nsp, r.child_name));
+      v_substituted := r.child_oid is not null and v_now is not null and v_now::oid <> r.child_oid;
+
       select count(*) into v_chunks from pgpm.archive_ledger
        where parent_table = p_parent and child_name = r.child_name;
-      if v_chunks > 0 and not pgpm._is_write_blocked(p_parent, r.child_name) then
+      if v_chunks > 0 and not v_substituted and not pgpm._is_write_blocked(p_parent, r.child_name) then
         delete from pgpm.archive_ledger where parent_table = p_parent and child_name = r.child_name;
         insert into pgpm.log (parent_table, action, lo, hi, rows, method)
           values (p_parent, 'archive_coverage_reset', r.lo, r.hi, v_chunks,

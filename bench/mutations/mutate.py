@@ -694,6 +694,32 @@ MUTATIONS = {
           "end;\n"
           "$$;\n", 1)],
     ),
+    "coverage_reset_by_name": (
+        "bench/coverage_reset_identity.sh",
+        "Pre-#518 _enforce_write_blocks: 'coverage found without its block is discarded' (#452) is "
+        "decided by NAME, _is_write_blocked(child_name), before and outside the #429 identity check "
+        "that _install_write_block makes further down the same loop body. A relation squatting on a "
+        "partition's name has no trigger, so the tick reads the REAL partition's coverage as unguarded "
+        "and deletes its pgpm.archive_ledger rows (archive_coverage_reset) in the same tick that logs "
+        "fail_write_block_identity for the same child; the rows described a relation still attached, "
+        "still blocked and unchanged, and archiving starts over from lo once the name is sorted out. "
+        "The identity predicate is left computed and unused, deliberately: the defect being modelled is "
+        "'the anchor is not consulted', not 'the anchor does not exist'. Part A of tests/129 is what "
+        "catches it, by the ledger row's identity and by which ids the strategy is handed afterwards.",
+        [("      if v_chunks > 0 and not v_substituted and not pgpm._is_write_blocked(p_parent, r.child_name) then\n",
+          "      if v_chunks > 0 and not pgpm._is_write_blocked(p_parent, r.child_name) then\n", 1)],
+    ),
+    "coverage_reset_unanchored_is_mismatch": (
+        "bench/coverage_reset_identity.sh",
+        "The tempting consistency fix for #518's predicate: `is distinct from`, the form retire() and "
+        "_archive_step use, instead of _install_write_block's `is not null and ... <>`. It reads a null "
+        "child_oid as a substitution, so on an install upgrading into identity anchoring every partition "
+        "created before the upgrade keeps coverage found without its block -- coverage nothing vouches "
+        "for, the exact #452 defect, for exactly the partitions an upgrade has nothing to compare against. "
+        "Part C of tests/129 is the only thing that catches it, which is why that part exists.",
+        [("      v_substituted := r.child_oid is not null and v_now is not null and v_now::oid <> r.child_oid;\n",
+          "      v_substituted := v_now::oid is distinct from r.child_oid;\n", 1)],
+    ),
     "hypertable_cutover_unverified_source": (
         "bench/hypertable_cutover_identity.sh",
         "Pre-#422 from_hypertable_cutover(): it locks the SOURCE by the name it resolved at the top "
