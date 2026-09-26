@@ -610,6 +610,7 @@ run_perf() {
     "bench/part_name_length.sh pgpm_perf31"
     "bench/untransmute_residue.sh pgpm_perf32"
     "bench/transmute_preconditions.sh pgpm_perf33"
+    "bench/uuidv7_regrain_archive.sh pgpm_perf34"
   )
   local selected=()
   local n=${#guards[@]} idx

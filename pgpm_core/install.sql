@@ -2222,9 +2222,16 @@ begin
   end if;
   v_batch := greatest(1, floor(cfg.archive_byte_budget::numeric / v_avg))::int;
 
+  -- The window's size and its newest control value, in one scan (a CTE read twice is materialised once).
+  -- The newest value is read with ORDER BY ... DESC LIMIT 1 and NOT max(), and the tie extension below
+  -- with ORDER BY ... ASC LIMIT 1 and NOT min(): PostgreSQL has no max(uuid) or min(uuid) before 18, so
+  -- as aggregates both raised 42883 on every uuidv7 table with an archive_fn, every tick's archive step
+  -- was logged as skip_archive, no ledger row was ever written and the aged partition was never
+  -- retired (#507). Same reasoning, and the same shape, as _frontier_native's read of the frontier.
   execute format(
-    'select count(*), max(%I)::text from (select %I from %I.%I t where t.%I >= %L order by t.%I limit %s) s',
-    cfg.control_column, cfg.control_column, v_nsp, p_child, cfg.control_column,
+    'with w as (select t.%I as c from %I.%I t where t.%I >= %L order by t.%I limit %s)
+     select (select count(*) from w), (select w.c::text from w order by w.c desc limit 1)',
+    cfg.control_column, v_nsp, p_child, cfg.control_column,
     pgpm._encode(cfg.control_kind, v_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz), cfg.control_column, v_batch)
     into v_batch_count, v_probe_hi_col;
 
@@ -2234,8 +2241,8 @@ begin
     v_probe_hi := pgpm._col_to_native(cfg, v_probe_hi_col);
     -- extend to the next distinct value past the boundary, so hi never splits a run of ties (a
     -- child's own CHECK bounds every row here to < v_child_hi already, so this can never overshoot it)
-    execute format('select min(%I)::text from %I.%I t where t.%I > %L',
-                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col)
+    execute format('select t.%I::text from %I.%I t where t.%I > %L order by t.%I asc limit 1',
+                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col, cfg.control_column)
       into v_next_distinct_col;
     v_stop := case when v_next_distinct_col is null then v_child_hi
                    else pgpm._col_to_native(cfg, v_next_distinct_col) end;
@@ -3301,8 +3308,12 @@ begin
 
   -- still a sub-range to copy: ensure its fine child exists (standalone, born with its validated bound
   -- CHECK), then COPY one budget batch into it. The copy is an anti-join against the child's PK, resumed from
-  -- the child's current max(control), so it never re-copies and never deletes. row_count < batch means the
-  -- remaining rows fit in this batch -> the sub-range is complete, advance the cursor to the next one.
+  -- the child's current newest control value, so it never re-copies and never deletes. row_count < batch means
+  -- the remaining rows fit in this batch -> the sub-range is complete, advance the cursor to the next one.
+  -- That resume point is read with ORDER BY ... DESC LIMIT 1 and NOT max(): PostgreSQL has no max(uuid)
+  -- before 18, so as max() it raised 42883 on every copy batch of a uuidv7 table, which made a uuidv7
+  -- monolith impossible to regrain and left auto-regrain logging skip_regrain every tick (#507). Same
+  -- reasoning, and the same shape, as _frontier_native's read of the frontier.
   if pgpm._native_gt(cfg.control_kind, v_hi, v_cursor) then
     v_lo_lit := pgpm._encode(cfg.control_kind, v_sub_lo, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz);
     v_hi_lit := pgpm._encode(cfg.control_kind, v_sub_hi, cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit, cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz);
@@ -3348,7 +3359,7 @@ begin
     execute format($f$
       insert into %7$I.%8$I (%6$s)
       select %6$s from %1$s s
-       where s.%2$I >= coalesce((select max(d2.%2$I) from %7$I.%8$I d2), %3$L)
+       where s.%2$I >= coalesce((select d2.%2$I from %7$I.%8$I d2 order by d2.%2$I desc limit 1), %3$L)
          and s.%2$I < %4$L
          and not exists (select 1 from %7$I.%8$I d where %9$s)
        order by s.%2$I

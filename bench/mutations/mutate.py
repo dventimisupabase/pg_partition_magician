@@ -1549,6 +1549,50 @@ $$;''',
   end if;
 """, "", 1)],
     ),
+    # Issue #507, one mutation per site so each is proven caught on its own. PostgreSQL has no max(uuid)
+    # or min(uuid) before 18, and three reads of a uuidv7 table's newest or next control value used
+    # exactly those aggregates; the fix reads all three with ORDER BY ... LIMIT 1, the way
+    # _frontier_native already did. Split three ways because the third site is only reached when a
+    # chunk is budget-limited: a single combined mutation would be caught by the first site's failure
+    # and prove nothing about whether tests/125 ever exercises the tie extension.
+    "regrain_copy_watermark_max_uuid": (
+        "bench/uuidv7_regrain_archive.sh",
+        "Pre-#507 regrain_step: the copy microbatch resumed from `(select max(d2.<control>) from <fine "
+        "child> d2)`. On a uuidv7 table that is 42883 'function max(uuid) does not exist' on the very "
+        "first copy batch, so pgpm.regrain() and regrain_history() die synchronously, and once "
+        "set_regrain has armed auto-regrain every maintain tick prepares, fails the copy, and logs "
+        "skip_regrain, forever, with the capture trigger left on a monolith that can never be split. "
+        "tests/125's parts (A) and (B) catch it: regrain() dying, and skip_regrain rows where the "
+        "monolith should have become three months.",
+        [("       where s.%2$I >= coalesce((select d2.%2$I from %7$I.%8$I d2 order by d2.%2$I desc limit 1), %3$L)\n",
+          "       where s.%2$I >= coalesce((select max(d2.%2$I) from %7$I.%8$I d2), %3$L)\n", 1)],
+    ),
+    "archive_chunk_boundary_max_uuid": (
+        "bench/uuidv7_regrain_archive.sh",
+        "Pre-#507 _next_archive_chunk: the byte-budget window's newest control value was read with "
+        "max(<control>) over the window. On a uuidv7 table with an archive_fn that is 42883 on every "
+        "tick's archive step, logged as skip_archive; no ledger row is ever written, "
+        "_archive_fully_covered stays false and retain() never drops the aged partition. tests/125 "
+        "catches it twice: the direct _next_archive_chunk call on the frozen monolith dies, and part (C) "
+        "finds skip_archive rows where the ledger should cover the aged month.",
+        [("    'with w as (select t.%I as c from %I.%I t where t.%I >= %L order by t.%I limit %s)\n"
+          "     select (select count(*) from w), (select w.c::text from w order by w.c desc limit 1)',\n"
+          "    cfg.control_column, v_nsp, p_child, cfg.control_column,\n",
+          "    'select count(*), max(%I)::text from (select %I from %I.%I t where t.%I >= %L order by t.%I limit %s) s',\n"
+          "    cfg.control_column, cfg.control_column, v_nsp, p_child, cfg.control_column,\n", 1)],
+    ),
+    "archive_chunk_tie_min_uuid": (
+        "bench/uuidv7_regrain_archive.sh",
+        "Pre-#507 _next_archive_chunk: the extension of a full chunk past a run of ties read the next "
+        "distinct control value with min(<control>). Reached only when the window fills the byte "
+        "budget, so a fixture whose partitions each fit one chunk never gets here and a guard would "
+        "pass with the defect present; tests/125 part (C) forces the aged month through a 400-byte "
+        "budget, asserts that it took several chunks, and so finds the skip_archive rows this puts back.",
+        [("    execute format('select t.%I::text from %I.%I t where t.%I > %L order by t.%I asc limit 1',\n"
+          "                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col, cfg.control_column)\n",
+          "    execute format('select min(%I)::text from %I.%I t where t.%I > %L',\n"
+          "                   cfg.control_column, v_nsp, p_child, cfg.control_column, v_probe_hi_col)\n", 1)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
