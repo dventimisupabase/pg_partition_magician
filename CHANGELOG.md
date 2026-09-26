@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **A refusal assertion around a committing procedure pins the SQLSTATE or the message, and a guard
+  keeps every one of them pinned** (#522). pgTAP's `throws_ok` and `throws_like` run the statement
+  under test inside a plpgsql function, so a procedure that does NOT refuse runs on to its first COMMIT
+  there and dies with 2D000 `invalid transaction termination`, rolling back into the same state a
+  refusal leaves. `throws_ok(sql, NULL, description)` pins neither SQLSTATE nor message (the
+  three-argument overload reads a second argument that is not five octets, NULL included, as the
+  message), so four refusal tests passed with their refusal deleted: the transition-table refusal in
+  `tests/72_transmute_attributes_test.sql`, the keyless and nullable-key `p_track_changes` refusals in
+  `tests/timescale/db/10` and `14`, and the E2 cutover failure in `tests/timescale/db/08`. Each now pins
+  the refusal's own message with `throws_like`, or for E2 the DROP's `2BP01` and its message, and each
+  was shown to fail with its refusal removed (the first three on that 2D000, E2 on a COMMIT moved ahead
+  of the DROP). `bench/throws_pinned.sh` re-issues every `throws_*` around `call pgpm.` with the
+  statement swapped for one that raises exactly that 2D000 and requires pgTAP to say `not ok`, after two
+  controls prove the instrument; `./test.sh discriminate` requires it to fail against
+  `throws_ok_null_pattern`, the catalogue's first test-file mutation. The issue's third finding, three
+  wrapper-driven files missing from `perf.yml`'s path filter, was already moot: the filter went when PRs
+  moved to the merge queue, and the perf and discriminate jobs run on every PR.
 - **Retention dropping the coarse source of an in-flight regrain reclaims that regrain instead of
   orphaning it** (#519). With auto-regrain, an `archive_fn` and `retain` all on, the archive step and the
   regrain worked the same wholly-aged coarse child at once, and when archiving covered it first `retire()`

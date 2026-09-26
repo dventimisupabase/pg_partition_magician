@@ -1891,12 +1891,31 @@ $$;''',
         "flight and then finishes that regrain, is what names this mutant.",
         [(RETIRE_REGRAIN_RECLAIM, RETIRE_REGRAIN_CANCEL_WHOLE_PARENT, 1)],
     ),
+    "throws_ok_null_pattern": (
+        "bench/throws_pinned.sh",
+        "Pre-#522 tests/72: the transition-table refusal asserted with throws_ok(..., NULL, desc). "
+        "pgTAP's three-argument overload reads a second argument that is not five octets, NULL "
+        "included, as the MESSAGE, so this resolves to errcode NULL and errmsg NULL and accepts any "
+        "error at all, including the 2D000 a transmute that did NOT refuse raises at its first COMMIT "
+        "inside the wrapper; the relkind check after it passes then too, because the statement rolled "
+        "back. The first test-file mutation in this catalogue, deliberately: the defect is in the "
+        "assertion, not in pgpm, and bench/throws_pinned.sh judges assertions, so the file it has to be "
+        "pointed at is the test. Puts the exact pre-#522 text back, so the guard's probe finds a site "
+        "that says ok where it must say not ok.",
+        [("select throws_like($$ call pgpm.transmute('public.ev72t', 'id', 1000) $$,\n"
+          "  'pg_partition_magician: cannot transmute % -- the row trigger(s) (ev72t_after) use a transition table%',\n",
+          "select throws_ok($$ call pgpm.transmute('public.ev72t', 'id', 1000) $$, NULL,\n", 1)],
+    ),
 }
 
-# name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
+# name -> source file (repo-relative), for mutations that don't touch pgpm_core/install.sql.
 # bench/discriminate.sh reads this via --list to know which base file AND which container a
 # mutation's guard needs; anything not listed here defaults to the core install + core container.
+# The source need not be an install.sql: a guard that judges the TESTS (bench/throws_pinned.sh) has
+# its defect put back into the test file it judges, and discriminate.sh hands the guard that mutant
+# exactly as it hands the others theirs.
 MUTATION_SRC = {
+    "throws_ok_null_pattern": "tests/72_transmute_attributes_test.sql",
     "hypertable_cutover_unverified_source": "pgpm_hypertable/install.sql",
     "hypertable_cutover_unverified_dest": "pgpm_hypertable/install.sql",
     "hypertable_catchup_strict_watermark": "pgpm_hypertable/install.sql",

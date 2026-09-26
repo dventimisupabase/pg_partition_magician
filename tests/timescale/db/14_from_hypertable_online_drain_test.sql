@@ -130,9 +130,11 @@ create table hp_null (ts timestamptz not null, device_id bigint, temp double pre
 select create_hypertable('hp_null', 'ts', chunk_time_interval => interval '1 day');
 insert into hp_null (ts, device_id, temp)
   select now() - (g || ' hours')::interval, g, g from generate_series(1, 10) g;
-select throws_ok(
+-- Pinned to the refusal's own message (#522): a copy that did NOT refuse would commit per chunk and die
+-- with 2D000 "invalid transaction termination" inside the wrapper, which the previous NULL, NULL accepted.
+select throws_like(
   $$ call pgpm.from_hypertable_copy('hp_null', 'ts', p_track_changes => true) $$,
-  NULL, NULL,
+  'pg_partition_magician: from_hypertable_copy(%, p_track_changes => true) cannot track by a key with a nullable column%',
   'p_track_changes on a key with a nullable column is refused (a NULL key can never be reconciled)');
 
 select * from finish();

@@ -600,7 +600,7 @@ run_perf() {
     "bench/grid_timezone.sh pgpm_perf17"
     "bench/set_regrain_off_midflight.sh pgpm_perf24"
     "bench/regrain_reconcile_snapshot.sh pgpm_perf19"
-    "bench/set_archive_fn_return_type.sh pgpm_perf24"
+    "bench/set_archive_fn_return_type.sh pgpm_perf41"
     "bench/cutover_trigger_state.sh pgpm_perf20"
     "bench/datestyle_bounds.sh pgpm_perf25"
     "bench/dropped_fk_identity.sh pgpm_perf26"
@@ -620,6 +620,7 @@ run_perf() {
     "bench/transmute_resume_zone.sh pgpm_perf23"
     "bench/archive_chunk_ties.sh pgpm_perf38"
     "bench/retire_regrain_source.sh pgpm_perf39"
+    "bench/throws_pinned.sh pgpm_perf40"
   )
   local selected=()
   local n=${#guards[@]} idx

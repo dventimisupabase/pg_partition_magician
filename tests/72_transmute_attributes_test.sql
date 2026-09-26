@@ -138,7 +138,14 @@ create function public.ev72t_trg() returns trigger language plpgsql as $$ begin 
 create trigger ev72t_after after insert on public.ev72t
   referencing new table as newrows for each row execute function public.ev72t_trg();
 
-select throws_ok($$ call pgpm.transmute('public.ev72t', 'id', 1000) $$, NULL,
+-- Pinned to the refusal's own message, down to WHICH trigger it names (#522). throws_like is a
+-- function, so a transmute that did NOT refuse would run on to its first COMMIT inside it and die with
+-- 2D000 "invalid transaction termination", rolling back into the very unpartitioned state the check
+-- below expects. The previous throws_ok(..., NULL, desc) pinned neither SQLSTATE nor message (pgTAP's
+-- three-argument overload reads a non-five-octet second argument, NULL included, as the message), so
+-- it accepted that too. bench/throws_pinned.sh keeps every assertion of this shape pinned.
+select throws_like($$ call pgpm.transmute('public.ev72t', 'id', 1000) $$,
+  'pg_partition_magician: cannot transmute % -- the row trigger(s) (ev72t_after) use a transition table%',
   'a row trigger with a transition table is refused rather than silently dropped');
 
 select is((select relkind::text from pg_class where oid = 'public.ev72t'::regclass), 'r',

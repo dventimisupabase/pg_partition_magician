@@ -20,9 +20,13 @@ select is((select count(*)::int from e1), 30, 'E1: dropping the destination leav
 select mk_plain_hypertable('e2', 30, '1 day', '5 days');
 create view e2_v as select * from e2;
 call pgpm.from_hypertable_copy('e2', 'ts');
+-- Pinned to the DROP's own dependency error, SQLSTATE and message (#522). The cutover's first COMMIT
+-- comes after the swap, so a cutover that reached it inside this wrapper (nothing failed, or a COMMIT
+-- moved ahead of the DROP) would die with 2D000 "invalid transaction termination" and roll back into
+-- the same intact source the check below expects; the previous NULL, NULL accepted that too.
 select throws_ok(
   $$ call pgpm.from_hypertable_cutover('e2', 'ts', interval '1 month') $$,
-  NULL, NULL,
+  '2BP01', 'cannot drop table e2 because other objects depend on it',
   'E2: the cutover fails when another object depends on the source');
 select is(
   (select count(*)::int from timescaledb_information.hypertables where hypertable_name = 'e2'),

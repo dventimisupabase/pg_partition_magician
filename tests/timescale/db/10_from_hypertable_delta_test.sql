@@ -52,9 +52,11 @@ select is(
 -- change tracking needs a key to reconcile by: a keyless table refuses it up front (fail fast, not a silent
 -- fallback to append-only that would lose updates/deletes).
 select mk_plain_hypertable('hp_d2_keyless', 30, '1 day', '5 days');
-select throws_ok(
+-- Pinned to the refusal's own message (#522): a copy that did NOT refuse would commit per chunk and die
+-- with 2D000 "invalid transaction termination" inside the wrapper, which the previous NULL, NULL accepted.
+select throws_like(
   $$ call pgpm.from_hypertable_copy('hp_d2_keyless', 'ts', p_track_changes => true) $$,
-  NULL, NULL,
+  'pg_partition_magician: from_hypertable_copy(%, p_track_changes => true) needs a key to reconcile changes by%',
   'p_track_changes on a keyless table is refused (no key to reconcile by)');
 
 select * from finish();
