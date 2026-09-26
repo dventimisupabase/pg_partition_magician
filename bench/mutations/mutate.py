@@ -382,6 +382,27 @@ REGRAIN_RENAME_LEDGER_CARRY = """    -- ...and its archive coverage with it (#51
      where parent_table = p_parent and child_name = v_child_name;
 """
 
+# _next_archive_chunk's extension past the encoding's unit (#513), whole. The `if` that opens it shares
+# its first line with the `no progress possible` return two statements down at a different indent, so
+# the pattern carries the body too: matched as a block it is unique, and a block that stops matching is
+# one mutate.py refuses to build rather than a clean copy passed off as a mutant.
+ARCHIVE_CHUNK_TIES_BLOCK = """    if not pgpm._native_gt(cfg.control_kind, v_stop, v_lo) then
+      v_unit := case cfg.control_kind
+                  when 'text_time' then case cfg.text_time_unit when 's' then '1 second' else '1 millisecond' end
+                  when 'uuidv7' then '1 millisecond'
+                  when 'time' then '1 microsecond'
+                  else '1' end;
+      execute format('select min(%I)::text from %I.%I t where t.%I >= %L',
+                     cfg.control_column, v_nsp, p_child, cfg.control_column,
+                     pgpm._encode(cfg.control_kind, pgpm._grid_next(cfg.control_kind, v_unit, v_lo, cfg.partition_tz),
+                                  cfg.text_time_prefix, cfg.text_time_width, cfg.text_time_radix, cfg.text_time_unit,
+                                  cfg.text_time_alphabet, cfg.text_time_discard_bits, cfg.text_time_epoch, cfg.partition_tz))
+        into v_next_distinct_col;
+      v_stop := case when v_next_distinct_col is null then v_child_hi
+                     else pgpm._col_to_native(cfg, v_next_distinct_col) end;
+    end if;
+"""
+
 MUTATIONS = {
     "transmute_no_commits": (
         "bench/transmute_lock.sh",
@@ -1770,6 +1791,21 @@ $$;''',
         "asserts right after the preparing step that the chunk is recorded under the new name and nothing "
         "under the old.",
         [(REGRAIN_RENAME_LEDGER_CARRY, "", 1)],
+    ),
+    "archive_chunk_native_ties": (
+        "bench/archive_chunk_ties.sh",
+        "Pre-#513 _next_archive_chunk: the chunk ends at the next distinct COLUMN value decoded to the "
+        "native grid, and nothing handles that decode landing on the chunk's own lo. For text_time and "
+        "uuidv7 the decode truncates to the encoding's unit (a second for ObjectId and KSUID, a "
+        "millisecond for uuidv7, ULID and cuid), so a unit holding at least a chunk's worth of rows (a "
+        "bulk import minted within one second) makes v_stop = v_lo: the picker returns no chunk, "
+        "_archive_step continues without a log row, and every later tick stops at the same place. The "
+        "partition is never covered nor retired, and status() shows nothing. One site: the extension "
+        "past the unit, removed whole, so the mutant falls through to the `no progress possible` return "
+        "that follows it, which is the shipped behaviour exactly. tests/125's ledger identity (three "
+        "chunks, the burst whole in the second) and its retire assertions are what catch it, through "
+        "bench/archive_chunk_ties.sh.",
+        [(ARCHIVE_CHUNK_TIES_BLOCK, "", 1)],
     ),
 }
 

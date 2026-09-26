@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **A burst of rows minted within one second (or millisecond) no longer stalls the archiving of its
+  partition, silently and for good** (#513). `pgpm._next_archive_chunk` ends a chunk at the next distinct
+  control value, decoded to the native grid. For `text_time` and `uuidv7` that decode truncates to the
+  encoding's unit (a second for ObjectId and KSUID, a millisecond for uuidv7, ULID and cuid), so when one
+  unit held at least a chunk's worth of rows (a bulk import) the next distinct value decoded to the chunk's
+  own `lo`: the picker returned no chunk, `_archive_step` moved on without a log row, and every later tick
+  stopped at the same place. The partition was never covered, `retire()` never dropped it, and `status()`
+  showed nothing. The picker now extends such a chunk past the unit, to the first row minted after it (or
+  the child's `hi`), so the tied rows travel as one oversized chunk, which is what the contract always said
+  a run of ties does. `tests/125_archive_chunk_ties_test.sql` walks the issue's fixture (100 ObjectId ids
+  in one second, a budget for about 35) through write-block, archive and retire and asserts the ledger's
+  exact three chunks; `bench/archive_chunk_ties.sh` runs that file in the perf track, and
+  `./test.sh discriminate` requires it to fail against `archive_chunk_native_ties`, the mutation that
+  removes the extension. The uuidv7 millisecond takes the same step but is not exercised until #507
+  (`max(uuid)` in the same picker) lands.
+
 - **Day and week partitions are named by the UTC date they start on, in every `partition_tz`** (#503).
   A day-denominated step is an absolute 86400 s lattice from the anchor instant, but `_part_name`
   rendered its label as the wall date of the cell's start in `partition_tz`. In a zone with daylight
