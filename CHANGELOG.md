@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **A schema whose name needs quoting no longer wedges archive, retire and regrain** (#512).
+  `_is_write_blocked` and `_regrain_capture_active` selected the parent's `nspname` and cast the raw
+  name back with `::regnamespace`, whose input parses its text as an SQL identifier: for a managed
+  table in `"Sales"` the lookup raised `schema "sales" does not exist`, so every `maintain()` tick
+  logged `skip_archive`, nothing was archived and the aged partition was never dropped, while an
+  auto-regrain could not prepare (`skip_regrain`) and the janitor logged `skip_regrain_capture` per
+  child; once a lower-case `sales` schema existed the cast instead answered silently for the twin's
+  same-named child. Both functions now compare the child's `relnamespace` against the parent's
+  namespace OID and never re-parse a name. `tests/124_quoted_schema_test.sql` drives the archive,
+  regrain and twin cases with a lower-case control alongside each; `bench/quoted_schema.sh` runs it
+  against an arbitrary install so `./test.sh discriminate` proves it fails against the
+  `schema_name_regnamespace_cast` mutation.
 - **`maintain` re-applies its 200 ms `lock_timeout` after the retain boundary too, so auto-regrain's
   swap gives up instead of blocking the parent** (#514). `set local` dies at `COMMIT`, and `maintain`
   put `lock_timeout` back after each of its boundaries except the one after `retain`, which is the one

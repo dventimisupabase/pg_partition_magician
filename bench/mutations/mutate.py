@@ -1012,6 +1012,20 @@ begin
           "  perform pgpm._regrain_capture_grant(p_parent, v_delta_reg);\n", "", 1),
          ("  if v_delta_reg is not null then perform pgpm._regrain_capture_grant(p_parent, v_delta_reg); end if;\n", "", 1)],
     ),
+    "schema_name_regnamespace_cast": (
+        "bench/quoted_schema.sh",
+        "Pre-#512 _is_write_blocked and _regrain_capture_active: the parent's schema is selected by NAME "
+        "and cast back with `v_nsp::regnamespace`, whose input parses its text as an SQL identifier. A "
+        "schema that needs quoting (\"Sales\") downcases: with no lower-case twin the lookup raises "
+        "`schema \"sales\" does not exist` (skip_archive on every tick, nothing archived, the aged child "
+        "never retired; a regrain cannot prepare and the janitor logs skip_regrain_capture), and once a "
+        "twin exists it silently answers for the twin's same-named child. Both sites go back, so the "
+        "mutant is exactly the shipped shape and not one function patched around the other. tests/124's "
+        "quoted-schema archive, regrain and twin cases catch it.",
+        [("declare v_nsp_oid oid;\nbegin\n  select c.relnamespace into v_nsp_oid from pg_class c where c.oid = p_parent;\n",
+          "declare v_nsp name;\nbegin\n  select n.nspname into v_nsp from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.oid = p_parent;\n", 2),
+         ("c.relnamespace = v_nsp_oid", "c.relnamespace = v_nsp::regnamespace", 2)],
+    ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
         "Pre-#366 archive._pq_lz77_tokens: LZ77 candidate lookup materializes a per-position temp "
