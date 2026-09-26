@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **regrain's change capture is found by identity, re-minted per regrain, and writable by the parent's
+  writers** (#496). The per-parent delta table and trigger function were found by NAME, derived from the
+  parent's CURRENT relname, and kept once minted. An ordinary `ALTER TABLE ... RENAME` of the parent
+  mid-regrain therefore left the source's trigger writing the delta it was given while the reconcile, the
+  swap gate and the swap all derived a new name, found nothing, counted 0 pending and swapped: every
+  change committed since the copy went with the source (an UPDATE reverted, a DELETE resurrected, an
+  INSERT gone). A key column renamed between two regrains left the delta with the first regrain's
+  columns while the trigger function inserted the current key's, so every write into the source raised
+  for the life of the next regrain. And the delta was created by whoever ran the tick, with no grants,
+  while the trigger runs as the writer, so every non-owner role with DML on the parent got
+  `permission denied` on every write into the regraining child. The prepare tick now records the oids it
+  minted in `config.regrain_delta_oid` and `config.regrain_capture_fn_oid`, and every reader resolves the
+  relations from there (`_regrain_capture_names`; the parent-derived names, now `_regrain_capture_derive`,
+  are what it mints under and the fallback when nothing is recorded); it drops and re-mints the delta on
+  every prepare from the key as it is then, refusing a foreign relation on the name rather than truncating
+  it; and it owns the delta like the parent and grants `INSERT` on it to every role holding `INSERT`,
+  `UPDATE` or `DELETE` on the parent (`_regrain_capture_grant`), re-synced on every tick so a grant made
+  mid-regrain is honoured from the next tick. Re-running `install.sql` backfills the two anchors for a
+  regrain already in flight. Pinned by `tests/124`, run against its three mutations by the new
+  `bench/regrain_capture_identity.sh` (`regrain_capture_by_name`, `regrain_delta_reused`,
+  `regrain_delta_ungranted`); `bench/upgrade_in_place.sh` now upgrades with a regrain in flight and
+  requires the anchors backfilled by identity (`upgrade_regrain_capture_backfill_noop`).
 - **`pgpm.dropped_fk` records anchor a preserved incoming key by identity, from any session** (#498).
   The cutover recorded `pg_get_constraintdef()` as rendered in the transmuting session, which leaves the
   referenced table unqualified whenever that session's `search_path` can see it, and `restore_incoming_fks`

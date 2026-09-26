@@ -46,7 +46,8 @@ $$;
 -- So the schema drop below leaves all three, and a trigger left on a child mid-regrain keeps
 -- appending to a delta table nothing will ever drain. untransmute drops the same two objects the
 -- same way; this is the other exit. The names come from pgpm._regrain_capture_names, the single
--- derivation every caller uses, which is why this block has to run BEFORE the schema drop.
+-- resolver every caller uses (the oids pgpm.config recorded at prepare, or failing those the names
+-- derived from the parent), which is why this block has to run BEFORE the schema drop.
 do $$
 declare r record; v_nsp name; v_delta name; v_fn name;
 begin

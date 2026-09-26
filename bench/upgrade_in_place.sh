@@ -99,6 +99,8 @@ pgpm.config:regrain_batch
 pgpm.config:regrain_max_blocks
 pgpm.config:regrain_to
 pgpm.config:regrain_cursor
+pgpm.config:regrain_delta_oid
+pgpm.config:regrain_capture_fn_oid
 pgpm.config:retain_batch
 pgpm.config:archive_fn
 pgpm.config:archive_byte_budget
@@ -220,6 +222,17 @@ run "$DB" "select pgpm.resume('public.up_t')" >/dev/null
 run "$DB" "call pgpm.maintain_obtain('public.up_t')" >/dev/null
 run "$DB" "call pgpm.maintain('public.up_t')" >/dev/null
 
+# A regrain IN FLIGHT across the upgrade (#496). Before the two anchor columns existed, its capture relations
+# were found by the parent's name alone; the upgrade must record their oids, or the rename hazard is back for
+# exactly the regrain the operator had running. Move the frontier into the forward partition so the monolith
+# freezes, then ONE tick: 'prepared' is the tick that mints the capture. Asserted, because everything the
+# anchor assertion below says is also true of a run that never had a regrain in flight.
+run "$DB" "insert into public.up_t (id, body) values (1500, 'freeze')" >/dev/null
+MONO=$(q "$DB" "select child_name from pgpm.part where parent_table = 'public.up_t'::regclass and attached
+                 order by lo::numeric limit 1")
+check "LIVENESS: a regrain is in flight before the degrade" \
+  "$(q "$DB" "select pgpm.regrain_step('public.up_t', '$MONO', '100', 50)")" "prepared"
+
 BODIES_BEFORE=$(q "$DB" "select string_agg(body, ',' order by body) from public.up_t")
 CONFIG_BEFORE=$(q "$DB" "select control_column||'/'||partition_step from pgpm.config
                           where parent_table = 'public.up_t'::regclass")
@@ -272,6 +285,12 @@ ANCHORED=$(q "$DB" "select count(*) filter (where p.child_oid is not null
                       join pg_namespace n on n.oid = c.relnamespace
                      where p.parent_table = 'public.up_t'::regclass")
 check "the upgrade backfilled child_oid, to each child's own oid" "$ANCHORED" "$NPARTS/$NPARTS"
+# ASSERTION 3b (#496), by identity: each anchor must be the relation its own derived name resolves to. A
+# backfill that wrote nothing reads null/null, one that wrote a plausible oid somewhere else reads false.
+check "the upgrade anchored the in-flight regrain's capture (delta/fn)" \
+  "$(q "$DB" "select coalesce((regrain_delta_oid = to_regclass('public.up_t_pgpm_regrain_delta')::oid)::text, 'null')
+                || '/' || coalesce((regrain_capture_fn_oid = to_regprocedure('public.up_t_pgpm_regrain_capture()')::oid)::text, 'null')
+                from pgpm.config where parent_table = 'public.up_t'::regclass")" "true/true"
 check "rows survived, by identity"                       "$(q "$DB" "select string_agg(body, ',' order by body) from public.up_t")" "$BODIES_BEFORE"
 check "registration survived (control column / step)"    "$(q "$DB" "select control_column||'/'||partition_step from pgpm.config where parent_table = 'public.up_t'::regclass")" "$CONFIG_BEFORE"
 check "the upgrade run was recorded"                     "$(q "$DB" "select count(*)||'/'||max(version) from pgpm.installed")" "2/$(q "$FRESH" "select pgpm.version()")"
