@@ -74,7 +74,12 @@ contract and the [guide](../docs/guide.md#archiving-before-a-drop) for the opera
   by DuckDB, Athena, Redshift Spectrum, Spark, Trino, and Snowflake with no conversion step -- a
   from-scratch, zero-dependency writer with real limits (see below).
 
-GZIP compression applies to either format (`archive.config.compress`, off by default). It's not
+GZIP compression applies to either format (`archive.config.compress`, off by default). With it on, an
+NDJSON object takes the `.ndjson.gz` suffix and Content-Type `application/gzip`: `archive.to_s3`
+writes `<prefix><child>.ndjson.gz` (nothing at the plain key) and the automatic strategy adds the same
+suffix to its own keys. A large `archive.to_s3` export is a stream of gzip members, one per
+`part_bytes` of NDJSON, which `gunzip`, `zcat`, Python's `gzip`, DuckDB and Hadoop all read as one
+file. A Parquet object keeps its `.parquet` name and compresses its pages internally. It's not
 free: real compression time runs from ~50ms/MB on compressible data up to ~2.6s/MB on
 near-incompressible data. On the automatic `archive_fn` path this compounds with
 `pgpm.config.archive_byte_budget` (the per-tick chunk size) with no timeout of its own -- see
