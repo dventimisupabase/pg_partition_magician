@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **`untransmute` hands back the monolith with none of pgpm's own apparatus left on it** (#508). It
+  captured and replayed the parent's row triggers, and `DETACH` strips their clones, but the triggers
+  maintenance puts directly on the monolith child were never touched. A monolith retention had reached
+  but not dropped, because archiving was deferred or because recorded coverage kept the block after the
+  frontier regressed (#452), came back as an unmanaged table whose `pgpm_write_block` rejected every
+  INSERT, UPDATE and DELETE with "past its retention boundary", with `pgpm.config` and `pgpm.part` gone so
+  no tick could ever lift it. And with a regrain in flight, `pgpm_regrain_capture` rode the monolith into
+  the restored table, so `untransmute`'s own `drop function` died on the dependency and the whole call
+  rolled back, neither the documented refusal nor a reverse; a reverse that got past it would have
+  orphaned the not-yet-attached fine copies, which the parent's `DROP` never reaches. Now, under the lock
+  and after the gate, `untransmute` lifts the block through `_remove_write_block` and abandons an in-flight
+  regrain through `regrain_cancel` (trigger and `TRUNCATE` guard off, copies dropped, delta cleared, cursor
+  null, one `regrain_cancel` log row), then reverses as before; a regrain that has swapped still shuts the
+  door. `tests/125_untransmute_residue_test.sql` builds all three states (deferred block, coverage-kept
+  block, mid-regrain), witnesses each before the reverse and asserts by which rows and which triggers
+  remain; `bench/untransmute_residue.sh` drives the same file for `./test.sh discriminate`, where the
+  `untransmute_keeps_write_block` and `untransmute_keeps_regrain_capture` mutations each put one half of
+  the defect back.
 - **A name pgpm derives from the table's is never truncated; `transmute` and `set_regrain` refuse
   instead** (#510). `_part_name` cast `<rel>_p<label>` to `name`, which silently cuts it to 63 bytes, and
   its comment called that cosmetic because `pgpm.part` holds the bounds. But `obtain` decides whether a

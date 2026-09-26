@@ -285,8 +285,18 @@ back, restores identity, the row triggers (each in the enabled state the parent 
 incoming FKs, and clears `pgpm` state. The monolith is the
 attached partition with the smallest `lo`.
 
+It also takes off the monolith whatever **maintenance** put there after the conversion, so the table handed
+back is the operator's again with none of pgpm's machinery on it. The retention **write block**
+(`pgpm_write_block`) comes off: a monolith retention had reached but not dropped, because archiving was
+deferred or because recorded coverage kept the block after the frontier regressed, would otherwise come
+back unmanaged and rejecting every write, with no `pgpm` state left to lift it. Coverage recorded for it
+stays in `pgpm.archive_ledger`, as it does after a `retire`. And a **regrain still in flight** on the
+monolith is abandoned exactly as [`regrain_cancel`](#regrain_cancel) would abandon it (capture trigger and
+`TRUNCATE` guard off, fine copies dropped, delta cleared, one `regrain_cancel` log row): before its swap the
+monolith still holds every row, so nothing is lost but the copy work.
+
 It is a **one-way door** once any row lives outside the monolith's range -- a forward partition after the
-frontier crosses `B`, or finer children from a regraining -- because a
+frontier crosses `B`, or the finer children a regrain's swap has put in the monolith's place -- because a
 metadata-only reverse would lose those rows.
 
 The door is checked twice. Once before anything is touched, under no lock a writer would feel, so a

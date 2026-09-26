@@ -1458,6 +1458,34 @@ $$;''',
          ("         and pgpm._native_gt(r.control_kind, p.hi, pgpm._grid_next(r.control_kind, coalesce(r.regrain_to, r.partition_step), p.lo, r.partition_tz))\n",
           "", 1)],
     ),
+    "untransmute_keeps_write_block": (
+        "bench/untransmute_residue.sh",
+        "Pre-#508 untransmute: the parent's triggers are captured and replayed and DETACH strips their "
+        "clones, but pgpm_write_block sits on the monolith CHILD (retention's fence, ENABLE ALWAYS), so a "
+        "monolith retention had reached but not dropped -- archiving deferred, or coverage kept the block "
+        "after the frontier regressed (#452) -- was handed back as an unmanaged table that rejected every "
+        "INSERT, UPDATE and DELETE with 'past its retention boundary', with pgpm.config and pgpm.part gone "
+        "so no tick could ever lift it. Removes only the _remove_write_block call, so the mutant is exactly "
+        "'the block is not lifted' and tests/125's sections (A) and (B) are what catch it; the regrain "
+        "half stays intact, which is what shows those sections discriminate on their own.",
+        [("  perform pgpm._remove_write_block(p_parent, v_mon);\n", "", 1)],
+    ),
+    "untransmute_keeps_regrain_capture": (
+        "bench/untransmute_residue.sh",
+        "Pre-#508 untransmute during an in-flight regrain: pgpm_regrain_capture rides the monolith child "
+        "into the restored table, so untransmute's own `drop function <rel>_pgpm_regrain_capture()` dies "
+        "with 'cannot drop function ... because other objects depend on it' and the whole call rolls back "
+        "(no loss, but neither the documented refusal nor the clean reverse), and a reverse that got past "
+        "that would orphan the not-yet-attached fine copies, which are standalone relations the parent's "
+        "DROP never reaches. Removes only the regrain_cancel branch, so the write-block half stays intact "
+        "and tests/125's section (C) is what catches it.",
+        [("""  if exists (select 1 from pgpm.config where parent_table = p_parent and regrain_cursor is not null)
+     or exists (select 1 from pgpm.part where parent_table = p_parent and not attached)
+     or pgpm._regrain_capture_active(p_parent, v_mon) then
+    perform pgpm.regrain_cancel(p_parent);
+  end if;
+""", "", 1)],
+    ),
 }
 
 # name -> source install.sql (repo-relative), for mutations that don't touch pgpm_core/install.sql.
