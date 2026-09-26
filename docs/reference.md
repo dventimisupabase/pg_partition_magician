@@ -208,8 +208,12 @@ value decodes to more than one partition step plus one hour past `now()` and `p_
 (a future-dated row would pin the monolith's permanent `hi` there); a non-PK `UNIQUE` secondary index does not include the
 partition key (global uniqueness could not be enforced); an incoming FK exists and `p_incoming_fks` is
 `'error'`; a standalone table matching the child-partition naming already exists (an orphan from an
-interrupted run); or a relation already occupies one of the `<index>_pgpm` names the conversion needs for
-the partitioned copies of the table's secondary indexes (also usually a leftover from an interrupted run).
+interrupted run); a name the conversion derives from the table's (the monolith's `<rel>_p<lo>_to_<hi>`, a
+fine cell's `<rel>_p<lo>`, the staging `<rel>_pgpm_new`) would exceed PostgreSQL's 63-byte identifier
+limit, which pgpm never truncates (the message names the offending name and says how many bytes to shorten
+the table name by; the budget is under [Partition naming](#partition-naming)); or a relation already
+occupies one of the `<index>_pgpm` names the conversion needs for the partitioned copies of the table's
+secondary indexes (also usually a leftover from an interrupted run).
 
 ```sql
 call pgpm.transmute('public.search_history', 'id', interval '1 month',
@@ -1425,6 +1429,12 @@ starts in February, on a monthly grid) is left alone rather than retried forever
 `status().coarse_partitions`. A `p_target_step` coarser than `partition_step` (compared at
 `partition_anchor`) is refused.
 
+Two targets are refused at call time rather than left to wedge every tick: a `p_target_step` coarser than
+`partition_step` (auto-regrain would reselect the same unsplittable child forever), and one whose fine
+names `<rel>_p<label>` would exceed PostgreSQL's 63-byte identifier limit. A finer step has a wider label,
+so a table whose monthly names fit can still be refused a daily target; the message names the offending
+name and says how many bytes to shorten the table name by (see [Partition naming](#partition-naming)).
+
 ### `set_obtain`
 
 ```sql
@@ -1922,6 +1932,17 @@ share a name.
 
 The name is a human-facing label; `pgpm.part` holds the authoritative bounds. The `_to_` form is also
 what keeps `transmute`'s orphan check from mistaking a monolith for a leftover of an interrupted regrain.
+
+**Names are never truncated.** PostgreSQL cuts an identifier to 63 bytes, and a cut label would make two
+cells share a name, which `obtain`, `extend_to` and `regrain_step` read as "already exists" and skip: the
+forward grid would silently stop growing. So `transmute` refuses a table whose derived names (the
+monolith's, the fine cells', the `<rel>_pgpm_new` staging name) would not fit, naming the offending name
+and the bytes to shorten the table name by, and `set_regrain` refuses a target step whose wider labels
+would not fit. The budget, in bytes: a fine name is `len(<rel>) + 2 + label`, the monolith's is
+`len(<rel>) + 6 + 2 * label`, the staging name is `len(<rel>) + 9`, where the label is 4 (year), 7 (month),
+10 (day), 13 (hour), 16 (minute) or 19 (id). A monthly grid therefore takes a table name of up to 43 bytes
+when the data spans more than one month (a coarse monolith) and 54 when it does not; an id grid, whose
+labels are 19 digits, takes 19 and 42.
 
 ## Internal adapter layer
 

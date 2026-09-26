@@ -922,6 +922,13 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   synchronous and the paced auto-regrain path are gap-free (the source stays whole and attached until the
   atomic swap, which transiently drops and re-adds any incoming FK within one transaction).
 - **There is no `DEFAULT`**: a write outside the forward grid is refused rather than parked.
+- **Table names have a byte budget.** Every partition is named `<rel>_p<label>` (the monolith
+  `<rel>_p<lo>_to_<hi>`), and pgpm never lets PostgreSQL cut such a name to 63 bytes, because a cut
+  label makes two cells share a name and the grid would silently stop growing. `transmute` refuses a
+  table whose derived names would not fit, and `set_regrain` a target step whose wider labels would not;
+  both say how many bytes to shorten the table name by. On a monthly grid the table name can be up to 43
+  bytes when the data spans more than one month; the full budget is under
+  [Partition naming](reference.md#partition-naming).
 - **Retain uses plain `DROP`** (a brief lock); retention over coarse history waits on regrain.
 - **Logical-replication subscribers are covered.** Both pgpm triggers, the write block and the regrain
   change capture, are enabled `ALWAYS`, so a write applied with `session_replication_role = replica` is

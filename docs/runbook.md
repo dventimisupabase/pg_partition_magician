@@ -218,7 +218,8 @@ DETAIL:  Partition key of the failing row contains (id) = (...).
 
 **What it means.** pgpm keeps **no `DEFAULT` partition**. `obtain` maintains a grid of real partitions
 running `config.obtain` steps ahead of the write frontier, and a row outside that grid has nowhere to go,
-so PostgreSQL refuses it. There are exactly two ways to be outside it.
+so PostgreSQL refuses it. There are two ways to be outside it, and one way, for a table converted before
+pgpm enforced its byte budget on names, to have no forward grid at all.
 
 **Above the grid** -- the value is further ahead than the lookahead reaches. Check the ceiling:
 
@@ -234,6 +235,21 @@ advance predictably and rarely hit this.
 **Below the grid** -- the value is older than the retention floor, so its partition was deliberately
 dropped. This is correct: retention reclaimed that range. Do not widen retention to make the write
 succeed unless you actually want that data kept.
+
+**No grid was ever built** -- the table was converted by a pgpm older than the one that refuses over-long
+names. Its name was long enough that every forward cell's `<rel>_p<label>` was cut to the same 63 bytes,
+the monolith took that name, and `obtain` skipped every cell as already existing, with nothing logged.
+`newest_bound` sits at the monolith's `hi` while maintenance is healthy, and since the upgrade every tick
+logs the refusal instead of skipping:
+
+```sql
+select parent_table, child_name from pgpm.part where attached and octet_length(child_name) = 63;
+select parent_table, method, at from pgpm.log where action = 'skip_obtain' order by at desc limit 5;
+```
+
+The repair is the same for every such table: `untransmute` (a clean reverse, since every row is still in
+the monolith), rename the table within the budget under
+[Partition naming](reference.md#partition-naming), and `transmute` again.
 
 **What to do.**
 
