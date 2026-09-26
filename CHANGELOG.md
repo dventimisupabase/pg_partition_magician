@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **Day and week partitions are named by the UTC date they start on, in every `partition_tz`** (#503).
+  A day-denominated step is an absolute 86400 s lattice from the anchor instant, but `_part_name`
+  rendered its label as the wall date of the cell's start in `partition_tz`. In a zone with daylight
+  saving that lattice drifts an hour against local midnight twice a year, so two adjacent cells could
+  start on the same wall date: with the anchor at a summer midnight, the New York cells starting 00:00
+  EDT and 23:00 EST of the fall-back Sunday; with the default anchor, the 00:00Z cells of the fall-back
+  Sunday and the Monday in `Atlantic/Azores`. And `set_partition_tz`, documented as safe on a day step
+  because "only the names move", moved every label onto the previous cell's after a change to a zone
+  west of the old one. `obtain` and `extend_to` skip a candidate whose name already exists, so the
+  second cell of any such pair was never built: a permanent one-day hole that refused every write once
+  the frontier reached it, with nothing logged and a healthy `status()`. Fixed-second cells (day, week,
+  hour, minute) are now all labelled by the UTC reading of their start, the rule hour and minute labels
+  already followed; month and year cells keep their wall-month label in `partition_tz`. A day grid's
+  zone is therefore a pure setting: its bounds and names are both absolute. Names of existing day
+  partitions are not changed (the name is a label; `pgpm.part` holds the bounds). `tests/125` pins the
+  rule, `bench/day_label_utc.sh` runs it against `part_name_day_label_in_zone`, and `tests/111`'s three
+  day-label expectations follow the new rule.
 - **Archive coverage follows the partition, not a stale name** (#511). `pgpm.archive_ledger` is keyed
   `(parent_table, lo)` and matches chunks to their partition by `child_name`, and two things changed
   what a name meant without touching it. `regrain`'s swap dropped a partly archived source (allowed since
@@ -290,6 +307,60 @@
   reproduces the three-session interleaving by lock state and asserts by identity that the UPDATE
   survives the swap; `bench/regrain_reconcile_snapshot.sh` drives it against the
   `regrain_reconcile_delete_by_watermark` mutation, which `./test.sh discriminate` requires it to fail.
+
+- **A `timestamp` or `date` control column's grid is the column's own wall clock, recorded as
+  `partition_tz = 'UTC'`** (#504). pgpm read a naive value as wall time in the transmuting session's
+  zone, computed the grid on the resulting instants and rendered every bound back in that zone with an
+  offset the column then discarded. A calendar step round-trips that way, but the day and hour steps are
+  an absolute lattice of seconds that does not sit on the column's clock in a zone with an offset: under
+  `America/New_York` a `date` column with a day step got a monolith `CHECK` of `d < yesterday's date`
+  (the 00:00Z boundary rendered as 20:00 the previous day), so phase 2's `VALIDATE` failed with a raw
+  `23514` after phase 1 had committed and the `NOT VALID` `CHECK` rejected every row dated today; with an
+  hourly step the two cells either side of the autumn fall-back rendered to the same naive wall time
+  (05:00Z and 06:00Z are both 01:00 in New York), `CREATE TABLE` refused the second as an empty range
+  and the grid could never extend past that hour; and `set_partition_tz` accepted a zone change for such
+  a column, after which new bound literals were rendered in a different zone from the existing ones.
+  Now a naive column's values are taken as what they are, wall readings: a day is `[D 00:00, D+1 00:00)`
+  in the column's values, an hour `[H:00, H+1:00)`, a month `[1st 00:00, next 1st 00:00)`, and every
+  literal is that reading. That is the UTC lattice, so `transmute` records `UTC` for such a column
+  whatever the session's zone (as it does for an `id` grid) and `set_partition_tz` refuses to move it.
+  The write frontier for such a column is `now()` on that same clock, so an application writing local
+  wall time from a zone east of UTC runs ahead of it by its offset, which the forward slack covers on a
+  day or coarser grid and needs `obtain` above the offset in hours on an hourly one. A naive-column
+  table transmuted from a non-UTC session on an unreleased build keeps its recorded zone (its grid is on
+  that lattice). `tests/126` pins the rule, `bench/naive_column_utc_grid.sh` runs it against
+  `naive_column_grid_in_session_zone`, and `tests/111` (d) follows it.
+  A grid converted before this change keeps the zone it was recorded in, and pgpm keeps reading it there;
+  `tests/archive/db/16_encode_partition_tz_test.sql` (#501's guard) now builds that legacy state by hand,
+  since it is the state on which the transports' zone argument is observable.
+
+- **A month step is one lattice where midnight on the 1st falls in a daylight-saving gap** (#505). Where
+  a zone's clocks jumped forward at midnight on the 1st (`America/Asuncion` on 2023-10-01, `Asia/Amman`
+  on 2016-04-01), `_grid_floor` correctly resolved the boundary to the first instant of the month, which
+  reads 01:00 on the wall clock, but `_grid_next` added the month to that reading as it stood and landed
+  an hour past the next boundary: `next(floor(Oct))` was 01:00 on November 1 while `floor(Nov)` was
+  00:00. `regrain_step` walks its sub-ranges with exactly that pair, so the October child ended an hour
+  after the November child began, the swap's `ATTACH` failed with "would overlap", and under
+  auto-regrain that was `skip_regrain` on every tick, forever. `_grid_next` now steps a month boundary
+  from its month's wall midnight, so the two functions describe one lattice; an off-grid value (the
+  anchor `set_regrain` compares two widths from) still steps by a plain calendar month. `tests/127` pins
+  the pair regrain computes on both gaps and on a twelve-step chain, under two session zones;
+  `bench/month_step_dst_gap.sh` runs it against `grid_next_month_unsnapped`, and the existing
+  `grid_session_timezone` mutation is re-anchored on the rewritten line.
+
+- **A resumed `transmute` keeps the zone its bound was computed in** (#506). Phase 1 computes the
+  monolith's bound in the transmuting session's zone and records it in `pgpm.transmute_inflight` so a
+  re-run after a failure between the phases resumes on it, but the claim did not record the zone. A
+  resume from a session in another zone reused the bound and then registered `config.partition_tz`
+  from its own session, so the monolith sat on one lattice and every later grid computation on another:
+  `obtain`'s first candidates half-overlapped the monolith and were skipped, a hole one whole step wide
+  was left right past its `hi` (writes there failed with "no partition of relation found for row"), and
+  `set_partition_tz` refused to repair it. `pgpm.transmute_inflight` now carries `partition_tz`, the
+  claim records it, a resume adopts it along with the bound, and the `transmute_resume` log row names
+  the zone it reused. A claim recorded before the column existed carries null there and a resume keeps
+  the session's zone, as before. `tests/128` resumes a New York claim from a UTC session and checks the
+  monolith's bound is a boundary in the recorded zone and the first forward child starts exactly at it;
+  `bench/transmute_resume_zone.sh` runs it against `transmute_resume_session_zone`.
 
 - **PRs land through a merge queue, and the repository moved to `neptunestation-com`.** GitHub offers the queue only on organization-owned repositories, which is why the move; the explainer now lives at `neptunestation-com.github.io/pg_partition_magician` and the old Pages URL does not redirect (the old repository URL does). Every PR workflow (`test`, `lint`, `perf`, `archive`, `observe`,
   `locktrace`, `lockview`) now also runs on `merge_group`, so the queue tests `main` plus the queued

@@ -276,8 +276,8 @@ same session or a new one.
 foreign keys were never touched, because those are dropped only by the cutover itself. You rarely
 need to: every `maintain_all` tick sweeps for abandoned conversions and undoes them, deciding "abandoned"
 from whether the session that claimed the conversion is still connected rather than from a timeout, so a
-long scan is never mistaken for a dead one. Re-running `transmute` resumes from the recorded bound rather
-than recomputing one.
+long scan is never mistaken for a dead one. Re-running `transmute` resumes from the recorded bound, in the
+zone that bound was computed in, rather than recomputing one.
 
 The one hard requirement is that the **control column be `NOT NULL`** (a partition key cannot be null, and
 `transmute` never scans to enforce it). A key is *not* required: if the table's **primary key** includes
@@ -974,6 +974,9 @@ For step-by-step procedures when an alert fires, see the [runbook](runbook.md). 
   `pgpm.config.partition_tz` and used for every later boundary and partition name whatever zone
   maintenance runs in. Month and year boundaries are midnight on the 1st in that zone; day and shorter
   steps are a fixed number of seconds, so in a zone with daylight saving a daily boundary sits an hour
-  off local midnight for part of the year. A `timestamp` or `date` column is read as wall time in that
-  zone. For UTC boundaries, `set timezone = 'UTC'` before the call; change the zone afterwards only with
-  `pgpm.set_partition_tz`, which refuses a change the grid built so far is not on.
+  off local midnight for part of the year, and their partitions are named by the UTC date (or hour)
+  they start at. A `timestamp` or `date` column has no zone: its grid is the column's own wall clock
+  (recorded as `UTC`), so its days and hours are whole wall days and hours in the column's values, and
+  its zone cannot be changed. For UTC boundaries on a `timestamptz` column, `set timezone = 'UTC'`
+  before the call; change the zone afterwards only with `pgpm.set_partition_tz`, which refuses a change
+  the grid built so far is not on.

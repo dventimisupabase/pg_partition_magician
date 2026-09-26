@@ -22,10 +22,13 @@
 # Usage: grid_timezone.sh <container> <db> [install.sql]
 # Runs on the plain core image (it needs pgtap and pg_prove, both of which it has). GRID_TZ_TEST_FILE
 # overrides the test file's path inside the container, for running from a worktree that is mounted
-# somewhere other than /repo.
+# somewhere other than /repo, and is also how the other zone-class guards (bench/day_label_utc.sh and
+# its siblings) drive THEIR pgTAP file through this same harness; GRID_TZ_LABEL names the property the
+# PASS/FAIL line reports for that file.
 set -uo pipefail
 C="${1:?container}"; DB="${2:?db}"; INSTALL="${3:-/repo/pgpm_core/install.sql}"
 TEST_FILE="${GRID_TZ_TEST_FILE:-/repo/tests/111_grid_timezone_test.sql}"
+LABEL="${GRID_TZ_LABEL:-the grid is computed in the recorded zone, from any session}"
 fail=0
 
 q() { docker exec "$C" psql -U postgres "$@"; }
@@ -53,8 +56,8 @@ if [ "$fail" = 0 ]; then
   # so a harness broken enough to fail against everything would be reported as proving the mutation.
   # Hence the count, asserted separately and printed either way.
   ran=$(echo "$out" | grep -cE '^(not )?ok [0-9]+ -')
-  if [ "$rc" = 0 ]; then printf 'PASS  %-58s %s\n' "the grid is computed in the recorded zone, from any session" "$ran ran"
-  else printf 'FAIL  %-58s %s\n' "the grid is computed in the recorded zone, from any session" "$ran ran"; fail=1; fi
+  if [ "$rc" = 0 ]; then printf 'PASS  %-58s %s\n' "$LABEL" "$ran ran"
+  else printf 'FAIL  %-58s %s\n' "$LABEL" "$ran ran"; fail=1; fi
   if [ "$ran" -eq 0 ]; then
     printf 'FAIL  %-58s %s\n' "the assertions were reached at all" "0 ran"
     echo "$out" | tail -20 | sed 's/^/      /'

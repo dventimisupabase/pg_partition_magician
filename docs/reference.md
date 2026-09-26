@@ -56,11 +56,20 @@ is **time**.
 
 The grid is computed in the **zone of the session that runs the call**, recorded in
 `pgpm.config.partition_tz` and used for every boundary and partition name from then on, whatever zone
-maintenance's session runs in. Month and year boundaries fall at midnight on the 1st in that zone; a
-`timestamp` or `date` control column is read as wall time in it. For UTC-aligned boundaries, run
-`set timezone = 'UTC'` first. The call refuses a session zone that is not a name in `pg_timezone_names`
-(a POSIX rule or a bare abbreviation), and the zone can be changed afterwards only with
-[`set_partition_tz`](#set_partition_tz).
+maintenance's session runs in. Month and year boundaries fall at midnight on the 1st in that zone (at the
+first instant of that day where the zone's clocks skipped midnight); day and shorter steps are a fixed
+number of seconds from the anchor, named by the UTC date or hour they start at. For UTC-aligned boundaries, run `set timezone = 'UTC'` first. The call refuses a session zone that is
+not a name in `pg_timezone_names` (a POSIX rule or a bare abbreviation), and the zone can be changed
+afterwards only with [`set_partition_tz`](#set_partition_tz).
+
+A `timestamp` or `date` control column carries no zone, so its grid is computed on the column's **own
+wall clock** whatever the session's zone: a day is `[D 00:00, D+1 00:00)` in the column's values, an hour
+`[H:00, H+1:00)`, a month `[1st 00:00, next 1st 00:00)`, and every bound literal is that reading. That is
+the UTC lattice, so `partition_tz` is recorded as `UTC` for such a column and cannot be changed. pgpm's
+write frontier for it is `now()` read on that same clock, so an application writing local wall time from
+a zone east of UTC runs ahead of the frontier by its offset; the forward slack `obtain x partition_step`
+covers that on a day or coarser grid with any `obtain` of at least 1, and on an hourly grid needs `obtain`
+greater than the offset in hours.
 
 The cutover moves no rows, and runs in **three transactions** so that none of its locks scales with the
 row count: add the monolith's bound `CHECK` as `NOT VALID` (catalog only, instant); commit, which drops
@@ -272,9 +281,9 @@ attempt is always yours to abort: the claim it left records your session as its 
 so a conversion that never got there left them in place, and there is nothing for this to re-add.
 
 It **abandons; it does not resume**. Finishing a half-done conversion of a live table unattended is a
-larger action than pgpm will take on your behalf. To try again, call `transmute` again: it finds the
-recorded row and reuses the bound already on the table rather than recomputing one against a frontier that
-has since moved.
+larger action than pgpm will take on your behalf. To try again, call `transmute` again, from a session in
+any zone: it finds the recorded row and reuses the bound already on the table, and the zone that bound was
+computed in, rather than recomputing one against a frontier that has since moved.
 
 You mostly will not need to call this. Every `maintain_all` tick sweeps for abandoned conversions and
 undoes them, and it decides "abandoned" from whether the session that claimed the conversion is still
@@ -1522,12 +1531,16 @@ upgrade case: an install that predates the column has it backfilled to `UTC`, an
 built from a non-UTC session has to be told which zone that was.
 
 `p_tz` must be a name in `pg_timezone_names` (any casing; the canonical spelling is stored). An `id` grid
-is refused: it has no calendar and never reads the zone. A change is **refused** when the newest
+is refused: it has no calendar and never reads the zone. A `timestamp` or `date` control column is
+refused too: it carries no zone, its grid is its own wall clock (recorded as `UTC`), and the zone also
+decides how its bound literals are rendered and read, so a change would shift every new partition
+against the existing ones. A change is **refused** when the newest
 partition's upper bound is not a grid boundary in the new zone, because `obtain` would then skip every
 candidate that half-overlaps the current tail and create the first one past it, leaving a permanent
-hole. A day-denominated step is the same lattice in every zone, so its zone can always change (only the
-names move); a month or year step can only be moved to the zone the grid was in fact built in. Each
-accepted call writes a `set_partition_tz` row to `pgpm.log` with `old -> new` in `method`.
+hole. A day-denominated step is the same lattice in every zone and its partitions are named by UTC date,
+so its zone can always change and nothing about the grid moves; a month or year step can only be moved to
+the zone the grid was in fact built in. Each accepted call writes a `set_partition_tz` row to `pgpm.log`
+with `old -> new` in `method`.
 
 ## Observability
 
@@ -1830,7 +1843,7 @@ One row per managed table (`parent_table` is the primary key). Columns:
 | `control_kind` | `text` | `time`, `id`, `uuidv7`, or `text_time` |
 | `partition_step` | `text` | grid width (`1 month` for time/uuidv7/text_time; a bigint for id) |
 | `partition_anchor` | `text` | grid origin, a native value in the same form as `pgpm.part`'s bounds |
-| `partition_tz` | `text` | the zone boundaries are computed in and names rendered in: the transmuting session's `TimeZone` (`UTC` for id); change it only with [`set_partition_tz`](#set_partition_tz) |
+| `partition_tz` | `text` | the zone calendar boundaries are computed in and month/year names rendered in: the transmuting session's `TimeZone` (`UTC` for id, and for a `timestamp`/`date` column, whose grid is its own wall clock); change it only with [`set_partition_tz`](#set_partition_tz) |
 | `obtain` | `int` | partitions kept ahead of the frontier |
 | `retain` | `text` | retention horizon (interval for time/uuidv7/text_time, bigint count for id; null = keep) |
 | `retain_batch` | `int` | max partitions one `retain()` call attempts, oldest first (null = unbounded) |
@@ -1934,6 +1947,7 @@ carries a `pgpm_monolith_bound` `CHECK` and is refusing writes outside `[lo, hi)
 | `nsp` / `rel` | `name` | its schema and name as of the conversion's start, so the bound can still be dropped by name after the rename |
 | `control_kind` | `text` | `time`, `id`, `uuidv7` or `text_time` |
 | `lo` / `hi` | `text` | the native bounds the `CHECK` is enforcing; a retry reuses these rather than recomputing |
+| `partition_tz` | `text` | the zone `lo` and `hi` were computed in; a retry adopts it along with them, whatever zone its own session runs in (null on a row written before the column existed, which a retry reads as "keep this session's zone") |
 | `started_at` | `timestamptz` | when the conversion added the bound |
 
 ### `pgpm.archive_ledger`
@@ -1959,9 +1973,12 @@ is `<rel>_p<lo>_to_<hi>`, both bounds formatted at the step's granularity:
 - time/uuidv7/text_time: `events_p2026_03` (a fine month), `events_p2026_03_to_2026_07` (the monolith)
 - id: `events_p0000000000000010000`, `events_p0000000000000000000_to_0000000000000060000`
 
-Day and coarser labels are rendered in `config.partition_tz`. Hour and minute labels are rendered in UTC,
-because a zone with daylight saving repeats an hour every autumn and two adjacent cells would otherwise
-share a name.
+Month and year labels are rendered in `config.partition_tz`, the zone those calendar cells are defined
+in. Day and shorter labels are rendered in UTC: those steps are a fixed number of seconds from the anchor
+whatever the zone, and in a zone with daylight saving the day lattice drifts an hour against local
+midnight twice a year, so two adjacent day cells could otherwise start on the same wall date (as two
+adjacent hour cells share a wall hour every autumn) and share a name. UTC never repeats a date or an
+hour.
 
 The name is a human-facing label; `pgpm.part` holds the authoritative bounds. The `_to_` form is also
 what keeps `transmute`'s orphan check from mistaking a monolith for a leftover of an interrupted regrain.

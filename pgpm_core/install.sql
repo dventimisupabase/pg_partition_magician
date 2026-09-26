@@ -51,8 +51,9 @@ create table if not exists pgpm.config (
   -- The zone every calendar step is computed in, and every partition name rendered in (#455). Recorded
   -- from the transmuting session's TimeZone, so the grid the operator saw at conversion is the grid for
   -- the life of the table, whatever zone pg_cron's session runs in. A month boundary is midnight on the
-  -- 1st IN THIS ZONE; a naive (timestamp / date) control value is read as wall time IN THIS ZONE.
-  -- 'UTC' for id grids, which have no calendar. Change it with pgpm.set_partition_tz, never by hand.
+  -- 1st IN THIS ZONE. 'UTC' for id grids, which have no calendar, and for a naive (timestamp / date)
+  -- control column, which has no zone: its grid is the column's own wall clock, which is the UTC lattice
+  -- (#504), and set_partition_tz refuses to move it. Change it with pgpm.set_partition_tz, never by hand.
   partition_tz     text        not null default 'UTC',
   obtain          int         not null default 30,
   retain        text,                    -- interval (time/uuidv7) | bigint count (id); null = keep
@@ -297,6 +298,10 @@ create table if not exists pgpm.transmute_inflight (
   control_kind  text        not null,
   lo            text        not null,
   hi            text        not null,
+  -- #506: the zone lo and hi were computed in (the claiming session's, #455). A resume reuses the bound,
+  -- so it has to reuse this too, whatever zone the resuming session runs in; null on a claim recorded
+  -- before the column existed, which a resume reads as "keep this session's zone", the old behaviour.
+  partition_tz  text,
   started_at    timestamptz not null default now(),
   owner_pid           int,
   owner_backend_start timestamptz
@@ -306,6 +311,7 @@ create table if not exists pgpm.transmute_inflight (
 -- becoming permanently stuck behind a liveness check it has no data for.
 alter table pgpm.transmute_inflight add column if not exists owner_pid int;
 alter table pgpm.transmute_inflight add column if not exists owner_backend_start timestamptz;
+alter table pgpm.transmute_inflight add column if not exists partition_tz text;
 
 -- Is the session that claimed a conversion still alive? (#405)
 --
@@ -795,8 +801,9 @@ returns text language sql stable as $$
 $$;
 
 -- Is the control column NAIVE: timestamp without time zone, or date? Such a value carries no zone of
--- its own, and pgpm reads it as wall time in partition_tz (see _col_to_native). false for every other
--- column type, and for a missing column.
+-- its own, so its grid is the column's own wall clock: partition_tz is 'UTC' for it (#504) and
+-- _col_to_native reads it as wall time in that zone. false for every other column type, and for a
+-- missing column.
 create or replace function pgpm._control_naive(p_parent regclass, p_control name)
 returns boolean language sql stable as $$
   select coalesce((select t.typname in ('timestamp', 'date')
@@ -808,8 +815,9 @@ $$;
 -- Rendered as wall time in p_tz WITH that instant's numeric offset: a timestamptz column reads the
 -- exact instant from the offset; a timestamp or date column ignores the offset (PostgreSQL's documented
 -- rule for zone-carrying input to a zoneless type) and keeps the wall time in p_tz, which is precisely
--- what a naive value means here. So one literal serves `for values from`, the monolith's bound CHECK
--- and every `ctl >= lo and ctl < hi` predicate, from any session, for all three column types.
+-- what a naive value means here (p_tz is 'UTC' for such a column, #504, so that wall time is the
+-- column's own reading of the lattice instant). So one literal serves `for values from`, the monolith's
+-- bound CHECK and every `ctl >= lo and ctl < hi` predicate, from any session, for all three column types.
 create or replace function pgpm._time_literal(p_ts timestamptz, p_tz text)
 returns text language plpgsql immutable as $$
 declare v_wall timestamp; v_off int; v_us text;
@@ -872,13 +880,25 @@ $$;
 -- the next grid boundary after p_lo, computed in p_tz
 create or replace function pgpm._grid_next(p_kind text, p_step text, p_lo text, p_tz text)
 returns text language plpgsql immutable as $$
-declare v_months int;
+declare v_months int; v_wall timestamp;
 begin
   if p_kind in ('time', 'uuidv7', 'text_time') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     if v_months > 0 then
-      -- calendar step, on the wall clock in p_tz: the same arithmetic _grid_floor's month branch does
-      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);
+      -- calendar step, on the wall clock in p_tz: the same arithmetic _grid_floor's month branch does.
+      -- Snapped first (#505). A grid value is the first instant of its month in p_tz, and where midnight
+      -- on the 1st fell in a DST gap (America/Asuncion 2023-10-01, Asia/Amman 2016-04-01) that instant
+      -- reads 01:00 on the wall clock: adding the months to the reading as it stands lands an hour past
+      -- the next boundary, next(floor(Oct)) <> floor(Nov), and regrain_step's consecutive sub-ranges
+      -- overlap by that hour (the swap's ATTACH fails "would overlap", skip_regrain on every tick). The
+      -- snap applies only to an instant that IS its month's first instant (the wall midnight of its
+      -- month converts back to exactly it); an off-grid value, such as the anchor set_regrain steps from
+      -- to compare two widths, still moves by a plain calendar month from its own reading.
+      v_wall := p_lo::timestamptz at time zone p_tz;
+      if (date_trunc('month', v_wall) at time zone p_tz) = p_lo::timestamptz then
+        v_wall := date_trunc('month', v_wall);
+      end if;
+      return pgpm._ts_text((v_wall + make_interval(months => v_months)) at time zone p_tz);
     end if;
     -- Fixed step: an absolute number of seconds, NOT `+ p_step::interval`. On a timestamptz, `+ '1 day'`
     -- is a calendar day in the session zone (23 or 25 hours across a DST transition) while _grid_floor's
@@ -941,7 +961,8 @@ $$;
 -- kind adds (#455). A NAIVE column (timestamp without time zone, date) carries no zone, and its text cast
 -- through ::timestamptz would take the SESSION's zone, so the same stored value would decode to one
 -- instant in an operator's session and another in pg_cron's. It is read as wall time in partition_tz
--- instead, which is exactly what _time_literal writes back. A timestamptz column's text carries its
+-- instead, which is exactly what _time_literal writes back; and partition_tz is 'UTC' for such a column
+-- (#504), so this maps the column's own reading onto the lattice unchanged. A timestamptz column's text carries its
 -- offset and round-trips exactly. Always ::timestamp first: `date at time zone` casts the date to a
 -- timestamptz in the session zone and converts the WRONG way. Per-row SQL (regrain's reconcile) inlines
 -- the same rule as an expression rather than calling this, which does a catalog lookup.
@@ -971,11 +992,19 @@ $$;
 -- it has to be unique per range: a name that would exceed PostgreSQL's 63-byte identifier limit is
 -- REFUSED rather than truncated (#510, below).
 --
--- Rendered in p_tz for day and coarser granularities (#455): "the month it is in partition_tz", which
--- is what the operator who chose the zone reads off the name. Sub-day granularities render in UTC
--- instead: a DST-observing zone's wall clock repeats an hour every autumn, so two adjacent hourly cells
--- would share a label, and obtain skips a candidate whose name already exists, which would be a hole at
--- every fall-back. UTC never repeats an hour.
+-- The label's zone follows the cell's definition. A calendar cell (month, year) is defined on the wall
+-- clock in p_tz, so it is labelled by its wall month there (#455): "the month it is in partition_tz",
+-- which is what the operator who chose the zone reads off the name. A fixed-second cell (day, week,
+-- hour, minute) is an absolute lattice from the anchor instant, zone-free by construction, and is
+-- labelled by the UTC reading of its start (#503): two instants a whole number of days apart never share
+-- a UTC date, and two an hour apart never share a UTC hour. The wall clock of a DST-observing zone does
+-- both. It repeats an hour every autumn, which is why sub-day labels were in UTC from the start; and the
+-- day lattice drifts an hour against local midnight twice a year, so the two day cells straddling a
+-- fall-back could start on the same wall date (00:00 EDT and 23:00 EST of the same Sunday when the
+-- anchor is a summer midnight; the 00:00Z cells of the Sunday and the Monday in Atlantic/Azores). obtain
+-- skips a candidate whose name already exists, so a shared label was a permanent one-day hole, and it
+-- also meant set_partition_tz on a day grid moved every label onto its neighbour's. Labelled in UTC, a
+-- day grid's zone changes nothing about it at all: bounds and names are both absolute.
 drop function if exists pgpm._part_name(name, text, text, text);
 create or replace function pgpm._part_name(p_relname name, p_kind text, p_step text, p_lo_native text,
                                            p_hi_native text, p_tz text)
@@ -988,12 +1017,12 @@ begin
   if p_kind in ('time', 'uuidv7', 'text_time') then
     v_months := (extract(year from p_step::interval) * 12 + extract(month from p_step::interval))::int;
     v_secs   := extract(epoch from p_step::interval);
-    v_label_tz := p_tz;
+    v_label_tz := case when v_months > 0 then p_tz else 'UTC' end;
     if    v_months >= 12 and v_months % 12 = 0 then fmt := 'YYYY';
     elsif v_months > 0                          then fmt := 'YYYY_MM';
     elsif v_secs  >= 86400                       then fmt := 'YYYY_MM_DD';
-    elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';   v_label_tz := 'UTC';
-    else                                              fmt := 'YYYY_MM_DD_HH24MI'; v_label_tz := 'UTC';
+    elsif v_secs  >= 3600                        then fmt := 'YYYY_MM_DD_HH24';
+    else                                              fmt := 'YYYY_MM_DD_HH24MI';
     end if;
     v_lo := to_char(p_lo_native::timestamptz at time zone v_label_tz, fmt);
     if v_coarse then v_hi := to_char(p_hi_native::timestamptz at time zone v_label_tz, fmt); end if;
@@ -1204,7 +1233,8 @@ $$;
 -- p_value is in the CONTROL COLUMN's own representation (a uuid literal, a text_time id, a bigint id, a
 -- timestamptz-parseable string) -- decoded the same way pgpm._frontier_native decodes max(control), so a
 -- caller passes exactly what it would have inserted. For a timestamp or date column the value is read
--- as wall time in config.partition_tz, the same rule every other read of that column follows (#455).
+-- as wall time in config.partition_tz, which is 'UTC' for such a column (#504): the same rule every
+-- other read of that column follows (#455).
 --
 -- p_max caps how many NEW partitions this call may create. The check runs BEFORE any DDL: a wildly-off
 -- p_value (a typo, an off-by-a-few-zeros id) is refused loudly and immediately, creating nothing, rather
@@ -3682,6 +3712,7 @@ declare
   v_idmax bigint[]; v_m bigint; v_i int; v_idnext bigint[]; v_seq text; v_n bigint;
   v_monolith name; v_monreg regclass;
   v_tz text;   -- #455: the zone the grid is computed in, recorded in config.partition_tz
+  v_claim_tz text;   -- #506: the zone recorded with the claim, which a resume adopts along with the bound
   v_frontier_native text; v_min_raw text; v_max_raw text; v_min_native text; v_lo_native text; v_hi_native text;
   v_max_ts timestamptz; v_skew_limit timestamptz;   -- #457: the decoded data maximum and how far ahead of now() it may sit
   -- #277: everything CREATE TABLE ... LIKE does NOT carry, captured before the rename and replayed onto
@@ -3707,18 +3738,6 @@ begin
   -- reached config by any other route (a hand edit).
   if p_retain is not null and not pgpm._retain_nonnegative(p_control_kind, p_retain) then
     raise exception 'pg_partition_magician: p_retain cannot be negative (got %) -- a negative retain puts the retention horizon past the partition taking writes, so the first maintenance tick would drop every partition, that one included; zero keeps only the partition taking writes, null keeps everything', p_retain;
-  end if;
-  -- #455: the zone the grid is computed in, for the life of the table. The transmuting session's, so the
-  -- grid the operator sees at conversion is the grid maintenance keeps extending whatever zone pg_cron's
-  -- session runs in; 'UTC' for id, which has no calendar. Only a pg_timezone_names name is recorded (see
-  -- _canonical_tz), and this is checked before anything is committed, so a refusal costs nothing.
-  if p_control_kind = 'id' then
-    v_tz := 'UTC';
-  else
-    v_tz := pgpm._canonical_tz(current_setting('TimeZone'));
-    if v_tz is null then
-      raise exception 'pg_partition_magician: this session''s TimeZone (%) is not a name in pg_timezone_names, and pgpm records the transmuting session''s zone as the one the partition grid is computed in for the life of the table. Set a named zone first (set timezone = ''UTC'' for UTC-aligned boundaries, the usual choice) and re-run.', current_setting('TimeZone');
-    end if;
   end if;
   -- #309: validate the lock timeout HERE, before anything is committed. set_config raises on a bad value
   -- anyway, but it would do so from inside phase 1 or, worse, phase 3 -- after the O(rows) validation
@@ -3829,6 +3848,31 @@ begin
     -- the bounds this kind computes route rows to the wrong partition (see _check_text_time_collation).
     -- Not gated by p_force_text_time: that flag overrides a sampling heuristic, and this is arithmetic.
     perform pgpm._check_text_time_collation(p_parent, p_control, p_tt_prefix, p_tt_width, p_tt_radix, p_tt_alphabet);
+  end if;
+
+  -- #455: the zone the grid is computed in, for the life of the table. The transmuting session's, so the
+  -- grid the operator sees at conversion is the grid maintenance keeps extending whatever zone pg_cron's
+  -- session runs in. Only a pg_timezone_names name is recorded (see _canonical_tz), and this is checked
+  -- before anything is committed, so a refusal costs nothing.
+  --
+  -- 'UTC' for an id grid, which has no calendar, and for a NAIVE control column (timestamp without time
+  -- zone, date), which has no zone (#504): its values are wall readings, and the grid is computed on that
+  -- wall clock directly, so a day is [D 00:00, D+1 00:00) in the column's own values, an hour
+  -- [H:00, H+1:00), a month [1st 00:00, next 1st 00:00), and every bound literal is that reading with no
+  -- offset. That is exactly the UTC lattice. Reading the column as wall time in the session's zone
+  -- instead put the absolute day and hour lattices off the column's clock: a New York session rendered
+  -- the 00:00Z day boundary as 20:00 the previous day, which a date column read as the previous DATE, so
+  -- the monolith's CHECK excluded every row dated today and phase 2's VALIDATE failed after phase 1 had
+  -- committed; and the two hourly cells either side of a fall-back rendered to the same naive wall time,
+  -- an empty range CREATE TABLE refused, so the grid could never extend past that hour. set_partition_tz
+  -- refuses to change it for such a column, because the zone also decides how its literals are read.
+  if p_control_kind = 'id' or (p_control_kind = 'time' and v_typname in ('timestamp', 'date')) then
+    v_tz := 'UTC';
+  else
+    v_tz := pgpm._canonical_tz(current_setting('TimeZone'));
+    if v_tz is null then
+      raise exception 'pg_partition_magician: this session''s TimeZone (%) is not a name in pg_timezone_names, and pgpm records the transmuting session''s zone as the one the partition grid is computed in for the life of the table. Set a named zone first (set timezone = ''UTC'' for UTC-aligned boundaries, the usual choice) and re-run.', current_setting('TimeZone');
+    end if;
   end if;
 
   -- Orphaned-child guard (REDESIGN.md): regrain creates each fine child as a standalone table
@@ -4214,10 +4258,11 @@ begin
   end if;
   execute format('select t.%I::text from %s t order by t.%I asc limit 1', p_control, p_parent::text, p_control)
     into v_min_raw;
-  -- #455: a naive (timestamp / date) control value has no zone; read it as wall time in v_tz, the rule
-  -- _col_to_native applies everywhere else, so the monolith's lower bound is the one every later session
-  -- would compute. A timestamptz text already carries its offset. pgpm.config does not exist yet, so
-  -- this is the inline form of that rule, with v_typname already looked up above.
+  -- #455: a naive (timestamp / date) control value has no zone; read it as wall time in v_tz (which is
+  -- 'UTC' for such a column, #504), the rule _col_to_native applies everywhere else, so the monolith's
+  -- lower bound is the one every later session would compute. A timestamptz text already carries its
+  -- offset. pgpm.config does not exist yet, so this is the inline form of that rule, with v_typname
+  -- already looked up above.
   if p_control_kind = 'time' and v_min_raw is not null then
     v_min_raw := case when v_typname in ('timestamp', 'date') then pgpm._ts_text(v_min_raw::timestamp at time zone v_tz)
                       else pgpm._ts_text(v_min_raw::timestamptz) end;
@@ -4339,9 +4384,9 @@ begin
   -- failed attempt: resuming it is exactly what a take-over does. Matched on both columns, the identity
   -- we are about to record; a recycled pid with an older backend_start fails the match and is caught by
   -- the first arm instead, because its owner is dead.
-  insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi,
+  insert into pgpm.transmute_inflight (parent_table, nsp, rel, control_kind, lo, hi, partition_tz,
                                        owner_pid, owner_backend_start)
-  values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native,
+  values (p_parent, v_nsp, v_rel, p_control_kind, v_lo_native, v_hi_native, v_tz,
           pg_backend_pid(), (select backend_start from pg_stat_activity where pid = pg_backend_pid()))
       on conflict (parent_table) do update
          set owner_pid           = excluded.owner_pid,
@@ -4349,7 +4394,7 @@ begin
        where not pgpm._session_alive(transmute_inflight.owner_pid, transmute_inflight.owner_backend_start)
           or (transmute_inflight.owner_pid = excluded.owner_pid
               and transmute_inflight.owner_backend_start = excluded.owner_backend_start)
-  returning lo, hi, (xmax <> 0) into v_lo_native, v_hi_native, v_resumed;
+  returning lo, hi, partition_tz, (xmax <> 0) into v_lo_native, v_hi_native, v_claim_tz, v_resumed;
 
   if not found then
     raise exception 'pg_partition_magician: a transmute of % is already in progress in another session', p_parent;
@@ -4359,6 +4404,16 @@ begin
   -- than recomputing one -- the frontier has moved on since, but no row can have landed outside the recorded
   -- range, because the CHECK was rejecting exactly those the whole time. xmax is 0 on an insert and the
   -- updating xid on an update, which is what distinguishes the two here.
+  --
+  -- And reuse the ZONE that bound was computed in (#506). The bound sits on the claiming session's lattice
+  -- (#455); registering THIS session's zone instead put the monolith on one lattice and every later grid
+  -- computation on another, so obtain's first candidates half-overlapped the monolith and were skipped, a
+  -- hole one whole step wide was left right past its hi (writes there failed), and set_partition_tz
+  -- refused the repair because the grid built past the hole was on the wrong lattice for the original
+  -- zone. A claim recorded before the column existed carries null and keeps this session's zone.
+  if v_resumed then
+    v_tz := coalesce(v_claim_tz, v_tz);
+  end if;
   v_monolith := pgpm._part_name(v_rel, p_control_kind, p_step, v_lo_native, v_hi_native, v_tz);
 
   -- #509: the cutover RENAMEs the table to this name, so the name has to be free, and nothing before this
@@ -4727,7 +4782,8 @@ begin
   -- looking the table up by name would never see it (#275).
   if v_resumed then
     insert into pgpm.log (parent_table, action, lo, hi, method)
-      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native, 'reused the recorded bound');
+      values (v_parent, 'transmute_resume', v_lo_native, v_hi_native,
+              'reused the recorded bound' || case when v_claim_tz is null then '' else ', computed in ' || v_claim_tz end);
   end if;
 
   -- record the original table, now the bounded MONOLITH coarse child, as an attached partition
@@ -5488,6 +5544,13 @@ begin
   if not found then raise exception 'pg_partition_magician: % is not managed', p_parent; end if;
   if cfg.control_kind = 'id' then
     raise exception 'pg_partition_magician: % is an id grid, which has no calendar; partition_tz is never consulted for it and stays ''UTC''', p_parent;
+  end if;
+  -- #504: a naive column has no zone either. Its grid is its own wall clock (partition_tz is 'UTC' for
+  -- it, see _transmute), and because the zone also decides how its bound literals are rendered and read,
+  -- a change would put every new partition's catalog bound off by the offset against the existing ones:
+  -- pgpm.part and pg_class disagreeing, and a wall-clock hole in the forward grid that refuses writes.
+  if cfg.control_kind = 'time' and pgpm._control_naive(p_parent, cfg.control_column) then
+    raise exception 'pg_partition_magician: set_partition_tz(%, %) refused -- column % of % is a timestamp or date column, which carries no zone: its grid and its bound literals are the column''s own wall clock (recorded as ''UTC''), and rendering new bounds in another zone would shift them by that zone''s offset against every existing partition', p_parent, p_tz, cfg.control_column, p_parent;
   end if;
   v_tz := pgpm._canonical_tz(p_tz);
   if v_tz is null then

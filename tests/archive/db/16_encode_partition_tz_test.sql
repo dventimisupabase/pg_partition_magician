@@ -13,7 +13,8 @@
 -- two rows at wall 10:15 and 10:45 on 2024-01-02 and one at wall 15:30 the same day, 15:00 being the
 -- hour the UTC rendering of 10:00-05 names. Transmuted under New York on an hourly grid, all three land
 -- in the monolith, whose own [lo, hi) from pgpm.part is handed to each strategy exactly as
--- pgpm._archive_step hands it. The archiving session then runs under UTC, as pg_cron's does. Witnesses
+-- pgpm._archive_step hands it. Since #504 the grid is put into the pre-#504 legacy state (a naive grid
+-- recorded in New York) by hand, see below; that is the state on which the defect is observable. The archiving session then runs under UTC, as pg_cron's does. Witnesses
 -- first: the grid really is recorded in a zone other than the session's, the column really is naive,
 -- and the two renderings of the same [lo, hi) really select different rows on it (three against one),
 -- so a correct object could not come from a fixture the defect never had a chance to touch. The
@@ -29,6 +30,23 @@ insert into public.tz16 (ts, id, payload) values
   ('2024-01-02 10:45:00', 2, 'in-b'),
   ('2024-01-02 15:30:00', 3, 'twin');   -- the hour the UTC rendering of the child's lo names
 call pgpm.transmute('public.tz16', 'ts', interval '1 hour');
+-- #504 records a naive column's grid on the UTC lattice (partition_tz 'UTC'), and set_partition_tz refuses
+-- to move it, so no API call produces a naive grid in another zone any more. A table converted BEFORE
+-- #504 still has one: partition_tz is the transmuting session's zone, and pgpm.part's bounds and the
+-- anchor are the instants whose wall clock IN THAT ZONE was the cell boundary. The partition bounds
+-- themselves are naive wall clocks and read the same under either recording, so the legacy state
+-- differs from what transmute just built only in partition_tz and in the stored native text, each
+-- shifted by the zone's offset. Put that state back by hand: it is what every upgraded install still
+-- carries, pgpm_core keeps reading it in partition_tz (_col_to_native, the regrain reconcile, obtain),
+-- and this file is the only guard that the transports do the same.
+update pgpm.part
+   set lo = pgpm._ts_text((lo::timestamptz at time zone 'UTC') at time zone 'America/New_York'),
+       hi = pgpm._ts_text((hi::timestamptz at time zone 'UTC') at time zone 'America/New_York')
+ where parent_table = 'public.tz16'::regclass;
+update pgpm.config
+   set partition_tz     = 'America/New_York',
+       partition_anchor = pgpm._ts_text((partition_anchor::timestamptz at time zone 'UTC') at time zone 'America/New_York')
+ where parent_table = 'public.tz16'::regclass;
 set timezone = 'UTC';   -- the archiving session: pg_cron runs under the cluster's zone
 
 select mk_archive_config('tz16', false);

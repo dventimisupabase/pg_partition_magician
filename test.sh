@@ -612,6 +612,11 @@ run_perf() {
     "bench/transmute_preconditions.sh pgpm_perf33"
     "bench/uuidv7_regrain_archive.sh pgpm_perf34"
     "bench/archive_ledger_identity.sh pgpm_perf35"
+    "bench/day_label_utc.sh pgpm_perf36"
+    "bench/day_label_utc.sh pgpm_perf37"
+    "bench/naive_column_utc_grid.sh pgpm_perf21"
+    "bench/month_step_dst_gap.sh pgpm_perf22"
+    "bench/transmute_resume_zone.sh pgpm_perf23"
   )
   local selected=()
   local n=${#guards[@]} idx

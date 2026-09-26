@@ -1091,7 +1091,7 @@ begin
         "absolute so the mutant is exactly 'the zone parameter is not consulted', not 'the day lattice "
         "is broken again', and a catch is a catch for the right reason. tests/111's month-step pairs "
         "(computed under two session zones) and its transmute-under-New-York walk are what catch it.",
-        [("      return pgpm._ts_text(((p_lo::timestamptz at time zone p_tz) + make_interval(months => v_months)) at time zone p_tz);\n",
+        [("      return pgpm._ts_text((v_wall + make_interval(months => v_months)) at time zone p_tz);\n",
           "      return pgpm._ts_text(p_lo::timestamptz + make_interval(months => v_months));\n", 1)],
     ),
     "datestyle_session_render": (
@@ -1216,6 +1216,71 @@ begin
     perform pgpm._part_name(v_rel, cfg.control_kind, p_target_step, cfg.partition_anchor, null, cfg.partition_tz);
   end if;
 """, "", 1)],
+    ),
+    "grid_next_month_unsnapped": (
+        "bench/month_step_dst_gap.sh",
+        "Pre-#505 _grid_next: the calendar step adds the months to the grid value's wall reading as it "
+        "stands. A grid value is the first instant of its month in partition_tz, and where midnight on the "
+        "1st fell in a DST gap (America/Asuncion 2023-10-01, Asia/Amman 2016-04-01) that instant reads "
+        "01:00, so next(floor(Oct)) lands at 01:00 on Nov 1 while floor(Nov) is 00:00 on Nov 1: "
+        "regrain_step's consecutive sub-ranges overlap by that hour, the swap's ATTACH fails 'would "
+        "overlap', and auto-regrain logs skip_regrain on every tick, forever. The snap that steps such a "
+        "value from its wall midnight is removed, and nothing else: an off-grid value never took it. "
+        "tests/127's next(floor(Oct)) = floor(Nov) pairs, its cursor-floors-to-itself check and its "
+        "twelve-step chain are what catch it.",
+        [("      if (date_trunc('month', v_wall) at time zone p_tz) = p_lo::timestamptz then\n"
+          "        v_wall := date_trunc('month', v_wall);\n"
+          "      end if;\n",
+          "", 1)],
+    ),
+    "transmute_resume_session_zone": (
+        "bench/transmute_resume_zone.sh",
+        "Pre-#506 _transmute: a resume reuses the claim's bound but ignores the zone recorded with it and "
+        "registers config.partition_tz from the RESUMING session. The bound sits on the claiming session's "
+        "lattice, so the monolith is on one lattice and every later grid computation on another: obtain's "
+        "first candidates half-overlap the monolith and are skipped, a hole one whole step wide is left "
+        "right past its hi (writes there fail with no partition found), and set_partition_tz refuses the "
+        "repair. The column and the recording stay; only the adoption on resume is removed, so the mutant "
+        "is exactly 'the recorded zone is not consulted'. tests/128's resume from a UTC session of a New "
+        "York claim is what catches it: partition_tz reads UTC, the monolith's hi is not a UTC boundary, "
+        "and obtain leaves the hole.",
+        [("  if v_resumed then\n    v_tz := coalesce(v_claim_tz, v_tz);\n  end if;\n", "", 1)],
+    ),
+    "part_name_day_label_in_zone": (
+        "bench/day_label_utc.sh",
+        "Pre-#503 _part_name: a day or week label is the wall DATE of the cell's start in partition_tz, "
+        "although the day lattice is an absolute 86400 s lattice from the anchor instant. In a zone with "
+        "daylight saving that lattice drifts an hour against local midnight twice a year, so the two "
+        "cells straddling a fall-back can start on the same wall date (00:00 EDT and 23:00 EST of the "
+        "same Sunday when the anchor is a summer midnight; the 00:00Z cells of the Sunday and the Monday "
+        "in Atlantic/Azores) and share a name; and after set_partition_tz to a zone west of the old one "
+        "every cell's new label is its predecessor's old one. obtain and extend_to skip a candidate whose "
+        "name already exists before their overlap check, so the second cell of the pair is never built: a "
+        "permanent one-day hole that refuses writes. tests/125's adapter pairs, its New York grid across "
+        "the fall-back and its zone change on a UTC day grid are what catch it.",
+        [("    v_label_tz := case when v_months > 0 then p_tz else 'UTC' end;\n",
+          "    v_label_tz := case when v_months > 0 or v_secs >= 86400 then p_tz else 'UTC' end;\n", 1)],
+    ),
+    "naive_column_grid_in_session_zone": (
+        "bench/naive_column_utc_grid.sh",
+        "Pre-#504 _transmute and set_partition_tz: a timestamp or date control column records the "
+        "transmuting SESSION's zone as partition_tz, and set_partition_tz accepts a change for it. The "
+        "column's values are wall readings with no zone, but the fixed-step lattices are absolute seconds "
+        "from the anchor instant, so read in a zone with an offset they no longer sit on the column's own "
+        "clock: under America/New_York the 00:00Z day boundary renders as 20:00 the previous day, which a "
+        "date column reads as the previous DATE, so the monolith's CHECK excludes every row dated today "
+        "and phase 2's VALIDATE fails after phase 1 committed; the hourly cells either side of the autumn "
+        "fall-back render to the same naive wall time and CREATE TABLE refuses the second as an empty "
+        "range; and after an accepted zone change every new bound literal is rendered in a different zone "
+        "from the existing ones. Two sites, because the refusal is half of the fix: without it a table "
+        "correctly recorded as UTC can still be moved off its own clock. tests/126's date-column "
+        "conversion, its hourly cells across the fall-back and its refused set_partition_tz are what catch it.",
+        [("  if p_control_kind = 'id' or (p_control_kind = 'time' and v_typname in ('timestamp', 'date')) then\n    v_tz := 'UTC';\n",
+          "  if p_control_kind = 'id' then\n    v_tz := 'UTC';\n", 1),
+         ("  if cfg.control_kind = 'time' and pgpm._control_naive(p_parent, cfg.control_column) then\n"
+          "    raise exception 'pg_partition_magician: set_partition_tz(%, %) refused -- column % of % is a timestamp or date column, which carries no zone: its grid and its bound literals are the column''s own wall clock (recorded as ''UTC''), and rendering new bounds in another zone would shift them by that zone''s offset against every existing partition', p_parent, p_tz, cfg.control_column, p_parent;\n"
+          "  end if;\n",
+          "", 1)],
     ),
     "archive_lz77_hash_scratch": (
         "bench/archive_lz77_memory.sh",
