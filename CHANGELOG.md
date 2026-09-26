@@ -330,6 +330,9 @@
   table transmuted from a non-UTC session on an unreleased build keeps its recorded zone (its grid is on
   that lattice). `tests/126` pins the rule, `bench/naive_column_utc_grid.sh` runs it against
   `naive_column_grid_in_session_zone`, and `tests/111` (d) follows it.
+  A grid converted before this change keeps the zone it was recorded in, and pgpm keeps reading it there;
+  `tests/archive/db/16_encode_partition_tz_test.sql` (#501's guard) now builds that legacy state by hand,
+  since it is the state on which the transports' zone argument is observable.
 
 - **A month step is one lattice where midnight on the 1st falls in a daylight-saving gap** (#505). Where
   a zone's clocks jumped forward at midnight on the 1st (`America/Asuncion` on 2023-10-01, `Asia/Amman`
