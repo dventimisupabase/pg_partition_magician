@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **Turning auto-regrain off mid-flight abandons the run it started, instead of stranding it** (#516).
+  `set_regrain(parent, null)` wrote `regrain_to` and nothing else. `maintain` dispatches `regrain_step` only
+  while `regrain_to` is set, so the run in flight was never driven again, and the capture janitor keeps
+  capture on the child whose range covers `config.regrain_cursor`, which nothing cleared, so it was never
+  swept either: the capture trigger kept taxing every write into the source and filling a delta nobody
+  drained, the not-yet-attached copies stayed on disk, and `TRUNCATE` of the parent stayed refused as "a
+  regrain is in flight", indefinitely, until the operator found `regrain_cancel`. The reference promised
+  `maintain` would sweep it and the runbook promised the run would complete; the code did neither. Now a
+  `set_regrain(parent, null)` that actually turns auto-regrain off, with a regrain in flight, abandons that
+  run through `regrain_cancel` (capture and the `TRUNCATE` guard off, delta cleared, copies dropped, cursor
+  null, one `regrain_cancel` row); the source still holds every row, so only the copy work is lost. A call
+  that finds auto-regrain already off changes nothing, so it never cancels an operator-driven regrain. The
+  reference, the runbook's "Disk is filling during a regrain" and the guide now say so.
+  `tests/129_set_regrain_off_midflight_test.sql` witnesses the run in flight (capture, cursor, a captured
+  update, the refused `TRUNCATE`) before the call and asserts by identity what is left after it and after
+  three more ticks; `bench/set_regrain_off_midflight.sh` drives the same file for `./test.sh discriminate`,
+  where the `set_regrain_off_keeps_regrain` mutation puts the defect back.
+
 - **A burst of rows minted within one second (or millisecond) no longer stalls the archiving of its
   partition, silently and for good** (#513). `pgpm._next_archive_chunk` ends a chunk at the next distinct
   control value, decoded to the native grid. For `text_time` and `uuidv7` that decode truncates to the

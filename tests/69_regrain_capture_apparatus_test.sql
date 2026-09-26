@@ -66,8 +66,10 @@ select is((select count(*) from public.ca2_pgpm_regrain_delta), 0::bigint,
   'the delta is cleared at the swap, so status shows no phantom backlog');
 
 -- ======================= the janitor reaps an abandoned regrain =======================
--- Turning auto-regrain off mid-flight leaves capture installed with nobody reconciling it. maintain's
--- per-tick sweep tears it down, exactly as _enforce_write_blocks does for write blocks.
+-- A cursor cleared out from under an in-flight regrain leaves capture installed with nobody reconciling
+-- it. maintain's per-tick sweep tears it down, exactly as _enforce_write_blocks does for write blocks.
+-- The abandonment here is a hand edit of the cursor; turning auto-regrain off mid-flight is no longer
+-- one, since set_regrain(parent, null) cancels the run outright (#516, tests/129).
 call pg_temp.mk('ca3');
 select pgpm.set_regrain('public.ca3', '100');
 select pgpm.regrain_step('public.ca3','ca3_p0000000000000000000_to_0000000000000003000','100',50);
